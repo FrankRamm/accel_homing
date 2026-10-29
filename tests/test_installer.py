@@ -807,6 +807,70 @@ class HostFixture(unittest.TestCase):
         self.assertNotIn("[include accel_homing.cfg]", text)
         self.assertIn("beacon_accel:x", changes[self.axes]["data"].decode())
 
+    def test_generic_names_are_install_only(self):
+        for mode in (("--uninstall",), ("--rollback", "offline-backup")):
+            with self.subTest(mode=mode), contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit):
+                installer.arguments(list(mode) + ["--generic-names"])
+        self.assertTrue(installer.arguments(["--generic-names", "--dry-run", "--no-restart"]).generic_names)
+
+    def test_generic_names_rename_both_pin_aliases_with_only_one_selected_axis(self):
+        legacy = ("\n [beacon_accel_homing] ; Preserve header comment\nbeacon: beacon\naccel_chip: beacon\n"
+                  "x_threshold: 6.1\ny_threshold: 7.2\n# printer.beacon_accel_homing is historical\n")
+        self.config.write_bytes((CONFIG + legacy + SAVED).encode())
+        self.axes.write_bytes(AXES.replace("tmc2209_stepper_x:virtual_endstop", "beacon_accel:x")
+                              .replace("!PA0", "beacon_accel:y").encode())
+        changes, _, sensor = self.plan("--generic-names", "--axes", "x")
+        self.assertEqual(sensor, "beacon")
+        self.assertEqual(changes[self.config]["data"],
+                         (CONFIG + legacy.replace("[beacon_accel_homing]", "[accel_homing]") + SAVED).encode())
+        y_before = self.axes.read_bytes().split(b"[stepper_y]", 1)[1].split(b"[tmc2209 stepper_x]", 1)[0]
+        y_after = changes[self.axes]["data"].split(b"[stepper_y]", 1)[1].split(b"[tmc2209 stepper_x]", 1)[0]
+        self.assertEqual(y_after, y_before.replace(b"beacon_accel:y", b"accel_homing:y"))
+        self.assertIn(b"endstop_pin: accel_homing:x", changes[self.axes]["data"])
+        self.assertNotIn(b"previous: endstop_pin: beacon_accel", changes[self.axes]["data"])
+
+    def test_generic_names_preserve_explicit_legacy_sensor_selection(self):
+        self.config.write_bytes((CONFIG + "\n[beacon second]\nserial: fixture-second\n"
+                                 "[beacon_accel_homing]\nbeacon: beacon second\nx_threshold: 6.1\n" + SAVED).encode())
+        changes, _, sensor = self.plan("--generic-names")
+        self.assertEqual(sensor, "beacon second")
+        self.assertIn(b"[accel_homing]\nbeacon: beacon second\nx_threshold: 6.1\n", changes[self.config]["data"])
+        plugin = next(section for section in installer.ConfigDocument(self.config, changes[self.config]["data"]).sections
+                      if section.name == "accel_homing")
+        self.assertEqual(plugin.get("accel_chip"), "beacon second")
+
+    def test_generic_names_refuse_active_legacy_references_before_staging(self):
+        for reference in ("    SET_BEACON_ACCEL_HOMING AXIS=X THRESHOLD=1\n",
+                          "    BEACON_ACCEL_HOMING_STATUS\n",
+                          "    {% set state = printer.beacon_accel_homing %}\n",
+                          '    {% set state = printer["beacon_accel_homing"] %}\n',
+                          "    M118 beacon_accel:x\n"):
+            with self.subTest(reference=reference):
+                self.config.write_bytes((CONFIG + reference + "\n[beacon_accel_homing]\n" + SAVED).encode())
+                original = self.config.read_bytes(), self.axes.read_bytes()
+                with mock.patch.object(installer.Section, "replace") as replace, \
+                     mock.patch.object(installer.Section, "generic_name") as rename, \
+                     self.assertRaisesRegex(installer.InstallError, "legacy macro/object/command reference"):
+                    self.plan("--generic-names")
+                replace.assert_not_called()
+                rename.assert_not_called()
+                self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), original)
+                self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_generic_names_already_generic_header_normalizes_remaining_pin_and_is_idempotent(self):
+        self.require_symlinks()
+        self.config.write_bytes((CONFIG + "\n[accel_homing]\naccel_chip: beacon\n" + SAVED).encode())
+        self.axes.write_bytes(AXES.replace("tmc2209_stepper_x:virtual_endstop", "accel_homing:x")
+                              .replace("!PA0", "beacon_accel:y").encode())
+        first = self.plan("--generic-names")[0]
+        installer.apply_plan(first, self.config, selected=self.selected)
+        current = self.config.read_bytes(), self.axes.read_bytes()
+        self.assertIn(b"endstop_pin: accel_homing:y", current[1])
+        self.assertEqual(self.plan("--generic-names")[0], {})
+        self.assertEqual(self.plan()[0], {})
+        self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), current)
+
     def test_multiple_sensors_requires_full_name(self):
         self.config.write_text(CONFIG + "\n[adxl345 toolhead]\ncs_pin: host:None\n")
         with self.assertRaisesRegex(installer.InstallError, "Expected one configured"):
@@ -1725,6 +1789,146 @@ class UninstallFixture(unittest.TestCase):
         self.uninstall()
         self.assertEqual(self.config.read_bytes(), old_config)
         self.assertEqual(self.links, original_links)
+
+    def legacy_names_fixture(self, split=False, newline="\n"):
+        plugin = ("# Existing Wayne configuration\n [beacon_accel_homing] ; keep header comment\n"
+                  "beacon: beacon\nx_threshold: 6.2\ny_threshold: 6.3\n"
+                  "max_sample_age: 0.020\nmax_report_travel: 1.0\nmax_startup_travel: 3.0\n")
+        saved = SAVED.replace("#*# [accel_homing_model default]\n#*# x_threshold = 6.5\n", "")
+        plugin_file = self.config.parent / "legacy-homing.cfg" if split else self.config
+        config = CONFIG + ("\n[include legacy-homing.cfg]\n" if split else "\n" + plugin) + saved
+        self.config.write_bytes(config.replace("\n", newline).encode())
+        if split:
+            plugin_file.write_bytes(plugin.replace("\n", newline).encode())
+        self.axes.write_bytes(AXES.replace("tmc2209_stepper_x:virtual_endstop", "beacon_accel:x")
+                              .replace("!PA0", "beacon_accel:y").replace("\n", newline).encode())
+        wayne = self.home / "original-wayne-source"
+        wayne.mkdir()
+        original_module = wayne / "beacon_accel_homing.py"
+        original_module.write_text("# Original Wayne module\n")
+        self.links[self.extras / original_module.name] = {"kind": "symlink", "target": str(original_module)}
+        return plugin_file
+
+    def test_generic_names_transaction_restores_wayne_baseline_after_calibration_and_update(self):
+        plugin_file = self.legacy_names_fixture()
+        original = self.capture()
+        first = self.install("managed", "--replace-existing-links")
+        first_manifest = (first / "manifest.json").read_bytes()
+        self.assertIn(b"accel_chip: beacon\n", plugin_file.read_bytes())
+        self.config.write_bytes(self.config.read_bytes() +
+                                b"#*# [accel_homing_model default]\n#*# x_threshold = 9.2\n#*# y_threshold = 8.1\n")
+        before, axes_before = self.config.read_bytes(), self.axes.read_bytes()
+        normalized = self.install("managed", "--generic-names", "--axes", "x")
+        self.assertEqual(self.config.read_bytes(), before.replace(b"[beacon_accel_homing]", b"[accel_homing]"))
+        self.assertEqual(self.axes.read_bytes(), axes_before.replace(b"beacon_accel:", b"accel_homing:"))
+        self.assertEqual((first / "manifest.json").read_bytes(), first_manifest)
+        changes = {entry["path"]: entry for entry in self.manifest(normalized)["changes"]}
+        self.assertEqual(base64.b64decode(changes[str(self.config)]["before"]["data"]), before)
+        self.assertEqual(base64.b64decode(changes[str(self.config)]["after"]["data"]), self.config.read_bytes())
+        self.assertEqual(self.config.read_bytes().split(installer.SAVE_MARKER.encode(), 1)[1],
+                         before.split(installer.SAVE_MARKER.encode(), 1)[1])
+        self.install("update")
+        self.assertIn(b"[accel_homing]", self.config.read_bytes())
+        self.assertNotIn(b"[beacon_accel_homing]", self.config.read_bytes())
+        unrelated = b"#*# [bed_mesh default]\n#*# points = 0.1, 0.2\n"
+        self.config.write_bytes(self.config.read_bytes().replace(b"model_coef = 1.234", b"model_coef = 9.876") + unrelated)
+        plan, _receipt = self.uninstall()
+        self.assertEqual(len(plan["history"]), 3)
+        self.assertEqual(self.axes.read_bytes(), base64.b64decode(original[str(self.axes)]["data"]))
+        self.assertEqual(self.config.read_bytes(), base64.b64decode(original[str(self.config)]["data"])
+                         .replace(b"model_coef = 1.234", b"model_coef = 9.876") + unrelated)
+        self.assertEqual(self.capture()[str(self.repo / ".git/info/exclude")], original[str(self.repo / ".git/info/exclude")])
+        self.assertEqual({str(path): self.snapshot(path) for path in self.links},
+                         {str(self.extras / name): original[str(self.extras / name)] for name in installer.MODULES})
+
+    def test_generic_names_split_includes_survive_save_config_newline_changes(self):
+        plugin_file = self.legacy_names_fixture(split=True, newline="\r\n")
+        original = self.capture()
+        original_plugin = plugin_file.read_bytes()
+        self.install("managed", "--replace-existing-links")
+        saved = b"#*# [accel_homing_model default]\n#*# x_threshold = 9.2\n"
+        # Klipper SAVE_CONFIG normalizes the main file's newlines independently
+        # of the included plugin/rail files.
+        self.config.write_bytes(self.config.read_bytes().replace(b"\r\n", b"\n") + saved)
+        before, plugin_before = self.config.read_bytes(), plugin_file.read_bytes()
+        self.install("managed", "--generic-names")
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(plugin_file.read_bytes(), plugin_before.replace(b"[beacon_accel_homing]", b"[accel_homing]"))
+        plugin_file.write_bytes(plugin_file.read_bytes().replace(b"\r\n", b"\n"))
+        self.axes.write_bytes(self.axes.read_bytes().replace(b"\r\n", b"\n").replace(b"run_current: 1.2", b"run_current: 1.25"))
+        self.install("update")
+        self.uninstall()
+        self.assertEqual(plugin_file.read_bytes().replace(b"\r\n", b"\n"), original_plugin.replace(b"\r\n", b"\n"))
+        self.assertEqual(self.config.read_bytes().replace(b"\r\n", b"\n"),
+                         base64.b64decode(original[str(self.config)]["data"]).replace(b"\r\n", b"\n"))
+        self.assertEqual(self.axes.read_bytes().replace(b"\r\n", b"\n"),
+                         base64.b64decode(original[str(self.axes)]["data"]).replace(b"\r\n", b"\n")
+                         .replace(b"run_current: 1.2", b"run_current: 1.25"))
+
+    def test_generic_names_history_rejects_tampered_threshold_policy_and_section(self):
+        self.legacy_names_fixture()
+        self.install("managed", "--replace-existing-links")
+        normalized = self.install("managed", "--generic-names")
+        original_manifest = (normalized / "manifest.json").read_bytes()
+        original_config = self.config.read_bytes()
+        for old, new in ((b"x_threshold: 6.2", b"x_threshold: 9.9"),
+                         (b"max_report_travel: 1.0", b"max_report_travel: nan"),
+                         (b"[gcode_macro PRINT_START]", b"[gcode_macro UNOWNED]"),
+                         (b"[accel_homing]", b"[unowned_homing]")):
+            with self.subTest(change=new):
+                manifest = json.loads(original_manifest)
+                changed = original_config.replace(old, new)
+                self.assertNotEqual(changed, original_config)
+                entry = next(item for item in manifest["changes"] if item["path"] == str(self.config))
+                entry["after"]["data"] = base64.b64encode(changed).decode("ascii")
+                (normalized / "manifest.json").write_text(json.dumps(manifest))
+                self.config.write_bytes(changed)
+                current = self.capture()
+                backups = set((self.config.parent / ".accel_homing_backups").iterdir())
+                with self.assertRaisesRegex(installer.InstallError, "outside installer ownership|Unrecognized"):
+                    installer.make_uninstall_plan(self.selected)
+                with self.assertRaisesRegex(installer.InstallError, "outside installer ownership|Unrecognized"):
+                    self.plan("--generic-names")
+                self.assertEqual(self.capture(), current)
+                self.assertEqual(set((self.config.parent / ".accel_homing_backups").iterdir()), backups)
+        (normalized / "manifest.json").write_bytes(original_manifest)
+        self.config.write_bytes(original_config)
+
+    def test_generic_names_validator_preserves_historical_marker_based_alias_conversion(self):
+        self.config.write_bytes((CONFIG + "\n[accel_homing]\naccel_chip: beacon\n" + SAVED).encode())
+        self.axes.write_bytes(AXES.replace("tmc2209_stepper_x:virtual_endstop", "beacon_accel:x")
+                              .replace("!PA0", "beacon_accel:y")
+                              .replace("endstop_pin: beacon_accel:x\n",
+                                       "# accel_homing previous: endstop_pin: beacon_accel:x\nendstop_pin: beacon_accel:x\n").encode())
+        original = self.capture()
+        self.install()
+        self.assertIn(b"# accel_homing previous: endstop_pin: beacon_accel:x\n", self.axes.read_bytes())
+        self.uninstall()
+        self.assertEqual(self.capture(), original)
+
+    def test_generic_names_preserve_preexisting_matching_pin_comments(self):
+        self.legacy_names_fixture()
+        self.axes.write_bytes(self.axes.read_bytes().replace(
+            b"endstop_pin: beacon_accel:x\n",
+            b"# accel_homing previous: endstop_pin: beacon_accel:x\nendstop_pin: beacon_accel:x\n"))
+        original = self.capture()
+        self.install("managed", "--replace-existing-links")
+        before = self.axes.read_bytes()
+        self.install("managed", "--generic-names")
+        self.assertEqual(self.axes.read_bytes(), before.replace(b"\nendstop_pin: beacon_accel:", b"\nendstop_pin: accel_homing:"))
+        self.uninstall()
+        self.assertEqual(self.capture(), original)
+
+    def test_generic_names_history_rejects_reverse_duplicate_and_unrelated_header_changes(self):
+        helper = installer.load_uninstaller()
+        api = installer.uninstall_api()
+        for before, after in ((b"[accel_homing]\n", b"[beacon_accel_homing]\n"),
+                              (b"[beacon_accel_homing]\n", b"[accel_homing]\n[beacon_accel_homing]\n"),
+                              (b"[beacon_accel_homing]\n[accel_homing]\n", b"[accel_homing]\n[accel_homing]\n"),
+                              (b"[gcode_macro ORIGINAL]\n", b"[gcode_macro RENAMED]\n")):
+            with self.subTest(before=before, after=after), \
+                 self.assertRaisesRegex(installer.InstallError, "Unrecognized section changes"):
+                helper._valid_config_change(before, after, self.config, self.config, api)
 
     def test_managed_line_edit_or_changed_section_refuses_before_writes(self):
         self.install()

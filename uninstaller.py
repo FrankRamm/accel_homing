@@ -236,6 +236,11 @@ def _valid_config_change(before, after, path, main, api):
     old_names = [section.name.lower() for section in document.sections]
     new_names = [section.name.lower() for section in installed.sections]
     expected = old_names[:]
+    if "beacon_accel_homing" in old_names and "accel_homing" in new_names:
+        if "accel_homing" in old_names or "beacon_accel_homing" in new_names:
+            _fail(api, "Unrecognized section changes in installation backup: %s" % path)
+        expected[old_names.index("beacon_accel_homing")] = "accel_homing"
+        document.sections[old_names.index("beacon_accel_homing")].generic_name()
     if path == main and len(new_names) == len(expected) + 1 and new_names[-1] == "include " + api.MANAGED:
         expected.append("include " + api.MANAGED)
         document.insertions.setdefault(document.active_end, []).append(
@@ -251,7 +256,25 @@ def _valid_config_change(before, after, path, main, api):
             if pin != original.get("endstop_pin"):
                 if pin not in ("accel_homing:" + axis, "beacon_accel:" + axis):
                     _fail(api, "Unrecognized endstop change in %s" % path)
-                replace["endstop_pin"] = pin
+                # A naming transaction replaces only this token. Ordinary
+                # activation still records the previous pin as a comment.
+                renamed = False
+                if pin == "accel_homing:" + axis and original.get("endstop_pin") == "beacon_accel:" + axis:
+                    index = changed.options["endstop_pin"][0][0]
+                    old_index = original.options["endstop_pin"][0][0]
+                    previous = "# accel_homing previous: " + document.lines[
+                        old_index].lstrip().rstrip("\r\n") + document.newline
+                    markers = []
+                    for lines, option_index in ((document.lines, old_index), (installed.lines, index)):
+                        start = option_index
+                        while start and lines[start - 1] == previous:
+                            start -= 1
+                        markers.append(option_index - start)
+                    commented = markers[1] > markers[0]
+                    if not commented:
+                        renamed = original.generic_pin(axis)
+                if not renamed:
+                    replace["endstop_pin"] = pin
             if changed.get("homing_retract_dist") != original.get("homing_retract_dist"):
                 if changed.get("homing_retract_dist") != "0":
                     _fail(api, "Unrecognized retract change in %s" % path)

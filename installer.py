@@ -27,6 +27,7 @@ SAVE_MARKER = "#*# <---------------------- SAVE_CONFIG ---------------------->"
 MANAGED = "accel_homing.cfg"
 SECTION = re.compile(r"^\s*\[([^]]+)\]\s*(?:[#;].*)?$")
 OPTION = re.compile(r"^(\s*)([\w]+)(\s*[:=]\s*)(.*?)(\r?\n)?$")
+LEGACY_REFERENCE = re.compile(r"\b(?:beacon_accel_homing|beacon_accel_homing_status|set_beacon_accel_homing)\b|\bbeacon_accel\s*:", re.I)
 SERVICE_NAME = re.compile(r"[A-Za-z0-9_:][A-Za-z0-9_.:@\\-]*\.service\Z")
 SERVICE_PROPERTIES = ("Id", "LoadState", "ActiveState", "SubState", "MainPID", "InvocationID",
                       "ControlGroup", "ExecStart", "WorkingDirectory", "FragmentPath", "DropInPaths",
@@ -278,6 +279,24 @@ class Section:
             index = self.options[name.lower()][0][0]
             self.document.replacements[index] = "# accel_homing previous: " + self.document.lines[index].lstrip()
 
+    def generic_name(self):
+        if self.name.lower() != "beacon_accel_homing":
+            return
+        line = self.document.lines[self.start]
+        match = SECTION.match(line)
+        name = re.sub("beacon_accel_homing", "accel_homing", match.group(1), flags=re.I)
+        self.document.replacements[self.start] = line[:match.start(1)] + name + line[match.end(1):]
+
+    def generic_pin(self, axis):
+        if self.get("endstop_pin") != "beacon_accel:" + axis:
+            return False
+        index, match = self.options["endstop_pin"][0]
+        line = self.document.lines[index]
+        self.document.replacements[index] = (line[:match.start(4)]
+            + match.group(4).replace("beacon_accel:" + axis, "accel_homing:" + axis, 1)
+            + line[match.end(4):])
+        return True
+
 
 class ConfigDocument:
     def __init__(self, path, original=None):
@@ -369,6 +388,28 @@ def choose_sensor(graph, selected=None, existing=None):
                            "is not an accelerometer; configure its separate [adxl345 ...] first." %
                            (len(configured), ", ".join(configured) or "none"))
     return graph.one(configured[0]).name
+
+
+def validate_generic_names(graph, existing):
+    """Only the known plugin header and X/Y endstop aliases can be renamed."""
+    recognized = set()
+    if existing and existing.name.lower() == "beacon_accel_homing":
+        recognized.add((existing.document.path, existing.start))
+    for axis in ("x", "y"):
+        rail = graph.one("stepper_" + axis, False)
+        if rail and rail.get("endstop_pin") == "beacon_accel:" + axis:
+            recognized.add((rail.document.path, rail.options["endstop_pin"][0][0]))
+    for document in graph.documents.values():
+        include_headers = {section.start for section in document.sections
+                           if section.name.lower().startswith("include ")}
+        for index, line in enumerate(document.lines[:document.active_end]):
+            if index in include_headers or (document.path, index) in recognized:
+                continue
+            active = re.split(r"[#;]", line, maxsplit=1)[0]
+            if LEGACY_REFERENCE.search(active):
+                raise InstallError("--generic-names cannot safely migrate a legacy macro/object/command "
+                                   "reference in %s:%d. Adapt that active reference explicitly first; "
+                                   "no files changed." % (document.path, index + 1))
 
 
 def validate_homing_speeds(graph, args, family, existing):
@@ -530,6 +571,10 @@ def make_plan(source, selected, args):
     if len(plugins) > 1:
         raise InstallError("Use either [accel_homing] or [beacon_accel_homing], not both.")
     existing = plugins[0] if plugins else None
+    generic_names = getattr(args, "generic_names", False)
+    if generic_names:
+        load_uninstaller().validate_installation_history(selected, uninstall_api())
+        validate_generic_names(graph, existing)
     sensor = choose_sensor(graph, args.accel_chip, existing)
     family = sensor.split()[0].lower()
     if not any((selected["repo"] / "klippy" / location / (family + ".py")).is_file()
@@ -547,7 +592,16 @@ def make_plan(source, selected, args):
                         "workflows require its verified stock G28 predecessor and bypass all override "
                         "G-code, including current/enable setup, SYNC_MOTORS and Z/Beacon actions. "
                         "Prepare suitable test currents/enables and nozzle clearance independently.")
-    prefix = "beacon_accel" if existing and existing.name.lower() == "beacon_accel_homing" else "accel_homing"
+    prefix = ("beacon_accel" if existing and existing.name.lower() == "beacon_accel_homing"
+              and not generic_names else "accel_homing")
+    if generic_names:
+        if existing:
+            existing.generic_name()
+        for axis in ("x", "y"):
+            rail = graph.one("stepper_" + axis, False)
+            if rail:
+                rail.generic_pin(axis)
+        messages.append("Generic plugin section and X/Y pin names requested; active calibration and SAVE_CONFIG preserved.")
     overrides = {name: repr(getattr(args, name)) for name in
                  ("max_report_travel", "max_startup_travel")
                  if getattr(args, name) is not None}
@@ -577,7 +631,8 @@ def make_plan(source, selected, args):
             main = graph.documents[selected["config"]]
             main.insertions.setdefault(main.active_end, []).append(main.newline + "[include " + MANAGED + "]" + main.newline + main.newline)
     for axis, (rail, speed, actual_speed) in speeds.items():
-        rail.replace("endstop_pin", prefix + ":" + axis)
+        if not (generic_names and rail.get("endstop_pin") == "beacon_accel:" + axis):
+            rail.replace("endstop_pin", prefix + ":" + axis)
         rail.replace("homing_retract_dist", "0")
         for key in ("homing_accel", "min_home_dist"):
             rail.disable(key)
@@ -1134,6 +1189,8 @@ def arguments(argv=None):
     parser.add_argument("--no-update-manager", action="store_true", help="install without managed git source/Moonraker registration (offline/development opt-out)")
     parser.add_argument("--moonraker-config", help="select the actual Moonraker config; must match this Klippy API socket")
     parser.add_argument("--accel-chip", help="full configured section, e.g. 'adxl345 toolhead'")
+    parser.add_argument("--generic-names", action="store_true",
+                        help="rename a legacy plugin section and both X/Y pin aliases to generic names; refuse legacy macro/object/command references")
     parser.add_argument("--axes", default="x,y", help="x,y (default), x or y")
     parser.add_argument("--homing-speed", type=float,
                         help="explicitly replace selected homing speeds; default preserves configured values and rejects policy conflicts")
@@ -1157,6 +1214,8 @@ def arguments(argv=None):
         parser.error("choose --rollback or --uninstall")
     if (args.rollback or args.uninstall) and (args.max_report_travel is not None or args.max_startup_travel is not None):
         parser.error("--max-report-travel and --max-startup-travel apply only to installation/update")
+    if (args.rollback or args.uninstall) and args.generic_names:
+        parser.error("--generic-names applies only to installation/update")
     return args
 
 

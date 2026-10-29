@@ -120,6 +120,7 @@ pending work before installing or updating.
 | `--klipper-python PATH` | Select its exact venv Python when discovery cannot establish it. |
 | `--moonraker-config PATH` | Select the Moonraker config correlated with that Klippy socket. |
 | `--accel-chip 'adxl345 toolhead'` | Select a full configured sensor section; preserve suffix case. |
+| `--generic-names` | Rename a legacy plugin section and both X/Y pin aliases transactionally; preserve calibration and reject active legacy macro/object/command references. Installation/update only. |
 | `--axes x,y`, `--axes x`, `--axes y` | Install both axes by default, or only the selected axis. |
 | `--homing-speed N` | Explicitly replace selected-axis homing speeds in mm/s. |
 | `--max-report-travel N` | Opt into the generic reporting policy, finite 0.1–2.0 mm. |
