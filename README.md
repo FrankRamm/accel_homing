@@ -1,23 +1,73 @@
-# MISC
+# Accelerometer Homing
 
-This repo collects smaller Monolith projects that are useful on their own but do not need separate repositories yet.
+Use a configured accelerometer as an X/Y impact endstop in Klipper or Kalico.
+This experimental plugin deliberately contacts mechanical stops. Supervise
+initial homing and calibration with an accessible emergency stop.
 
-Each project lives in its own folder with its own README, files, and notes. Start from the project folder that matches what you are looking for, then check its compatibility notes, CAD/STL/DXF files, BOM details, images, and warnings before printing, machining, wiring, or ordering parts.
+## Install
 
-Some projects are experiments, support parts, or one-off solutions. Use them with the same care you would use for any hardware modification, especially when heat, wiring, or rails are involved.
+Run in the Linux printer host's shell as the existing Klipper service user,
+with the printer idle:
 
-This [FrankRamm/MISC testing fork](https://github.com/FrankRamm/MISC/tree/codex/universal-accel-homing) extends the original Beacon Accelerometer Homing project by [CloakedWayne](https://github.com/CloakedWayne). The experimental accelerometer extension is intended for contribution to [Monolith3D/MISC](https://github.com/Monolith3D/MISC) after physical validation; it is not an endorsed upstream release. See the project's [credits and provenance](Beacon_Accel_Homing/NOTICE).
+```bash
+cd ~
+git clone https://github.com/FrankRamm/accel_homing.git
+~/accel_homing/install.sh
+```
 
-## Projects
+The installer backs up its changes, configures X/Y homing and Moonraker
+updates, and restarts the verified services. It may ask for your
+Linux sudo password. It does not home the printer.
 
-| Project | What it does |
-| --- | --- |
-| [Accelerometer Homing](Beacon_Accel_Homing/) | Experimental extension of CloakedWayne's Beacon X/Y impact homing to compatible configured accelerometers, with supervised calibration and measured charts. |
-| [Better CF tube mounting](CF_tube_mounting/) | A sturdier way to mount a CF X-axis tube. |
-| [Hollow MGN12 Rails](Hollow_MGN12_rails/) | CAD for experimenting with hollowed MGN12 rails. |
-| [Monolith logo](Monolith_logo/) | Monolith logo files for graphics, decals, and cutting. |
-| [Monolith belt clamp](https://github.com/Monolith3D/Toolheads_for_Monolith/tree/main/Monolith_Belt_Clamp) | Milled and SLM belt clamps, maintained in Toolheads for Monolith. |
-| [SLM Chamber Heater Ducts](SLM_Chamber_Heater_Ducts/) | SLM ducts and mounts for common chamber heaters. |
-| [Structural Side Panels V2-VT](Structural_Side_Panels_V2-VT/) | Structural side panel files for V2 and VT builds. |
-| [Monolith Extrusion Door](Monolith_Extrusion_Door/) | A practical extrusion-door experiment for V2 and VT frames. |
-| [WS7040 Anti-Vibration Mount](WS7040_Anti-Vibration_Mount/) | A quieter, vibration-isolated mount for the WS7040 blower. |
+Read the [first calibration instructions](docs/SIMPLE_CALIBRATION.md) before
+moving the printer. Existing MISC installations must follow the
+[migration instructions](docs/INSTALLATION.md#migrate-from-the-misc-plugin) first.
+
+For later updates, use **accel_homing → Update** in Mainsail or Fluidd while idle.
+
+## Uninstall
+
+Run while idle:
+
+```bash
+~/accel_homing/uninstall.sh
+```
+
+After uninstallation succeeds, restart the services listed in its output.
+Only after those restarts, and after checking that no remaining plugin links
+or manual updater entries need this checkout, remove the source if desired:
+
+```bash
+rm -rf ~/accel_homing
+```
+
+Keep the printed backup paths if you may need to undo the uninstall.
+[Uninstall and recovery details](docs/INSTALLATION.md#uninstall).
+
+## Documentation
+
+[Installation and migration](docs/INSTALLATION.md) ·
+[Supported sensors and limits](docs/COMPATIBILITY.md) ·
+[Configuration](docs/CONFIGURATION.md) ·
+[Console commands](docs/COMMANDS.md) ·
+[Calibration](docs/SIMPLE_CALIBRATION.md) ·
+[Accuracy](docs/ACCURACY.md) ·
+[Plots](docs/PLOTS.md) ·
+[Beta experiment](docs/BETA.md) ·
+[Troubleshooting](docs/TROUBLESHOOTING.md) ·
+[Technical reference](docs/DETAILS.md) ·
+[Offline tests](TESTING.md).
+
+## Credits and thanks
+
+**[CloakedWayne](https://github.com/CloakedWayne) created the original Beacon
+Accelerometer Homing plugin and its impact-detection algorithm** in
+[Monolith3D/MISC](https://github.com/Monolith3D/MISC/tree/main/Beacon_Accel_Homing).
+This project builds on that work and retains its GPLv3 license and attribution.
+
+Thank you to everyone who has tested the plugin, shared results and helped
+improve it. Special thanks to **Ingstromentalist**, **Acke**, and **mc-red** for
+their time, patience and continued testing. Your reports make this work possible.
+
+Maintained by [FrankRamm](https://github.com/FrankRamm).
+[Full attribution and provenance](NOTICE) · [GPLv3](LICENSE).
