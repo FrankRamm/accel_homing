@@ -368,6 +368,107 @@ class UpdaterFixture(unittest.TestCase):
         self.assertEqual(self.moon_config.read_bytes(), current)
         self.assertFalse((self.config.parent / updater.RECEIPT).exists())
 
+    def test_manual_tilde_entry_uses_live_moonraker_home_and_is_preserved_through_rerun_and_uninstall(self):
+        manual = (self.moon_config.read_bytes() + b"\n# operator updater\n" + updater.stanza(self.source)
+                  .split(b"\n", 1)[1].replace(("path: %s\n" % self.source).encode(), b"path: ~/accel_homing\n"))
+        self.moon_config.write_bytes(manual)
+        self.refresh()
+        self.moon.update(path_environment={"HOME": str(self.home)}, owner_home=str(self.home / "other-passwd-home"))
+        plan = self.updater_plan()
+        self.assertNotIn(self.moon_config, plan["changes"])
+        self.assertEqual(plan["context"]["append"], "")
+        backup = self.install_config(plan)
+        self.moon.update(path_environment={"HOME": str(self.home)}, owner_home=str(self.home / "other-passwd-home"))
+        self.assertEqual(self.updater_plan()["changes"], {})
+        manifest = json.loads((backup / "manifest.json").read_text())
+        self.assertNotIn(self.moon_config, updater.validate_record(manifest, self.selected, installer.uninstall_api()))
+        current = manual + b"\n[operator]\nkeep: yes\n"
+        self.moon_config.write_bytes(current)
+        self.refresh()
+        self.moon.update(path_environment={"HOME": str(self.home)}, owner_home=str(self.home))
+        with mock.patch.object(installer, "proc_instances", return_value=[]), \
+                mock.patch.object(installer, "service_instances", return_value=[]):
+            restore = installer.make_uninstall_plan(self.selected)
+            installer.apply_uninstall_plan(restore, self.selected)
+        self.assertEqual(self.moon_config.read_bytes(), current)
+        self.assertFalse((self.config.parent / updater.RECEIPT).exists())
+
+    def test_manual_tilde_entry_uses_verified_owner_home_only_when_live_home_is_absent(self):
+        manual = self.moon_config.read_bytes() + updater.stanza(self.source).replace(
+            ("path: %s\n" % self.source).encode(), b"path: ~/accel_homing\n")
+        self.moon_config.write_bytes(manual)
+        self.refresh()
+        self.moon.update(path_environment={}, owner_home=str(self.home))
+        self.assertNotIn(self.moon_config, self.updater_plan()["changes"])
+        self.assertEqual(self.moon_config.read_bytes(), manual)
+
+    def test_manual_tilde_entry_unknown_or_different_moonraker_home_refuses_with_absolute_path_advice(self):
+        manual = self.moon_config.read_bytes() + updater.stanza(self.source).replace(
+            ("path: %s\n" % self.source).encode(), b"path: ~/accel_homing\n")
+        self.moon_config.write_bytes(manual)
+        self.refresh()
+        cases = (({"HOME": str(self.home / "different-home")}, str(self.home), 77),
+                 ({"HOME": ""}, str(self.home), 77),
+                 ({"HOME": "relative-home"}, str(self.home), 77),
+                 ({}, None, 77),
+                 (None, str(self.home), 77),
+                 (None, str(self.home), None),
+                 ({"HOME": str(self.home)}, str(self.home), None))
+        for environment, owner, pid in cases:
+            with self.subTest(environment=environment, owner=owner, pid=pid):
+                self.moon.update(path_environment=environment, owner_home=owner, pid=pid)
+                # The discovery context is synthetic; retain the existing
+                # independent identity tests for stopped-service verification.
+                with mock.patch.object(updater, "assert_identity"):
+                    with self.assertRaises(installer.InstallError) as stopped:
+                        self.updater_plan()
+                self.assertIn("use path: %s" % self.source, str(stopped.exception))
+                self.assertEqual(self.moon_config.read_bytes(), manual)
+                self.assertFalse((self.config.parent / updater.RECEIPT).exists())
+                self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_manual_tilde_support_does_not_accept_other_paths_or_expand_shell_variables(self):
+        original = self.moon_config.read_bytes()
+        for configured in ("~/another-source", "~another-user/accel_homing", "$HOME/accel_homing",
+                           "accel_homing", str(self.home / "another-source")):
+            with self.subTest(configured=configured):
+                manual = original + updater.stanza(self.source).replace(
+                    ("path: %s\n" % self.source).encode(), ("path: %s\n" % configured).encode())
+                self.moon_config.write_bytes(manual)
+                self.refresh()
+                self.moon.update(path_environment={"HOME": str(self.home)}, owner_home=str(self.home))
+                with self.assertRaisesRegex(installer.InstallError, "conflicting existing"):
+                    self.updater_plan()
+                self.assertEqual(self.moon_config.read_bytes(), manual)
+                self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_manual_tilde_entry_still_requires_exact_origin_branch_and_options(self):
+        original = self.moon_config.read_bytes()
+        entry = updater.stanza(self.source).replace(("path: %s\n" % self.source).encode(), b"path: ~/accel_homing\n")
+        cases = (entry.replace(updater.ORIGIN.encode(), b"https://example.invalid/other.git"),
+                 entry.replace(b"primary_branch: main", b"primary_branch: other"),
+                 entry.replace(b"managed_services: klipper", b"managed_services: other"),
+                 entry + b"install_script: install.sh\n")
+        for invalid in cases:
+            with self.subTest(entry=invalid):
+                manual = original + invalid
+                self.moon_config.write_bytes(manual)
+                self.refresh()
+                self.moon.update(path_environment={"HOME": str(self.home)}, owner_home=str(self.home))
+                with self.assertRaisesRegex(installer.InstallError, "conflicting existing"):
+                    self.updater_plan()
+                self.assertEqual(self.moon_config.read_bytes(), manual)
+
+    def test_owned_absolute_path_cannot_be_changed_to_tilde_and_adopted_as_manual(self):
+        self.install_config(self.updater_plan())
+        current = self.moon_config.read_bytes().replace(("path: %s\n" % self.source).encode(), b"path: ~/accel_homing\n")
+        self.moon_config.write_bytes(current)
+        self.refresh()
+        self.moon.update(path_environment={"HOME": str(self.home)}, owner_home=str(self.home))
+        with self.assertRaisesRegex(installer.InstallError, "owned Moonraker.*changed/missing"):
+            self.updater_plan()
+        self.assertEqual(self.moon_config.read_bytes(), current)
+
     def test_owned_direct_append_edit_cannot_be_adopted_as_a_manual_entry(self):
         self.install_config(self.updater_plan())
         changed = self.moon_config.read_bytes().replace(

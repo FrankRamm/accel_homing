@@ -339,7 +339,7 @@ def direct_suffix(repo, add_base, add_stanza):
     return text + (stanza(repo) if add_stanza else b"")
 
 
-def matching_stanza(section, repo, api):
+def matching_stanza(section, repo, api, moon):
     expected = api.ConfigDocument(section.document.path, stanza(repo)).sections[0]
     header = section.document.lines[section.start]
     if (not header.startswith("[") or api.SECTION.match(header).group(1) != SECTION
@@ -350,7 +350,26 @@ def matching_stanza(section, repo, api):
             match = api.OPTION.match(line)
             if not match or match.group(1):
                 return False
-    return all(section.get(name) == expected.get(name) for name in expected.options)
+    if any(section.get(name) != expected.get(name) for name in expected.options if name != "path"):
+        return False
+    configured = section.get("path")
+    if configured == expected.get("path"):
+        return True
+    if configured != "~/accel_homing":
+        return False
+    # Use the selected live Moonraker's expansion, never this installer's HOME.
+    # Stopped-unit discovery cannot establish its future process environment.
+    environment = moon.get("path_environment")
+    if not moon.get("pid") or environment is None:
+        _fail(api, "Moonraker's live home is unavailable for path: ~/accel_homing; use path: %s" % repo)
+    try:
+        resolved = Path(_expand_moon_path(configured, environment, moon.get("owner_home"))).resolve()
+    except (OSError, ValueError, RuntimeError):
+        resolved = None
+    if resolved != repo.resolve():
+        _fail(api, "path: ~/accel_homing does not identify the installed clone under Moonraker's "
+              "verified home; use path: %s" % repo)
+    return True
 
 
 def journal_layout(context, selected, api):
@@ -505,7 +524,7 @@ def make_plan(source, selected, args, api):
     if existing:
         if existing.document.path == include and include.read_bytes() == stanza(repo):
             direct = False
-        elif existing.document.path != moon["config"] or not matching_stanza(existing, repo, api):
+        elif existing.document.path != moon["config"] or not matching_stanza(existing, repo, api, moon):
             _fail(api, "conflicting existing [%s]; preserve/reconcile it instead of overwriting" % SECTION)
     elif previous:
         _fail(api, "owned Moonraker updater registration is missing; preserve/reconcile it before updating")
