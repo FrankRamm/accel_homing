@@ -145,9 +145,10 @@ Diagnostics may report current/best quiet candidate spans, per-axis peak-to-peak
 g, sample/batch ages, rejection details and cleanup state. Those ages are
 snapshots at the reported event, not continuously updated live measurements.
 
-Charts are PNG-only bounded diagnostic traces. Final ACCURACY summaries are
-retained and per-home temporary captures are removed. Beta emits its own
-labelled PNG and same-command diagnostic report. See [plots](PLOTS.md) and
+Charts are PNG-only bounded diagnostic traces published only for successful
+workflows. Per-home ACCURACY traces remain in memory; failures retain console
+statistics without a chart. A successful Beta proposal emits a labelled PNG;
+its same-command console diagnostics also cover failures. See [plots](PLOTS.md) and
 [Beta](BETA.md).
 
 The source/API references and unresolved physical limits are collected in

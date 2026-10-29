@@ -15,16 +15,21 @@ keep Z supported/clear, and supervise with an accessible emergency stop.
 ## Stationary noise before movement
 
 Every new per-axis calibration command first acquires three disjoint one-second
-stationary-noise windows and exports their summary. This runs once before the
+stationary-noise windows. This runs once before the
 first candidate home, not before each threshold retry or same-run continuation.
 X and Y each get a new measurement, including after a save/restart. A previous
 standalone `ACCEL_HOMING_CALIBRATE_NOISE` result is never reused.
 
 The measurement requires an idle, unpaused printer, an empty motion queue and
 an exclusive sensor stream. It leaves motor enable/current and fan state as
-they are. A failed measurement, changed context, sensor fault or failed summary
-export aborts calibration before movement; it does not fall back to a default
-threshold.
+they are. A failed measurement, changed context or sensor fault aborts calibration
+before movement; it does not fall back to a default threshold. Transient sample
+gaps and fresh-data/acquisition timeouts permit only the bounded complete-window retries described in
+[the noise policy](PLOTS.md#stationary-noise).
+
+The noise summary stays in memory until the calibration qualifies. Rendering
+must succeed before the model is staged/saved, and the PNG is published only
+after required cleanup and saving succeed. An aborted calibration saves no PNG.
 
 Without an explicit `START_THRESHOLD`, fresh noise selects the initial
 candidate using the same baseline-subtracted XYZ magnitude as the detector.

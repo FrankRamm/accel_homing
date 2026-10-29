@@ -80,7 +80,8 @@ ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1
 
 This measures repeated commanded travel at the active threshold and speed.
 An early trigger with valid current capture/halt/center evidence reverses its
-recorded commanded halt travel, publishes a partial report and starts one
+recorded commanded halt travel, reports failure in the console without an
+accuracy PNG and starts one
 normal calibration of the failing axis. Its first candidate is the actual
 threshold used by the failed attempt **plus 0.25 g**; later steps use configured
 `calibration_step`. Successful recovery calibration saves and restarts Klipper.

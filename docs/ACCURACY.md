@@ -44,7 +44,7 @@ threshold, measured onset and peak acceleration. It reports minimum, maximum,
 mean, range, population standard deviation in mm and population variance in mm².
 Range is max minus min; population variance divides by N. Fewer than two
 accepted measured homes have no standard deviation/variance. An interrupted run
-is labelled incomplete rather than filling missing values.
+reports incomplete statistics in the console without saving a chart.
 
 Travel is reported to 0.001 mm from commanded/firmware steps. Small reported
 variation does not prove correct-stop contact, no missed steps or a physically
@@ -66,8 +66,9 @@ When that evidence is valid, the same command:
    settling. A valid zero-step halt needs no reverse move.
 2. Invalidates the rejected XY homing assignment without disabling the motors
    or inventing a new physical center coordinate.
-3. Publishes the partial accuracy PNG and removes temporary per-home captures.
-   Export or cleanup failure stops the handoff.
+3. Reports the failed accuracy run in the console and discards its bounded
+   in-memory capture traces. It saves no accuracy PNG. Required cleanup must
+   succeed before the handoff.
 4. Starts one standard calibration of the failing axis at the actual threshold
    used by the failed ACCURACY attempt **plus exactly 0.25 g**. This increment
    is fixed; later candidate changes use configured `calibration_step`.
@@ -97,15 +98,16 @@ Unexpected physical behavior requires the emergency stop and manual review.
 
 ## PNG and cleanup
 
-ACCURACY keeps one final overview PNG per requested axis in the configured
-chart directory. It includes accepted traces and travel/statistics, with the
-actual detector threshold. Partial final summaries remain available on failure
-when enough data can be exported.
+A successful ACCURACY run keeps one final overview PNG per requested axis in
+the configured chart directory. It includes accepted traces and travel/statistics,
+with the actual detector threshold. Any failed, rejected or cancelled run saves
+no accuracy PNG, including when another requested axis already completed.
 
-Per-home PNGs use a private run-specific OS temporary directory outside the
-chart/config roots. Their current-run receipts and bytes are checked before
-final publication. They are removed after final summaries and on abort/cancel
-or export failure. Existing chart-directory outputs are not deleted.
+Per-home traces and their current-run provenance stay bounded in memory; no
+per-home PNG or scratch capture file is written. Required cleanup and every
+axis's rendering complete before final publication starts. A later publication
+error attempts to remove only this run's new files. Existing chart-directory
+outputs are preserved. Partial statistics remain available in console/status.
 
 See [plot locations and access](PLOTS.md) and
 [troubleshooting](TROUBLESHOOTING.md). `ACCEL_HOMING_CANCEL` is not an immediate

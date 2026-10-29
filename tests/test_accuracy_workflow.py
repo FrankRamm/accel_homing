@@ -182,8 +182,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["statistics"], expected)
             self.assert_restored(rig)
 
-    @unittest.skipUnless(os.name == "posix", "Klipper temporary-directory fallbacks are Linux paths")
-    def test_temporary_captures_stay_outside_watched_roots_until_summary_then_are_removed(self):
+    def test_memory_captures_create_no_files_before_the_completed_summary(self):
         with tempfile.TemporaryDirectory() as base:
             config = Path(base) / "config"
             output = config / "charts"
@@ -195,15 +194,13 @@ class AccuracyWorkflowTests(unittest.TestCase):
             rig.workflow.chart_start_args = {"config_file": str(config / "printer.cfg")}
             writer = workflow_module.write_accuracy
             def inspect_summary(*args, **kwargs):
-                source = Path(kwargs["capture_directory"])
-                self.assertNotIn(config, source.parents)
-                self.assertNotIn(output, source.parents)
-                captures = list(source.iterdir())
-                self.assertEqual(len(captures), 3)
-                self.assertTrue(all(path.suffix == ".png" for path in captures))
+                self.assertNotIn("capture_directory", kwargs)
+                captures = args[2]["x"]
+                self.assertFalse(captures["discovery_capture_paths"])
+                self.assertTrue(all(not item for item in captures["capture_paths"]))
+                self.assertEqual(rig.capture_directories, [])
                 self.assertEqual(list(output.iterdir()), [previous])
                 paths = writer(*args, **kwargs)
-                self.assertTrue(all(path.is_file() for path in captures))
                 self.assertTrue(all(Path(path).is_file() for path in paths.values()))
                 return paths
             with mock.patch.object(workflow_module.tempfile, "gettempdir", return_value=str(config / "tmp")), \
@@ -217,53 +214,44 @@ class AccuracyWorkflowTests(unittest.TestCase):
             self.assertFalse((config / "tmp").exists())
             self.assert_restored(rig)
 
-    def test_no_safe_temp_parent_and_begin_failure_leave_no_captures_or_motion(self):
+    def test_accuracy_does_not_require_a_temp_parent_and_begin_failure_leaves_no_motion(self):
         with tempfile.TemporaryDirectory() as temp:
-            rig = AccuracyRig({"charts_directory": str(Path(temp).anchor)})
-            with mock.patch.object(workflow_module.tempfile, "TemporaryDirectory") as create, \
-                    self.assertRaisesRegex(CommandError, "outside the chart/config"):
+            rig = AccuracyRig({"charts_directory": temp})
+            with mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=AssertionError("unexpected temporary capture")) as create:
                 rig.accuracy()
             create.assert_not_called()
-            self.assertEqual(rig.scripts, [])
-            self.assertEqual(rig.toolhead.moves, [])
             self.assert_restored(rig)
             rig = AccuracyRig({"charts_directory": temp})
             rig.policy_error = "synthetic begin failure"
             with self.assertRaisesRegex(CommandError, "begin failure"):
                 rig.accuracy()
-            self.assertEqual(len(rig.capture_directories), 1)
+            self.assertEqual(rig.capture_directories, [])
             self.assertEqual(rig.scripts, [])
             self.assert_restored(rig)
 
-    def test_temporary_cleanup_failure_reports_error_without_replacing_original_motion_error(self):
+    def test_no_temporary_capture_cleanup_can_replace_an_original_motion_error(self):
         for motion_failure in (False, True):
             with self.subTest(motion_failure=motion_failure), tempfile.TemporaryDirectory() as temp:
                 rig = AccuracyRig({"charts_directory": temp})
-                create_directory = rig.workflow._accuracy_capture_directory
-                def failing_cleanup_directory():
-                    temporary = create_directory()
-                    cleanup = temporary.cleanup
-                    def fail_cleanup():
-                        cleanup()
-                        raise OSError("synthetic temporary cleanup failure")
-                    temporary.cleanup = fail_cleanup
-                    return temporary
                 fault = OSError("synthetic original recenter failure")
                 motion = mock.patch.object(rig.workflow, "_recenter", side_effect=fault) \
                     if motion_failure else contextlib.nullcontext()
-                error_type = OSError if motion_failure else CommandError
-                with mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=failing_cleanup_directory), \
-                        motion, self.assertLogs(level="ERROR"), self.assertRaises(error_type) as caught:
-                    rig.accuracy()
+                with mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=AssertionError("unexpected temporary capture")) as create, motion:
+                    if motion_failure:
+                        with self.assertRaises(OSError) as caught:
+                            rig.accuracy()
+                    else:
+                        rig.accuracy()
+                    create.assert_not_called()
                 if motion_failure:
                     self.assertIs(caught.exception, fault)
+                    self.assertEqual(rig.workflow.last_result["result"], "aborted")
                 else:
-                    self.assertIn("temporary accuracy capture cleanup failed", str(caught.exception))
-                self.assertEqual(rig.workflow.last_result["result"], "aborted")
-                self.assertIn("capture_cleanup_error", rig.workflow.last_result)
+                    self.assertEqual(rig.workflow.last_result["result"], "complete")
+                self.assertNotIn("capture_cleanup_error", rig.workflow.last_result)
                 self.assert_restored(rig)
 
-    def test_later_summary_failure_keeps_published_axis_and_cleans_all_intermediates(self):
+    def test_later_summary_failure_publishes_no_axis_or_intermediate(self):
         with tempfile.TemporaryDirectory() as temp:
             rig = AccuracyRig({"charts_directory": temp})
             def fail_y(payload):
@@ -274,8 +262,8 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 rig.accuracy(axis="XY")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "aborted")
-            self.assertEqual(set(result["summary_paths"]), {"x_png"})
-            self.assertEqual(list(Path(temp).iterdir()), [Path(result["summary_paths"]["x_png"])])
+            self.assertNotIn("summary_paths", result)
+            self.assertEqual(list(Path(temp).iterdir()), [])
             self.assertEqual(result["paths"], [])
             self.assert_restored(rig)
 
@@ -295,7 +283,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 self.assertIsNotNone(axis["rejected"])
                 self.assertFalse(axis["complete"])
                 self.assertEqual(len(rig.toolhead.moves), 2)
-                self.assertIn("summary_paths", result)
+                self.assertNotIn("summary_paths", result)
                 self.assert_restored(rig)
 
     def test_xy_default_and_explicit_order_recenter_x_before_y_preserve_z(self):
@@ -377,7 +365,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     self.assertEqual(len(result["axis_results"]["x"]["trials"]), max(0, preceding - 1))
                     self.assertIsNotNone(result["axis_results"]["x"]["rejected"])
                     self.assertEqual(result["axis_results"]["y"]["trials"], [])
-                    self.assertIn("summary_paths", result)
+                    self.assertNotIn("summary_paths", result)
                     if preceding == 2:
                         stats = result["axis_results"]["x"]["statistics"]
                         self.assertIsNone(stats["stddev_mm"])
@@ -522,7 +510,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             self.assertTrue(result["axis_results"]["x"]["complete"])
             self.assertFalse(result["axis_results"]["y"]["complete"])
             self.assertEqual(result["paths"], [])
-            self.assertIn("summary_paths", result)
+            self.assertNotIn("summary_paths", result)
             self.assert_restored(rig)
 
     def test_stale_result_or_cross_trial_sensor_times_cannot_be_reused(self):
@@ -594,7 +582,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                                    ("summary", ValueError), ("summary", OSError)):
             with self.subTest(target=target, error_type=error_type), tempfile.TemporaryDirectory() as temp:
                 rig = AccuracyRig({"charts_directory": temp})
-                writer = workflow_module.write_capture
+                writer = workflow_module.prepare_capture
                 count = 0
                 def fail_second(*args, **kwargs):
                     nonlocal count
@@ -602,7 +590,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     if count == 2:
                         raise error_type("synthetic capture export failure")
                     return writer(*args, **kwargs)
-                with mock.patch.object(workflow_module, "write_capture", side_effect=fail_second) \
+                with mock.patch.object(workflow_module, "prepare_capture", side_effect=fail_second) \
                         if target == "capture" else mock.patch.object(
                             workflow_module, "write_accuracy", side_effect=error_type("synthetic summary export failure")):
                     logs = self.assertLogs(level="ERROR") if target == "summary" else contextlib.nullcontext()
@@ -615,7 +603,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 if target == "summary":
                     self.assertIn("chart_error", result)
                 else:
-                    self.assertIn("summary_paths", result)
+                    self.assertNotIn("summary_paths", result)
                     self.assertNotIn("capture_paths", result["axis_results"]["x"])
                 self.assert_restored(rig)
 
@@ -635,7 +623,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(rig.home_calls), 3)
                 self.assertEqual(len(rig.toolhead.moves), 2)
                 self.assertEqual(set(rig.disabled), {"stepper_x", "stepper_y"})
-                self.assertIn("summary_paths", result)
+                self.assertNotIn("summary_paths", result)
                 self.assert_restored(rig)
 
     def test_motion_and_restoration_faults_are_not_reclassified_as_chart_errors(self):
@@ -695,8 +683,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             self.assertIn("cleanup failed", result["reason"])
             self.assertEqual(result["axis_results"]["x"]["statistics"]["count"], 2)
             self.assertTrue(result["axis_results"]["x"]["complete"])
-            metadata = [item for item in rig.workflow.renderer.calls if item["kind"] == "accuracy"][-1]
-            self.assertEqual(metadata["result"], "aborted")
+            self.assertEqual([item for item in rig.workflow.renderer.calls if item["kind"] == "accuracy"], [])
             self.assert_restored(rig)
 
     def test_status_and_results_retain_metadata_without_raw_capture_arrays(self):

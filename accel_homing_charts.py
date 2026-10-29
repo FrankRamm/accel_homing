@@ -29,10 +29,15 @@ _NOISE_WINDOW_SECONDS = 1.0
 _Receipt = collections.namedtuple("_Receipt", (
     "kind", "run_id", "axis", "iteration", "record_json", "metadata_json",
     "trace", "png_path", "png_sha256", "simulated"))
+_MemoryReceipt = collections.namedtuple("_MemoryReceipt", (
+    "kind", "run_id", "axis", "iteration", "record_json", "metadata_json", "trace", "simulated"))
+_PreparedPNG = collections.namedtuple("_PreparedPNG", ("kind", "label", "clock_json", "data"))
+_MAX_CAPTURE_TRACE_POINTS = 4096
+_MAX_CAPTURE_RECEIPT_JSON_BYTES = 128 * 1024
 
 
 class CapturePaths(dict):
-    """Public file paths plus a private immutable, non-JSON provenance receipt."""
+    """Optional public paths plus a private immutable provenance receipt."""
     __slots__ = ("_receipt",)
 
     def __init__(self, paths, receipt):
@@ -248,7 +253,7 @@ def _capture_data(capture, record):
     return _envelope(delta), metadata
 
 
-def _publish(directory, label, clock, data, check_running=None):
+def _publish(directory, label, clock, data, check_running=None, _owned_paths=None):
     _check_png(data, decode_pixels=False)
     _check_running(check_running)
     destination = Path(directory).expanduser().resolve()
@@ -264,9 +269,10 @@ def _publish(directory, label, clock, data, check_running=None):
     def owned(path):
         try:
             current = os.lstat(path)
-        except FileNotFoundError:
+        except OSError:
             return False
         return (current.st_dev, current.st_ino) == identity
+    published = None
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
@@ -301,12 +307,130 @@ def _publish(directory, label, clock, data, check_running=None):
                 if owned(published):
                     os.unlink(published)
                 raise
+            # Staging cleanup is part of success. If it fails, the guarded
+            # rollback below must still see and remove this owned final name.
+            if owned(temporary):
+                os.unlink(temporary)
             _check_running(check_running)
+            if _owned_paths is not None:
+                _owned_paths.append((str(published), identity))
             return str(published)
         raise ValueError("PNG chart filename collisions exceeded their bounded limit")
+    except Exception:
+        if published is not None and owned(published):
+            try:
+                os.unlink(published)
+            except OSError:
+                pass
+        raise
     finally:
         if owned(temporary):
             os.unlink(temporary)
+
+
+def _publish_group(directory, images, check_running=None):
+    """Publish already-rendered outputs; roll back only this group's inodes."""
+    paths, owned_paths = [], []
+    try:
+        for label, clock, data in images:
+            path = _publish(directory, label, clock, data, check_running, _owned_paths=owned_paths)
+            paths.append(path)
+        _check_running(check_running)
+        return paths
+    except Exception:
+        for path, identity in owned_paths:
+            try:
+                current = os.lstat(path)
+                if (current.st_dev, current.st_ino) == identity:
+                    os.unlink(path)
+            except OSError:
+                pass
+        raise
+
+
+def prepare_capture(run_id, axis, capture, record, simulated=False, check_running=None):
+    """Freeze a bounded display trace without rendering or writing a file."""
+    _check_running(check_running)
+    _identity(run_id, axis)
+    if record.get("result", "impact") != "impact" or record.get("capture_valid") is False:
+        raise ValueError("Only a valid impact capture can be prepared for publication")
+    trace, metadata = _capture_data(capture, record)
+    record_json, metadata_json = _json(record), _json(metadata)
+    if len(record_json.encode("utf-8")) + len(metadata_json.encode("utf-8")) > _MAX_CAPTURE_RECEIPT_JSON_BYTES:
+        raise ValueError("Capture receipt metadata exceeds its memory limit")
+    receipt = _MemoryReceipt("memory_capture", run_id, axis, record.get("workflow_attempt"),
+                             record_json, metadata_json, trace, bool(simulated))
+    _check_running(check_running)
+    return CapturePaths({}, receipt)
+
+
+def _prepared_capture(prepared):
+    if not isinstance(prepared, CapturePaths) or prepared:
+        raise ValueError("A deferred capture requires its in-memory receipt")
+    receipt = prepared.receipt
+    if not isinstance(receipt, _MemoryReceipt) or receipt.kind != "memory_capture":
+        raise ValueError("Invalid deferred capture receipt")
+    _identity(receipt.run_id, receipt.axis)
+    if (not isinstance(receipt.record_json, str) or not isinstance(receipt.metadata_json, str)
+            or len(receipt.record_json.encode("utf-8")) + len(receipt.metadata_json.encode("utf-8"))
+            > _MAX_CAPTURE_RECEIPT_JSON_BYTES or type(receipt.simulated) is not bool):
+        raise ValueError("Invalid deferred capture metadata")
+    record, metadata = json.loads(receipt.record_json), json.loads(receipt.metadata_json)
+    if (not isinstance(record, dict) or not isinstance(metadata, dict)
+            or _json(record) != receipt.record_json or _json(metadata) != receipt.metadata_json
+            or record.get("workflow_attempt") != receipt.iteration):
+        raise ValueError("Deferred capture metadata does not match its receipt")
+    trace = receipt.trace
+    if (not isinstance(trace, tuple) or not 2 <= len(trace) <= _MAX_CAPTURE_TRACE_POINTS
+            or any(not isinstance(row, tuple) or len(row) != 4
+                   or not all(_finite(value) for value in row) for row in trace)
+            or any(first[0] >= second[0] for first, second in zip(trace, trace[1:]))
+            or trace[0][0] != 0.0):
+        raise ValueError("Invalid deferred capture display trace")
+    count = metadata.get("sample_count")
+    baseline, peaks = metadata.get("baseline_g"), metadata.get("absolute_peak_g")
+    first, last = metadata.get("first_sample_time_s"), metadata.get("last_sample_time_s")
+    if (type(count) is not int or not len(trace) <= count <= _MAX_SAMPLES
+            or not isinstance(baseline, list) or len(baseline) != 3
+            or not all(_finite(value) for value in baseline)
+            or not _finite(first) or not _finite(last) or last <= first
+            or not math.isclose(trace[-1][0], last - first, rel_tol=1e-12, abs_tol=1e-9)
+            or not isinstance(peaks, dict) or set(peaks) != set("xyz")
+            or any(not _finite(peaks[axis]) or not math.isclose(
+                peaks[axis], max(abs(row[index]) for row in trace), rel_tol=1e-12, abs_tol=1e-12)
+                   for index, axis in enumerate("xyz", 1))):
+        raise ValueError("Deferred capture measurements do not match its trace")
+    return receipt, record, metadata
+
+
+def publish_captures(directory, prepared, renderer=None, check_running=None):
+    """Render every qualified capture before publishing any of this group."""
+    if not isinstance(prepared, (tuple, list)) or not 1 <= len(prepared) <= 2:
+        raise ValueError("Capture publication requires one or two qualified axes")
+    clock, rendered, receipts = _clock(), [], []
+    for item in prepared:
+        _check_running(check_running)
+        receipt, record, metadata = _prepared_capture(item)
+        phase, sample = record.get("workflow_phase"), record.get("accuracy_sample")
+        suffix = (" - Qualifier" if phase == "discovery" else " - Home %02d" % sample
+                  if type(sample) is int and sample > 0 else "")
+        title = "Accel Homing %s%s" % (receipt.axis.upper(), suffix)
+        payload = {"kind": "capture", "axis": receipt.axis, "record": record, "trace": receipt.trace,
+                   "capture": metadata, "title": title, "simulated": receipt.simulated, **clock}
+        data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
+        _check_png(data, decode_pixels=False)
+        rendered.append((title, clock, data))
+        receipts.append(receipt)
+    paths = _publish_group(directory, rendered, check_running)
+    return [CapturePaths({"png": path}, _Receipt(
+                "capture", receipt.run_id, receipt.axis, receipt.iteration, receipt.record_json,
+                receipt.metadata_json, _envelope(receipt.trace, 64), path,
+                hashlib.sha256(image[2]).hexdigest(), receipt.simulated))
+            for path, receipt, image in zip(paths, receipts, rendered)]
+
+
+def publish_capture(directory, prepared, renderer=None, check_running=None):
+    return publish_captures(directory, [prepared], renderer, check_running)[0]
 
 
 def write_capture(directory, run_id, axis, capture, record, simulated=False,
@@ -326,7 +450,6 @@ def write_capture(directory, run_id, axis, capture, record, simulated=False,
     receipt = _Receipt("capture", run_id, axis, record.get("workflow_attempt"),
                        _json(record), _json(metadata), _envelope(trace, 64), path,
                        hashlib.sha256(data).hexdigest(), bool(simulated))
-    _check_running(check_running)
     return CapturePaths({"png": path}, receipt)
 
 
@@ -335,6 +458,14 @@ def _capture_reference(directory, paths, run_id, axis, record, simulated, check_
     if paths is None:
         return None
     expected_id = "%s_a%03d" % (run_id, record["workflow_attempt"])
+    if isinstance(paths, CapturePaths) and isinstance(paths.receipt, _MemoryReceipt):
+        receipt, _record, _metadata = _prepared_capture(paths)
+        if (receipt.run_id != expected_id or receipt.axis != axis
+                or receipt.iteration != record["workflow_attempt"]
+                or receipt.record_json != _json(record) or receipt.simulated != bool(simulated)):
+            raise ValueError("Accuracy capture receipt does not match this current-run record")
+        _check_running(check_running)
+        return paths
     if not isinstance(paths, CapturePaths) or set(paths) != {"png"}:
         raise ValueError("Accuracy PNG requires its immutable current-run capture receipt")
     receipt = paths.receipt
@@ -380,14 +511,16 @@ def validate_accuracy(directory, run_id, axis_results, result="complete", reason
 def write_accuracy(directory, run_id, axis_results, result, reason=None, simulated=False,
                    renderer=None, check_running=None, capture_directory=None,
                    published_paths=None):
+    if result != "complete":
+        raise ValueError("Only a complete accuracy measurement can publish a PNG")
     axes = validate_accuracy(directory, run_id, axis_results, result, reason, simulated,
                              renderer=renderer, check_running=check_running,
                              capture_directory=capture_directory)
     clock = _clock()
-    # Retain already-published axes if a later render/publication fails.
     paths = {} if published_paths is None else published_paths
     if not isinstance(paths, dict) or paths:
         raise ValueError("Accuracy published paths must start as an empty mapping")
+    rendered, keys = [], []
     for axis, item in axes.items():
         traces = [reference.receipt.trace for reference in item["capture_paths"] if reference is not None]
         payload = {"kind": "accuracy", "axis": axis, "result": result, "reason": reason,
@@ -395,9 +528,10 @@ def write_accuracy(directory, run_id, axis_results, result, reason=None, simulat
                    "statistics": item["statistics"], "traces": traces,
                    "discovery": item.get("discovery"), "simulated": bool(simulated), **clock}
         data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
-        paths[axis + "_png"] = _publish(directory, "Accel Homing Accuracy " + axis.upper(),
-                                        clock, data, check_running)
-    _check_running(check_running)
+        _check_png(data, decode_pixels=False)
+        rendered.append(("Accel Homing Accuracy " + axis.upper(), clock, data))
+        keys.append(axis + "_png")
+    paths.update(zip(keys, _publish_group(directory, rendered, check_running)))
     return paths
 
 
@@ -428,10 +562,11 @@ def _noise_reference(run_id, iteration, item, simulated):
     return receipt
 
 
-def write_noise(directory, run_id, iterations, recommendation, result, reason=None, simulated=False,
-                renderer=None, check_running=None):
+def prepare_noise(run_id, iterations, recommendation, result, reason=None, simulated=False,
+                  renderer=None, check_running=None):
+    """Validate and render completed noise while keeping its PNG only in memory."""
     _noise_identity(run_id, 1)
-    if result not in ("complete", "aborted", "incomplete", "failed", "cancelled") \
+    if result != "complete" \
             or not isinstance(iterations, list) or len(iterations) > 3 \
             or (reason is not None and (not isinstance(reason, str) or len(reason) > 4000)):
         raise ValueError("Invalid stationary noise PNG report")
@@ -462,9 +597,26 @@ def write_noise(directory, run_id, iterations, recommendation, result, reason=No
                "traces": [receipt.trace for receipt in receipts],
                "recommendation": recommendation, "simulated": bool(simulated), **clock}
     data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
-    path = _publish(directory, "Accel Homing Noise", clock, data, check_running)
+    _check_png(data, decode_pixels=False)
     _check_running(check_running)
-    return {"png": path}
+    return _PreparedPNG("noise", "Accel Homing Noise", _json(clock), data)
+
+
+def publish_noise(directory, prepared, check_running=None):
+    if (not isinstance(prepared, _PreparedPNG) or prepared.kind != "noise"
+            or prepared.label != "Accel Homing Noise" or not isinstance(prepared.clock_json, str)):
+        raise ValueError("Noise publication requires its immutable prepared PNG")
+    clock = json.loads(prepared.clock_json)
+    if not isinstance(clock, dict) or _json(clock) != prepared.clock_json:
+        raise ValueError("Invalid prepared noise timestamp")
+    return {"png": _publish(directory, prepared.label, clock, prepared.data, check_running)}
+
+
+def write_noise(directory, run_id, iterations, recommendation, result, reason=None, simulated=False,
+                renderer=None, check_running=None):
+    prepared = prepare_noise(run_id, iterations, recommendation, result, reason, simulated,
+                             renderer, check_running)
+    return publish_noise(directory, prepared, check_running)
 
 
 def beta_motion_statistics(capture, record):
@@ -557,7 +709,7 @@ def write_beta_motion(directory, run_id, axis, iterations, homes=(), result="com
     _identity(run_id, axis)
     if (not isinstance(iterations, (tuple, list)) or len(iterations) > 3
             or not isinstance(homes, (tuple, list)) or len(homes) > 100
-            or result not in ("complete", "beta_proposed", "aborted", "incomplete", "failed", "cancelled")
+            or result not in ("complete", "beta_proposed")
             or (reason is not None and (not isinstance(reason, str) or len(reason) > 4000))
             or (proposed_threshold_g is not None and
                 (not _finite(proposed_threshold_g) or proposed_threshold_g <= 0))):
@@ -618,7 +770,6 @@ def write_beta_motion(directory, run_id, axis, iterations, homes=(), result="com
                "title": title, "simulated": bool(simulated), **clock}
     data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
     path = _publish(directory, title, clock, data, check_running)
-    _check_running(check_running)
     return {"png": path}
 
 

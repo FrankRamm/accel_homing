@@ -257,7 +257,7 @@ class BetaPNGTests(unittest.TestCase):
             self.assertEqual(renderer.payloads, [])
             self.assertEqual(list(Path(temp).iterdir()), [])
 
-    def test_failure_png_preserves_valid_homes_and_marks_incomplete_trial(self):
+    def test_failed_beta_with_valid_prior_homes_never_renders_or_publishes(self):
         record, capture = beta_event()
         record["beta_telemetry"] = make_homing().beta_home_telemetry(capture, record)
         valid = charts.compact_beta_home(capture, record)
@@ -267,14 +267,12 @@ class BetaPNGTests(unittest.TestCase):
                       "capture": {"samples": []}}
         renderer = RecordingRenderer()
         with tempfile.TemporaryDirectory() as temp:
-            paths = charts.write_beta_motion(temp, "beta_event", "x", [], homes=[valid, incomplete],
-                                            result="aborted", reason="simulated capture fault",
-                                            simulated=True, renderer=renderer)
-            self.assertTrue(Path(paths["png"]).is_file())
-            payload = renderer.payloads[0]
-            self.assertEqual(len(payload["homes"]), 1)
-            self.assertEqual(payload["incomplete_homes"][0]["workflow_attempt"], 2)
-            self.assertNotIn("samples", payload["incomplete_homes"][0])
+            with self.assertRaisesRegex(ValueError, "Invalid Beta calibration PNG report"):
+                charts.write_beta_motion(temp, "beta_event", "x", [], homes=[valid, incomplete],
+                                         result="aborted", reason="simulated capture fault",
+                                         simulated=True, renderer=renderer)
+            self.assertEqual(renderer.payloads, [])
+            self.assertEqual(list(Path(temp).iterdir()), [])
 
 
 if __name__ == "__main__":

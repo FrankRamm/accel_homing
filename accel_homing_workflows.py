@@ -27,13 +27,15 @@ try:
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
                                       write_noise_capture, beta_motion_statistics,
-                                      compact_beta_home, write_beta_motion)
+                                      compact_beta_home, write_beta_motion, prepare_capture,
+                                      publish_captures, prepare_noise, publish_noise)
 except ImportError:
     from accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                      PNGRenderer, default_dependency_directory, preflight_renderer,
                                      validate_accuracy, write_accuracy, write_capture, write_noise,
                                      write_noise_capture, beta_motion_statistics,
-                                     compact_beta_home, write_beta_motion)
+                                     compact_beta_home, write_beta_motion, prepare_capture,
+                                     publish_captures, prepare_noise, publish_noise)
 
 try:
     from .homing import PrinterHoming as _PrinterHoming
@@ -273,12 +275,10 @@ class AccelHomingWorkflows:
         if session.get("finish_interrupted"):
             raise self._error(session["finish_interrupted"])
         if session.get("finishing") and session.get("finish_result") != "complete":
-            if self.session is not session:
-                raise self._error("partial PNG export was interrupted")
-            # A shutdown/print interruption is reportable after cleanup. This
-            # branch exports only already-qualified data and cannot seed a
-            # model, resume a trial or authorize movement.
-            return
+            raise self._error("unsuccessful workflows do not publish PNG charts")
+        preflight_check = session.get("chart_preflight_check")
+        if preflight_check is not None:
+            preflight_check()
         if session["mode"] == "noise" and not session.get("sensor_stopped"):
             self._check_noise_running(session)
         else:
@@ -333,6 +333,14 @@ class AccelHomingWorkflows:
             self.gcode.respond_info('<a href="%s">View PNG: %s<br><img src="%s" alt="%s" '
                                     'style="max-width:100%%;height:auto"></a>' % (
                                         escaped, alt, escaped, alt))
+
+    def _announce_pngs(self, paths, description, result):
+        """Display failure cannot invalidate an already committed measurement."""
+        try:
+            self._show_pngs(paths, description)
+        except Exception as exc:
+            result["display_error"] = str(exc)
+            logging.exception("accel_homing: unable to announce completed PNG charts")
 
     def _status(self, name):
         obj = self.printer.lookup_object(name, None)
@@ -639,7 +647,7 @@ class AccelHomingWorkflows:
                 result = dict(result, result="aborted", save_config=False,
                               operation_reason=result.get("reason"),
                               reason="recovery calibration cleanup failed: %s" % exc)
-            elif session is not None and session["mode"] in ("accuracy", "noise"):
+            elif session is not None and session["mode"] in ("accuracy", "noise", "charts"):
                 result = {"result": "aborted", "reason": "workflow cleanup failed: %s" % exc}
             raise
         finally:
@@ -657,7 +665,9 @@ class AccelHomingWorkflows:
             finally:
                 self.last_result = result
                 if session is None or not (session.get("beta")
-                                           or session.get("accuracy_recovery_pending")):
+                                           or session.get("accuracy_recovery_pending")
+                                           or (session.get("chart_pending")
+                                               and result.get("result") == "complete")):
                     self.session = None
                 self.reactor.update_timer(self.timer, self.reactor.NEVER)
 
@@ -824,6 +834,8 @@ class AccelHomingWorkflows:
                         "records": [], "paths": [], "candidate": self.start_threshold,
                         "saved_thresholds": dict(self.owner.threshold_g),
                         "saved_back_off": self.owner.back_off_dist,
+                        "chart_preflight_check": (self.chart_preflight_check
+                                                   if mode in ("charts", "accuracy") else None),
                         "save_config": (mode == "calibration" and bool(gcmd.get_int(
                             "SAVE_CONFIG", save_config_default, minval=0, maxval=1)))}
         if mode == "calibration":
@@ -1014,7 +1026,9 @@ class AccelHomingWorkflows:
                 "sensor": context["sensor"], "backend": context["backend"],
                 "full_scale_g": context["full_scale_g"],
                 "axis_context": "machine-mapped XYZ after configured axes_map",
-                "sensor_context": context}
+                "sensor_context": context,
+                "acquisition_attempts": capture.get("acquisition_attempts", 1),
+                "acquisition_faults": list(capture.get("acquisition_faults", ()))}
 
     def _noise_candidate(self, peak):
         required = max(self.start_threshold, peak * 1.2, peak + 0.1)
@@ -1040,12 +1054,13 @@ class AccelHomingWorkflows:
                 "configured_start_g": self.start_threshold,
                 "threshold_limit_g": limit, "unavailable_axes": unavailable, "clamped": False}
 
-    def _noise_result(self, session, ending):
+    def _noise_result(self, session, ending, export=True):
         complete = ending.get("result") == "complete" and len(session["iterations"]) == NOISE_ITERATIONS
         recommendation = session.get("recommendation") if complete else None
         result = {"mode": "noise", "run_id": session["run_id"],
                   "iterations_requested": NOISE_ITERATIONS,
                   "iterations": list(session["iterations"]),
+                  "acquisition_faults": list(session["noise_acquisition_faults"]),
                   "recommendation": recommendation, **ending}
         if session.get("calibration_preflight"):
             result.update(purpose="calibration_preflight", calibration_axis=session["axis"])
@@ -1053,11 +1068,12 @@ class AccelHomingWorkflows:
         if (not complete and timing_fault is not None
                 and timing_fault is not session.get("timing_fault_before")):
             result["timing_fault"] = dict(timing_fault)
+        if not complete or not export:
+            return result
         try:
             result["summary_paths"] = write_noise(
                 self.charts_directory, session["run_id"], session["iterations"],
                 recommendation, result["result"], result.get("reason"), **self._chart_options(session))
-            self._show_pngs(result["summary_paths"], "Stationary noise")
         except Exception as exc:
             logging.exception("accel_homing: unable to export stationary noise summary")
             result.update(chart_error=str(exc), recommendation=None)
@@ -1074,7 +1090,8 @@ class AccelHomingWorkflows:
         session.update(mode="noise", state="running", iterations=[], context=context,
                        snapshot=self._noise_snapshot(), noise_generation=self.owner.operation_generation,
                        timing_fault_before=getattr(self.owner, "sample_timing_fault", None),
-                       iteration=0, recommendation=None, sensor_started=False, sensor_stopped=True)
+                       iteration=0, recommendation=None, sensor_started=False, sensor_stopped=True,
+                       noise_acquisition_faults=[])
         self.session = session
         return session
 
@@ -1088,10 +1105,28 @@ class AccelHomingWorkflows:
         session["sensor_token"] = self.owner.noise_session
         self._info("Recording three stationary one-second windows with the current motor/fan state. "
                    "Keep the toolhead still; no homing or motor-state changes are requested")
+
+        def acquisition_fault(diagnostic):
+            self._check_noise_running(session)
+            diagnostic["noise_iteration"] = session["iteration"]
+            session["noise_acquisition_faults"].append(diagnostic)
+            if diagnostic["will_retry"]:
+                self._info("Stationary noise window %d/3 discarded (%s); acquiring a fresh complete "
+                           "window: retry %d/%d for this window, %d/%d for this session" % (
+                               session["iteration"], diagnostic["reason"],
+                               diagnostic["window_retries"], diagnostic["window_retry_limit"],
+                               diagnostic["session_retries"], diagnostic["session_retry_limit"]))
+            else:
+                self._info("Stationary noise window %d/3 could not be reacquired: %s" % (
+                    session["iteration"], diagnostic["message"]))
+            self._info("Stationary noise acquisition diagnostic " +
+                       json.dumps(diagnostic, sort_keys=True, allow_nan=False))
+
         for iteration in range(1, NOISE_ITERATIONS + 1):
             session["iteration"] = iteration
             capture = self.owner.collect_noise_window(lambda: self._check_noise_running(session),
-                                                      NOISE_DURATION)
+                                                      NOISE_DURATION, recover_transient=True,
+                                                      on_acquisition_fault=acquisition_fault)
             self._check_noise_running(session)
             record = self._noise_record(session, iteration, capture)
             try:
@@ -1124,7 +1159,7 @@ class AccelHomingWorkflows:
         self._restore()
         session.update(finishing=True, finish_result="complete")
         try:
-            noise_result = self._noise_result(session, {"result": "complete"})
+            noise_result = self._noise_result(session, {"result": "complete"}, export=False)
             if noise_result["result"] != "complete":
                 raise self._error(noise_result.get("reason", "noise export failed"))
             self._chart_check(session)
@@ -1161,7 +1196,9 @@ class AccelHomingWorkflows:
             "impact_metric": "xyz_magnitude", "noise_magnitude_peak_g": peak,
             "initial_threshold_source": "explicit_start_threshold" if explicit else "stationary_noise",
             "start_threshold_g": start if explicit else candidate,
-            "summary_paths": dict(noise_result["summary_paths"])}
+            "acquisition_faults": list(noise_result["acquisition_faults"]),
+            "summary_paths": {}}
+        session["deferred_noise_result"] = noise_result
         if not explicit:
             if limit is None:
                 raise self._error("stationary XYZ-magnitude noise cannot select a calibration start "
@@ -1187,6 +1224,7 @@ class AccelHomingWorkflows:
         self._check_running(session)
         self._check_stopped_noise_context(session)
         session.update(mode="calibration", state="running")
+        session.pop("sensor_token", None)
 
     def cmd_NOISE(self, gcmd):
         self._clear_noise_seeds()
@@ -1213,6 +1251,16 @@ class AccelHomingWorkflows:
                        ", ".join("%s=%s" % (axis.upper(), "unavailable above the safe ceiling" if value is None
                                              else "%.6g g" % value)
                                  for axis, value in session["recommendation"]["start_threshold_g"].items()))
+            # The measurement, cleanup, PNG publication and final seed-context
+            # check have succeeded. Announce the committed report last; a later
+            # cancellation can clear its hints without invalidating its data.
+            self._announce_pngs(self.last_result["summary_paths"], "Stationary noise", self.last_result)
+            try:
+                self._check_stopped_noise_context(session)
+            except Exception:
+                # Announcing a committed report can observe a later external
+                # change. Its measured data stay valid; its cached hints do not.
+                self._clear_noise_seeds()
         except Exception as exc:
             self._clear_noise_seeds()
             if self.session is session:
@@ -1788,6 +1836,24 @@ class AccelHomingWorkflows:
         # Final release may yield while its motion completes. Recheck all ten
         # accepted trials before staging any model settings.
         self._qualified_validation_records()
+        noise_png = None
+        if session.get("deferred_noise_result") is not None:
+            generation, preflight = self.owner.operation_generation, self.preflight_generation
+            snapshot, context = self._noise_snapshot(), self._noise_context()
+
+            def current_noise_report():
+                self._check_running(session)
+                self._noise_idle_queue()
+                if (self.owner.operation_generation != generation
+                        or self.preflight_generation != preflight
+                        or self._noise_snapshot() != snapshot or self._noise_context() != context):
+                    raise self._error("calibration context changed while preparing its stationary noise PNG")
+
+            noise_png = prepare_noise(session["run_id"], session["iterations"],
+                                      session["recommendation"], "complete",
+                                      renderer=self.renderer, check_running=current_noise_report)
+            current_noise_report()
+            self._qualified_validation_records()
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
                     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "expected_center_travel_mm": self._geometry(axis)[1],
@@ -1859,6 +1925,17 @@ class AccelHomingWorkflows:
                 raise
         else:
             self._info("Model staged only. Run SAVE_CONFIG to write printer.cfg and restart")
+        if noise_png is not None:
+            try:
+                # Qualification, motion cleanup and any required SAVE_CONFIG
+                # have succeeded. Publishing already-rendered bytes does not
+                # yield back to the reactor during a requested restart.
+                paths = publish_noise(self.charts_directory, noise_png)
+                self.last_result["stationary_noise"]["summary_paths"] = dict(paths)
+                self._announce_pngs(paths, "Stationary noise", self.last_result)
+            except Exception as exc:
+                self.last_result["chart_error"] = str(exc)
+                logging.exception("accel_homing: qualified calibration noise PNG publication failed")
 
     def cmd_CALIBRATE(self, gcmd):
         if self.session is None:
@@ -2365,19 +2442,24 @@ class AccelHomingWorkflows:
                     or self.owner.operation_generation != operation):
                 raise self._error("Beta report export was cancelled or interrupted")
         try:
-            paths = write_beta_motion(
-                self.charts_directory, session["run_id"], session["axis"],
-                session["beta_motion_iterations"], homes=session["beta_homes"],
-                result=result.get("result", "aborted"), reason=result.get("reason"),
-                proposed_threshold_g=result.get("proposed_threshold_g"), renderer=self.renderer,
-                check_running=check_report)
-            check_report()
-            result["summary_paths"] = paths
-            self._show_pngs(paths, "Beta calibration experiment")
+            if result.get("result") != "beta_proposed":
+                paths = None
+            else:
+                paths = write_beta_motion(
+                    self.charts_directory, session["run_id"], session["axis"],
+                    session["beta_motion_iterations"], homes=session["beta_homes"],
+                    result=result["result"], reason=result.get("reason"),
+                    proposed_threshold_g=result.get("proposed_threshold_g"), renderer=self.renderer,
+                    check_running=check_report)
+            if paths is not None:
+                check_report()
+                result["summary_paths"] = paths
         except Exception as exc:
             logging.exception("accel_homing: Beta PNG export failed")
             result.update(chart_error=str(exc), result="aborted", proposed_threshold_g=None)
             result.setdefault("reason", "Beta PNG export failed: %s" % exc)
+        if result.get("summary_paths"):
+            self._announce_pngs(result["summary_paths"], "Beta calibration experiment", result)
         try:
             diagnostics = self._beta_diagnostics(session, result)
             result["beta_diagnostics"] = diagnostics
@@ -2656,6 +2738,8 @@ class AccelHomingWorkflows:
             for item in session.get("axis_results", {}).values():
                 for key in ("capture_paths", "discovery_capture_paths", "rejection_capture_paths"):
                     item.pop(key, None)
+        if temporary is None:
+            return
         try:
             temporary.cleanup()
         except Exception as exc:
@@ -2852,14 +2936,12 @@ class AccelHomingWorkflows:
         self._require_centered(gcmd)
         self._chart_preflight()
         axes = list(requested)
-        temporary = self._accuracy_capture_directory()
         session = None
         recovery = False
         try:
             self._begin(gcmd, "accuracy", axes=axes)
             session = self.session
             session.update(state="running", axes=axes, samples_requested=samples,
-                           capture_directory=str(Path(temporary.name).resolve()),
                            attempt_limit=len(axes) * (samples + 1), sample_index=0,
                            configured_speeds={axis: self.owner.rails_by_axis[axis].get_homing_info().speed
                                               for axis in axes},
@@ -2886,12 +2968,10 @@ class AccelHomingWorkflows:
                                   "recovery": dict(session["accuracy_recovery_pending"])})
                     recovery = True
                     return
-                # Validate temporary capture bytes before terminal release.
-                # Final publication follows restoration, so release failures
-                # receive an aborted summary retaining accepted measurements.
+                # Validate immutable in-memory captures before terminal release.
+                # Failed attempts and aborted runs never create capture PNGs.
                 try:
                     validate_accuracy(self.charts_directory, session["run_id"], session["axis_results"],
-                                      capture_directory=session["capture_directory"],
                                       **self._chart_options(session))
                 except (ValueError, OSError) as exc:
                     raise self._error("accuracy summary validation failed: %s" % exc) from exc
@@ -2907,7 +2987,7 @@ class AccelHomingWorkflows:
         finally:
             error_active = sys.exc_info()[0] is not None
             try:
-                self._cleanup_accuracy_captures(temporary, session, error_active)
+                self._cleanup_accuracy_captures(None, session, error_active)
                 if recovery and not error_active:
                     self._start_accuracy_recalibration(session)
             finally:
@@ -2939,24 +3019,24 @@ class AccelHomingWorkflows:
                     axis_result["statistics"] = self._accuracy_statistics(axis_result["trials"])
                     axis_result["complete"] = len(axis_result["trials"]) == session["samples_requested"]
                 try:
-                    paths = write_capture(session["capture_directory"],
+                    if quality != "good":
+                        if quality == "early":
+                            try:
+                                self._prepare_accuracy_recovery(session, axis, record, reason)
+                            except self.printer.command_error as exc:
+                                raise self._error("%s; no automatic move follows this error; manually recenter" % exc) from exc
+                            return
+                        raise self._error(reason + "; no automatic move follows this result; manually recenter")
+                    paths = prepare_capture(
                                           "%s_a%03d" % (session["run_id"], session["attempts"]),
-                                          axis, capture, record, **self._chart_options(session))
+                                          axis, capture, record,
+                                          check_running=lambda: self._chart_check(session))
                 except (ValueError, OSError) as exc:
                     raise self._error("accuracy capture export failed: %s" % exc) from exc
                 finally:
                     # Bound memory to one capture, even on export rejection.
                     del capture
                 self._check_running(session)
-                if quality != "good":
-                    axis_result["rejection_capture_paths"] = paths
-                    if quality == "early":
-                        try:
-                            self._prepare_accuracy_recovery(session, axis, record, reason)
-                        except self.printer.command_error as exc:
-                            raise self._error("%s; no automatic move follows this error; manually recenter" % exc) from exc
-                        return
-                    raise self._error(reason + "; no automatic move follows this result; manually recenter")
                 if sample_index == 0:
                     axis_result["discovery_capture_paths"] = paths
                     self._info("%s discovery home qualified; excluded from accuracy statistics" % axis.upper())
@@ -3003,12 +3083,16 @@ class AccelHomingWorkflows:
                   "attempts": session["attempts"], "axis_results": self._public_accuracy_results(session),
                   "records": list(session["records"]), "paths": list(session["paths"]), **ending}
         paths = {}
+        if result["result"] != "complete":
+            self._info("Accuracy run %s: %s. Commanded travel is reported to 0.001 mm; "
+                       "these measurements do not certify physical stop position" % (
+                           session["run_id"], result["result"]))
+            return result
         try:
             write_accuracy(self.charts_directory, session["run_id"],
                            session["axis_results"], result["result"], result.get("reason"),
-                           capture_directory=session["capture_directory"], published_paths=paths,
+                           published_paths=paths,
                            **self._chart_options(session))
-            self._show_pngs(paths, "Accuracy")
         except Exception as exc:
             logging.exception("accel_homing: unable to export accuracy summary")
             result["chart_error"] = str(exc)
@@ -3017,6 +3101,7 @@ class AccelHomingWorkflows:
                 result["reason"] = "accuracy summary export failed: %s" % exc
         if paths:
             result["summary_paths"] = dict(paths)
+            self._announce_pngs(paths, "Accuracy", result)
         self._info("Accuracy run %s: %s. Commanded travel is reported to 0.001 mm; "
                    "these measurements do not certify physical stop position" % (
                        session["run_id"], result["result"]))
@@ -3025,26 +3110,46 @@ class AccelHomingWorkflows:
     def _test_xy(self):
         session = self.session
         axes = session["axes"]
+        prepared = []
         for index, axis in enumerate(axes):
             record, capture = self._home(axis)
             quality, reason = self._quality(axis, record)
-            if session["mode"] == "charts":
-                paths = write_capture(self.charts_directory, session["run_id"], axis, capture, record,
-                                      **self._chart_options(session))
-                session["paths"].append({"axis": axis, **paths})
-                self._show_pngs(paths, axis.upper() + " measured acceleration")
             if quality != "good":
                 paths = list(session["paths"])
                 self._finish({"result": "rejected", "reason": reason, "paths": paths}, release=True)
                 raise self._error(reason + "; no automatic move follows this result; manually recenter")
+            if session["mode"] == "charts":
+                prepared.append(prepare_capture(session["run_id"], axis, capture, record,
+                                                 check_running=lambda: self._chart_check(session)))
+            del capture
             if index + 1 < len(axes):
                 # Return only the trusted axis to center when another axis
                 # follows; the next axis retains its manually confirmed center.
                 self._recenter(axis)
         self._release_terminal_home(axis, record)
+        session["chart_pending"] = bool(prepared)
         self._finish({"result": "complete", "mode": session["mode"],
                       "run_id": session["run_id"], "records": list(session["records"]),
                       "paths": list(session["paths"])})
+        if prepared:
+            try:
+                paths = publish_captures(self.charts_directory, prepared, renderer=self.renderer,
+                                         check_running=lambda: self._chart_check(session))
+                session["paths"] = [{"axis": current_axis, **current_paths}
+                                    for current_axis, current_paths in zip(axes, paths)]
+                self.last_result["paths"] = list(session["paths"])
+            except Exception as exc:
+                self.last_result.update(result="aborted", reason="chart export failed: %s" % exc,
+                                        chart_error=str(exc), paths=[])
+                raise
+            finally:
+                session.pop("chart_pending", None)
+                if self.session is session:
+                    self.session = None
+                    self.reactor.update_timer(self.timer, self.reactor.NEVER)
+        for item in session["paths"]:
+            self._announce_pngs({key: value for key, value in item.items() if key != "axis"},
+                                item["axis"].upper() + " measured acceleration", self.last_result)
         self._info("%s %s complete; these measurements do not certify physical stop position"
                    % (" and ".join(axis.upper() for axis in axes), session["mode"]))
 

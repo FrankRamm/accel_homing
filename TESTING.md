@@ -24,6 +24,8 @@ python3 -B -m unittest discover -s tests -p 'test_updater.py' -v
 python3 -B -m unittest discover -s tests -p 'test_accuracy_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_simple_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_beta_calibration.py' -v
+python3 -B -m unittest discover -s tests -p 'test_noise_recovery.py' -v
+python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -v
 ```
 
 The tests cover installation/ownership/rollback, adapter contracts and faults,
@@ -46,12 +48,18 @@ full suite run establish different things; identify which were actually done.
 - Premature calibration returns reverse current signed start-to-halt commanded
   travel before the next candidate; faults/failed returns do not count as
   completed recovery.
-- ACCURACY uses the active threshold, retains final summaries and removes
-  temporary per-home captures. Early-trigger recovery requires current evidence,
-  finishes output/cleanup, then starts standard calibration at the failed
+- ACCURACY uses the active threshold and bounded in-memory capture receipts.
+  Only a complete workflow publishes final summaries. Early-trigger recovery
+  requires current evidence, reports failure without a PNG and completes cleanup,
+  then starts standard calibration at the failed
   threshold plus exactly 0.25 g. Only successful calibration saves/restarts.
-- Beta produces a labelled PNG and diagnostic proposal without staging/saving
-  thresholds/models or restarting.
+- Stationary noise retries discard complete rejected windows, respect per-window
+  and whole-session limits, and keep homing/Beta policies unchanged.
+- Failed measurements do not invoke final PNG publication. Every multi-axis
+  image is rendered before publication; rollback removes only newly owned files.
+- Beta produces a labelled PNG only for a successful restored proposal; failures
+  retain bounded console diagnostics without staging/saving thresholds/models
+  or restarting.
 - Standalone installation uses a complete canonical native Git clone, root
   entrypoints and main/origin/main updater configuration. Legacy MISC ownership
   is not silently adopted; uninstall leaves source deletion to the operator.

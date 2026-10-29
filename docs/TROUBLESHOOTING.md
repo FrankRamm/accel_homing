@@ -79,10 +79,11 @@ No inline preview does not necessarily mean no PNG: read the saved path.
 Use formatted Mainsail output or the frontend file browser. Remote/header-only
 authentication may not authorize a browser image GET. See [plot access](PLOTS.md).
 
-An incomplete PNG preserves available diagnostics; it is not a successful
-measurement. PNG export failures, temporary-capture cleanup faults and
-unsupported output filesystem operations are reported separately. Preserve
-those errors and any final partial PNG.
+Failed, rejected or cancelled measurements save no partial PNG. Preserve the
+console/status diagnostics, including the failed window, retries and cleanup
+results. PNG export failures and unsupported output filesystem operations are
+reported separately. An optional preview/link error after a successful saved
+measurement is reported as `display_error`; its valid PNG remains available.
 
 `ACCEL_HOMING_CANCEL` is not an immediate emergency stop. Use the accessible
 emergency stop for unexpected active movement. A shutdown/homing fault can

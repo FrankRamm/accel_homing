@@ -325,7 +325,7 @@ class PortablePNGTests(unittest.TestCase):
                 rename.assert_not_called()
             self.assertEqual(list(Path(temp).iterdir()), [])
 
-    def test_cancel_after_atomic_link_keeps_completed_png_and_cleans_only_its_staging_file(self):
+    def test_cancel_after_atomic_link_removes_owned_png_and_staging_file(self):
         clock = {"filename_time": "2026-10-27 01:00:00"}
         with tempfile.TemporaryDirectory() as temp:
             destination, calls = Path(temp), []
@@ -335,11 +335,7 @@ class PortablePNGTests(unittest.TestCase):
                     raise RuntimeError("cancelled after complete publication")
             with self.assertRaisesRegex(RuntimeError, "cancelled after complete publication"):
                 charts._publish(destination, "accel_homing_x_home", clock, png_bytes(), cancel)
-            files = list(destination.iterdir())
-            self.assertEqual(len(files), 1)
-            self.assertEqual(files[0].suffix, ".png")
-            self.assertEqual(files[0].read_bytes(), png_bytes())
-            self.assertEqual(charts._check_png(files[0].read_bytes()), (24, 16))
+            self.assertEqual(list(destination.iterdir()), [])
 
     def test_final_name_create_close_write_pipeline_completes_before_late_cancellation(self):
         # Model Moonraker schedule_file_event(CREATE) and complete_file_write
@@ -394,7 +390,7 @@ class PortablePNGTests(unittest.TestCase):
                 self.assertEqual([kind for kind, _path in events], ["CREATE", "CLOSE_WRITE"])
                 self.assertEqual(pending, {})
                 self.assertEqual(len(notifications), 1)
-                self.assertEqual(set(root.iterdir()), {notifications[0][1]})
+                self.assertEqual(set(root.iterdir()), set() if cancelled else {notifications[0][1]})
 
     def test_final_name_completion_failure_raises_and_cleans_owned_png_and_staging(self):
         clock = {"filename_time": "2026-10-27 01:00:00"}
@@ -571,18 +567,20 @@ class AccuracyPNGTests(unittest.TestCase):
             self.assertNotIn("receipt", json.dumps(axes))
             self.assertTrue(all(path.suffix == ".png" for path in Path(temp).rglob("*") if path.is_file()))
 
-    def test_partial_summary_has_honest_failure_and_no_unearned_variance(self):
+    def test_partial_statistics_remain_valid_without_publishing_failed_summary(self):
         renderer = RecordingRenderer()
         with tempfile.TemporaryDirectory() as temp:
             item = simulated_axis(temp, "partial", travels=(175.,), requested=3, renderer=renderer)
             item["capture_paths"][0] = None
-            paths = charts.write_accuracy(temp, "partial", {"x": item}, "aborted",
-                                          reason="Synthetic export failure", simulated=True, renderer=renderer)
-            payload = renderer.payloads[-1]
-            self.assertEqual(payload["result"], "aborted")
-            self.assertIsNone(payload["statistics"]["variance_mm2"])
-            self.assertEqual(payload["traces"], [])
-            self.assertTrue(Path(paths["x_png"]).is_file())
+            checked = charts.validate_accuracy(temp, "partial", {"x": item}, "aborted",
+                                                reason="Synthetic export failure", simulated=True)
+            self.assertIsNone(checked["x"]["statistics"]["variance_mm2"])
+            previous_files, previous_renders = list(Path(temp).iterdir()), len(renderer.payloads)
+            with self.assertRaisesRegex(ValueError, "Only a complete"):
+                charts.write_accuracy(temp, "partial", {"x": item}, "aborted",
+                                      reason="Synthetic export failure", simulated=True, renderer=renderer)
+            self.assertEqual(list(Path(temp).iterdir()), previous_files)
+            self.assertEqual(len(renderer.payloads), previous_renders)
 
     def test_immutable_receipt_record_digest_png_bytes_and_path_are_checked(self):
         renderer = RecordingRenderer()
@@ -650,7 +648,7 @@ class AccuracyPNGTests(unittest.TestCase):
                 charts.validate_accuracy(output, "separate", {"x": item}, simulated=True,
                                          capture_directory=source)
 
-    def test_later_axis_render_failure_retains_only_already_published_summary_paths(self):
+    def test_later_axis_render_failure_prevents_every_summary_publication(self):
         renderer = RecordingRenderer()
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as output:
             axes = {"x": simulated_axis(source, "partial_axes", renderer=renderer),
@@ -665,10 +663,10 @@ class AccuracyPNGTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "Y summary failure"):
                 charts.write_accuracy(output, "partial_axes", axes, "complete", simulated=True,
                                       renderer=renderer, capture_directory=source, published_paths=published)
-            self.assertEqual(set(published), {"x_png"})
-            self.assertEqual(list(Path(output).iterdir()), [Path(published["x_png"])])
+            self.assertEqual(published, {})
+            self.assertEqual(list(Path(output).iterdir()), [])
 
-    def test_maximum_xy_accuracy_uses_temporary_individual_pngs_and_two_bounded_overviews(self):
+    def test_maximum_xy_accuracy_accepts_legacy_file_receipts_and_two_bounded_overviews(self):
         renderer = RecordingRenderer()
         with tempfile.TemporaryDirectory() as output:
             with tempfile.TemporaryDirectory() as source:
@@ -722,19 +720,19 @@ class NoisePNGTests(unittest.TestCase):
                     self.assertEqual(renderer.payloads[-1]["recommendation"]["start_threshold_g"],
                                      {"x": None, "y": None})
 
-    def test_incomplete_or_faulted_window_cannot_recommend_and_failure_is_png_only(self):
+    def test_incomplete_or_faulted_window_cannot_recommend_or_publish(self):
         renderer = RecordingRenderer()
         with tempfile.TemporaryDirectory() as temp:
             iterations, recommendation = simulated_noise_run(temp, "partial", peaks=(.1, .2))
             with self.assertRaisesRegex(ValueError, "three valid"):
                 charts.write_noise(temp, "partial", iterations, recommendation, "complete", renderer=renderer)
-            with self.assertRaisesRegex(ValueError, "cannot recommend"):
+            with self.assertRaises(ValueError):
                 charts.write_noise(temp, "partial", iterations, recommendation, "failed", renderer=renderer)
-            paths = charts.write_noise(temp, "partial", iterations, None, "failed",
-                                       reason="Synthetic sensor fault", simulated=True, renderer=renderer)
-            self.assertEqual(renderer.payloads[-1]["result"], "failed")
-            self.assertIsNone(renderer.payloads[-1]["recommendation"])
-            self.assertTrue(Path(paths["png"]).is_file())
+            with self.assertRaises(ValueError):
+                charts.write_noise(temp, "partial", iterations, None, "failed",
+                                   reason="Synthetic sensor fault", simulated=True, renderer=renderer)
+            self.assertEqual(renderer.payloads, [])
+            self.assertEqual(list(Path(temp).iterdir()), [])
             item, capture = simulated_noise_window(temp, "source", 1)
             capture["fault"] = "saturated"
             with self.assertRaises(ValueError):

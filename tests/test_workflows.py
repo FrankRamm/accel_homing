@@ -532,7 +532,7 @@ class Rig:
         self.noise_calls.append("stop")
         self.owner.noise_session = None
 
-    def collect_noise(self, check_running, duration):
+    def collect_noise(self, check_running, duration, **acquisition_options):
         check_running()
         self.noise_window_count += 1
         iteration = self.noise_window_count
@@ -2420,7 +2420,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                     rig = Rig({"charts_directory": temp})
                     if failure == "suspect":
                         rig.home_results.append({"travel_mm": 15.0})
-                    context = mock.patch.object(workflow_module, "write_capture",
+                    context = mock.patch.object(workflow_module, "prepare_capture",
                                                 side_effect=OSError("synthetic export error")) \
                         if failure == "export" else contextlib.nullcontext()
                     with context, mock.patch.object(rig.workflow, "_release_terminal_home") as release:
@@ -2557,8 +2557,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                         self.assertEqual(rig.toolhead.moves, [] if bad_axis == "x" else
                                          [([150.0, None, None], 50.0)])
                         self.assertEqual(rig.workflow.last_result["result"], "rejected")
-                        self.assertEqual(len(rig.workflow.last_result["paths"]),
-                                         len(expected) if callback == "cmd_CHARTS" else 0)
+                        self.assertEqual(rig.workflow.last_result["paths"], [])
                         self.assertIsNone(rig.workflow.session)
                         self.assertEqual(rig.configfile.saved, {})
                         self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
@@ -2578,7 +2577,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                         rig.bad_capture = {"samples": [], "dropped": 0}
                     elif failure == "unexpected":
                         rig.home_results.append(RuntimeError("synthetic unexpected error"))
-                    context = mock.patch.object(workflow_module, "write_capture", side_effect=OSError("synthetic export error")) \
+                    context = mock.patch.object(workflow_module, "prepare_capture", side_effect=OSError("synthetic export error")) \
                         if failure == "export" else contextlib.nullcontext()
                     with context, self.assertRaises(Exception):
                         getattr(rig.workflow, callback)(GCmd(CENTERED=1))

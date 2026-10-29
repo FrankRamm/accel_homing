@@ -101,7 +101,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 self.assertEqual(partial["result"], "aborted")
                 self.assertEqual(len(partial["axis_results"][axis]["trials"]), max(0, prior - 1))
                 self.assertEqual(partial["axis_results"][axis]["rejected"]["travel_mm_exact"], 51.175)
-                self.assertTrue(Path(partial["summary_paths"][axis + "_png"]).is_file())
+                self.assertNotIn("summary_paths", partial)
                 self.assertEqual(rig.toolhead.position[1 - index], initial[1 - index])
                 self.assertEqual(rig.toolhead.position[2:], initial[2:])
                 self.assertEqual(rig.disabled, [])
@@ -334,28 +334,28 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 self.assertEqual(rig.workflow.last_result["threshold_g"], 2.5)
                 self.assertEqual(len(rig.home_calls), 12)
 
-    def test_summary_and_temporary_cleanup_finish_before_calibration_noise_starts(self):
+    def test_failure_metrics_and_memory_cleanup_finish_before_calibration_noise_starts(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = self.rig(directory)
             rig.home_results.extend([{"travel_mm": 51.175}] + [{}] * 11)
             def inspect_noise(_iteration):
                 partial = rig.workflow.session["source_accuracy"]
                 self.assertEqual(partial["result"], "aborted")
-                self.assertTrue(Path(partial["summary_paths"]["x_png"]).is_file())
-                self.assertTrue(all(not path.exists() for path in rig.capture_directories))
+                self.assertNotIn("summary_paths", partial)
+                self.assertEqual(rig.capture_directories, [])
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertEqual(rig.idle_state, "Printing")
             rig.on_noise = inspect_noise
             rig.accuracy()
 
-    def test_cancel_shutdown_motor_off_and_printing_during_summary_block_handoff(self):
+    def test_cancel_shutdown_motor_off_and_printing_during_finalization_block_handoff(self):
         for ending in ("cancel", "shutdown", "motor-off", "printing", "pause", "sd-active"):
             with self.subTest(ending=ending), tempfile.TemporaryDirectory() as directory:
                 rig = self.rig(directory)
                 rig.home_results.append({"travel_mm": 51.175})
-                def interrupt(payload):
-                    if payload["kind"] != "accuracy":
-                        return
+                finalize = rig.workflow._accuracy_result
+                def interrupt(session, result_ending):
+                    result = finalize(session, result_ending)
                     if ending == "cancel":
                         rig.workflow.cmd_CANCEL(GCmd())
                     elif ending == "shutdown":
@@ -369,64 +369,57 @@ class AccuracyRecoveryTests(unittest.TestCase):
                         rig.sd_active = True
                     else:
                         rig.print_state = "printing"
-                rig.workflow.renderer.on_render = interrupt
-                with self.assertRaises(CommandError):
+                    return result
+                with mock.patch.object(rig.workflow, "_accuracy_result", side_effect=interrupt), \
+                        self.assertRaises(CommandError):
                     rig.accuracy()
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assert_no_calibration(rig)
 
-    def test_cancel_and_external_motion_during_temporary_cleanup_block_handoff(self):
+    def test_cancel_and_external_motion_during_memory_cleanup_block_handoff(self):
         for ending in ("cancel", "move", "preflight", "source"):
             with self.subTest(ending=ending), tempfile.TemporaryDirectory() as directory:
                 rig = self.rig(directory)
                 rig.home_results.append({"travel_mm": 51.175})
-                create = rig.workflow._accuracy_capture_directory
-                def directory_with_interrupt():
-                    temporary = create()
-                    cleanup = temporary.cleanup
-                    def interrupt():
-                        cleanup()
-                        self.assertIsNotNone(rig.workflow.session)
-                        if ending == "cancel":
-                            rig.workflow.cmd_CANCEL(GCmd())
-                        elif ending == "move":
-                            rig.toolhead.position[0] += 1.
-                        elif ending == "preflight":
-                            rig.workflow.preflight_generation += 1
-                        else:
-                            rig.owner.last["x"] = copy.copy(rig.owner.last["x"])
-                    temporary.cleanup = interrupt
-                    return temporary
-                with mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=directory_with_interrupt), \
+                cleanup = rig.workflow._cleanup_accuracy_captures
+                def interrupt(*args):
+                    cleanup(*args)
+                    self.assertIsNotNone(rig.workflow.session)
+                    if ending == "cancel":
+                        rig.workflow.cmd_CANCEL(GCmd())
+                    elif ending == "move":
+                        rig.toolhead.position[0] += 1.
+                    elif ending == "preflight":
+                        rig.workflow.preflight_generation += 1
+                    else:
+                        rig.owner.last["x"] = copy.copy(rig.owner.last["x"])
+                with mock.patch.object(rig.workflow, "_cleanup_accuracy_captures", side_effect=interrupt), \
                         self.assertRaises(CommandError):
                     rig.accuracy()
                 self.assert_no_calibration(rig)
 
-    def test_summary_or_temp_cleanup_failure_blocks_calibration_without_losing_primary_error(self):
-        for stage in ("summary", "cleanup", "motion-and-cleanup"):
+    def test_aborted_accuracy_never_calls_summary_or_temporary_capture_writers(self):
+        for stage in ("early", "motion"):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
                 rig = self.rig(directory)
                 rig.home_results.append({"travel_mm": 51.175})
-                create = rig.workflow._accuracy_capture_directory
-                def failing_directory():
-                    temporary = create()
-                    cleanup = temporary.cleanup
-                    def fail():
-                        cleanup()
-                        raise OSError("synthetic temporary cleanup failure")
-                    temporary.cleanup = fail
-                    return temporary
-                patch = (mock.patch.object(workflow_module, "write_accuracy", side_effect=OSError("summary fault"))
-                         if stage == "summary" else
-                         mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=failing_directory))
-                if stage == "motion-and-cleanup":
+                if stage == "motion":
                     rig.home_results.clear()
                     rig.home_results.append(CommandError("original homing fault"))
-                with patch, self.assertRaises(CommandError) as caught:
-                    rig.accuracy()
-                if stage == "motion-and-cleanup":
+                with mock.patch.object(workflow_module, "write_accuracy", side_effect=AssertionError("failed summary")) as writer, \
+                        mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=AssertionError("temporary capture")) as directory_writer:
+                    if stage == "motion":
+                        with self.assertRaises(CommandError) as caught:
+                            rig.accuracy()
+                    else:
+                        rig.accuracy()
+                    writer.assert_not_called()
+                    directory_writer.assert_not_called()
+                if stage == "motion":
                     self.assertIn("original homing fault", str(caught.exception))
-                self.assert_no_calibration(rig)
+                    self.assert_no_calibration(rig)
+                else:
+                    self.assertEqual(rig.workflow.last_result["result"], "calibrated")
 
     def test_cancel_during_calibration_command_creation_blocks_first_calibration_home(self):
         with tempfile.TemporaryDirectory() as directory:

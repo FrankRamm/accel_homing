@@ -78,11 +78,15 @@ manual thresholds override ordinary saved models; comment them out and issue
 [configuration](docs/CONFIGURATION.md#thresholds-and-saved-models).
 
 An early ACCURACY trigger with valid current capture/halt/center evidence can
-reverse its recorded commanded halt travel, save the partial report, then start
+reverse its recorded commanded halt travel, report the failure in the console, then start
 normal calibration at the actual failed threshold **plus 0.25 g**. Successful
 recovery calibration saves and restarts Klipper. Prepare XY again and rerun the
 exact accuracy command printed in the console; it does not rerun automatically.
 [Recovery details](docs/ACCURACY.md#early-trigger-automatic-recalibration).
+
+Charts are saved only after the requested workflow and its required cleanup/save
+succeed. Failed, rejected or cancelled runs keep console diagnostics without
+saving a partial PNG, including temporary per-home images.
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.

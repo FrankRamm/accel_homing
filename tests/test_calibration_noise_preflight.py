@@ -1,8 +1,9 @@
-"""Source-only calibration noise regressions; execution requires operator approval."""
+"""Offline calibration-noise regressions; no printer or service access."""
 import contextlib
 import itertools
 import json
 import math
+from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
@@ -60,7 +61,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                 metadata = json.loads(rig.configfile.saved[("accel_homing_model default", axis.lower() + "_metadata")])
                 self.assertEqual(metadata["stationary_noise_seed"]["candidate_step_g"], .2)
                 self.assertEqual(metadata["stationary_noise_seed"]["start_threshold_g"], 1.1)
-                self.assertEqual(metadata["stationary_noise_measurement"], measurement)
+                self.assertEqual(metadata["stationary_noise_measurement"], dict(measurement, summary_paths={}))
                 payload = next(item for item in rig.workflow.renderer.calls if item["kind"] == "noise")
                 self.assertAlmostEqual(payload["records"][0]["noise_magnitude_peak_g"],
                                        measurement["noise_magnitude_peak_g"])
@@ -156,13 +157,13 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
             self.assertEqual(rig.scripts[-1], "SAVE_CONFIG")
 
     def test_sensor_and_export_faults_abort_before_first_home(self):
-        for fault in ("capture", "record", "capture_export", "summary_export"):
+        for fault in ("capture", "record", "capture_export"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
                 rig = NoiseRig({"charts_directory": temp})
                 collect = rig.owner.collect_noise_window
 
-                def bad_capture(check_running, duration):
-                    capture = collect(check_running, duration)
+                def bad_capture(check_running, duration, **acquisition_options):
+                    capture = collect(check_running, duration, **acquisition_options)
                     if fault == "capture": capture["fault"] = "saturated"
                     elif fault == "record": capture["cutoff_time_s"] = capture["samples"][0][0]
                     return capture
@@ -177,7 +178,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                 self.assertEqual(rig.workflow.noise_seeds, {})
 
     def test_interruptions_and_context_changes_at_each_noise_yield_never_allow_motion(self):
-        for stage, fault in itertools.product(("preflight", "window", "capture_export", "stop", "summary", "display"),
+        for stage, fault in itertools.product(("preflight", "window", "capture_export", "stop"),
                                               ("cancel", "disconnect", "motor-off", "position", "queue")):
             with self.subTest(stage=stage, fault=fault), tempfile.TemporaryDirectory() as temp:
                 rig = NoiseRig({"charts_directory": temp})
@@ -218,6 +219,29 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                 self.assertTrue(interrupted[0])
                 self.assert_no_motion_or_config(rig)
                 self.assertEqual(rig.workflow.noise_seeds, {})
+
+    def test_deferred_summary_preparation_yields_only_after_qualification_and_never_stages_on_interruption(self):
+        for fault in ("cancel", "disconnect", "motor-off", "position", "queue", "renderer"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                rig = NoiseRig({"charts_directory": temp})
+
+                def rendered(payload):
+                    if payload["kind"] != "noise": return
+                    self.assertEqual(len(rig.home_calls), 11)
+                    self.assertEqual(rig.configfile.saved, {})
+                    if fault == "cancel": rig.workflow.cmd_CANCEL(GCmd())
+                    elif fault == "disconnect": rig.workflow._disconnect()
+                    elif fault == "motor-off": rig.owner.operation_generation += 1
+                    elif fault == "position": rig.toolhead.position[1] += 1.
+                    elif fault == "queue": rig.toolhead.busy = (11., 10., True)
+                    else: raise OSError("synthetic summary renderer failure")
+
+                rig.workflow.renderer.on_render = rendered
+                with mock.patch.object(workflow_module.logging, "exception"), self.assertRaises(Exception):
+                    rig.calibrate(save=0)
+                self.assertEqual(rig.configfile.saved, {})
+                self.assertIsNone(rig.workflow.session)
+                self.assertEqual(list(Path(temp).rglob("*.png")), [])
 
 
 if __name__ == "__main__":

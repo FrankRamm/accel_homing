@@ -322,7 +322,7 @@ class BetaCalibrationTests(unittest.TestCase):
         self.assertEqual(rig.home_calls, [])
         self.assertEqual(rig.configfile.saved, {})
 
-    def test_failed_home_is_retained_as_incomplete_and_partial_beta_png_is_attempted(self):
+    def test_failed_home_is_retained_as_incomplete_without_attempting_a_beta_png(self):
         rig = BetaRig()
         rig.home_results.append(CommandError("synthetic home transport failure"))
         with self.assertRaisesRegex(CommandError, "home transport failure"):
@@ -331,7 +331,7 @@ class BetaCalibrationTests(unittest.TestCase):
         self.assertEqual(len(trials), 1)
         self.assertEqual(trials[0]["beta_decision"], "incomplete")
         self.assertIn("home transport failure", trials[0]["beta_reason"])
-        self.assertIn(("export", True), rig.beta_events)
+        self.assertNotIn(("export", True), rig.beta_events)
         self.assertEqual(rig.configfile.saved, {})
 
     def test_ordinary_calibration_retains_legacy_capture_and_save_semantics(self):

@@ -1,7 +1,7 @@
 # Beta moving-noise calibration experiment
 
-BETA is a separate supervised experiment. It produces a **Beta-labelled PNG**
-and a threshold suggestion, with a diagnostic report in the same command's
+BETA is a separate supervised experiment. A successful proposal produces a
+**Beta-labelled PNG** and threshold suggestion, with a diagnostic report in the same command's
 console output. It does not stage/save a threshold or model, call SAVE_CONFIG
 or restart Klipper. Its suggestion is not hardware qualification.
 
@@ -59,9 +59,11 @@ an abort when reporting remains available. They include:
 - Cleanup/restoration state, partial-output errors and the final proposal/result.
 - `physical_position_verified: false`.
 
-One combined Beta PNG records available motion/noise/trial information.
-Partial reports can explain an abort; they are not successful proposals.
-A rendering/reporting failure is itself reported when possible.
+One combined Beta PNG records a successful proposal's motion/noise/trial
+information after required cleanup succeeds. Failed, incomplete or cancelled
+experiments save no PNG. Bounded console diagnostics still explain the abort,
+including available trials and cleanup results. A rendering/reporting failure
+is itself reported when possible.
 
 ## Limits and cancellation
 

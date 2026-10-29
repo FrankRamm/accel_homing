@@ -53,6 +53,8 @@ MOTION_LAG = 0.015         # s, commanded speed is taken this much earlier, so s
 COMMAND_WINDOW = 0.004     # s, window for the commanded speed
 EARLY_INTERVAL = 0.003     # s, watchdog interval until the toolhead is seen moving
 GAP_SAMPLES = 5            # missing samples that make the integrated speed untrustworthy
+NOISE_WINDOW_RETRIES = 2   # fresh complete reacquisitions; stationary workflows only
+NOISE_SESSION_RETRIES = 3  # shared by all requested stationary windows
 ENABLE_SETTLE = 0.25       # s, motors switched on before homing settle before the reading
 BASELINE_NOISE_RATIO = 0.20  # all-axis peak-to-peak / current impact threshold
 NATIVE_BASELINE_NOISE_FLOOR = 0.5  # g peak-to-peak, also capped by the impact threshold
@@ -75,6 +77,14 @@ FAILURES = {
     "no_motion": "toolhead motion was not verified before the startup deadline",
     "proof_overflow": "native startup motion-proof history exceeded its bounded capacity",
 }
+
+
+class _NoiseAcquisitionFailure(Exception):
+    """Only explicit stationary gaps/timeouts may request a fresh window."""
+
+    def __init__(self, reason, message, latched_fault=None):
+        super().__init__(message)
+        self.reason, self.latched_fault = reason, latched_fault
 
 
 def validate_threshold(value, name, error, full_scale=None):
@@ -473,6 +483,7 @@ class BeaconAccelHoming:
             self.stream_timeout = self.backend.max_age
 
         self.lock = threading.Lock()
+        self.sensor_fault_lock = threading.Lock()
         self.endstops = {}
         self.trigger_cmds = {}
         self.beacon = self.helper = self.toolhead = self.main_mcu = None
@@ -1763,7 +1774,12 @@ class BeaconAccelHoming:
                 self._capture_batch(params)
 
     def _sensor_fault(self, reason):
-        self.sensor_fault = reason
+        with self.sensor_fault_lock:
+            # A later gap cannot make malformed/stale/driver-error data
+            # recoverable while a stationary callback is waiting to be polled.
+            if self.noise_session is None or self.sensor_fault in (None, "sample_gap"):
+                self.sensor_fault = reason
+            reason = self.sensor_fault
         attempt = self.attempt
         if attempt is not None and not attempt.done:
             self._fire(attempt, reason, mcu.MCU_trsync.REASON_HOST_REQUEST)
@@ -2151,7 +2167,8 @@ class BeaconAccelHoming:
             raise self.printer.command_error("accel_homing: noise measurement requires an exclusive sensor stream")
         session = {"context": context, "sensor": self.sensor, "helper": self.helper,
                    "helper_scale": dict(self.helper._scale) if self.backend is None else None,
-                   "windows_started": 0}
+                   "generation": self.operation_generation,
+                   "windows_started": 0, "retries": 0}
         self.noise_session = session
         with self.lock:
             # A prior home's peak tail must not be extended by stationary data.
@@ -2176,34 +2193,105 @@ class BeaconAccelHoming:
         if self.helper is not None:
             self._stop_stream()
 
-    def collect_noise_window(self, check_running, duration=1.0):
-        """Collect one fresh bounded sensor-time window with no motion state writes."""
+    def _check_noise_session(self, session):
+        if (self.noise_session is not session or self.sensor is not session["sensor"]
+                or self.helper is not session["helper"]
+                or self.operation_generation != session["generation"] or not self.stream_on
+                or self.homing_active or self.attempt is not None
+                or self.beta_capture is not None or self.beta_motion_capture is not None
+                or (self.backend is not None and not self.backend.active)):
+            raise self.printer.command_error("accel_homing: noise measurement cancelled or disconnected")
+        if (self._noise_shared_client() or self.noise_sensor_context() != session["context"]
+                or self.session_scale != self.scale
+                or (self.backend is None and self.helper._scale != session["helper_scale"])):
+            raise self.printer.command_error("accel_homing: sensor scale, mapping or client changed during noise measurement")
+
+    def collect_noise_window(self, check_running, duration=1.0, recover_transient=False,
+                             on_acquisition_fault=None):
+        """Collect a complete window; opt-in retries discard all failed-window data.
+
+        The beta stationary reference remains strict by default. Ordinary noise
+        workflows explicitly opt in, without changing any moving detector path.
+        """
         session = self.noise_session
         if session is None or not math.isfinite(duration) or duration != 1.0:
             raise self.printer.command_error("accel_homing: noise measurement requires a one-second session")
-        check_running()
-        started = self.reactor.monotonic()
-        session["windows_started"] += 1
-        window = {"index": session["windows_started"],
-                  "cutoff": self.main_mcu.estimated_print_time(started),
-                  "duration": duration, "samples": [], "last": None,
-                  "interval": None, "complete": False, "changed": False}
-        with self.lock:
-            self.noise_window = window
-            if self.backend is not None:
-                self.backend.prepare_reference()
+        retries, failures, expected_fault = 0, [], None
+        while True:
+            check_running()
+            with self.lock, self.sensor_fault_lock:
+                self._check_noise_session(session)
+                # A callback or cancellation may have changed the fault while
+                # the main thread reported the retry. Clear only our exact
+                # recoverable latch while installing its replacement window.
+                if self.sensor_fault != expected_fault:
+                    raise self.printer.command_error("accel_homing: noise measurement: %s" %
+                                                     FAILURES.get(self.sensor_fault, "acquisition fault changed before retry"))
+                started = self.reactor.monotonic()
+                session["windows_started"] += 1
+                window = {"index": session["windows_started"],
+                          "cutoff": self.main_mcu.estimated_print_time(started),
+                          "duration": duration, "samples": [], "last": None,
+                          "interval": None, "complete": False, "changed": False}
+                self.sensor_fault = None
+                self.noise_window = window
+                if self.backend is not None:
+                    if self.backend.fault == expected_fault:
+                        self.backend.fault = None
+                    self.backend.prepare_reference()
+            try:
+                capture = self._collect_noise_window(session, window, check_running, started)
+                if failures:
+                    capture["acquisition_faults"] = list(failures)
+                    capture["acquisition_attempts"] = retries + 1
+                return capture
+            except _NoiseAcquisitionFailure as exc:
+                check_running()
+                self._check_noise_session(session)
+                will_retry = (recover_transient and retries < NOISE_WINDOW_RETRIES
+                              and session["retries"] < NOISE_SESSION_RETRIES)
+                diagnostic = {"reason": exc.reason, "message": str(exc),
+                              "window": window["index"], "window_attempt": retries + 1,
+                              "cutoff_time_s": window["cutoff"],
+                              "discarded_sample_count": len(window["samples"]),
+                              "first_sample_time_s": (window["samples"][0][0]
+                                                      if window["samples"] else None),
+                              "last_sample_time_s": window["last"],
+                              "will_retry": will_retry,
+                              "window_retry_limit": NOISE_WINDOW_RETRIES,
+                              "session_retry_limit": NOISE_SESSION_RETRIES,
+                              "window_retries": retries + int(will_retry),
+                              "session_retries": session["retries"] + int(will_retry),
+                              **window.get("fault_details", {})}
+                failures.append(diagnostic)
+                logging.info("accel_homing: stationary acquisition fault %s",
+                             json.dumps(diagnostic, sort_keys=True))
+                if on_acquisition_fault is not None:
+                    on_acquisition_fault(dict(diagnostic))
+                if not will_retry:
+                    suffix = "; stationary noise retry budget exhausted" if recover_transient else ""
+                    raise self.printer.command_error(str(exc) + suffix)
+                # Reporting can yield or cancel. The next iteration validates
+                # ownership/context again before clearing any stream fault.
+                check_running()
+                self._check_noise_session(session)
+                retries += 1
+                session["retries"] += 1
+                expected_fault = exc.latched_fault
+
+    def _collect_noise_window(self, session, window, check_running, started):
         try:
             while True:
                 check_running()
                 now = self.reactor.monotonic()
-                if (self.noise_session is not session or self.sensor is not session["sensor"]
-                        or self.helper is not session["helper"]):
-                    raise self.printer.command_error("accel_homing: noise measurement cancelled or disconnected")
-                if (self._noise_shared_client() or self.noise_sensor_context() != session["context"]
-                        or self.session_scale != self.scale
-                        or (self.backend is None and self.helper._scale != session["helper_scale"])):
-                    raise self.printer.command_error("accel_homing: sensor scale, mapping or client changed during noise measurement")
+                self._check_noise_session(session)
+                if self.noise_window is not window:
+                    raise self.printer.command_error("accel_homing: stationary noise window ownership changed")
                 if self.sensor_fault is not None:
+                    if self.sensor_fault == "sample_gap":
+                        raise _NoiseAcquisitionFailure("sample_gap",
+                            "accel_homing: noise measurement: %s" % FAILURES["sample_gap"],
+                            latched_fault="sample_gap")
                     raise self.printer.command_error("accel_homing: noise measurement: %s" % FAILURES[self.sensor_fault])
                 with self.lock:
                     complete, last = window["complete"], window["last"]
@@ -2222,9 +2310,11 @@ class BeaconAccelHoming:
                         "noise_wait", sensor_now, last, last,
                         cutoff=window["cutoff"], reason="too_old", sample_time=last,
                         max_age=self.stream_timeout)
-                    raise self.printer.command_error("accel_homing: noise measurement stopped receiving fresh samples")
-                if now - started > duration + STREAM_START_TIMEOUT:
-                    raise self.printer.command_error("accel_homing: noise measurement acquisition timeout")
+                    raise _NoiseAcquisitionFailure("no_fresh_data",
+                        "accel_homing: noise measurement stopped receiving fresh samples")
+                if now - started > window["duration"] + STREAM_START_TIMEOUT:
+                    raise _NoiseAcquisitionFailure("acquisition_timeout",
+                        "accel_homing: noise measurement acquisition timeout")
                 self.reactor.pause(now + 0.005)
         finally:
             with self.lock:
@@ -2296,6 +2386,16 @@ class BeaconAccelHoming:
                                 and abs(interval - window["interval"]) > max(0.000003, interval * 0.10))):
                         if quality is not None:
                             quality["gap_observations"] += 1
+                        window["fault_details"] = {
+                            "phase": "noise_batch", "backend": "beacon_raw" if self.backend is None else self.backend.kind,
+                            "gap_s": gap, "gap_limit_s": 5.0 * interval + 0.000003,
+                            "sample_interval_s": interval,
+                            "previous_sample_interval_s": window["interval"],
+                            "interval_change_limit_s": max(0.000003, interval * 0.10),
+                            "rejected_sample_time_s": when, "sensor_now_s": sensor_now,
+                            "batch_start_clock": params["start_clock"],
+                            "batch_delta_clock": params["delta_clock"],
+                            "batch_sample_count": count}
                         self._sensor_fault("sample_gap")
                         return
                 values = tuple(axis[number] for axis in raw)
