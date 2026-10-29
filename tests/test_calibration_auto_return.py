@@ -82,7 +82,8 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
             self.assertFalse(rig.home_calls[offset]["candidate_qualified"])
             self.assertEqual(rig.home_calls[offset]["successes"], 0)
             self.assertEqual(rig.home_calls[offset]["homed_axes"], "z")
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
         self.assertEqual(rig.workflow.last_result["successes"], 10)
         self.assertEqual(rig.workflow.last_result["repeatability_limit_mm"], 2.)
 

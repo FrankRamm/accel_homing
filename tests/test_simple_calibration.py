@@ -309,7 +309,8 @@ class ImpactDiscoveryTests(unittest.TestCase):
         rig.home_results.extend([{"travel_mm": 145.}] + [{"travel_mm": 150.}] * 9 + [{"travel_mm": 152.}])
         rig.calibrate(save=0)
         self.assertEqual(len(rig.home_calls), 11)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
         self.assertEqual(rig.workflow.last_result["repeatability_spread_mm"], 2.)
 
 
@@ -340,7 +341,8 @@ class SimpleWorkflowTests(unittest.TestCase):
         for offset in (0, 11, 22):
             self.assertFalse(rig.home_calls[offset]["candidate_qualified"])
             self.assertEqual(rig.home_calls[offset]["successes"], 0)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
         self.assertEqual(rig.workflow.last_result["restarts"], 2)
 
     def test_failed_set_cannot_exceed_sensor_headroom_or_global_attempt_budget(self):
@@ -359,7 +361,8 @@ class SimpleWorkflowTests(unittest.TestCase):
         rig.home_results.append({"travel_mm": 19.999})
         rig.calibrate(save=0, START_THRESHOLD=1, STEP=.25)
         self.assertIsNone(rig.workflow.session)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
         self.assertEqual([call["threshold"] for call in rig.home_calls], [1.] + [1.25] * 11)
 
     def test_saved_vector_model_uses_same_detector_but_legacy_models_stay_legacy(self):
@@ -395,7 +398,8 @@ class SimpleWorkflowTests(unittest.TestCase):
         rig.home_results.extend([{}] + [{"travel_mm": 150., "travel_mm_exact": 150.}] * 9 +
                                 [{"travel_mm": 152., "travel_mm_exact": 152.0001}])
         rig.calibrate(save=0)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
         self.assertEqual(rig.workflow.last_result["restarts"], 1)
 
 

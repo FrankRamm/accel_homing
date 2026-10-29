@@ -44,7 +44,8 @@ class SimpleRecordedReturnTests(unittest.TestCase):
         rig.home_results.extend([{"travel_mm": 20., "halt_travel_mm_signed": -25.}] + [{}] * 11)
         rig.calibrate(save=0)
         self.assertEqual(rig.toolhead.moves[0], ([20., None, None], 50.))
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
         self.assertEqual(rig.workflow.last_result["recovery"]["last_return_mm_signed"], 25.)
 
     def test_return_reads_current_commanded_coordinate_without_arrival_or_motor_verification(self):
@@ -138,7 +139,8 @@ class SimpleRecordedReturnTests(unittest.TestCase):
         rig.workflow._validate_model_connection()
         rig.home_results.extend([{"travel_mm": 2.}] + [{}] * 11)
         rig.calibrate(save=0, START_THRESHOLD=3.)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 3.25)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 3.25)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 3.75)
         self.assertEqual(rig.workflow.last_result["recovery"], {
             "count": 1, "last_return_mm_signed": 2.,
             "accounting": "completed_commanded_returns", "physical_position_verified": False})

@@ -160,7 +160,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig.accuracy(axis=axis.upper())
                 saved = rig.configfile.saved
                 value = saved[(rig.config.get_name(), axis + "_threshold")]
-                self.assertEqual(float(value), 2.5)
+                self.assertEqual(float(value), 3.)
                 self.assertNotIn((rig.config.get_name(), "threshold"), saved)
                 self.assertNotIn((rig.config.get_name(), ("y" if axis == "x" else "x") + "_threshold"), saved)
                 options = dict(rig.config.options, **{axis + "_threshold": value})
@@ -174,7 +174,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig.gcode.ready_gcode_handlers.clear()
                 reloaded = AccelHomingWorkflows(rig.owner, config)
                 self.assertIn(axis, reloaded.manual_axes)
-                self.assertEqual(rig.owner.threshold_g[axis], 2.5)
+                self.assertEqual(rig.owner.threshold_g[axis], 3.)
 
     def test_saved_model_supplies_recovered_value_without_manual_override(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -187,7 +187,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig.owner.threshold_g["x"] = 8.
             rig.gcode.ready_gcode_handlers.clear()
             AccelHomingWorkflows(rig.owner, Config(rig, {"charts_directory": directory}, sections=sections))
-            self.assertEqual(rig.owner.threshold_g["x"], 2.5)
+            self.assertEqual(rig.owner.threshold_g["x"], 3.)
 
     def test_save_error_reports_failed_persistence_without_claiming_restart_completed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -274,7 +274,8 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig = self.rig(directory)
             rig.home_results.extend([{"travel_mm": 51.175, "start_position_mm": 450.}] + [{}] * 11)
             rig.accuracy()
-            self.assertEqual(rig.workflow.last_result["threshold_g"], 2.5)
+            self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 2.5)
+            self.assertEqual(rig.workflow.last_result["threshold_g"], 3.0)
 
     def test_missing_config_staging_interface_refuses_before_return(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -331,7 +332,8 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 # return; the rejected zero-step trigger caused only settling.
                 self.assertEqual(rig.toolhead.moves[0][0], [150., None, None])
                 self.assertEqual(rig.workflow.last_result["accuracy_recovery"]["return_mm_signed"], 0.)
-                self.assertEqual(rig.workflow.last_result["threshold_g"], 2.5)
+                self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 2.5)
+                self.assertEqual(rig.workflow.last_result["threshold_g"], 3.0)
                 self.assertEqual(len(rig.home_calls), 12)
 
     def test_failure_metrics_and_memory_cleanup_finish_before_calibration_noise_starts(self):
@@ -515,7 +517,8 @@ class AccuracyRecoveryTests(unittest.TestCase):
             result = rig.workflow.last_result
             self.assertEqual([item["threshold"] for item in rig.home_calls], [2.25] + [2.5] * 3 + [2.75] * 11)
             self.assertEqual(result["successes"], 10)
-            self.assertEqual(result["threshold_g"], 2.75)
+            self.assertEqual(result["tested_threshold_g"], 2.75)
+            self.assertEqual(result["threshold_g"], 3.25)
             self.assertEqual(result["restarts"], 1)
             self.assertEqual(result["repeatability_spread_mm"], 0.)
             self.assertEqual(rig.scripts.count("SAVE_CONFIG"), 1)

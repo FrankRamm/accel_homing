@@ -74,13 +74,16 @@ configurable g maximum or fixed 15 g maximum. The legacy
 `calibration_max_threshold` option is accepted but ignored, with a deprecation
 warning, so an existing configuration can still load.
 
-When the sensor range is known, the candidate must remain at or below
+When the sensor range is known, the candidate and final saved threshold must
+remain at or below
 `0.8 * sensor_full_scale_g`. This existing 80% rule is a conservative software
 headroom policy, not the physical saturation point. The active stream range is
 checked again before arming; sensor saturation, invalid data and other fault
 checks remain separate. An unknown range prevents automatic noise-based
 selection; an explicit, otherwise valid `START_THRESHOLD` can still be used.
-No candidate is clamped downward to fit a limit.
+Neither value is clamped downward to fit a limit. If the qualified candidate
+plus the final 0.5 g margin exceeds that ceiling, calibration aborts without
+staging a model, saving configuration or publishing its noise PNG.
 Before arming, the derived raw trigger limit and its squared value used by the
 XYZ-magnitude detector must both be finite and positive. This validates numeric
 representation rather than adding a configurable g maximum.
@@ -220,6 +223,20 @@ A clean cycle has one discovery impact plus ten endstop checks. `SAVE_CONFIG=1` 
 the default: successful calibration stages the selected axis model, saves it,
 and restarts Klipper. `SAVE_CONFIG=0` only stages it until an explicit save.
 The other axis's saved model is not changed.
+
+After the ten checks pass, add **0.5 g once** to the qualified candidate and
+stage that value as the selected axis's threshold. For example, ten checks at
+1.25 g produce a saved threshold of 1.75 g. Discovery, retries and all ten
+checks still use the candidate without this final margin; the higher saved
+value was **not tested by those ten homes**. A later `SAVE_CONFIG`, restart or
+model reload does not add the margin again. Failed qualification stages no
+replacement threshold. Beta proposals are unchanged.
+
+Console output and saved metadata distinguish `tested_threshold_g`,
+`saved_threshold_g` and `threshold_margin_g` (0.5), with
+`saved_threshold_tested: false`. The final result's `threshold_g` is the saved
+value; `candidate_g` remains the tested candidate. Stationary-noise charts
+continue to describe their measurement and initial-value hints.
 
 New models record `impact_metric: xyz_magnitude` in their JSON metadata. After
 reload, that axis uses the **same vector detector and offset-only reference**

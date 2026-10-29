@@ -121,6 +121,9 @@ Current simple calibration uses fresh three-window stationary noise to select
 an initial candidate, then requires an impact beyond 20 mm inside the
 midpoint-to-endstop travel band. It excludes discovery and requires ten fresh
 validation homes at the candidate threshold with travel range at most 2 mm.
+After qualification, the saved threshold is that candidate plus 0.5 g once,
+subject to sensor headroom. Metadata distinguishes the tested candidate from
+the higher saved value, which those homes did not test.
 
 Premature impacts reverse recorded signed **start-to-halt** command travel,
 not merely trigger travel; the workflow then settles, increases the candidate

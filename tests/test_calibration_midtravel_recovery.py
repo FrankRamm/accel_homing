@@ -70,7 +70,8 @@ class MidtravelRecoveryTests(unittest.TestCase):
                 self.assertEqual(rig.toolhead.position[2:], initial[2:])
                 self.assertEqual(rig.disabled, [])
                 result = rig.workflow.last_result
-                self.assertEqual(result["threshold_g"], 2.5)
+                self.assertEqual(result["tested_threshold_g"], 2.5)
+                self.assertEqual(result["threshold_g"], 3.0)
                 self.assertEqual(result["successes"], 10)
                 self.assertEqual(result["recovery"]["count"], 1)
                 self.assertEqual(result["recovery"]["last_return_mm_signed"], -sign * halt)
@@ -99,7 +100,8 @@ class MidtravelRecoveryTests(unittest.TestCase):
                 with mock.patch.object(rig.workflow, "_home", side_effect=home_with_other_axis_state):
                     rig.calibrate(axis.upper(), save=0, START_THRESHOLD=2.25, STEP=.25)
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [2.25, 2.5] + [2.75] * 11)
-                self.assertEqual(rig.workflow.last_result["threshold_g"], 2.75)
+                self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 2.75)
+                self.assertEqual(rig.workflow.last_result["threshold_g"], 3.25)
                 self.assertEqual(rig.workflow.last_result["restarts"], 2)
                 self.assertEqual(rig.workflow.last_result["recovery"], {
                     "count": 2, "last_return_mm_signed": -51.175 if positive else 51.175,
@@ -118,7 +120,8 @@ class MidtravelRecoveryTests(unittest.TestCase):
                 rig.home_results.extend([{"travel_mm": 45.},
                                          {"travel_mm": 45., "halt_travel_mm_signed": -45. - extra}] + [{}] * 11)
                 rig.calibrate("Y", save=0)
-                self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
+                self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
+                self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
                 self.assertEqual(rig.workflow.last_result["recovery"]["count"], 2)
                 self.assertEqual(rig.workflow.last_result["recovery"]["last_return_mm_signed"], 45. + extra)
 
@@ -128,7 +131,8 @@ class MidtravelRecoveryTests(unittest.TestCase):
         rig.calibrate(save=0)
         self.assertEqual([call["threshold"] for call in rig.home_calls],
                          [1. + .25 * i for i in range(12)] + [4.] * 11)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 4.)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 4.)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 4.5)
         self.assertEqual(rig.workflow.last_result["restarts"], 12)
         recovery = rig.workflow.last_result["recovery"]
         self.assertEqual(recovery["count"], 12)
@@ -144,7 +148,8 @@ class MidtravelRecoveryTests(unittest.TestCase):
         rig.calibrate(save=0)
         self.assertEqual([call["threshold"] for call in rig.home_calls],
                          [1., 1.25, 1.5, 1.5, 1.5, 1.75] + [2.] * 11)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 2.)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 2.)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 2.5)
         self.assertEqual(rig.workflow.last_result["restarts"], 4)
         for status in (states[2], states[5]):
             self.assertEqual(status["recovery"]["count"], 2)
@@ -185,7 +190,8 @@ class MidtravelRecoveryTests(unittest.TestCase):
         self.assertEqual(workflow.get_status(0)["active"]["recovery"]["count"], 1)
         rig.home_results.extend([{"travel_mm": 90.}] + [{}] * 11)
         rig.calibrate(save=0)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
         self.assertEqual(rig.workflow.last_result["restarts"], 2)
         self.assertEqual(rig.workflow.last_result["recovery"]["count"], 2)
         self.assertEqual(rig.workflow.last_result["recovery"]["last_return_mm_signed"], 90.)

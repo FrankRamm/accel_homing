@@ -23,6 +23,7 @@ python3 -B -m unittest discover -s tests -p 'test_installer.py' -v
 python3 -B -m unittest discover -s tests -p 'test_updater.py' -v
 python3 -B -m unittest discover -s tests -p 'test_accuracy_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_simple_calibration.py' -v
+python3 -B -m unittest discover -s tests -p 'test_calibration_margin.py' -v
 python3 -B -m unittest discover -s tests -p 'test_beta_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_noise_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -v
@@ -44,7 +45,10 @@ full suite run establish different things; identify which were actually done.
 - Calibration discovers an impact after more than 20 mm inside the configured
   midpoint-to-stop band, excludes discovery and needs ten validation homes with
   max-minus-min travel at most 2.00 mm. A running spread above that rejects the
-  candidate immediately.
+  candidate immediately. Only after qualification, the staged/saved threshold
+  receives a single 0.5 g margin. Trial thresholds stay unchanged; the final
+  value must fit sensor headroom without clamping, and metadata reports that
+  the higher value was not tested by those homes.
 - Premature calibration returns reverse current signed start-to-halt commanded
   travel before the next candidate; faults/failed returns do not count as
   completed recovery.

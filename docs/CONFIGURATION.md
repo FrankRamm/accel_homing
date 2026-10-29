@@ -80,6 +80,9 @@ reviewing the reported mismatch rather than editing generated metadata.
 
 Successful normal calibration defaults to `SAVE_CONFIG=1`: it writes the
 selected axis model and restarts Klipper. `SAVE_CONFIG=0` stages the model only.
+Its threshold is the qualified candidate plus a fixed 0.5 g final margin; the
+ten qualification homes test the candidate before that addition. Both values
+must satisfy known-range headroom. Saving or reloading never adds the margin again.
 The former active thresholds are restored when that workflow ends; saving and
 reloading are still required to activate the staged model. An ordinary restart
 discards unsaved staged values. See [calibration](SIMPLE_CALIBRATION.md).

@@ -27,7 +27,7 @@ are retained; the plugin does not rotate or delete old final chart outputs.
 | Command | Motion | Output |
 | --- | --- | --- |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | None | Three-window stationary-noise overview. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Yes | Fresh stationary-noise summary after the calibration, cleanup and required save succeed. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Yes | Fresh stationary-noise summary after calibration, cleanup and required save succeed; its hints exclude the final 0.5 g saving margin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Yes | Measured acceleration capture for that home; omit AXIS for X then Y. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final accuracy overview per requested axis after every axis succeeds. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Yes | Combined **Beta** moving-noise/trial diagnostic and suggestion report. |

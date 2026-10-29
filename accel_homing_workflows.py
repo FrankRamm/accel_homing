@@ -57,6 +57,7 @@ _OVERRIDE_G28 = _HomingOverride.cmd_G28 if _HomingOverride is not None else None
 AXES = {"x": 0, "y": 1}
 CALIBRATION_MIN_TRAVEL_MM = 20.0
 CALIBRATION_REPEATABILITY_MM = 2.0
+CALIBRATION_THRESHOLD_MARGIN_G = 0.5
 SIMPLE_CALIBRATION = "impact20_vector_v2"
 REQUIRED_SUCCESSES = 10
 REPEATABILITY_LIMIT_MM = 1.5
@@ -1828,7 +1829,7 @@ class AccelHomingWorkflows:
     def _save_model(self):
         qualified = self._qualified_validation_records()
         session = self.session
-        axis, threshold = session["axis"], session["candidate"]
+        axis, tested_threshold = session["axis"], session["candidate"]
         minimum = min(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
         maximum = max(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
         spread = self._repeatability_spread(qualified)
@@ -1836,6 +1837,7 @@ class AccelHomingWorkflows:
         # Final release may yield while its motion completes. Recheck all ten
         # accepted trials before staging any model settings.
         self._qualified_validation_records()
+        threshold = self._calibration_saved_threshold(tested_threshold)
         noise_png = None
         if session.get("deferred_noise_result") is not None:
             generation, preflight = self.owner.operation_generation, self.preflight_generation
@@ -1854,6 +1856,9 @@ class AccelHomingWorkflows:
                                       renderer=self.renderer, check_running=current_noise_report)
             current_noise_report()
             self._qualified_validation_records()
+            # Rendering can yield; the final value must still fit the current
+            # sensor headroom, not just the lower threshold used by the trials.
+            threshold = self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
                     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "expected_center_travel_mm": self._geometry(axis)[1],
@@ -1871,6 +1876,10 @@ class AccelHomingWorkflows:
                     "impact_peak_g": [r.get("impact_peak_g") for r in qualified],
                     "calibration_start_threshold_g": session["start_threshold_g"],
                     "calibration_step_g": session["threshold_step_g"],
+                    "tested_threshold_g": tested_threshold,
+                    "saved_threshold_g": threshold,
+                    "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
+                    "saved_threshold_tested": False,
                     "calibration_quiet_range_enforced": session["quiet_range_enforced"],
                     "calibration_settle_time_s": session["calibration_settle_time_s"],
                     "recovery": self._calibration_recovery_status(session),
@@ -1882,7 +1891,7 @@ class AccelHomingWorkflows:
         encoded_metadata = json.dumps(metadata, separators=(",", ":"), allow_nan=False)
         configfile = self.printer.lookup_object("configfile")
         recovery = session.get("accuracy_recovery")
-        encoded_threshold = ("%.17g" if recovery is not None else "%.6f") % threshold
+        encoded_threshold = "%.17g" % threshold
         configfile.set(self.model_section, "version", "1")
         configfile.set(self.model_section, axis + "_threshold", encoded_threshold)
         configfile.set(self.model_section, axis + "_successes", str(REQUIRED_SUCCESSES))
@@ -1893,6 +1902,9 @@ class AccelHomingWorkflows:
             # own include conflict; never edit config/include files directly.
             configfile.set(self.config.get_name(), axis + "_threshold", encoded_threshold)
         result = {"result": "calibrated", "axis": axis, "threshold_g": threshold,
+                  "tested_threshold_g": tested_threshold, "saved_threshold_g": threshold,
+                  "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
+                  "saved_threshold_tested": False,
                   "successes": REQUIRED_SUCCESSES, "model": self.model_name,
                   "run_id": session["run_id"], "save_config": session["save_config"],
                   "repeatability_spread_mm": spread,
@@ -1902,9 +1914,11 @@ class AccelHomingWorkflows:
             result.update(accuracy_recovery=dict(recovery), source_accuracy=session["source_accuracy"])
         save = session["save_config"]
         self._finish(result)
-        self._info("%s model %s calibrated at %.2f g after ten qualified homes with commanded "
-                   "travel spread %s mm <= %.2f mm. %s" % (
-            axis.upper(), self.model_name, threshold, spread, CALIBRATION_REPEATABILITY_MM,
+        self._info("%s model %s: ten qualified homes tested at %.12g g with commanded "
+                   "travel spread %s mm <= %.2f mm; staging %.12g g "
+                   "(tested threshold + %.1f g). The saved threshold was not tested by those homes. %s" % (
+            axis.upper(), self.model_name, tested_threshold, spread, CALIBRATION_REPEATABILITY_MM,
+            threshold, CALIBRATION_THRESHOLD_MARGIN_G,
             "The selected manual override is staged with this model." if recovery is not None and axis in self.manual_axes
             else "Explicit manual threshold overrides remain active." if axis in self.manual_axes
             else "The saved model supplies this axis threshold after restart."))
@@ -1936,6 +1950,17 @@ class AccelHomingWorkflows:
             except Exception as exc:
                 self.last_result["chart_error"] = str(exc)
                 logging.exception("accel_homing: qualified calibration noise PNG publication failed")
+
+    def _calibration_saved_threshold(self, tested_threshold):
+        # Always derive from the qualified candidate, never from an earlier
+        # saved/staged value. Trial records continue to describe that candidate.
+        threshold = float(Decimal(str(tested_threshold)) + Decimal(str(CALIBRATION_THRESHOLD_MARGIN_G)))
+        if (not math.isfinite(threshold)
+                or not math.isclose(threshold - tested_threshold, CALIBRATION_THRESHOLD_MARGIN_G,
+                                    rel_tol=1e-12, abs_tol=0.0)):
+            raise self._error("saved calibration threshold must preserve the full finite +0.5 g margin")
+        self._validate_calibration_threshold(threshold, "saved calibration threshold (tested threshold + 0.5 g)")
+        return threshold
 
     def cmd_CALIBRATE(self, gcmd):
         if self.session is None:

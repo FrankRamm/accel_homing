@@ -71,7 +71,9 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `BEACON_ACCEL_HOMING_STATUS` | Show detector/preparation diagnostics; retained legacy command. |
 | `SET_BEACON_ACCEL_HOMING AXIS=X THRESHOLD=1` | Legacy alias of `SET_ACCEL_HOMING`. |
 
-**CALIBRATE saves the selected axis and restarts Klipper by default.** Prepare
+**CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
+0.5 g once to the candidate after ten checks pass; those homes test the candidate,
+not the higher saved value. The other axis is unchanged. Prepare
 XY again after restart before calibrating the other axis. Explicit X/Y/shared
 manual thresholds override ordinary saved models; comment them out and issue
 `RESTART` while idle to use calibration. See

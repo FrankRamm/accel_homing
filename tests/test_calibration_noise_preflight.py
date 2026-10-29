@@ -115,7 +115,8 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
             self.assertEqual(rig.noise_calls, ["start", 1, 2, 3, "stop"])
             self.assertEqual(rig.workflow.last_result["successes"], 10)
             self.assertEqual(rig.workflow.last_result["restarts"], 2)
-            self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
+            self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
+            self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
             self.assertEqual(rig.workflow.last_result["repeatability_limit_mm"], 2.)
             rig.toolhead.kin.limits[:2] = [(1., -1.)] * 2
             rig.idle_state = "Ready"

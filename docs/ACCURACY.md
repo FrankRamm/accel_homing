@@ -73,13 +73,16 @@ When that evidence is valid, the same command:
    used by the failed ACCURACY attempt **plus exactly 0.25 g**. This increment
    is fixed; later candidate changes use configured `calibration_step`.
 5. Performs normal fresh stationary-noise checks, discovery and ten qualified
-   validation homes. It saves only after that calibration succeeds.
+   validation homes. It then adds the normal **0.5 g final margin** to the
+   qualified candidate and saves only after that calibration succeeds.
 
 For example, a failed attempt using 1.75 g starts recovery calibration at
-2.00 g. A temporary SET threshold counts as the effective threshold; recovery
-does not assume the configured default or the model's older value.
+2.00 g. If that candidate passes, the saved threshold is 2.50 g; those ten homes
+tested 2.00 g, not 2.50 g. A temporary SET threshold counts as the effective
+threshold; recovery does not assume the configured default or the model's older value.
 The 0.5 g calibration minimum, known sensor-range headroom and finite-number
-requirements still apply. A calculated candidate outside those limits aborts.
+requirements still apply to both candidate and saved threshold. Either value
+outside those limits aborts without clamping or saving a replacement.
 
 If a manual shared or axis setting would override the new model after reload,
 recovery also stages the failing axis's replacement threshold through native

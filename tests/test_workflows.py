@@ -1292,7 +1292,8 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(rig.home_calls[1]["attempt"], 2)
             self.assertEqual(rig.home_calls[1]["homed_axes"], "z")
             self.assertEqual(rig.scripts, ["G28 X"] * 12 + ["SAVE_CONFIG"])
-            self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+            self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+            self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
 
     def test_pressed_result_is_never_a_success_even_with_apparent_step_travel(self):
         rig = Rig()
@@ -1312,7 +1313,8 @@ class CalibrationTests(unittest.TestCase):
         self.assertFalse(rig.home_calls[3]["candidate_qualified"])
         self.assertEqual(rig.home_calls[3]["attempt"], 4)
         self.assertEqual(rig.workflow.last_result["successes"], 10)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
         self.assertEqual(len(rig.scripts), 15)
 
     def test_faults_or_missing_step_travel_abort_without_threshold_escalation(self):
@@ -1717,7 +1719,8 @@ class CalibrationGridTests(unittest.TestCase):
             self.assertEqual(rig.effects(), before)
             self.assertIs(rig.workflow.session, session)
         rig.calibrate(START_THRESHOLD=1, STEP=.25)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
 
     def test_calibration_reference_requires_every_trial_context_condition(self):
         rig = Rig()
@@ -1805,7 +1808,8 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
                     self.assertFalse(rig.home_calls[10]["candidate_qualified"])
                     self.assertEqual(rig.home_calls[10]["successes"], 0)
                     self.assertEqual(rig.home_calls[11]["successes"], 0)
-                    self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+                    self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+                    self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
                     self.assertEqual(rig.workflow.last_result["restarts"], 1)
 
     def test_reported_three_point_six_two_five_range_restarts_with_an_empty_window(self):
@@ -1820,7 +1824,8 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
                                 [{}] + [{"travel_mm": 149.0}] * 10)
         rig.calibrate(save=0)
         self.assertEqual(len(rig.home_calls), 19)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
         self.assertEqual(rig.workflow.last_result["repeatability_spread_mm"], 0.0)
         metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
         self.assertEqual(metadata["min_commanded_travel_mm"], 149.0)
@@ -1889,7 +1894,8 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
                 self.assertEqual(metadata["min_commanded_travel_mm"], 148.0)
                 self.assertEqual(metadata["max_commanded_travel_mm"], 148.0)
                 self.assertEqual(metadata["repeatability_spread_mm"], 0.0)
-                self.assertEqual(rig.workflow.last_result["threshold_g"], 1.25)
+                self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
+                self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [1.0] * 3 + [1.25] * 11)
 
     def test_repeatability_failure_after_early_retry_increments_and_restarts_everything(self):
@@ -1899,7 +1905,8 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
         rig.calibrate(save=0)
         self.assertEqual([c["threshold"] for c in rig.home_calls],
                          [1.0] * 3 + [1.25] * 11 + [1.5] * 11)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
         self.assertEqual(rig.workflow.last_result["restarts"], 2)
         self.assertEqual(rig.workflow.last_result["successes"], 10)
 
@@ -1965,7 +1972,8 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
         rig = Rig({"calibration_start_threshold": 0.755})
         rig.home_results.extend([{"threshold_g": 0.76}] * 11)
         rig.calibrate(save=0)
-        self.assertEqual(rig.workflow.last_result["threshold_g"], 0.755)
+        self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 0.755)
+        self.assertEqual(rig.workflow.last_result["threshold_g"], 1.255)
         self.assertEqual(rig.workflow.last_result["repeatability_spread_mm"], 0.0)
 
 
@@ -2241,7 +2249,7 @@ class ModelTests(unittest.TestCase):
                     if early:
                         calibrated.home_results.append({"travel_mm": 2.0})
                     calibrated.calibrate(axis.upper())
-                    threshold = 1.25 if early else 1.0
+                    threshold = 1.75 if early else 1.5
                     self.assertEqual(calibrated.home_calls[0]["threshold"], 1.0)
                     if early:
                         self.assertEqual(calibrated.home_calls[1]["threshold"], 1.25)

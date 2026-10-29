@@ -54,6 +54,10 @@ preparation after that restart before calibrating Y:
 ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
 ```
 
+The saved threshold is the candidate that passed ten checks **plus 0.5 g**,
+applied once after qualification. Those checks test the candidate; they do not
+test the higher saved value. The other axis is unchanged.
+
 Both commands first measure fresh stationary noise. The default start grid is
 1 g with 0.25 g steps. `START_THRESHOLD` explicitly chooses the first candidate
 but still performs the measurement; `STEP` alone changes grid spacing while
@@ -84,7 +88,8 @@ recorded commanded halt travel, reports failure in the console without an
 accuracy PNG and starts one
 normal calibration of the failing axis. Its first candidate is the actual
 threshold used by the failed attempt **plus 0.25 g**; later steps use configured
-`calibration_step`. Successful recovery calibration saves and restarts Klipper.
+`calibration_step`. Successful recovery calibration saves its qualified
+candidate plus the normal 0.5 g final margin and restarts Klipper.
 The console then tells you to prepare XY again and rerun the exact accuracy
 command; it does not rerun accuracy automatically.
 
