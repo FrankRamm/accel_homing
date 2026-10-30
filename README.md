@@ -1,5 +1,13 @@
 # Accelerometer Homing
 
+**Development / experimental: `codex/accuracy-filters`.** This branch adds an
+opt-in causal `FILTERED` detector and explicit RAW controls. Software tests and
+synthetic plots do not establish a physical improvement. Existing RAW models
+remain RAW until an explicit FILTERED calibration succeeds and is saved.
+Use the [filter comparison procedure](docs/FILTERS.md) to collect a RAW baseline,
+calibrate FILTERED, inspect the same-trace diagnostic and compare independent
+completed accuracy runs across the calibration restart.
+
 Use a configured accelerometer as an X/Y impact endstop in Klipper or Kalico.
 This experimental plugin deliberately contacts mechanical stops. Supervise
 initial homing and calibration with an accessible emergency stop.
@@ -11,11 +19,12 @@ with the printer idle:
 
 ```bash
 cd ~
-git clone https://github.com/FrankRamm/accel_homing.git
-~/accel_homing/install.sh
+git clone --branch codex/accuracy-filters https://github.com/FrankRamm/accel_homing.git
+~/accel_homing/install.sh --branch codex/accuracy-filters
 ```
 
-The installer backs up its changes, configures X/Y homing and Moonraker
+This branch requires the explicit development branch argument. The installer
+backs up its changes, configures X/Y homing and Moonraker
 updates, and restarts the verified services. It may ask for your
 Linux sudo password. It does not home the printer.
 
@@ -36,7 +45,7 @@ type: git_repo
 channel: dev
 path: ~/accel_homing
 origin: https://github.com/FrankRamm/accel_homing.git
-primary_branch: main
+primary_branch: codex/accuracy-filters
 is_system_service: False
 managed_services: klipper
 ```
@@ -64,6 +73,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Measure three stationary one-second noise windows and export a PNG; no movement or threshold change. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both axes must use this plugin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
+| `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Experimental raw/causal-filter comparison of the same valid home; shows actual control, shadow replay, thresholds, noise and censored timing. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Measure repeated commanded-travel variation and save an accuracy PNG; X, Y or XY, 2–50 samples per axis. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal; use `AXIS=Y` for Y. Beta PNG and diagnostics only, no saved threshold/model or restart. |
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
@@ -89,6 +99,14 @@ exact accuracy command printed in the console; it does not rerun automatically.
 Charts are saved only after the requested workflow and its required cleanup/save
 succeed. Failed, rejected or cancelled runs keep console diagnostics without
 saving a partial PNG, including temporary per-home images.
+
+On this development branch, CALIBRATE, TEST, CHARTS, FILTER_CHARTS and ACCURACY
+accept `DETECTOR=RAW|FILTERED`. Explicit mode selection uses that mode's own
+saved threshold. FILTERED must be calibrated separately; a RAW threshold is not
+silently reused. `ACCURACY ... BASELINE=<completed_raw_run_id>` compares two
+actual independent completed runs. The compact baseline receipt is inside the
+successful PNG and survives restart; no JSON sidecar is required. Reprepare XY
+before **every** moving command. See [the exact sequence](docs/FILTERS.md#operator-sequence).
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.
@@ -121,6 +139,7 @@ Keep the printed backup paths if you may need to undo the uninstall.
 [Calibration](docs/SIMPLE_CALIBRATION.md) ·
 [Accuracy](docs/ACCURACY.md) ·
 [Plots](docs/PLOTS.md) ·
+[Experimental filters and A/B comparison](docs/FILTERS.md) ·
 [Beta experiment](docs/BETA.md) ·
 [Troubleshooting](docs/TROUBLESHOOTING.md) ·
 [Technical reference](docs/DETAILS.md) ·

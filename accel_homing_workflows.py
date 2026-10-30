@@ -23,6 +23,13 @@ import urllib.parse
 import uuid
 
 try:
+    from .accel_homing_filters import (detector_config, CausalImpactDetector,
+                                       robust_reference, DETECTOR_VERSION)
+except ImportError:
+    from accel_homing_filters import (detector_config, CausalImpactDetector,
+                                      robust_reference, DETECTOR_VERSION)
+
+try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
@@ -189,6 +196,8 @@ class AccelHomingWorkflows:
         if config.get("threshold", None) is not None:
             self.manual_axes.update(AXES)
         self.model = None
+        self.staged_detector_profiles = {}
+        self.staged_detector_types = {}
         if config.has_section(self.model_section):
             self.model = self.printer.load_object(config, self.model_section)
             for axis, threshold in self.model.thresholds.items():
@@ -257,6 +266,8 @@ class AccelHomingWorkflows:
                  "Test X then Y from an explicitly confirmed center"),
                 ("ACCEL_HOMING_CHARTS_GENERATE", self.cmd_CHARTS,
                  "Export acceleration PNG charts; optional AXIS=X or AXIS=Y, default both"),
+                ("ACCEL_HOMING_FILTER_CHARTS", self.cmd_FILTER_CHARTS,
+                 "Experimental paired raw/filtered replay around an operator-supervised home"),
                 ("ACCEL_HOMING_ACCURACY", self.cmd_ACCURACY,
                  "Measure repeated X/Y commanded homing travel and accelerometer captures"),
                 ("ACCEL_HOMING_STATUS", self.cmd_STATUS,
@@ -572,6 +583,10 @@ class AccelHomingWorkflows:
                 raise self.printer.config_error("Saved %s model has no configured accelerometer endstop"
                                                 % axis.upper())
             saved = self.model.metadata[axis]
+            if saved.get("detector_type", "raw") == "filtered" and (
+                    saved.get("filter_sensor_context") != self.owner.noise_sensor_context()):
+                raise self.printer.config_error("Saved filtered %s model sensor/range/rate context changed; recalibrate"
+                                                % axis.upper())
             current = self._model_context(axis)
             for key, value in current.items():
                 if key not in saved or saved[key] != value:
@@ -784,6 +799,12 @@ class AccelHomingWorkflows:
                     and session.get("axis") == axis and self.in_home is True and self.home_axis == axis)
 
     def simple_detection(self, axis):
+        session = self.session
+        if isinstance(session, dict) and axis in session.get("detector_metrics", {}):
+            return session["detector_metrics"][axis] == "xyz_magnitude"
+        if (isinstance(session, dict) and axis in session.get("detector_types", {})
+                and session["detector_types"][axis] == "filtered"):
+            return True
         if (self.calibration_reference(axis)
                 and self.session.get("algorithm") == SIMPLE_CALIBRATION):
             return True
@@ -791,6 +812,82 @@ class AccelHomingWorkflows:
         return bool(model is not None and axis not in self.manual_axes
                     and axis in model.thresholds
                     and model.metadata[axis].get("impact_metric") == "xyz_magnitude")
+
+    def _profile(self, axis, detector):
+        model = self.model
+        if model is None or axis not in model.thresholds:
+            return None
+        metadata = model.metadata[axis]
+        selected = metadata.get("detector_type", "raw")
+        if selected == detector:
+            return {"threshold_g": model.thresholds[axis], "metadata": metadata}
+        return metadata.get("detector_profiles", {}).get(detector)
+
+    def detector_type(self, axis):
+        session = self.session
+        if isinstance(session, dict) and axis in session.get("detector_types", {}):
+            return session["detector_types"][axis]
+        if self.model is None or axis in self.manual_axes or axis not in self.model.thresholds:
+            return "raw"
+        return self.model.metadata[axis].get("detector_type", "raw")
+
+    def filter_config(self, axis):
+        session = self.session
+        if isinstance(session, dict) and axis in session.get("detector_configs", {}):
+            return detector_config(session["detector_configs"][axis])
+        profile = self._profile(axis, "filtered")
+        return detector_config(None if profile is None else profile["metadata"].get("detector_config"))
+
+    def _select_detectors(self, gcmd, mode, axes):
+        requested = gcmd.get("DETECTOR", None)
+        requested = None if requested is None else str(requested).strip().lower()
+        if requested is not None and requested not in ("raw", "filtered"):
+            raise gcmd.error("DETECTOR must be RAW or FILTERED")
+        types, thresholds, configs, metrics = {}, {}, {}, {}
+        for axis in axes:
+            kind = requested or self.detector_type(axis)
+            if mode == "calibration" and kind == "filtered" and axis in self.manual_axes:
+                raise gcmd.error("FILTERED calibration requires removing the explicit threshold and/or %s_threshold "
+                                 "configuration override before restart; existing manual thresholds retain RAW semantics" % axis)
+            types[axis] = kind
+            profile = self._profile(axis, kind)
+            explicit = gcmd.get(kind.upper() + "_THRESHOLD", None)
+            if mode == "calibration" and explicit is not None:
+                raise gcmd.error("calibration uses START_THRESHOLD; mode-specific thresholds are for tests/charts")
+            if explicit is not None:
+                threshold = gcmd.get_float(kind.upper() + "_THRESHOLD", minval=0.5)
+                self._validate_calibration_threshold(threshold, kind.upper() + "_THRESHOLD", gcmd.error)
+            elif requested is None or mode == "calibration":
+                threshold = self.owner.threshold_g[axis]
+            elif profile is not None:
+                threshold = profile["threshold_g"]
+                for key, value in self._model_context(axis).items():
+                    if profile["metadata"].get(key) != value:
+                        raise gcmd.error("selected %s profile context changed: %s; recalibrate" % (kind.upper(), key))
+                if kind == "filtered" and profile["metadata"].get("filter_sensor_context") != self.owner.noise_sensor_context():
+                    raise gcmd.error("selected FILTERED profile sensor/range/rate context changed; recalibrate")
+            elif kind == "raw" and self.detector_type(axis) == "raw":
+                threshold = self.owner.threshold_g[axis]
+            else:
+                raise gcmd.error("No calibrated %s profile for %s; calibrate DETECTOR=%s or specify %s_THRESHOLD" % (
+                    kind.upper(), axis.upper(), kind.upper(), kind.upper()))
+            if kind == "filtered" and mode != "calibration" and explicit is None and profile is not None:
+                for key, value in self._model_context(axis).items():
+                    if profile["metadata"].get(key) != value:
+                        raise gcmd.error("selected FILTERED profile context changed: %s; recalibrate" % key)
+                if profile["metadata"].get("filter_sensor_context") != self.owner.noise_sensor_context():
+                    raise gcmd.error("selected FILTERED profile sensor/range/rate context changed; recalibrate")
+            thresholds[axis] = threshold
+            metrics[axis] = ("xyz_magnitude" if kind == "filtered" or mode == "calibration"
+                             or (kind == "raw" and explicit is not None) else
+                             profile["metadata"].get("impact_metric", "selected_axis")
+                             if profile is not None and (requested is not None or axis not in self.manual_axes)
+                             else "selected_axis")
+            configs[axis] = detector_config(None if profile is None
+                                             else profile["metadata"].get("detector_config"))
+        return {"detector_types": types, "detector_configs": configs,
+                "detector_metrics": metrics,
+                "detector_explicit": requested is not None, "workflow_thresholds": thresholds}
 
     def _calibration_grid(self, gcmd, session=None):
         defaults = session or {"start_threshold_g": self.start_threshold,
@@ -820,6 +917,7 @@ class AccelHomingWorkflows:
         if mode == "calibration" and calibration_grid is None:
             calibration_grid = self._calibration_grid(gcmd)
         axes = axes if axes is not None else [axis] if axis else ["x", "y"]
+        selection = self._select_detectors(gcmd, mode, axes)
         self._preflight(axes, continuation=previous_accuracy is not None)
         if mode == "calibration" and self._geometry(axis)[1] <= CALIBRATION_MIN_TRAVEL_MM:
             raise gcmd.error("center-to-endstop travel must exceed 20 mm for impact discovery")
@@ -829,6 +927,7 @@ class AccelHomingWorkflows:
         if previous_accuracy is not None:
             self._check_accuracy_recovery(previous_accuracy)
         self.session = {"mode": mode, "axis": axis, "state": "starting",
+                        **selection,
                         "run_id": uuid.uuid4().hex, "successes": 0, "attempts": 0,
                         "candidate_qualified": False, "candidate_attempt": None,
                         "validation_records": [], "repeatability_spread_mm": None,
@@ -846,6 +945,8 @@ class AccelHomingWorkflows:
                                 calibration_settle_time_s=self.calibration_settle_time,
                                 recovery={"count": 0, "last_return_mm_signed": None})
             self._clear_noise_seeds()
+        else:
+            self.owner.threshold_g.update(selection["workflow_thresholds"])
 
     def _announce_calibration(self, session):
         self._info("%s calibration starts at %.6g g with %.6g g steps; XYZ magnitude; "
@@ -1018,7 +1119,20 @@ class AccelHomingWorkflows:
         magnitude_peak = max(math.sqrt(math.fsum((row[index] - baseline[axis]) ** 2
                                                 for index, axis in enumerate("xyz", 1)))
                              for row in samples)
-        return {"run_id": session["run_id"], "noise_iteration": iteration,
+        filtered_noise = {}
+        if "filtered" in session.get("detector_types", {}).values():
+            config = detector_config(session.get("detector_configs", {}).get(session.get("axis")))
+            reference = robust_reference([row[1:] for row in samples], config)
+            engine = CausalImpactDetector(1e9, reference["offset_g"], reference["noise_sigma_g"],
+                                          reference["weights_xyz"], config)
+            engine.previous_time = samples[0][0] - (samples[1][0] - samples[0][0])
+            filtered_peak = 0.
+            for row in samples:
+                engine.feed(row[0], row[1:])
+                filtered_peak = max(filtered_peak, engine.level_g)
+            filtered_noise = {"filtered_noise_peak_g": filtered_peak, "filter_reference": reference,
+                              "detector_config": config}
+        return {"run_id": session["run_id"], "noise_iteration": iteration, **filtered_noise,
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "baseline_g": baseline, "noise_peak_g": peaks,
@@ -1173,7 +1287,9 @@ class AccelHomingWorkflows:
         self._preflight([session["axis"]], continuation=continuation)
         self._require_unhomed_xy()
         self._check_stopped_noise_context(session)
-        peaks = [item["record"].get("noise_magnitude_peak_g") for item in session["iterations"]]
+        noise_metric = ("filtered_noise_peak_g" if session.get("detector_types", {}).get(session["axis"]) == "filtered"
+                        else "noise_magnitude_peak_g")
+        peaks = [item["record"].get(noise_metric) for item in session["iterations"]]
         if (len(peaks) != NOISE_ITERATIONS or any(
                 not isinstance(peak, (int, float)) or isinstance(peak, bool)
                 or not math.isfinite(peak) or peak < 0.0 for peak in peaks)):
@@ -1199,6 +1315,8 @@ class AccelHomingWorkflows:
             "start_threshold_g": start if explicit else candidate,
             "acquisition_faults": list(noise_result["acquisition_faults"]),
             "summary_paths": {}}
+        session["stationary_noise"].update(detector_type=session.get("detector_types", {}).get(session["axis"], "raw"),
+                                            decision_noise_metric=noise_metric)
         session["deferred_noise_result"] = noise_result
         if not explicit:
             if limit is None:
@@ -1344,6 +1462,13 @@ class AccelHomingWorkflows:
                                           else self.owner.threshold_g[axis])
         record["workflow_phase"] = ("validation" if session["candidate_qualified"] else "discovery") \
             if session["mode"] == "calibration" else session["mode"]
+        record.update(detector_type=record.get("detector_type", "raw"),
+                      detector_profile=session.get("detector_types", {}).get(axis, "raw"),
+                      model_context=self._model_context(axis),
+                      sensor_context=self.owner.noise_sensor_context(),
+                      geometry_context=self._model_context(axis)["geometry"])
+        if record["detector_type"] != session.get("detector_types", {}).get(axis, "raw"):
+            raise self._error("homing result detector does not match the selected profile")
         calibration_quality, calibration_reason = (self._quality(axis, record)
                                                    if session["mode"] == "calibration" else (None, None))
         early_calibration = calibration_quality == "early"
@@ -1424,7 +1549,7 @@ class AccelHomingWorkflows:
                 return None
             record = dict(source)
         record.update(run_id=session["run_id"], workflow_attempt=session["attempts"],
-                      workflow_threshold_g=session["saved_thresholds"][axis],
+                      workflow_threshold_g=session.get("workflow_thresholds", session["saved_thresholds"])[axis],
                       workflow_phase=("discovery" if session["sample_index"] == 0
                                       else "measurement"),
                       accuracy_sample=session["sample_index"], capture_valid=False)
@@ -1447,7 +1572,7 @@ class AccelHomingWorkflows:
         finite = lambda value: (isinstance(value, (int, float)) and not isinstance(value, bool)
                                 and math.isfinite(value))
         if expected_threshold is None:
-            expected_threshold = session["saved_thresholds"][axis]
+            expected_threshold = session.get("workflow_thresholds", session["saved_thresholds"])[axis]
         if (detector_record is not source_record or not isinstance(detector, dict)
                 or capture.get("fault") or capture.get("error")
                 or detector.get("axis") != axis or detector.get("attempt_count") != 1
@@ -1532,6 +1657,17 @@ class AccelHomingWorkflows:
         record["configured_homing_speed_mm_s"] = self.owner.rails_by_axis[axis].get_homing_info().speed
         record["homing_speed_mm_s"] = detector.get("homing_speed_mm_s")
         record["homing_accel_mm_s2"] = detector.get("homing_accel_mm_s2")
+        record["detector_type"] = detector.get("detector_type", "raw")
+        if record["detector_type"] == "filtered":
+            if (detector.get("detector_version") != DETECTOR_VERSION
+                    or detector_config(detector.get("detector_config")) != self.filter_config(axis)):
+                raise self._error("filtered capture configuration does not match selected detector")
+            record.update(detector_version=DETECTOR_VERSION, detector_config=detector["detector_config"],
+                          filter_reference=detector.get("filter_reference"),
+                          crossing_time_s=detector.get("crossing_time_s"),
+                          confirmation_time_s=detector.get("confirmation_time_s"),
+                          stop_request_time_s=detector.get("stop_request_time_s"),
+                          stop_request_interval_s=detector.get("stop_request_interval_s"))
         session["last_arm_time"] = arm
 
     def _quality(self, axis, record):
@@ -1888,11 +2024,41 @@ class AccelHomingWorkflows:
             metadata["stationary_noise_seed"] = dict(session["noise_seed"])
         if session.get("stationary_noise") is not None:
             metadata["stationary_noise_measurement"] = dict(session["stationary_noise"])
+        kind = session.get("detector_types", {}).get(axis, "raw")
+        metadata.update(detector_type=kind, detector_version=DETECTOR_VERSION if kind == "filtered" else None,
+                        detector_config=(self.filter_config(axis) if kind == "filtered" else None),
+                        decision_metric="causal_weighted_xyz" if kind == "filtered" else "xyz_magnitude",
+                        signal_parameters_experimental=kind == "filtered",
+                        moving_noise_policy="bounded_observation_only_frozen_on_first_candidate",
+                        reference_policy="stationary_median_mad_frozen_before_arm" if kind == "filtered" else "mean")
+        if kind == "filtered":
+            metadata.update(filter_sensor_context=self.owner.noise_sensor_context(),
+                            filter_reference_summaries=[r.get("filter_reference") for r in qualified],
+                            moving_noise_summaries=[r.get("filter_diagnostics", {}).get("moving_noise")
+                                                    if isinstance(r.get("filter_diagnostics"), dict) else None
+                                                    for r in qualified])
+        profiles = {}
+        if self.model is not None and axis in self.model.thresholds:
+            old = dict(self.model.metadata[axis])
+            profiles.update(old.pop("detector_profiles", {}))
+            profiles[old.get("detector_type", "raw")] = {"threshold_g": self.model.thresholds[axis], "metadata": old}
+        profiles.update(self.staged_detector_profiles.get(axis, {}))
+        profiles[kind] = {"threshold_g": threshold, "metadata": dict(metadata)}
+        metadata["detector_profiles"] = profiles
         encoded_metadata = json.dumps(metadata, separators=(",", ":"), allow_nan=False)
         configfile = self.printer.lookup_object("configfile")
         recovery = session.get("accuracy_recovery")
         encoded_threshold = "%.17g" % threshold
-        configfile.set(self.model_section, "version", "1")
+        selected_types = ({} if self.model is None else
+                          {a: self.model.metadata[a].get("detector_type", "raw") for a in self.model.thresholds})
+        selected_types.update(self.staged_detector_types)
+        selected_types[axis] = kind
+        # Record conservatively before the first staging mutation: even a
+        # partially failed native config staging must not allow a later RAW
+        # axis save to make an earlier FILTERED threshold load on old code.
+        self.staged_detector_types.update(selected_types)
+        model_version = 2 if "filtered" in selected_types.values() else 1
+        configfile.set(self.model_section, "version", str(model_version))
         configfile.set(self.model_section, axis + "_threshold", encoded_threshold)
         configfile.set(self.model_section, axis + "_successes", str(REQUIRED_SUCCESSES))
         configfile.set(self.model_section, axis + "_metadata", encoded_metadata)
@@ -1901,7 +2067,10 @@ class AccelHomingWorkflows:
             # Let native SAVE_CONFIG replace the selected override or report its
             # own include conflict; never edit config/include files directly.
             configfile.set(self.config.get_name(), axis + "_threshold", encoded_threshold)
+        self.staged_detector_profiles[axis] = json.loads(json.dumps(profiles, allow_nan=False))
         result = {"result": "calibrated", "axis": axis, "threshold_g": threshold,
+                  "detector_type": kind, "detector_config": metadata["detector_config"],
+                  "model_version": model_version,
                   "tested_threshold_g": tested_threshold, "saved_threshold_g": threshold,
                   "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
                   "saved_threshold_tested": False,
@@ -1979,6 +2148,10 @@ class AccelHomingWorkflows:
                     "SAVE_CONFIG", minval=0, maxval=1)) != session["save_config"]:
                 raise gcmd.error("SAVE_CONFIG cannot change while resuming calibration")
             self._calibration_grid(gcmd, session)
+            requested_detector = gcmd.get("DETECTOR", None)
+            if (requested_detector is not None and str(requested_detector).strip().lower()
+                    != session.get("detector_types", {}).get(axis, "raw")):
+                raise gcmd.error("DETECTOR cannot change while resuming calibration")
             self._continue_calibration()
             return
         grid = self._calibration_grid(gcmd)
@@ -2623,6 +2796,8 @@ class AccelHomingWorkflows:
                     emit("attempt.%d.%s" % (index, key), value)
 
     def cmd_BETA_CALIBRATE(self, gcmd):
+        if str(gcmd.get("DETECTOR", "RAW")).strip().lower() != "raw":
+            raise gcmd.error("Beta calibration retains the RAW detector; use ACCEL_HOMING_CALIBRATE DETECTOR=FILTERED")
         axis = gcmd.get("AXIS", "").lower()
         if axis not in AXES:
             raise gcmd.error("AXIS must be X or Y")
@@ -2638,6 +2813,7 @@ class AccelHomingWorkflows:
         self._begin(gcmd, "calibration", axis, calibration_grid=grid, save_config_default=0)
         session = self.session
         session.update(beta=True, save_config=False, state="running", beta_phase="preflight",
+                       detector_types={axis: "raw"}, detector_configs={axis: detector_config()},
                        beta_generation=self.owner.operation_generation,
                        beta_motion_iterations=[], beta_homes=[], beta_model_object=self.model,
                        beta_arguments={key: gcmd.get(key, None) for key in (
@@ -2731,6 +2907,64 @@ class AccelHomingWorkflows:
             axes = (axis,)
         self._start_xy(gcmd, "charts", axes=axes)
 
+    def cmd_FILTER_CHARTS(self, gcmd):
+        requested = str(gcmd.get("AXIS", "XY")).strip().lower()
+        if requested not in ("x", "y", "xy"):
+            raise gcmd.error("AXIS must be X, Y or XY")
+        self._require_centered(gcmd)
+        self._chart_preflight()
+        active_selection = self._select_detectors(gcmd, "charts", list(requested))
+        for axis in requested:
+            if (active_selection["detector_types"][axis] == "raw"
+                    and active_selection["detector_metrics"][axis] != "xyz_magnitude"):
+                raise gcmd.error("Active RAW comparison needs an XYZ detector; select DETECTOR=RAW with a saved "
+                                 "XYZ-calibrated RAW profile or supply an explicit RAW_THRESHOLD")
+        # Both threshold meanings must be available before any homing begins.
+        comparison = {}
+        for axis in requested:
+            values = {}
+            for kind in ("raw", "filtered"):
+                option = kind.upper() + "_THRESHOLD"
+                profile = self._profile(axis, kind)
+                if gcmd.get(option, None) is not None:
+                    value = gcmd.get_float(option, minval=.5)
+                    self._validate_calibration_threshold(value, option, gcmd.error)
+                elif profile is not None:
+                    if kind == "raw" and profile["metadata"].get("impact_metric") != "xyz_magnitude":
+                        raise gcmd.error("Raw comparison needs an XYZ-calibrated RAW profile or explicit RAW_THRESHOLD "
+                                         "for the XYZ metric; legacy selected-axis thresholds cannot be reused")
+                    for key, current in self._model_context(axis).items():
+                        if profile["metadata"].get(key) != current:
+                            raise gcmd.error("comparison %s profile context changed: %s; recalibrate or supply an explicit %s" % (
+                                kind.upper(), key, option))
+                    if kind == "filtered" and profile["metadata"].get("filter_sensor_context") != self.owner.noise_sensor_context():
+                        raise gcmd.error("comparison FILTERED profile sensor/range/rate context changed; recalibrate or supply FILTERED_THRESHOLD")
+                    value = profile["threshold_g"]
+                elif kind == "raw" and self.detector_type(axis) == "raw":
+                    raise gcmd.error("Raw comparison needs an XYZ-calibrated RAW profile or explicit RAW_THRESHOLD")
+                else:
+                    raise gcmd.error("Comparison requires a calibrated %s profile or explicit %s" % (kind.upper(), option))
+                values[kind + "_threshold_g"] = value
+                if active_selection["detector_types"][axis] == kind:
+                    values[kind + "_threshold_g"] = active_selection["workflow_thresholds"][axis]
+                if kind == "filtered":
+                    values["filter_config"] = detector_config(None if profile is None else profile["metadata"].get("detector_config"))
+            comparison[axis] = values
+        self._begin(gcmd, "charts", axes=list(requested))
+        session = self.session
+        try:
+            session.update(state="running", axes=list(requested), filter_comparison=comparison,
+                           detector_explicit=True)
+            if gcmd.get("RAW_THRESHOLD", None) is not None:
+                for axis in requested:
+                    if session["detector_types"][axis] == "raw":
+                        session["detector_metrics"][axis] = "xyz_magnitude"
+            self._test_xy()
+        except Exception as exc:
+            if self.session is session:
+                self._finish({"result": "aborted", "reason": str(exc)}, release=True)
+            raise
+
     def _accuracy_capture_directory(self):
         roots = [Path(self.charts_directory).resolve()]
         if self.chart_config_root is not None:
@@ -2785,17 +3019,26 @@ class AccelHomingWorkflows:
                       for stepper in toolhead.get_kinematics().get_steppers()),
                 tuple(line.is_motor_enabled() for line in self._xy_enable_lines()))
 
-    def _accuracy_recovery_context(self):
+    def _accuracy_recovery_context(self, session=None):
         # Backoff is deliberately restored by _finish; no movement is permitted
         # between this snapshot and replacement of the owned accuracy session.
-        snapshot = self._noise_snapshot()
+        snapshot = list(self._noise_snapshot())
+        if session is not None:
+            expected = dict(session["saved_thresholds"])
+            if not session.get("finishing"):
+                expected.update(session.get("workflow_thresholds", {}))
+            if dict(snapshot[2]) != expected:
+                raise self._error("accuracy threshold settings changed outside the selected profile")
+            # _finish restores the prior profile's numbers. Admit only that
+            # exact owned restoration, while preserving tamper checks above.
+            snapshot[2] = tuple(sorted(session["saved_thresholds"].items()))
         return (self._accuracy_position_reference(), snapshot[1:5], snapshot[6:])
 
     def _prepare_accuracy_recovery(self, session, axis, record, reason):
         """Return to the confirmed start using current step/halt evidence only."""
         self._check_running(session)
         finite = lambda value: type(value) in (int, float) and math.isfinite(value)
-        threshold = session["saved_thresholds"][axis]
+        threshold = session.get("workflow_thresholds", session["saved_thresholds"])[axis]
         candidate = float(Decimal(str(threshold)) + Decimal("0.25"))
         self._validate_calibration_threshold(candidate, "accuracy recovery START_THRESHOLD")
         if candidate <= threshold or self.max_attempts < REQUIRED_SUCCESSES + 1:
@@ -2917,9 +3160,17 @@ class AccelHomingWorkflows:
             "initial_increment_g": 0.25, "threshold_step_g": self.threshold_step,
             "return_mm_signed": -displacement,
             "physical_position_verified": False,
+            "detector_type": session.get("detector_types", {}).get(axis, "raw"),
             "rerun_command": "ACCEL_HOMING_ACCURACY AXIS=%s SAMPLES=%d CENTERED=1" % (
                 "".join(session["axes"]).upper(), session["samples_requested"])}
-        session["accuracy_recovery_context"] = self._accuracy_recovery_context()
+        rerun = session["accuracy_recovery_pending"]["rerun_command"]
+        if session.get("detector_explicit"):
+            rerun += " DETECTOR=" + session["detector_types"][axis].upper()
+        if session.get("baseline_run_id"):
+            rerun += " BASELINE=" + str(session["baseline_run_id"])
+        session["accuracy_recovery_pending"]["rerun_command"] = rerun
+        session["accuracy_recovery_pending"]["rerun_threshold_source"] = "new_saved_profile_after_restart"
+        session["accuracy_recovery_context"] = self._accuracy_recovery_context(session)
         self._info(reason + "; returned by reversing recorded commanded halt travel; "
                    "finalizing accuracy before one calibration starting at %.6g g" % candidate)
 
@@ -2931,7 +3182,7 @@ class AccelHomingWorkflows:
                 or self.preflight_generation != session["accuracy_preflight_generation"]
                 or self.owner.operation_generation != session["accuracy_generation"]
                 or getattr(self.owner, "sensor_fault", None) is not None
-                or self._accuracy_recovery_context() != session["accuracy_recovery_context"]
+                or self._accuracy_recovery_context(session) != session["accuracy_recovery_context"]
                 or self.owner.last.get(pending["axis"]) is not session["accuracy_halt"]["source"]
                 or result is None or result.get("run_id") != session["run_id"]
                 or result.get("result") != "aborted" or result.get("chart_error")
@@ -2943,6 +3194,7 @@ class AccelHomingWorkflows:
         pending = session["accuracy_recovery_pending"]
         source_accuracy = self.last_result
         params = {"AXIS": pending["axis"].upper(), "START_THRESHOLD": str(pending["start_threshold_g"]),
+                  "DETECTOR": session.get("detector_types", {}).get(pending["axis"], "raw").upper(),
                   "SAVE_CONFIG": "1"}
         gcmd = self.gcode.create_gcode_command("ACCEL_HOMING_CALIBRATE", "ACCEL_HOMING_CALIBRATE", params)
         grid = self._calibration_grid(gcmd)
@@ -2955,18 +3207,32 @@ class AccelHomingWorkflows:
         if requested not in ("x", "y", "xy"):
             raise gcmd.error("AXIS must be X, Y or XY")
         samples = gcmd.get_int("SAMPLES", 10, minval=2, maxval=50)
+        baseline_run_id = gcmd.get("BASELINE", None)
+        if baseline_run_id is not None and not re.fullmatch(r"[a-fA-F0-9]{32}", str(baseline_run_id)):
+            raise gcmd.error("BASELINE must be the 32-character run ID from a completed accuracy report")
         # Saving belongs only to a fully successful recovery calibration.
         if gcmd.get("SAVE_CONFIG", None) is not None:
             raise gcmd.error("SAVE_CONFIG is not supported by ACCEL_HOMING_ACCURACY")
         self._require_centered(gcmd)
         self._chart_preflight()
         axes = list(requested)
+        if baseline_run_id is not None:
+            try:
+                from .accel_homing_charts import read_accuracy_baseline
+            except ImportError:
+                from accel_homing_charts import read_accuracy_baseline
+            for axis in axes:
+                try:
+                    read_accuracy_baseline(self.charts_directory, baseline_run_id, axis)
+                except (ValueError, OSError) as exc:
+                    raise gcmd.error("BASELINE is not an available completed accuracy report: %s" % exc) from exc
         session = None
         recovery = False
         try:
             self._begin(gcmd, "accuracy", axes=axes)
             session = self.session
             session.update(state="running", axes=axes, samples_requested=samples,
+                           baseline_run_id=baseline_run_id,
                            attempt_limit=len(axes) * (samples + 1), sample_index=0,
                            configured_speeds={axis: self.owner.rails_by_axis[axis].get_homing_info().speed
                                               for axis in axes},
@@ -3101,8 +3367,10 @@ class AccelHomingWorkflows:
                            "criterion; all qualified accuracy trials remain in this report" % (
                                axis.upper(), REPEATABILITY_LIMIT_MM))
         result = {"mode": "accuracy", "run_id": session["run_id"],
+                  "detector_types": dict(session.get("detector_types", {})),
+                  "baseline_run_id": session.get("baseline_run_id"),
                   "axes": list(session["axes"]), "samples_requested": session["samples_requested"],
-                  "fixed_thresholds_g": {axis: session["saved_thresholds"][axis]
+                  "fixed_thresholds_g": {axis: session.get("workflow_thresholds", session["saved_thresholds"])[axis]
                                          for axis in session["axes"]},
                   "configured_homing_speeds_mm_s": dict(session["configured_speeds"]),
                   "attempts": session["attempts"], "axis_results": self._public_accuracy_results(session),
@@ -3117,6 +3385,7 @@ class AccelHomingWorkflows:
             write_accuracy(self.charts_directory, session["run_id"],
                            session["axis_results"], result["result"], result.get("reason"),
                            published_paths=paths,
+                           baseline_run_id=session.get("baseline_run_id"),
                            **self._chart_options(session))
         except Exception as exc:
             logging.exception("accel_homing: unable to export accuracy summary")
@@ -3130,6 +3399,10 @@ class AccelHomingWorkflows:
         self._info("Accuracy run %s: %s. Commanded travel is reported to 0.001 mm; "
                    "these measurements do not certify physical stop position" % (
                        session["run_id"], result["result"]))
+        if result["result"] == "complete":
+            self._info("Completed accuracy run ID: %s%s" % (
+                session["run_id"], " ; accepted BASELINE=" + str(session["baseline_run_id"])
+                if session.get("baseline_run_id") else ""))
         return result
 
     def _test_xy(self):
@@ -3144,8 +3417,21 @@ class AccelHomingWorkflows:
                 self._finish({"result": "rejected", "reason": reason, "paths": paths}, release=True)
                 raise self._error(reason + "; no automatic move follows this result; manually recenter")
             if session["mode"] == "charts":
-                prepared.append(prepare_capture(session["run_id"], axis, capture, record,
-                                                 check_running=lambda: self._chart_check(session)))
+                if session.get("filter_comparison"):
+                    try:
+                        from .accel_homing_charts import prepare_filter_capture
+                    except ImportError:
+                        from accel_homing_charts import prepare_filter_capture
+                    record["actual_repeatability"] = {"detector": record.get("detector_type", "raw"),
+                                                       "threshold_g": record["workflow_threshold_g"],
+                                                       "requested": 1, "accepted": 1, "spread_mm": None,
+                                                       "reason": "single_actual_home"}
+                    prepared.append(prepare_filter_capture(
+                        session["run_id"], axis, capture, record, **session["filter_comparison"][axis],
+                        check_running=lambda: self._chart_check(session)))
+                else:
+                    prepared.append(prepare_capture(session["run_id"], axis, capture, record,
+                                                     check_running=lambda: self._chart_check(session)))
             del capture
             if index + 1 < len(axes):
                 # Return only the trusted axis to center when another axis
@@ -3158,8 +3444,16 @@ class AccelHomingWorkflows:
                       "paths": list(session["paths"])})
         if prepared:
             try:
-                paths = publish_captures(self.charts_directory, prepared, renderer=self.renderer,
-                                         check_running=lambda: self._chart_check(session))
+                if session.get("filter_comparison"):
+                    try:
+                        from .accel_homing_charts import publish_filter_captures
+                    except ImportError:
+                        from accel_homing_charts import publish_filter_captures
+                    publisher = publish_filter_captures
+                else:
+                    publisher = publish_captures
+                paths = publisher(self.charts_directory, prepared, renderer=self.renderer,
+                                  check_running=lambda: self._chart_check(session))
                 session["paths"] = [{"axis": current_axis, **current_paths}
                                     for current_axis, current_paths in zip(axes, paths)]
                 self.last_result["paths"] = list(session["paths"])
@@ -3189,7 +3483,7 @@ class AccelHomingWorkflows:
             active.update(axes=list(session["axes"]),
                           samples_requested=session["samples_requested"],
                           sample_index=session["sample_index"],
-                          fixed_thresholds_g={axis: session["saved_thresholds"][axis]
+                          fixed_thresholds_g={axis: session.get("workflow_thresholds", session["saved_thresholds"])[axis]
                                               for axis in session["axes"]},
                           configured_homing_speeds_mm_s=dict(session["configured_speeds"]),
                           completed_samples={axis: len(item["trials"])

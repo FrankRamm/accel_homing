@@ -30,12 +30,12 @@ class UpdaterFixture(unittest.TestCase):
         native_source = self.home / "accel_homing"
         self.source.rename(native_source)
         self.source = native_source
-        identity = mock.patch.object(updater, "repo_identity", side_effect=lambda source, api: dict(
-            commit=self.commit, origin=updater.ORIGIN, branch=updater.BRANCH,
-            upstream="origin/" + updater.BRANCH))
+        identity = mock.patch.object(updater, "repo_identity", side_effect=lambda source, api, branch=updater.BRANCH: dict(
+            commit=self.commit, origin=updater.ORIGIN, branch=branch,
+            upstream="origin/" + branch))
         identity.start()
         self.addCleanup(identity.stop)
-        source = mock.patch.object(updater, "source_commit", side_effect=lambda source, api: self.commit)
+        source = mock.patch.object(updater, "source_commit", side_effect=lambda source, api, branch=updater.BRANCH: self.commit)
         source.start()
         self.addCleanup(source.stop)
         home = mock.patch.object(updater.Path, "home", return_value=self.home)

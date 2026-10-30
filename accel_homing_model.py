@@ -3,6 +3,39 @@
 import json
 import math
 
+try:
+    from .accel_homing_filters import detector_config, DETECTOR_VERSION
+except ImportError:
+    from accel_homing_filters import detector_config, DETECTOR_VERSION
+
+
+def _validate_detector_metadata(metadata):
+    kind = metadata.get("detector_type", "raw")
+    if kind not in ("raw", "filtered"):
+        raise ValueError("unknown saved detector type")
+    if kind == "filtered":
+        if metadata.get("impact_metric") != "xyz_magnitude":
+            raise ValueError("filtered model must use the XYZ vector metric")
+        if (type(metadata.get("detector_version")) is not int
+                or metadata["detector_version"] != DETECTOR_VERSION or "detector_config" not in metadata):
+            raise ValueError("filtered model lacks its exact detector version/configuration")
+        if (not isinstance(metadata["detector_config"], dict)
+                or set(metadata["detector_config"]) != set(detector_config())):
+            raise ValueError("filtered model must persist every exact detector parameter")
+        detector_config(metadata["detector_config"])
+    profiles = metadata.get("detector_profiles", {})
+    if not isinstance(profiles, dict) or set(profiles) - {"raw", "filtered"}:
+        raise ValueError("invalid saved detector profiles")
+    for profile_kind, profile in profiles.items():
+        if (not isinstance(profile, dict) or set(profile) != {"threshold_g", "metadata"}
+                or type(profile["threshold_g"]) not in (int, float)
+                or not math.isfinite(profile["threshold_g"]) or profile["threshold_g"] < .5
+                or not isinstance(profile["metadata"], dict)
+                or "detector_profiles" in profile["metadata"]
+                or profile["metadata"].get("detector_type", "raw") != profile_kind):
+            raise ValueError("invalid saved %s detector profile" % profile_kind)
+        _validate_detector_metadata(profile["metadata"])
+
 
 def _finite_metadata(value):
     if isinstance(value, float):
@@ -20,7 +53,7 @@ class AccelHomingModel:
         self.thresholds = {}
         self.successes = {}
         self.metadata = {}
-        self.version = config.getint("version", 1, minval=1, maxval=1)
+        self.version = config.getint("version", 1, minval=1, maxval=2)
         for axis in "xy":
             threshold = config.getfloat(axis + "_threshold", None,
                                         minval=0.5)
@@ -33,6 +66,9 @@ class AccelHomingModel:
                     raise ValueError("metadata must be an object")
                 if not _finite_metadata(metadata):
                     raise ValueError("metadata numbers must be finite")
+                _validate_detector_metadata(metadata)
+                if metadata.get("detector_type", "raw") == "filtered" and self.version < 2:
+                    raise ValueError("active filtered profiles require model schema version 2")
             except (ValueError, TypeError) as exc:
                 raise config.error("Invalid %s model metadata: %s" % (axis, exc))
             self.metadata[axis] = metadata

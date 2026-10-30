@@ -22,6 +22,25 @@ Do not add `SAVE_CONFIG`: ACCURACY rejects the parameter, including zero.
 A successful measurement alone does not save/restart. An early-trigger recovery
 can start a separate normal calibration that saves and restarts on success.
 
+## Development RAW/FILTERED A/B control
+
+Use explicit `DETECTOR=RAW` for the first completed control and keep its printed
+run ID and original PNG. After separately calibrating FILTERED and repreparing
+XY, compare the new independent series:
+
+```gcode
+ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=FILTERED SAMPLES=10 CENTERED=1 BASELINE=<raw_run_id>
+```
+
+Replace the placeholder with the successful control's actual 32-character ID.
+Both profiles and the compact PNG baseline receipt survive the saving
+calibration/restart. The report shows both actual series, counts, ranges,
+population standard deviations, threshold/mode/config differences and required
+context mismatches. It does not pool trials, infer paired physical measurements
+or use shadow replay as a baseline. A baseline from another axis, an incomplete
+run or a synthetic figure is refused. Old PNGs without the new receipt need a
+new baseline. See [the full supervised sequence and limits](FILTERS.md).
+
 ## Sequence and statistics
 
 For each axis:

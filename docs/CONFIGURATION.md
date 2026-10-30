@@ -78,6 +78,20 @@ each axis independently, ten-success qualification and sensor/geometry metadata.
 Changed context can prevent a model from being accepted; recalibrate after
 reviewing the reported mismatch rather than editing generated metadata.
 
+The development `codex/accuracy-filters` branch preserves RAW/FILTERED profiles
+independently per axis, including each metric, threshold and versioned
+configuration. `CALIBRATE ... DETECTOR=FILTERED` explicitly creates/selects the
+filtered profile and archives the previous RAW profile. The RAW profile remains
+available after saving/restart for `ACCURACY ... DETECTOR=RAW` and other explicit
+control workflows. Installing the branch alone does not convert an existing
+RAW model or change threshold units. A FILTERED profile must be recalibrated
+when its version/configuration or required sensor/context differs.
+
+Explicit manual thresholds retain RAW semantics. FILTERED calibration refuses
+those overrides before movement; remove the relevant explicit shared/axis
+values and restart while idle first. There is no separate `x_detector` or
+`y_detector` configuration option. See the [operator sequence](FILTERS.md).
+
 Successful normal calibration defaults to `SAVE_CONFIG=1`: it writes the
 selected axis model and restarts Klipper. `SAVE_CONFIG=0` stages the model only.
 Its threshold is the qualified candidate plus a fixed 0.5 g final margin; the

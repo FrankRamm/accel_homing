@@ -29,7 +29,8 @@ are retained; the plugin does not rotate or delete old final chart outputs.
 | `ACCEL_HOMING_CALIBRATE_NOISE` | None | Three-window stationary-noise overview. |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Yes | Fresh stationary-noise summary after calibration, cleanup and required save succeed; its hints exclude the final 0.5 g saving margin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Yes | Measured acceleration capture for that home; omit AXIS for X then Y. |
-| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final accuracy overview per requested axis after every axis succeeds. |
+| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final accuracy overview per requested axis after every axis succeeds; optional explicit `BASELINE=<run_id>` adds independent actual-run A/B statistics. |
+| `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Yes | Development raw/causal-filter comparison of the same valid trace; actual control, shadow replay, threshold/timing/noise and censoring are labelled separately. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Yes | Combined **Beta** moving-noise/trial diagnostic and suggestion report. |
 
 The plots show baseline-relative acceleration, the configured detector
@@ -41,6 +42,21 @@ Traces retain bounded summaries and signed extrema instead of every sample.
 A diagnostic chart cannot establish that all vector peaks or physical
 transients were preserved, nor measure end-to-end stopping latency. Synthetic
 fixtures are marked **SIMULATED / NOT PRINTER MEASUREMENT**.
+
+Development accuracy PNGs include a bounded compact successful-run receipt in
+PNG text metadata and the run ID in the filename. It survives calibration and
+restart so a later explicit BASELINE can compare actual independent series;
+there is no JSON sidecar. Keep the original host filename and metadata.
+Missing sensor/geometry/speed/acceleration context or a mismatch prevents an
+attribution to filtering. A replay trace is never used as a physical baseline.
+Read [the comparison procedure and interpretation](FILTERS.md).
+
+The filter figure's noise/PSD use only the validated stationary pre-arm
+reference, after filter warmup. No spectrum is drawn from a gapped, undersized
+or display-reduced trace. Confirmations after the actual stop-request cutoff
+are censored; after-cutoff curves are labelled response only. Ordinary FILTERED
+accuracy/capture plots show raw measured response, with the causal weighted
+threshold stated separately rather than overlaid on the raw magnitude.
 
 ## Stationary noise
 

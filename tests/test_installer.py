@@ -1561,6 +1561,46 @@ class UninstallFixture(unittest.TestCase):
     def manifest(self, backup):
         return json.loads((backup / "manifest.json").read_text())
 
+    def test_six_module_install_upgrades_and_uninstalls_with_full_history(self):
+        original = self.capture()
+        with mock.patch.object(installer, "MODULES", installer.LEGACY_MODULES):
+            legacy = self.install("six-module")
+        extra = self.extras / "accel_homing_filters.py"
+        self.assertNotIn(extra, self.links)
+        migration = installer.load_uninstaller().validate_migration(
+            self.selected, installer.uninstall_api())
+        self.assertEqual(migration[extra], {"kind": "absent"})
+        upgraded = self.install("six-module")
+        changed = self.manifest(upgraded)["changes"]
+        self.assertTrue({extra, self.repo / ".git/info/exclude"}.issubset(
+            {Path(entry["path"]) for entry in changed}))
+        # This fixture emulates links in memory, so make_plan also records
+        # unchanged legacy links. They must preserve their exact before state.
+        for entry in changed:
+            if Path(entry["path"]) not in (extra, self.repo / ".git/info/exclude"):
+                self.assertEqual(entry["before"], entry["after"])
+        self.assertEqual(next(entry["before"] for entry in changed if Path(entry["path"]) == extra),
+                         {"kind": "absent"})
+        self.assertEqual(self.links[extra]["kind"], "symlink")
+        self.assertIn("accel_homing_filters.py", (self.repo / ".git/info/exclude").read_text())
+        plan, _ = self.uninstall()
+        self.assertEqual(len(plan["history"]), 2)
+        self.assertEqual(self.capture(), original)
+        self.assertEqual(self.manifest(legacy)["status"], "installed")
+
+    def test_six_module_install_can_be_uninstalled_by_seven_module_package(self):
+        original = self.capture()
+        with mock.patch.object(installer, "MODULES", installer.LEGACY_MODULES):
+            self.install("six-module")
+        self.uninstall()
+        self.assertEqual(self.capture(), original)
+
+    def test_unsupported_module_subset_does_not_validate_exclude_ownership(self):
+        with mock.patch.object(installer, "MODULES", installer.LEGACY_MODULES[:-1]):
+            self.install("unsupported-five-module")
+        with self.assertRaisesRegex(installer.InstallError, "exclude backup contains unowned"):
+            installer.make_uninstall_plan(self.selected)
+
     def _assert_manual_thresholds_preserved_by_install_and_update(self, section):
         values = "threshold: 0.25\nx_threshold: 0.5\ny_threshold: 0.001\n"
         self.config.write_bytes((CONFIG + "\n[" + section + "]\n" + values + SAVED).encode())

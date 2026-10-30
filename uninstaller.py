@@ -443,9 +443,15 @@ def validate_installation_history(selected, api):
                 if after["kind"] != "file" or before["kind"] not in ("file", "absent"):
                     _fail(api, "Invalid Git exclude history", directory)
                 old = _bytes(before) if before["kind"] == "file" else b""
-                missing = ["klippy/extras/" + name for name in api.MODULES if "klippy/extras/" + name not in old.decode("utf-8").splitlines()]
-                expected = old + (b"\n" if old and not old.endswith(b"\n") else b"") + ("\n".join(missing) + "\n").encode()
-                if not missing or _bytes(after) != expected:
+                old_lines = old.decode("utf-8").splitlines()
+                expected = []
+                for modules in getattr(api, "SUPPORTED_MODULE_SETS", (api.MODULES,)):
+                    missing = ["klippy/extras/" + name for name in modules
+                               if "klippy/extras/" + name not in old_lines]
+                    if missing:
+                        expected.append(old + (b"\n" if old and not old.endswith(b"\n") else b"")
+                                        + ("\n".join(missing) + "\n").encode())
+                if _bytes(after) not in expected:
                     _fail(api, "Git exclude backup contains unowned changes", directory)
                 kind = "exclude"
             elif path == generated and before["kind"] == "absent":

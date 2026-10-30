@@ -20,8 +20,12 @@ import tempfile
 import time
 import uuid
 
-MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
-           "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py")
+LEGACY_MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
+                  "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py")
+MODULES = LEGACY_MODULES + ("accel_homing_filters.py",)
+# These exact package generations may appear in retained install transactions.
+# Do not infer historical exclude edits from only the currently shipped set.
+SUPPORTED_MODULE_SETS = (LEGACY_MODULES, MODULES)
 SENSORS = {"beacon", "adxl345", "lis2dw", "lis3dh", "mpu9250", "icm20948"}
 SAVE_MARKER = "#*# <---------------------- SAVE_CONFIG ---------------------->"
 MANAGED = "accel_homing.cfg"
@@ -995,6 +999,23 @@ def save_manifest(directory, manifest):
 
 
 def apply_plan(changes, config, writer=write_state, selected=None, before_write=None, updater=None):
+    uninstaller = load_uninstaller()
+    _, active, receipt = uninstaller.history(config, uninstall_api())
+    if updater is not None and selected is not None:
+        # A native installation may predate this journal. Preserve exact
+        # canonical existing links as explicit before==after baseline entries;
+        # otherwise the first newly added module would make a later migration
+        # mistake the original modules for unexplained foreign ownership.
+        # Only links to this already-verified managed source qualify. Ordinary
+        # foreign links still require their existing explicit replacement path.
+        changes = dict(changes)
+        recorded = {entry["path"] for item in active for entry in item["manifest"]["changes"]
+                    if entry["after"]["kind"] == "symlink"}
+        for name in MODULES:
+            path = selected["repo"] / "klippy/extras" / name
+            expected = {"kind": "symlink", "target": str(updater["source"] / name)}
+            if str(path) not in recorded and path not in changes and snapshot(path) == expected:
+                changes[path] = dict(expected, expected=dict(expected))
     if not changes:
         return None
     entries = []
@@ -1008,8 +1029,6 @@ def apply_plan(changes, config, writer=write_state, selected=None, before_write=
         if after["kind"] == "file":
             after["data"], after["mode"] = base64.b64encode(after["data"]).decode("ascii"), before.get("mode", 0o600)
         entries.append(dict(path=str(path), before=before, after=after))
-    uninstaller = load_uninstaller()
-    _, active, receipt = uninstaller.history(config, uninstall_api())
     context = {str(path): snapshot(path) for path in ConfigGraph(config).documents}
     metadata = dict(operation="install", repo=str(selected["repo"]) if selected else None,
                     parent=active[-1]["ref"] if active else None,
@@ -1187,6 +1206,8 @@ def arguments(argv=None):
     parser.add_argument("--klippy-socket", default=os.environ.get("KLIPPY_SOCKET"), help="read-only Klipper API socket (-a)")
     parser.add_argument("--klipper-python", help="exact selected Klipper venv interpreter when it cannot be detected; never bootstrap/global Python")
     parser.add_argument("--no-update-manager", action="store_true", help="install without managed git source/Moonraker registration (offline/development opt-out)")
+    parser.add_argument("--branch", choices=("main", "codex/accuracy-filters"),
+                        help="managed source/updater branch; default main; development filters remain experimental")
     parser.add_argument("--moonraker-config", help="select the actual Moonraker config; must match this Klippy API socket")
     parser.add_argument("--accel-chip", help="full configured section, e.g. 'adxl345 toolhead'")
     parser.add_argument("--generic-names", action="store_true",
@@ -1216,6 +1237,9 @@ def arguments(argv=None):
         parser.error("--max-report-travel and --max-startup-travel apply only to installation/update")
     if (args.rollback or args.uninstall) and args.generic_names:
         parser.error("--generic-names applies only to installation/update")
+    if args.branch is not None and (args.rollback or args.uninstall or args.no_update_manager):
+        parser.error("--branch applies only to managed installation/update")
+    args.branch = args.branch or "main"
     return args
 
 

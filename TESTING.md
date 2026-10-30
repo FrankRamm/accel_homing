@@ -27,6 +27,9 @@ python3 -B -m unittest discover -s tests -p 'test_calibration_margin.py' -v
 python3 -B -m unittest discover -s tests -p 'test_beta_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_noise_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -v
+python3 -B -m unittest discover -s tests -p 'test_filter_charts.py' -v
+python3 -B -m unittest discover -s tests -p 'test_filter_packaging.py' -v
+python3 -B -m unittest discover -s tests -p 'test_updater_branches.py' -v
 ```
 
 The tests cover installation/ownership/rollback, adapter contracts and faults,
@@ -34,6 +37,21 @@ fresh references, legacy/vector detector behavior, single-pass homing/release,
 noise selection, calibration geometry/early returns/repeatability, accuracy
 capture/recovery/statistics, PNG rendering and the isolated Beta experiment.
 A source test file's presence is not proof that it executed successfully.
+
+For real matplotlib visual QA of the new development figures, on the
+development machine only:
+
+```bash
+python3 -B tests/render_filter_examples.py --output /tmp/accel-homing-synthetic-plots
+```
+
+This renders a RAW-controlled same-trace filter example with a censored
+FILTERED confirmation, a successful synthetic RAW accuracy baseline and an
+independent synthetic FILTERED A/B report reusing the embedded PNG receipt.
+The prominent SYNTHETIC labels are required; none of the data are physical
+results. Inspect event markers/units, actual-vs-replay labels, pre-arm noise
+interval and spectrum availability, censoring, actual run counts/statistics,
+mode/threshold/settings differences and legible scientific tick labels.
 
 For a reproducible report, retain the exact commit, command/working directory,
 Python/platform/dependency versions, exit status, full test output and any
@@ -65,8 +83,23 @@ full suite run establish different things; identify which were actually done.
   retain bounded console diagnostics without staging/saving thresholds/models
   or restarting.
 - Standalone installation uses a complete canonical native Git clone, root
-  entrypoints and main/origin/main updater configuration. Legacy MISC ownership
+  entrypoints and explicit matching main/origin/main or development branch
+  updater configuration. Legacy MISC ownership
   is not silently adopted; uninstall leaves source deletion to the operator.
+- FILTERED uses the actual frozen validated stationary reference and actual
+  armed sample period. Same-trace replay initializes that exact profile, with
+  independently labelled warmed pre-arm diagnostics; pre-arm zeros must never
+  masquerade as noise attenuation. Shadow decisions stop strictly before the
+  lower bound of actual stop dispatch. Candidate/onset/confirmation differ.
+- Explicit RAW/FILTERED calibrated profiles coexist across SAVE_CONFIG/restart;
+  RAW thresholds are never implicitly converted. Accuracy BASELINE reads a
+  bounded validated successful PNG receipt from the same root/axis and keeps
+  actual independent-run statistics separate from replay. Required missing or
+  mismatched acceleration/speed/geometry/sensor context prevents attribution.
+- Combined packaging regression installs six modules on main, upgrades the
+  seventh module plus development updater branch in the same journal, validates
+  complete ownership/migration, and uninstalls while retaining unrelated later
+  configuration edits. Arbitrary historical module subsets are not accepted.
 
 These are software contracts, not physical measurements. A passing synthetic
 suite cannot establish correct-stop contact, actual motor current, carriage

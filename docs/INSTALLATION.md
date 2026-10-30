@@ -49,6 +49,83 @@ To inspect a plan without writes or automatic restarts:
 
 A dry run reports missing plotting dependencies but does not install them.
 
+## Explicit development branch
+
+`codex/accuracy-filters` is **development / experimental**. It adds an opt-in
+causal detector and comparison plots; installation does not home or calibrate
+the printer and does not convert saved RAW models.
+
+For a first installation of that branch:
+
+```bash
+git clone --branch codex/accuracy-filters https://github.com/FrankRamm/accel_homing.git ~/accel_homing
+~/accel_homing/install.sh --branch codex/accuracy-filters --dry-run
+~/accel_homing/install.sh --branch codex/accuracy-filters
+```
+
+For an existing clean native clone, inspect `git -C ~/accel_homing status
+--short` first and resolve local changes explicitly. Do not reset/stash them
+as an installation shortcut. On the first switch to the development branch:
+
+```bash
+git -C ~/accel_homing fetch origin
+git -C ~/accel_homing switch --track -c codex/accuracy-filters origin/codex/accuracy-filters
+~/accel_homing/install.sh --branch codex/accuracy-filters --dry-run
+~/accel_homing/install.sh --branch codex/accuracy-filters
+```
+
+If that local branch already exists, use `git -C ~/accel_homing switch
+codex/accuracy-filters` instead of recreating it. The source branch/upstream and
+the explicitly selected installer branch must agree. The matching Moonraker
+entry uses `primary_branch: codex/accuracy-filters`; do not leave it targeting
+main while loading development code. Only `main` and `codex/accuracy-filters`
+are accepted. `--branch` is a managed install/update option and is rejected
+with uninstall, rollback or `--no-update-manager`.
+
+The seventh `accel_homing_filters.py` module and its Git exclude entry are
+recorded transactionally. Existing six-module history and updater receipts
+remain valid; a later uninstall restores the actual prior owned configuration
+across both generations while preserving unrelated later edits. Retain the
+complete backup journal. Matching existing native manual Moonraker stanzas can
+receive a reversible branch-only edit; conflicting ownership is refused.
+
+Before returning to main **after saving any FILTERED axis**, keep the
+development code active and restore a valid selected RAW model for every
+affected axis. The supported operator route is normal supervised calibration:
+reprepare XY, run `ACCEL_HOMING_CALIBRATE AXIS=X DETECTOR=RAW CENTERED=1`, let it
+save/restart, then repeat manual preparation and RAW calibration for Y if Y
+was filtered. Confirm all affected selected models are RAW after restart and
+the saved model has returned to schema version 1. A model containing FILTERED
+uses schema version 2; current stable main rejects it at startup rather than
+reinterpreting a filtered threshold as RAW. Do not switch code first and leave
+an incompatible model, or restore an entire old `printer.cfg` over later edits.
+
+While **still running the development installer**, preview and restore the
+owned development installation history before switching source code:
+
+```bash
+~/accel_homing/uninstall.sh --dry-run
+~/accel_homing/uninstall.sh
+```
+
+This restores the journal's original activation and plugin-model baseline,
+including pre-existing native six-module links/main updater when present;
+a first-time install may be removed completely. Review that concrete plan.
+An exact unchanged installation transaction can instead use its printed
+`--rollback` path. After later calibration/config edits, rollback may refuse
+changed files; use the reviewed history-aware uninstall rather than forcing
+old file bytes over current edits.
+
+Verify the pre-development module/updater state is restored and no active
+development ownership remains. Then select the clean tracked main checkout.
+Defer service restart until source and restored links/configuration agree.
+The older main installer does **not** accept `--branch` and cannot validate an
+active development journal; if reinstalling main is needed after restoration,
+use its `install.sh --dry-run` and `install.sh` without `--branch`.
+If no FILTERED model was saved, the original RAW model was not converted and
+the exact recorded transaction rollback is sufficient when unchanged.
+See [the model rollback limits](FILTERS.md#returning-to-stable-code).
+
 ## What installation changes
 
 The transaction records original file bytes, modes and link targets under

@@ -5,7 +5,7 @@ commands belong in the Linux host shell instead.
 
 ## Prepare every moving workflow
 
-Before CALIBRATE, TEST, CHARTS, ACCURACY or BETA:
+Before CALIBRATE, TEST, CHARTS, FILTER_CHARTS, ACCURACY or BETA:
 
 1. Keep the printer idle and unpaused, with no queued motion or other active
    homing workflow.
@@ -27,11 +27,12 @@ for your machine and independent Z support. See the complete
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Read-only workflow/model/settings, result and plot paths. |
 | `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `DETECTOR=RAW|FILTERED`, `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
 | `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |
-| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. |
+| `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Development comparison: one actual home plus same-trace causal replay; `AXIS=X|Y|XY`, optional `DETECTOR=RAW|FILTERED`, explicit `RAW_THRESHOLD`/`FILTERED_THRESHOLD` in g when no suitable calibrated profile exists. |
+| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10; optional `DETECTOR=RAW|FILTERED`, `BASELINE=<completed_run_id>`. Recovery can start a saving calibration; see below. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal for X or Y. Optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0`; rejects `SAVE_CONFIG=1`. |
 | `ACCEL_HOMING_CANCEL` | Cancel owned workflow/pending preparation and restore temporary settings when handled. Not an emergency stop. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Temporary threshold for X or Y; optional `IMPACT_SIGN=-1|0|1`; until restart. |
@@ -40,6 +41,14 @@ for your machine and independent Z support. See the complete
 No separate centering-confirmation command or popup prompt is required.
 Only one workflow may own the sensor/motion session at a time. A new command
 during an active run is rejected; do not reissue it while automatic retries run.
+
+On `codex/accuracy-filters`, TEST and ordinary CHARTS also accept explicit
+`DETECTOR=RAW|FILTERED`. The selected mode uses its own saved threshold; test/chart
+commands can use an explicit mode-specific `RAW_THRESHOLD` or
+`FILTERED_THRESHOLD` instead. These are temporary experimental settings and are
+not saved or qualified. Calibration uses `START_THRESHOLD` instead. A RAW
+threshold is not silently reused for FILTERED. Omitted DETECTOR retains the
+selected model/manual mode. See the [supervised A/B sequence](FILTERS.md#operator-sequence).
 
 ## Calibration
 
