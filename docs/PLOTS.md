@@ -58,15 +58,28 @@ threshold and detected onset when available. New vector-model captures label
 XYZ magnitude; legacy captures retain their detector context. The measured
 onset/peak can differ from the threshold used to request stopping.
 
-Current actual FILTERED control uses onset markers at the threshold crossing of
+Pure FILTERED control uses onset markers at the threshold crossing of
 the candidate that actually confirms (`accepted_threshold_crossing_v1`). RAW
 control retains legacy lookback markers for its FILTERED diagnostic shadows,
 labelled `Estimated filtered lookback onset`. Confirmation and the host
 stop-request interval remain distinct and unchanged, and the original lookback
 still anchors the existing 15 ms impact-response window. Historical FILTERED
-baselines without a policy retain `filtered_lookback_v1`; new FILTERED PNG receipts
-use version 4 and list policy differences in actual-run comparisons. Existing
+baselines without a policy retain `filtered_lookback_v1`; new pure FILTERED PNG
+receipts use version 4 and list policy differences in actual-run comparisons. Existing
 images are not rewritten or reinterpreted as new-policy measurements.
+
+Explicit HYBRID ordinary CHARTS/ACCURACY retains FILTERED confirmation and
+labels its position policy separately as
+`associated_raw_threshold_crossing_v1`. Its position marker uses the associated
+RAW XYZ threshold crossing when selected, with an explicit FILTERED-crossing
+fallback when selection fails. Accuracy figures identify the requested HYBRID
+mode, FILTERED control, both thresholds and measured RAW-selection/fallback
+counts and reasons. The paired JSON keeps each home's selected sample/time and
+selection evidence. HYBRID's embedded receipt uses version 5; its bounded JSON
+retains schema version 1. Read those counts before interpreting aggregate variation;
+a HYBRID report can include both position sources. Confirmation, returned
+position and the host stop-request interval remain different events, and none
+measures physical contact or MCU halt. See [HYBRID timing](FILTERS.md#hybrid-position-timing).
 
 Traces retain bounded summaries and signed extrema instead of every sample.
 A diagnostic chart cannot establish that all vector peaks or physical

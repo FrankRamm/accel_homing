@@ -17,6 +17,7 @@ or a hard real-time endstop.
 | New simple calibration | Fresh XYZ resting offset; magnitude at each sample; no quiet-range gate or integrated motion proof. |
 | New saved model with `impact_metric: xyz_magnitude` | Same vector detector during ordinary homing, TEST, CHARTS and ACCURACY after reload, unless explicit config thresholds take precedence. |
 | Development FILTERED model | Versioned causal XYZ filtering and temporal confirmation; the accepted candidate's threshold crossing supplies the position timestamp. |
+| Explicit development HYBRID workflow | FILTERED confirmation with an associated RAW XYZ threshold crossing for position; explicit FILTERED fallback when RAW selection is unavailable or ambiguous. Both compatible saved profiles are required. |
 | Explicit config thresholds / older models | Legacy machine-axis detector with fresh quiet reference and its motion/pressed policies. |
 | Beta calibration | Isolated moving-noise experiment and proposal; does not replace or save the ordinary model. |
 
@@ -35,6 +36,16 @@ Saved calibrated thresholds and both profiles remain compatible without
 recalibration. Historical FILTERED measurements retain `filtered_lookback_v1`
 when their receipt has no explicit position policy; comparisons name that
 difference. See [filter policies and baseline receipts](FILTERS.md).
+
+Explicit HYBRID TEST/ordinary CHARTS/ACCURACY uses
+`associated_raw_threshold_crossing_v1` for position selection while retaining
+FILTERED confirmation and the original response-window anchor. A separate
+bounded RAW observer uses the saved XYZ threshold and its own arithmetic
+reference from the same stationary window. It supplies a timestamp only after
+the FILTERED candidate confirms; it never independently requests a stop.
+Selection provenance, fallback reasons and measured RAW/fallback counts remain
+visible in accuracy JSON/PNG. This does not establish physical stop latency.
+See [HYBRID requirements and limits](FILTERS.md#hybrid-position-timing).
 
 Changing a threshold through temporary SET does not save a new detector/model.
 Persistent manual overrides take precedence over saved model values on reload.

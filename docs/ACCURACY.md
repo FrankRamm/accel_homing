@@ -19,22 +19,25 @@ must use this plugin's endstop. `SAMPLES` is an integer from 2 through 50,
 default 10, per axis. `CENTERED=1` authorizes movement without another prompt.
 
 Do not add `SAVE_CONFIG`: ACCURACY rejects the parameter, including zero.
-A successful measurement alone does not save/restart. An early-trigger recovery
-can start a separate normal calibration that saves and restarts on success.
+A successful measurement alone does not save/restart. RAW/FILTERED early-trigger
+recovery can start a separate normal calibration that saves and restarts on
+success. HYBRID early-quality failures abort for operator review instead.
 
-## Compare 30 RAW and 30 FILTERED homes
+## Compare 30 RAW, pure FILTERED and HYBRID homes
 
 When both compatible calibrated profiles already exist, compare them directly;
-another calibration is not required just to collect this pair. Otherwise follow
-the [profile preparation sequence](FILTERS.md#operator-sequence) first. Explicit
+another calibration is not required to collect these measurements. Otherwise
+follow the [profile preparation sequence](FILTERS.md#operator-sequence) first. Explicit
 `DETECTOR` selects that mode's own saved threshold for the command. A successful
 ACCURACY run restores the previously selected mode instead of changing it.
 
-After a FILTERED position-policy update, collect a **fresh** RAW control followed
-by a fresh FILTERED series. Both FILTERED versions now use the accepted
-threshold-crossing sample for the position timestamp, rather than the older
-lower-level lookback. Confirmation and stop-request timing are unchanged.
-The saved RAW and FILTERED thresholds remain usable without recalibration.
+These are three different modes. RAW uses its own detector. Pure FILTERED uses
+the accepted FILTERED threshold crossing for its position timestamp. HYBRID
+keeps that FILTERED control/confirmation and selects an associated RAW XYZ
+threshold crossing for position, with an explicit FILTERED fallback when RAW
+selection is unavailable or ambiguous. The saved RAW and FILTERED thresholds
+remain usable without recalibration. HYBRID must be requested explicitly and
+does not become the persisted selected mode.
 
 Manually prepare XY before the fresh RAW command:
 
@@ -43,20 +46,43 @@ ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=RAW SAMPLES=30 CENTERED=1
 ```
 
 Keep its successful original PNG and JSON, and copy the console's **Completed
-accuracy run ID**. Manually prepare XY again before the FILTERED command:
+accuracy run ID**. Manually prepare XY again before the pure FILTERED command:
 
 ```gcode
 ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=FILTERED SAMPLES=30 CENTERED=1 BASELINE=ID_RAW
 ```
 
-Replace `ID_RAW` with the successful RAW control's actual 32-character run ID.
+Replace `ID_RAW` with the completed RAW run ID. Keep the pure FILTERED outputs
+and copy its completed run ID. Manually prepare XY again before HYBRID:
+
+```gcode
+ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=HYBRID SAMPLES=30 CENTERED=1 BASELINE=ID_FILTERED
+```
+
+Replace `ID_FILTERED` with the completed pure FILTERED run ID. `BASELINE` is
+optional for **each** command; omit the entire parameter for a standalone
+report. To compare HYBRID with RAW instead, use that completed actual RAW run
+in the same chart directory:
+
+```gcode
+ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=HYBRID SAMPLES=30 CENTERED=1 BASELINE=ID_RAW
+```
+
+Run IDs contain 32 hexadecimal characters. One command accepts one baseline;
+the preserved independent reports can be inspected separately without another
+physical series just to change the baseline plot. Choose either the RAW or
+FILTERED baseline for the HYBRID command in the three-series comparison.
+
 Each command has one excluded discovery home followed by 30 measured homes.
 Use the same sensor/mount/axes map, geometry, homing speed/acceleration, currents,
-fan state and physical setup. Repeat separately for Y with that axis's baseline.
-If an early trigger starts automatic recovery, the accuracy run is incomplete;
-the separate recovery calibration can save and restart. Reprepare after that
+fan state and physical setup. Repeat separately for Y only when both compatible
+saved Y profiles exist, using that axis's baseline.
+If a RAW/FILTERED early trigger starts automatic recovery, the accuracy run is
+incomplete; the separate recovery calibration can save and restart. Reprepare after that
 restart and follow the printed rerun command; see
 [early-trigger recovery](#early-trigger-automatic-recalibration).
+HYBRID instead aborts for manual inspection and recentering on an early-quality
+failure; it does not start the automatic return/recalibration path.
 
 Both saved detector profiles and the compact PNG baseline receipt survive a
 saving calibration/restart. The report shows both actual series, counts, ranges,
@@ -67,22 +93,35 @@ run or a synthetic figure is refused. Existing PNG baselines with a valid compac
 receipt remain usable without a JSON companion and retain their historical schema.
 A PNG without a valid completed-run receipt still requires a new baseline.
 
-For a before/after FILTERED comparison instead, the second command can select
-the verified original completed FILTERED PNG as its alternative baseline:
+For a before/after pure FILTERED comparison, its command can select the verified
+original completed FILTERED PNG as its alternative baseline:
 
 ```gcode
 ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=FILTERED SAMPLES=30 CENTERED=1 BASELINE=ID_PREVIOUS_FILTERED
 ```
 
 Replace `ID_PREVIOUS_FILTERED` with that original run's actual 32-character ID.
-Use one baseline ID per command. Choosing this alternative compares that new
-FILTERED series to the old FILTERED series; it does not also make a RAW A/B plot.
-The preserved files can be inspected separately without collecting a third
-physical series solely for another graph. A historical FILTERED receipt without
+Use one baseline ID per command. This compares the new pure FILTERED series to
+the old pure FILTERED series. A historical FILTERED receipt without
 an explicit position policy retains `filtered_lookback_v1`; new FILTERED receipts
 use version 4 with `accepted_threshold_crossing_v1`. The report lists this policy
 change as a treatment difference. Preserve the old files and interpret their
 position statistics separately instead of pooling or relabelling them.
+
+HYBRID receipts identify filtered control separately from
+`requested_detector=hybrid` and
+`position_policy=associated_raw_threshold_crossing_v1`. Their measured positions
+can include RAW selections and FILTERED fallbacks; inspect those counts and
+reasons before comparing aggregate spread or standard deviation. A different
+timestamp policy is a treatment difference, not proof of improved physical
+contact or unchanged end-to-end stop latency.
+RAW-selection counts describe eligibility. Even every selected RAW timestamp
+can coincide with the FILTERED crossing; a high selection count alone is no
+timing or accuracy improvement. Per-home `raw_minus_filtered_time_s` describes
+the sampled timestamp difference, not detector reaction or physical stop latency.
+HYBRID is available only on the native Beacon packet path; other backends fail
+preflight before movement. TEST's default XY selection needs both profiles on
+both axes; the commands above deliberately select X.
 
 ## Sequence and statistics
 
@@ -116,10 +155,13 @@ CALIBRATE requires ten qualified checks with range at most 2.00 mm; an existing
 
 ## Early-trigger automatic recalibration
 
-Recovery is limited to an early trigger with complete **current** capture,
-signed trigger/halt step evidence and an intact confirmed starting reference.
+For RAW and pure FILTERED, recovery is limited to an early trigger with complete
+**current** capture, signed trigger/halt step evidence and an intact confirmed
+starting reference.
 A sensor fault, missing/mismatched evidence, lost motor/position state,
 cancellation or invalid candidate prevents recovery.
+HYBRID does not enter this recovery procedure; an early-quality failure aborts
+with diagnostics for operator review and manual XY preparation.
 
 When that evidence is valid, the same command:
 
@@ -163,8 +205,8 @@ Unexpected physical behavior requires the emergency stop and manual review.
 
 ## Per-home JSON diagnostics
 
-Every successful RAW or FILTERED ACCURACY run automatically writes a diagnostic
-JSON beside each axis's overview PNG. No new option or calibration is needed,
+Every successful RAW, pure FILTERED or HYBRID ACCURACY run automatically writes
+a diagnostic JSON beside each axis's overview PNG. No new option or calibration is needed,
 and diagnostics do not change thresholds, filtering, returned trigger decisions
 or the number of homes. The console prints the JSON path as `Accuracy telemetry
 X: ... (schema 1; discovery + N measured homes)`.
@@ -182,8 +224,10 @@ Collision suffixes can differ between files. Use the announced paths and the
 JSON's `png_sha256` to associate the exact PNG, and preserve the original files
 and PNG metadata. The JSON has its own version 1 schema and
 `kind=completed_accuracy_telemetry`; it does not replace or change the compact
-baseline receipt embedded in the PNG. New FILTERED PNG receipts use version 4 to
-identify the position policy; the separate JSON schema remains version 1.
+baseline receipt embedded in the PNG. New pure FILTERED PNG receipts use version
+4 to identify the accepted-crossing position policy; HYBRID uses receipt version
+5 for its distinct requested mode, position configuration and selection counts.
+The separate JSON schema remains version 1.
 Historical PNG receipts remain readable without rewriting them. JSON cannot
 recreate diagnostics for older runs.
 The header also distinguishes actual runs (`simulated=false`) from synthetic QA.
@@ -212,8 +256,8 @@ unavailable reason even when their original sample identities are retained.
 `returned_trigger_time_s` is the timestamp value returned by `home_wait`, not
 the host time when that function finished.
 
-For FILTERED, diagnostics include the frozen reference offsets/noise weights,
-the effective onset gate and actual candidate/rejection counters. When native
+For FILTERED and HYBRID, diagnostics include the frozen reference offsets/noise
+weights, the effective onset gate and actual candidate/rejection counters. When native
 provenance is available, `state_before_window` is
 **post-stop deterministic replay** of the retained exact prefix, verified against
 the actual original event decisions. It is explicitly not an online state
@@ -222,6 +266,32 @@ separately. RAW marks filter state unavailable; an unsupported FILTERED capture
 reports missing native proof as its unavailable reason. Rows identify whether
 the filter processed them; post-confirmation values are not additional online
 filtering.
+
+HYBRID additionally retains its independent frozen RAW arithmetic reference,
+RAW XYZ threshold and the bounded selection evidence. Each home's
+`position_selection` identifies `actual_source` as `raw_threshold_crossing` or
+`filtered_threshold_crossing_fallback`, with an explicit `fallback_reason` when
+applicable, `raw_crossing_count`, association interval and selected time/sample.
+The [association interval and exact reasons](FILTERS.md#hybrid-position-timing)
+are bounded to the accepted candidate through its confirmation sample; later
+response rows cannot supply the selected crossing.
+`raw_crossing_count` counts every provable discrete edge, including a marker
+edge that remains ineligible for position. A native marker cannot supply the
+selected timestamp or RAW amplitude; a proven continuation-above code state can
+preserve an earlier finite crossing. Diagnostics retain
+`marker_rows_with_proven_above_code_state`,
+`marker_crossings_ineligible_for_position` and `native_clip_values`. These are
+RAW code-metric evidence, not recovered physical amplitudes.
+The RAW reference and FILTERED reference use the same admitted stationary
+pre-arm window but keep their distinct arithmetic offsets and filter weights;
+FILTERED noise weights are not applied to RAW XYZ magnitude.
+
+The completed report's `hybrid_position_summary` records measured
+`raw_selected_count`, `fallback_count` and `fallback_reasons`; the PNG displays
+the corresponding counts. Keep discovery separate from measured statistics.
+Fallback is reported as fallback rather than silently counted as a RAW-selected
+position. A HYBRID run is not a pure FILTERED run merely because its stop
+confirmation uses FILTERED.
 
 Planned movement-start and first-step timestamps are explicitly `null` with an
 unavailable reason: the existing homing interface does not expose them. Do not

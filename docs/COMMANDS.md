@@ -32,7 +32,7 @@ for your machine and independent Z support. See the complete
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
 | `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |
 | `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Development comparison: one actual home plus same-trace causal replay; `AXIS=X|Y|XY`, optional `DETECTOR=RAW|FILTERED`, explicit `RAW_THRESHOLD`/`FILTERED_THRESHOLD` in g when no suitable calibrated profile exists. |
-| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10; optional `DETECTOR=RAW|FILTERED`, `BASELINE=<completed_run_id>`. Recovery can start a saving calibration; see below. |
+| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10; optional `DETECTOR=RAW|FILTERED|HYBRID`, `BASELINE=<completed_run_id>`. RAW/FILTERED early-trigger recovery can start a saving calibration; HYBRID aborts for manual review. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal for X or Y. Optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0`; rejects `SAVE_CONFIG=1`. |
 | `ACCEL_HOMING_CANCEL` | Cancel owned workflow/pending preparation and restore temporary settings when handled. Not an emergency stop. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Temporary threshold for X or Y; optional `IMPACT_SIGN=-1|0|1`; until restart. |
@@ -49,6 +49,20 @@ commands can use an explicit mode-specific `RAW_THRESHOLD` or
 not saved or qualified. Calibration uses `START_THRESHOLD` instead. A RAW
 threshold is not silently reused for FILTERED. Omitted DETECTOR retains the
 selected model/manual mode. See the [supervised A/B sequence](FILTERS.md#operator-sequence).
+
+TEST, ordinary CHARTS and ACCURACY additionally accept `DETECTOR=HYBRID`.
+HYBRID requires the native Beacon packet path and validates both saved
+compatible profiles for every requested axis before movement. FILTERED controls
+confirmation; RAW supplies its own XYZ threshold
+and independent stationary reference for position timing. It rejects
+`RAW_THRESHOLD`/`FILTERED_THRESHOLD` overrides and unsupported tuning parameters.
+There is no HYBRID calibration or persistent HYBRID model selection.
+CALIBRATE, CALIBRATE_NOISE and FILTER_CHARTS reject HYBRID. Omitted DETECTOR
+retains the previously selected ordinary mode; request HYBRID explicitly.
+TEST always requests X then Y, so HYBRID TEST needs both saved profiles on both
+axes. Use explicit `AXIS=X` with CHARTS or ACCURACY for an X-only experiment.
+Read [the HYBRID selection/fallback rules](FILTERS.md#hybrid-position-timing) and
+[copyable 30-sample commands](ACCURACY.md#compare-30-raw-pure-filtered-and-hybrid-homes).
 
 ## Calibration
 
@@ -92,7 +106,8 @@ ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1
 ```
 
 This measures repeated commanded travel at the active threshold and speed.
-An early trigger with valid current capture/halt/center evidence reverses its
+For RAW or pure FILTERED, an early trigger with valid current
+capture/halt/center evidence reverses its
 recorded commanded halt travel, reports failure in the console without an
 accuracy PNG and starts one
 normal calibration of the failing axis. Its first candidate is the actual
@@ -101,6 +116,10 @@ threshold used by the failed attempt **plus 0.25 g**; later steps use configured
 candidate plus the normal 0.5 g final margin and restarts Klipper.
 The console then tells you to prepare XY again and rerun the exact accuracy
 command; it does not rerun accuracy automatically.
+
+HYBRID early-quality failure instead aborts with diagnostics and requires
+operator inspection and manual XY preparation. It performs no automatic return
+or recovery calibration, so existing profiles are not recalibrated by that path.
 
 `SAVE_CONFIG` is not an ACCURACY option: even `SAVE_CONFIG=0` is rejected.
 Read [accuracy and its recovery limits](ACCURACY.md) before running it.

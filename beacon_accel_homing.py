@@ -27,11 +27,13 @@ import mcu
 try:
     from .accel_homing_filters import (CausalImpactDetector, detector_config,
                                        robust_reference, signal_mode, native_clip_limits,
-                                       decode_native_row, decode_native_values, NATIVE_CLIP_POLICY)
+                                       decode_native_row, decode_native_values, NATIVE_CLIP_POLICY,
+                                       AssociatedRawPosition, HYBRID_POSITION_POLICY)
 except ImportError:
     from accel_homing_filters import (CausalImpactDetector, detector_config,
                                       robust_reference, signal_mode, native_clip_limits,
-                                      decode_native_row, decode_native_values, NATIVE_CLIP_POLICY)
+                                      decode_native_row, decode_native_values, NATIVE_CLIP_POLICY,
+                                      AssociatedRawPosition, HYBRID_POSITION_POLICY)
 
 try:
     from .accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
@@ -119,6 +121,7 @@ class QuietReference:
         self.low = self.high = None
         self._samples = collections.deque()
         self._sample_ids = collections.deque()
+        self._original_valid = collections.deque()
         self._minimum = [collections.deque() for _ in range(3)]
         self._maximum = [collections.deque() for _ in range(3)]
         self.overflow = False
@@ -129,7 +132,7 @@ class QuietReference:
         self.best_peak_to_peak = (0.0, 0.0, 0.0)
         self.oldest_batch_age = self.newest_batch_age = None
 
-    def add(self, when, values, identity=None):
+    def add(self, when, values, identity=None, original_valid=True):
         values = tuple(values)
         self.accepted += 1
         self.last = when
@@ -141,6 +144,7 @@ class QuietReference:
             return "baseline_overflow"
         self._samples.append((self.accepted, when, values))
         self._sample_ids.append(identity)
+        self._original_valid.append(bool(original_valid))
         self.totals = [a + b for a, b in zip(self.totals, values)]
         for value, minimum, maximum in zip(values, self._minimum, self._maximum):
             while minimum and minimum[-1][1] >= value:
@@ -171,6 +175,7 @@ class QuietReference:
             self.overflow = True
             self._samples.clear()
             self._sample_ids.clear()
+            self._original_valid.clear()
             for queue in self._minimum + self._maximum:
                 queue.clear()
             self.first, self.count = None, 0
@@ -188,6 +193,7 @@ class QuietReference:
     def _drop_first(self):
         number, _when, values = self._samples.popleft()
         self._sample_ids.popleft()
+        self._original_valid.popleft()
         self.totals = [a - b for a, b in zip(self.totals, values)]
         for queue in self._minimum + self._maximum:
             if queue[0][0] == number:
@@ -346,6 +352,7 @@ class Attempt:
         self.vector_mode = False   # XYZ magnitude; no acceleration-derived motion proof
         self.detector_type = "raw"
         self.filter_engine = self.filter_reference = self.filter_decision = None
+        self.hybrid_position = self.position_selection = None
         self.raw_bases = None
         self.reference_sample_bounds = None
         self.reference_interval = None
@@ -1343,7 +1350,7 @@ class BeaconAccelHoming:
                     reference.marker_axis_values = getattr(reference, "marker_axis_values", 0) + markers
                     reference.marker_first_sample = getattr(reference, "marker_first_sample", identity)
                     reference.marker_last_sample = identity
-                reference_error = reference.add(when, values, identity)
+                reference_error = reference.add(when, values, identity, original_valid=not bool(markers))
                 if reference_error is not None:
                     return reference_error
         return None
@@ -1525,6 +1532,13 @@ class BeaconAccelHoming:
             attempt.filter_engine = CausalImpactDetector(
                 threshold, filter_reference["offset_g"], filter_reference["noise_sigma_g"],
                 filter_reference["weights_xyz"], config)
+            raw_profile = self.workflows.hybrid_raw_profile(axis)
+            if raw_profile is not None:
+                # RAW arithmetic reference is independently frozen before arm.
+                # FILTERED's median/MAD/weights never enter its count metric.
+                attempt.hybrid_position = AssociatedRawPosition(raw_profile["threshold_g"], raw_bases,
+                    count_g, config, print_time, raw_profile,
+                    reference_original_valid=all(reference._original_valid), clip_values=attempt.native_clip_values)
         attempt.steppers = endstop.get_steppers()
         attempt.bases = bases
         attempt.raw_bases = raw_bases
@@ -1631,7 +1645,20 @@ class BeaconAccelHoming:
             return attempt.arm_time
         if attempt.onset_batch is None:
             return 0.0
+        if attempt.hybrid_position is not None:
+            return self._position_selection(attempt)["selected_time_s"]
         return self.onset_time(attempt)
+
+    def _position_selection(self, attempt):
+        """Freeze position attribution after dispatch, including immediate completion."""
+        if attempt.hybrid_position is None:
+            return None
+        if attempt.position_selection is None:
+            selection = attempt.hybrid_position.select(attempt.filter_decision)
+            selection["raw_reference"].update(sample_count=attempt.reference_sample_count,
+                sample_bounds=attempt.reference_sample_bounds, interval_s=attempt.reference_interval)
+            attempt.position_selection = selection
+        return attempt.position_selection
 
     def _commanded_speed(self, attempt, print_time, window=COMMAND_WINDOW):
         """Stepper speed along the move at a print time, from the step history."""
@@ -2375,6 +2402,9 @@ class BeaconAccelHoming:
             filtered.previous_time = first_time - attempt.sample_dt
         for position in range(count):
             xyz = tuple(raw[3 * position:3 * position + 3])
+            original_xyz = xyz
+            original_valid_for_position = (attempt.hybrid_position is None or
+                all(math.isfinite(value) and value != CLIPPED for value in xyz))
             if chronological_native:
                 if not all(math.isfinite(value) for value in xyz):
                     self._reject_homing_sample(attempt, "homing_xyz", "nonfinite_axis_value", source_params,
@@ -2406,6 +2436,10 @@ class BeaconAccelHoming:
                         sample_dt_s=None if previous_time is None else when - previous_time,
                         error=exc)
                     return
+                if attempt.hybrid_position is not None:
+                    # Observation is O(1); no association search precedes the
+                    # existing stop. No later row is observed after acceptance.
+                    attempt.hybrid_position.observe(when, xyz, identity, filtered, original_valid_for_position, original_xyz)
                 if decision is not None:
                     attempt.filter_decision = decision
                     attempt.confirmation_time = decision["confirmation_time_s"]
@@ -3425,9 +3459,15 @@ class BeaconAccelHoming:
                         "homing_accel_mm_s2": attempt.effective_accel,
                         "attempt_count": attempt_count}
             if attempt.filter_engine is not None:
-                detector["position_policy"] = attempt.filter_engine.position_policy
+                detector["position_policy"] = (HYBRID_POSITION_POLICY if attempt.hybrid_position is not None
+                                                 else attempt.filter_engine.position_policy)
                 detector["lookback_onset_time_s"] = (None if attempt.filter_decision is None else
                                                        attempt.filter_decision["lookback_onset_time_s"])
+            detector.update(control_detector=attempt.detector_type,
+                            requested_detector="hybrid" if attempt.hybrid_position is not None else attempt.detector_type)
+            if attempt.hybrid_position is not None:
+                detector["position_selection"] = self._position_selection(attempt)
+                detector["position_sample"] = detector["position_selection"]["selected_sample"]
             if attempt.filter_reference is not None:
                 ref = dict(attempt.filter_reference)
                 ref["offset_g"] = [attempt.filter_reference["offset_g"][index] * sign for index, sign in mapping]
@@ -3465,11 +3505,13 @@ class BeaconAccelHoming:
         onset_matches, onset_index = 0, None
         ref_matches, ref_indices = [0, 0], [None, None]
         event_matches, event_indices = {"crossing": 0, "confirmation": 0, "first_armed": 0}, {}
+        if attempt is not None and attempt.hybrid_position is not None:
+            event_matches["position"] = 0
         for batch_index, (start_clock, delta_clock, data, count_g) in enumerate(batches):
             count = sample_count(data)
             first_row = first_position if native_filtered and batch_index == 0 else 0
             if detector is not None:
-                for event in ("crossing", "confirmation", "first_armed"):
+                for event in event_matches:
                     stamp = detector.get(event + "_sample")
                     if stamp is not None and (start_clock, delta_clock, count) == (stamp[0], stamp[1], stamp[3]):
                         event_matches[event] += 1
@@ -3563,7 +3605,7 @@ class BeaconAccelHoming:
                         xyz[index] * sign * count_g for index, sign in mapping))
             original_offset += count - first_row
         if detector is not None:
-            for event in ("crossing", "confirmation", "first_armed"):
+            for event in event_matches:
                 index = event_indices.get(event)
                 detector[event + "_sample_matches"] = event_matches[event]
                 if event_matches[event] == 1 and index is not None and 0 <= index < len(samples):
@@ -3803,9 +3845,14 @@ class BeaconAccelHoming:
             "trigger_after_arm_s": round(recorded_onset - attempt.arm_time, 4) if onset else None,
         }
         if attempt.filter_engine is not None:
-            result["position_policy"] = attempt.filter_engine.position_policy
+            result["position_policy"] = (HYBRID_POSITION_POLICY if attempt.hybrid_position is not None
+                                           else attempt.filter_engine.position_policy)
             result["lookback_onset_time_s"] = (None if attempt.filter_decision is None else
                                                  attempt.filter_decision["lookback_onset_time_s"])
+        result.update(control_detector=attempt.detector_type,
+                      requested_detector="hybrid" if attempt.hybrid_position is not None else attempt.detector_type)
+        if attempt.hybrid_position is not None:
+            result["position_selection"] = self._position_selection(attempt)
         if attempt.motion_deadline is not None or self.backend is not None:
             result["motion_proof"] = self._motion_proof_status(attempt)
         with self.lock:

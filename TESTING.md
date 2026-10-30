@@ -96,6 +96,14 @@ full suite run establish different things; identify which were actually done.
   bounded validated successful PNG receipt from the same root/axis and keeps
   actual independent-run statistics separate from replay. Required missing or
   mismatched acceleration/speed/geometry/sensor context prevents attribution.
+- Explicit HYBRID preflights both saved compatible profiles for every requested
+  axis before movement. FILTERED confirmation/rejection and the response anchor
+  retain their behavior; an independent RAW XYZ observer supplies only the
+  associated position timestamp. Missing/ambiguous RAW evidence falls back with
+  explicit provenance and measured counts. Rejected candidates cannot donate a
+  timestamp, unsupported commands/overrides fail, and HYBRID early-quality
+  failure cannot enter automatic return/recalibration. Historical RAW/FILTERED
+  receipts remain readable with their recorded position policy.
 - Combined packaging regression installs six modules on main, upgrades the
   seventh module plus development updater branch in the same journal, validates
   complete ownership/migration, and uninstalls while retaining unrelated later

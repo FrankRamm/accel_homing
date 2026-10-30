@@ -26,8 +26,9 @@ It retains transverse components; it does not project onto one axis or use
 future samples. Moving-noise characterization is observation only and never
 raises the threshold or changes weights after arming.
 
-For both saved FILTERED versions, the position timestamp now uses the existing
-threshold-crossing sample of the candidate that actually confirms. Its policy is
+For both saved FILTERED versions in pure FILTERED mode, the position timestamp
+uses the existing threshold-crossing sample of the candidate that actually
+confirms. Its policy is
 `accepted_threshold_crossing_v1`; onset time, level and sample identity come from
 that crossing. The earlier lower-level lookback no longer supplies the returned
 position timestamp. Temporal confirmation, candidate rejection and the host
@@ -49,10 +50,117 @@ not automatically a FILTERED weighted-level threshold. CALIBRATE qualifies ten
 homes at the candidate and adds the existing **0.5 g once** only when staging
 the successful result. Those ten homes do not test the higher saved threshold.
 
+## HYBRID position timing
+
+Explicit `DETECTOR=HYBRID` is an experimental position policy for TEST,
+ordinary CHARTS and ACCURACY. The saved FILTERED detector still confirms the
+impact and requests stopping. When the bounded evidence identifies one eligible
+RAW XYZ crossing associated with that accepted FILTERED candidate, HYBRID uses
+the RAW crossing's original sample time and identity as its reported position.
+It does not use an earlier unconfirmed RAW event to request a stop.
+The selected RAW sample may occur before, at or after the FILTERED crossing
+within the association interval. Complete RAW selection coverage can therefore
+produce exactly the same timestamps as pure FILTERED. Coverage alone establishes
+neither an earlier position timestamp nor improved measured or physical accuracy.
+
+HYBRID requires the native Beacon packet path; unsupported backends are rejected
+before movement. Both saved profiles must be present and compatible for every
+requested axis before movement. The RAW profile must use XYZ magnitude, with
+matching sensor,
+backend, axes map, geometry, speed, acceleration and impact-sign context.
+FILTERED uses its own saved threshold/configuration. RAW uses its own saved
+threshold and an independent frozen arithmetic stationary reference. That
+reference is computed from the same admitted original pre-arm window as
+FILTERED; FILTERED's robust reference and noise weights remain separate.
+Its reference metadata records `standalone_raw_lifecycle_equivalent=false`
+because this shared-window admission belongs to FILTERED. The RAW metric and
+arithmetic reference do not imply that a separate RAW-controlled home would have
+the same preparation lifecycle or physical result.
+Threshold overrides and unsupported tuning options are rejected. A missing or
+incompatible saved profile is a preflight error, not permission to borrow the
+other mode's threshold. Existing compatible calibrations need no rewrite or
+replacement.
+
+The association interval begins at the latest of the arm time, the accepted
+candidate's original lookback onset (its continuous above-gate region), the
+accepted FILTERED threshold-crossing time minus configured `onset_lookback_s`,
+and the last rejected FILTERED candidate's time. The last-rejection boundary is
+exclusive: an event at or before it cannot be reused. The interval ends at the
+actual FILTERED confirmation sample. Later response samples cannot supply an
+earlier-looking position event.
+
+RAW must have exactly one provable discrete below-to-above threshold edge inside
+that interval, and the selected crossing must be an original finite row. Its
+selected time is that original sample time; there is no threshold interpolation.
+An already-high first available sample does not prove a crossing. Multiple
+finite or marker edges are ambiguous rather than permission to choose the
+earliest one.
+
+A native marker cannot supply the selected position time or amplitude. A later
+marker can preserve an earlier finite crossing's continuation-above state only
+when the native decoded endpoint-code lower bound about the frozen RAW baseline
+is at least the RAW threshold. This establishes threshold state in the declared
+RAW code metric, not a measured acceleration, true clipping sign or mechanical
+amplitude bound. An unknown state still requires fallback. A unique edge first
+reached on a marker is ineligible for RAW position even when its above-threshold
+state can be proved.
+
+The selection records these explicit reasons when RAW selection is unavailable:
+
+| Reason | Meaning |
+| --- | --- |
+| `raw_reference_contains_marker_estimates` | The stationary RAW reference contains native marker estimates, so its arithmetic baseline cannot justify a RAW timestamp. |
+| `raw_association_history_truncated` | The bounded observer no longer retains all required association evidence. |
+| `raw_window_has_unverifiable_samples` | The association window contains a sample whose RAW threshold state cannot be verified. |
+| `multiple_raw_threshold_crossings` | More than one provable below-to-above edge is present, including finite and marker edges. |
+| `no_associated_raw_threshold_crossing` | No provable below-to-above edge is present in the association interval. |
+| `raw_crossing_has_unverifiable_amplitude` | The unique provable edge occurs on a marker, which cannot supply the RAW position timestamp or amplitude. |
+| `filtered_not_accepted` | No FILTERED event was accepted; this diagnostic cannot authorize a successful home or completed accuracy output. |
+
+For an accepted FILTERED event, a RAW selection failure uses that accepted
+FILTERED threshold crossing as the explicit fallback position. It never uses
+an unconfirmed event or a row beyond confirmation. Missing/incompatible profiles
+and native backend requirements remain preflight errors rather than fallbacks.
+
+HYBRID retains FILTERED candidate rejection, confirmation, stop-request dispatch
+and the existing lookback anchor for the 15 ms impact-response window. This
+software policy does not measure physical contact time, MCU halt or end-to-end
+stop latency. RAW, pure FILTERED and HYBRID reports retain separate identities
+and position policies; do not pool their samples or relabel them as equivalent.
+
+HYBRID's `position_policy` is
+`associated_raw_threshold_crossing_v1`. Its control detector remains FILTERED
+while `requested_detector=hybrid` identifies the requested measurement mode.
+Each home's `position_selection` records the actual RAW selection or explicit
+`filtered_threshold_crossing_fallback`, the reason, number of RAW crossings,
+association interval and selected sample/time. The completed
+`hybrid_position_summary` counts `raw_selected_count`, `fallback_count` and
+`fallback_reasons`; the accuracy PNG displays those counts. Discovery remains
+separate from the measured series. HYBRID successful PNG receipts use version 5;
+pure FILTERED retains version 4 and its accepted-crossing policy. The separate
+bounded diagnostic JSON retains schema version 1. Old valid receipts retain
+their original schema, policy and interpretation.
+`raw_crossing_count` includes provable marker edges even though those edges
+cannot be selected for position. Per-home evidence also records
+`marker_rows_with_proven_above_code_state`,
+`marker_crossings_ineligible_for_position` and the native decoded clip endpoints
+used for the code-state bound.
+
+Request HYBRID explicitly each time. It does not create a saved HYBRID model or
+change the selected ordinary detector after a completed workflow. CALIBRATE,
+CALIBRATE_NOISE and FILTER_CHARTS reject HYBRID. An early-quality HYBRID failure
+aborts with diagnostics and requires manual inspection/recentering; automatic
+return and recovery calibration are disabled for that path.
+
+Use the [three independent 30-sample commands](ACCURACY.md#compare-30-raw-pure-filtered-and-hybrid-homes)
+for the full RAW/pure FILTERED/HYBRID comparison. Each command can optionally
+select one completed actual baseline. A chart replay remains diagnostic and
+cannot substitute for an independent physical series.
+
 ## Operator sequence
 
 If both compatible saved profiles are already available, use the
-[30-home RAW then FILTERED comparison](ACCURACY.md#compare-30-raw-and-30-filtered-homes)
+[30-home RAW, pure FILTERED and HYBRID comparison](ACCURACY.md#compare-30-raw-pure-filtered-and-hybrid-homes)
 without recalibrating just for that comparison. The sequence below also covers
 creating a missing FILTERED profile and inspecting a separate same-capture chart.
 
@@ -192,8 +300,8 @@ weighted threshold is stated separately rather than drawn over the raw norm.
 
 ## Read the actual A/B report
 
-Successful RAW and FILTERED ACCURACY commands now automatically publish a
-per-axis JSON diagnostic beside the existing PNG. `discovery` is separate from
+Successful RAW, pure FILTERED and HYBRID ACCURACY commands automatically publish
+a per-axis JSON diagnostic beside the existing PNG. `discovery` is separate from
 the measured `trials`; a 30-home report therefore retains one discovery record
 and 30 measured records. The JSON does not change detector/control parameters,
 calibrated thresholds or statistics. The PNG position-policy receipt versions
@@ -244,15 +352,19 @@ the machine before drawing a hardware conclusion.
 The compact validated receipt is embedded in the completed PNG. Keep its
 original filename and metadata on the host; image editors/recompression can
 strip that metadata. Old PNGs without this development receipt cannot serve
-as a baseline. New FILTERED actual runs use receipt version 4 and explicitly
+as a baseline. New pure FILTERED actual runs use receipt version 4 and explicitly
 record `context.position_policy=accepted_threshold_crossing_v1`, separately from
 the numerical detector configuration. Historical receipt versions 1 through 3
 remain readable with their original identities and detector configurations;
 an absent FILTERED position policy means `filtered_lookback_v1`. Existing valid
 RAW baselines remain readable. A/B labels distinguish FILTERED v1 signed from
-FILTERED v2 rectified and report position-policy differences as a treatment
+FILTERED v2 rectified, distinguish HYBRID requested timing from its FILTERED
+control, and report position-policy differences as a treatment
 difference. Old and new FILTERED series may be compared, but remain separate
 measurements; their position references must not be treated as equivalent.
+HYBRID uses receipt version 5 for its separate requested mode, raw position
+configuration and measured selection/fallback counts. The FILTERED control
+identity alone does not make its position policy equivalent to pure FILTERED.
 Absent censor metadata is displayed as unknown
 legacy evidence, not zero censored responses. Lookup accepts bounded safe IDs,
 never filesystem paths; rejects symlinks, duplicate IDs,

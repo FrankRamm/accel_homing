@@ -41,6 +41,7 @@ _FilterReceipt = collections.namedtuple("_FilterReceipt", (
 _MAX_FILTER_RECEIPT_BYTES = 2 * 1024 * 1024
 _ACCURACY_REPORT_KEY = b"AccelHomingAccuracy"
 _MAX_ACCURACY_REPORT_BYTES = 32768
+_MAX_HYBRID_REPORT_BYTES = 256 * 1024
 _MAX_ACCURACY_TELEMETRY_BYTES = 8 * 1024 * 1024
 _ACCURACY_CONTEXT_KEYS = ("sensor_context", "geometry_context", "homing_speed_mm_s",
                           "configured_homing_speed_mm_s", "homing_accel_mm_s2", "direction", "detector_type", "impact_metric",
@@ -267,7 +268,8 @@ def _algorithm_label(context):
             or config.get("version") != version or (version == 1 and "signal_mode" in config)
             or (version == 2 and config.get("signal_mode") != "rectified")):
         raise ValueError("Invalid frozen filter identity for chart label")
-    return "FILTERED v%d %s" % (version, "signed" if version == 1 else "rectified")
+    label = "FILTERED v%d %s" % (version, "signed" if version == 1 else "rectified")
+    return "HYBRID (%s control)" % label if context.get("position_policy") == "associated_raw_threshold_crossing_v1" else label
 
 
 def _position_policy(context):
@@ -275,12 +277,18 @@ def _position_policy(context):
     if context.get("detector_type", "raw") != "filtered":
         return "raw_threshold_crossing"
     policy = context.get("position_policy", "filtered_lookback_v1")
-    if policy not in ("accepted_threshold_crossing_v1", "filtered_lookback_v1"):
+    if policy not in ("accepted_threshold_crossing_v1", "filtered_lookback_v1", "associated_raw_threshold_crossing_v1"):
         raise ValueError("Invalid frozen filtered position policy")
     return policy
 
 
 def _position_label(context):
+    if _position_policy(context) == "associated_raw_threshold_crossing_v1":
+        selected = context.get("position_selection")
+        if selected:
+            return ("Associated RAW threshold crossing" if selected.get("actual_source") == "raw_threshold_crossing"
+                    else "FILTERED crossing fallback (%s)" % selected.get("fallback_reason"))
+        return "Associated RAW crossing / explicit FILTERED fallback"
     return {"raw_threshold_crossing": "Raw threshold crossing",
             "filtered_lookback_v1": "Estimated filtered lookback onset",
             "accepted_threshold_crossing_v1": "Accepted filtered threshold crossing"}[_position_policy(context)]
@@ -929,7 +937,7 @@ def _accuracy_telemetry_report(report, item, prepared, png_bytes):
         raise ValueError("Accuracy telemetry requires discovery and every measured home")
     discovery = validate_accuracy_home_telemetry(prepared["discovery"], item["discovery"])
     trials = [validate_accuracy_home_telemetry(encoded, record) for encoded, record in zip(prepared["trials"], item["trials"])]
-    return {"version": 1, "kind": "completed_accuracy_telemetry", "run_id": report["run_id"], "axis": report["axis"],
+    diagnostic = {"version": 1, "kind": "completed_accuracy_telemetry", "run_id": report["run_id"], "axis": report["axis"],
             "result": "complete", "measurement": "commanded_homing_travel", "physical_position_verified": False,
             "simulated": report["simulated"],
             "units": {"time": "seconds in separately labelled print-time snapshots", "acceleration": "g",
@@ -940,6 +948,9 @@ def _accuracy_telemetry_report(report, item, prepared, png_bytes):
             "png_sha256": hashlib.sha256(png_bytes).hexdigest(), "context": report["context"],
             "threshold_g": report["threshold_g"], "requested": report["requested"], "count": len(trials),
             "statistics": report["statistics"], "discovery": discovery, "trials": trials}
+    if report["version"] == 5:
+        diagnostic["hybrid_position_summary"] = report["hybrid_position_summary"]
+    return diagnostic
 
 
 def _accuracy_context(record):
@@ -947,6 +958,9 @@ def _accuracy_context(record):
     context["detector_type"] = context["detector_type"] or "raw"
     if context["detector_type"] == "filtered":
         context["position_policy"] = _position_policy(record)
+        if context["position_policy"] == "associated_raw_threshold_crossing_v1":
+            context.update(control_detector=record.get("control_detector"), requested_detector=record.get("requested_detector"),
+                           raw_position_profile=(record.get("position_selection") or {}).get("raw_profile"))
     return context
 
 
@@ -971,7 +985,8 @@ def _accuracy_report(run_id, axis, item, simulated):
                     "cause", "first_invalid_sample", "first_invalid_sample_index", "first_invalid_time_s",
                     "original_sample_count", "valid_prefix_sample_count", "censored_sample_count",
                     "confirmation_sample", "confirmation_sample_index", "confirmation_time_s", "observed_valid_prefix_peak_g")}})
-    report = {"version": 4 if config else 1,
+    hybrid = context.get("position_policy") == "associated_raw_threshold_crossing_v1"
+    report = {"version": 5 if hybrid else 4 if config else 1,
               "kind": "completed_accuracy", "run_id": run_id, "axis": axis,
               "result": "complete", "measurement": "commanded_homing_travel",
               "physical_position_verified": False, "simulated": bool(simulated),
@@ -981,7 +996,50 @@ def _accuracy_report(run_id, axis, item, simulated):
               "statistics": item["statistics"],
               "censored_response_count": len(censored_responses),
               "censored_responses": censored_responses}
+    if hybrid:
+        selections = json.loads(_json([trial.get("position_selection") for trial in trials]))
+        report.update(position_selections=selections,
+                      discovery_position_selection=json.loads(_json(item.get("discovery", {}).get("position_selection"))),
+                      hybrid_position_summary=_hybrid_position_summary(selections))
     return _validate_accuracy_report(report)
+
+
+def _hybrid_position_summary(selections):
+    reasons = collections.Counter(item["fallback_reason"] for item in selections if item.get("fallback_reason"))
+    selected = sum(item.get("actual_source") == "raw_threshold_crossing" for item in selections)
+    return {"nominal_hybrid_count": len(selections), "raw_selected_count": selected,
+            "fallback_count": len(selections) - selected, "fallback_reasons": dict(reasons),
+            "counts_exclude_discovery": True,
+            "position_time_offsets_s": [item.get("raw_minus_filtered_time_s") if item.get("actual_source") == "raw_threshold_crossing" else 0.
+                                        for item in selections],
+            "offset_reference": "selected_original_position_time_minus_filtered_crossing; fallback_is_zero"}
+
+
+def _validate_hybrid_accuracy(report):
+    try:
+        from .accel_homing_filters import validate_position_selection
+    except ImportError:
+        from accel_homing_filters import validate_position_selection
+    context = report["context"]
+    selections = report.get("position_selections")
+    discovery = report.get("discovery_position_selection")
+    if (context.get("position_policy") != "associated_raw_threshold_crossing_v1"
+            or context.get("control_detector") != "filtered" or context.get("requested_detector") != "hybrid"
+            or not isinstance(context.get("raw_position_profile"), dict)
+            or not isinstance(selections, list) or len(selections) != report["count"] or not isinstance(discovery, dict)):
+        raise ValueError("Incomplete HYBRID accuracy context/positions")
+    for selected in [discovery] + selections:
+        if not isinstance(selected, dict):
+            raise ValueError("HYBRID accuracy requires every original position receipt")
+        record = dict(context, result="impact", arm_time_s=selected.get("arm_time_s"),
+                      trigger_crossing_time_s=selected.get("filtered_crossing_time_s"),
+                      trigger_confirmation_time_s=selected.get("filtered_confirmation_time_s"),
+                      crossing_sample=selected.get("filtered_crossing_sample"))
+        validate_position_selection(selected, record)
+        if selected.get("raw_profile") != context["raw_position_profile"]:
+            raise ValueError("HYBRID RAW profile changed within the accuracy run")
+    if report.get("hybrid_position_summary") != _hybrid_position_summary(selections):
+        raise ValueError("HYBRID accuracy counts/offsets differ from the actual position receipts")
 
 
 def _baseline_identity(run_id, axis):
@@ -996,14 +1054,15 @@ def _validate_accuracy_report(report):
     _baseline_identity(report.get("run_id"), report.get("axis"))
     count, requested = report.get("count"), report.get("requested")
     context, travels = report.get("context"), report.get("travels_mm")
-    if (type(report.get("version")) is not int or report["version"] not in (1, 2, 3, 4)
+    if (type(report.get("version")) is not int or report["version"] not in (1, 2, 3, 4, 5)
             or report.get("kind") != "completed_accuracy"
             or report.get("result") != "complete" or report.get("measurement") != "commanded_homing_travel"
             or report.get("physical_position_verified") is not False or type(report.get("simulated")) is not bool
             or type(count) is not int or not 2 <= count <= 50 or requested != count
             or not _finite(report.get("threshold_g")) or report["threshold_g"] <= 0
             or not isinstance(context, dict)
-            or set(context) != set(_ACCURACY_CONTEXT_KEYS) | ({"position_policy"} if report["version"] == 4 else set())
+            or set(context) != set(_ACCURACY_CONTEXT_KEYS) | ({"position_policy"} if report["version"] in (4, 5) else set())
+                | ({"control_detector", "requested_detector", "raw_position_profile"} if report["version"] == 5 else set())
             or context.get("detector_type") not in ("raw", "filtered")
             or not isinstance(travels, list) or len(travels) != count
             or any(not _finite(value) or value <= 0 for value in travels)):
@@ -1012,10 +1071,14 @@ def _validate_accuracy_report(report):
               if context["detector_type"] == "filtered" else None)
     if config is not None:
         _filter_identity(context["detector_version"], config, report)
-    if report["version"] == 4:
+    if report["version"] in (4, 5):
         if config is None:
             raise ValueError("Position-policy accuracy receipts require a FILTERED detector")
         _position_policy(context)
+        if (report["version"] == 5) != (context["position_policy"] == "associated_raw_threshold_crossing_v1"):
+            raise ValueError("HYBRID position policy requires completed accuracy receipt version 5")
+        if report["version"] == 5:
+            _validate_hybrid_accuracy(report)
     elif (report["version"] == 3) != bool(config and config["version"] == 2):
         raise ValueError("Rectified FILTERED v2 requires accuracy receipt version 3; historical identities stay unchanged")
     _validate_accuracy_censoring(report, context, count)
@@ -1026,7 +1089,7 @@ def _validate_accuracy_report(report):
                    else not _finite(supplied[key]) or not math.isclose(supplied[key], value, rel_tol=1e-9, abs_tol=1e-12)
                    for key, value in computed.items())):
         raise ValueError("Completed accuracy receipt statistics do not match its actual trials")
-    if len(_json(report).encode("ascii")) > _MAX_ACCURACY_REPORT_BYTES:
+    if len(_json(report).encode("ascii")) > (_MAX_HYBRID_REPORT_BYTES if report["version"] == 5 else _MAX_ACCURACY_REPORT_BYTES):
         raise ValueError("Completed accuracy receipt exceeds its bounded metadata limit")
     return report
 
@@ -1107,11 +1170,16 @@ def _accuracy_report_from_png(data):
         chunk = data[offset + 8:offset + 8 + size]
         if kind == b"tEXt" and chunk.startswith(_ACCURACY_REPORT_KEY + b"\x00"):
             encoded = chunk[len(_ACCURACY_REPORT_KEY) + 1:]
-            if found is not None or len(encoded) > _MAX_ACCURACY_REPORT_BYTES:
+            if found is not None or len(encoded) > _MAX_HYBRID_REPORT_BYTES:
                 raise ValueError("Duplicate or oversized accuracy PNG receipt")
             try:
-                found = _validate_accuracy_report(json.loads(encoded.decode("ascii")))
+                decoded = json.loads(encoded.decode("ascii"))
+                if len(encoded) > _MAX_ACCURACY_REPORT_BYTES and (not isinstance(decoded, dict) or decoded.get("version") != 5):
+                    raise ValueError("oversized legacy accuracy PNG receipt")
+                found = _validate_accuracy_report(decoded)
             except (UnicodeError, ValueError, TypeError) as exc:
+                if len(encoded) > _MAX_ACCURACY_REPORT_BYTES:
+                    raise ValueError("Invalid or oversized accuracy PNG receipt: %s" % exc) from exc
                 raise ValueError("Invalid accuracy PNG receipt: %s" % exc)
         offset += size + 12
     if found is None:
@@ -1169,6 +1237,8 @@ def _compare_accuracy_reports(current, baseline):
                  and current["context"].get(key) != baseline["context"].get(key)]
     if _position_policy(current["context"]) != _position_policy(baseline["context"]):
         treatment.append("position_policy")
+    if current["context"].get("raw_position_profile") != baseline["context"].get("raw_position_profile"):
+        treatment.append("raw_position_profile")
     if current["threshold_g"] != baseline["threshold_g"]:
         treatment.append("threshold_g")
     return {"comparable_context": not missing and not mismatched, "missing_context": missing,
@@ -1842,6 +1912,9 @@ def _plot_capture(figure, payload):
     _traces(axis, trace)
     vector = record.get("impact_metric") == "xyz_magnitude"
     filtered_control = record.get("detector_type") == "filtered"
+    hybrid = record.get("position_selection")
+    if hybrid:
+        figure.set_size_inches(12, 8)
     magnitude = [(row[0], math.sqrt(sum(value * value for value in row[1:4]))) for row in trace]
     if vector:
         axis.plot([row[0] for row in magnitude], [row[1] for row in magnitude],
@@ -1855,9 +1928,13 @@ def _plot_capture(figure, payload):
         elapsed = onset - captured["first_sample_time_s"]
         if trace[0][0] <= elapsed <= trace[-1][0]:
             axis.axvline(elapsed, color="#5e4c77", linestyle=":", linewidth=1.1,
-                         label=_position_label(record) if filtered_control else "Detected onset")
+                         label="Accepted FILTERED crossing (control)" if hybrid else
+                         _position_label(record) if filtered_control else "Detected onset")
         else:
             elapsed = None
+    if hybrid and _finite(record.get("position_time_s")):
+        axis.axvline(record["position_time_s"] - captured["first_sample_time_s"], color="#ca5729",
+                     linestyle="--", linewidth=1.1, label=_position_label(record))
     channel = {"x": 1, "y": 2}[payload["axis"]]
     peak = (max(magnitude, key=lambda row: row[1]) if vector else
             max(trace, key=lambda row: abs(row[channel])))
@@ -1874,9 +1951,27 @@ def _plot_capture(figure, payload):
                          peak_line] + _range_observation_lines(captured) +
                          _response_censoring_lines(censoring, captured["first_sample_time_s"]) +
                          (["%s threshold %s g applies to causal weighted level; sensor input shown here" % (
-                           _algorithm_label(record), _number(record.get("threshold_g"), 5))] if filtered_control else []))
+                           _algorithm_label(record), _number(record.get("threshold_g"), 5))] if filtered_control else [])
+                         + _hybrid_position_lines(hybrid))
     axis.legend(loc="best", fontsize=8)
     _finish_layout(figure, "Stationary baseline removed. Commanded travel is not physical stop accuracy.")
+
+
+def _hybrid_position_lines(selection):
+    if not selection:
+        return []
+    reference = selection["raw_reference"]
+    return ["HYBRID actual position source: %s; fallback: %s" % (
+                selection["actual_source"], selection.get("fallback_reason") or "none"),
+            "RAW threshold %s g (%s); selected original time %s s; sample %s" % (
+                _number(selection["raw_threshold_g"], 6), selection["raw_threshold_source"],
+                _number(selection.get("selected_time_s"), 9), selection.get("selected_sample")),
+            "Association original [%.9f, %.9f] s; RAW edges %d; ambiguity %s; bounded history %d rows" % (
+                *(selection["association_window_s"]), selection["raw_crossing_count"],
+                selection["ambiguous"], selection["history_limit_rows"]),
+            "RAW arithmetic reference: counts %s; N=%s; shared FILTERED-qualified reference (independent RAW metric)" % (
+                ", ".join(_number(value, 5) for value in reference["baseline_sensor_counts"]), reference.get("sample_count")),
+            "RAW reference original sample bounds: %s; original online times, no interpolation" % reference.get("sample_bounds")]
 
 
 def _plot_filter(figure, payload):
@@ -2191,6 +2286,7 @@ def _plot_accuracy(figure, payload):
     stats = payload.get("statistics") or {}
     trials, traces = payload["trials"], payload["traces"]
     report, baseline, comparison = payload.get("report"), payload.get("baseline"), payload.get("comparison")
+    hybrid_summary = report.get("hybrid_position_summary") if report else None
     censored_count = sum(bool(trial.get("response_censoring")) for trial in trials)
     summary = ["Accepted homes: %d / %d" % (len(trials), payload["requested"])]
     if stats:
@@ -2204,6 +2300,12 @@ def _plot_accuracy(figure, payload):
         if report["context"]["detector_type"] == "filtered":
             summary.append("Position attribution: %s; confirmation and response-window policies are separate." %
                            _position_label(report["context"]))
+    if hybrid_summary:
+        summary.append("HYBRID actual positions: RAW selected %d/%d; FILTERED fallback %d/%d (discovery excluded)" % (
+            hybrid_summary["raw_selected_count"], len(trials), hybrid_summary["fallback_count"], len(trials)))
+        summary.append("Fallback reasons: %s; RAW saved threshold %s g" % (
+            ", ".join("%s=%d" % item for item in hybrid_summary["fallback_reasons"].items()) or "none",
+            _number(report["context"]["raw_position_profile"]["threshold_g"], 5)))
     summary.append("Censored responses: %d / %d | Commanded-travel repeatability remains measurable" % (
         censored_count, len(trials)))
     if censored_count:
@@ -2217,7 +2319,9 @@ def _plot_accuracy(figure, payload):
     if baseline:
         summary.append("Baseline marker provenance is unavailable in its embedded receipt; absence does not mean no markers.")
         figure.set_size_inches(12, 15)
-    axes = figure.subplots((5 if vector else 4) + (2 if baseline else 0), 1)
+    if hybrid_summary:
+        figure.set_size_inches(12, 19 if baseline else 16)
+    axes = figure.subplots((5 if vector else 4) + (2 if baseline else 0) + bool(hybrid_summary), 1)
     travel = axes[0]
     _axes_style(travel, "Travel (mm)", zero=False)
     travel.set_xlabel("Accepted measured home")
@@ -2313,9 +2417,24 @@ def _plot_accuracy(figure, payload):
                 math.sqrt(sum(value * value for value in trace[-1][1:4])), endpoint_labelled)
         _threshold(axis, trials[0])
         if filtered_control:
-            _axes_summary(axis, ["Filtered control threshold %s g applies to causal weighted level; see FILTER_CHARTS for decision traces" %
+            _axes_summary(axis, ["Filtered control threshold %s g applies to causal weighted level; original control/position events are in JSON" %
                                 _number(trials[0].get("threshold_g"), 5)])
         axis.legend(fontsize=8, loc="best")
+    if hybrid_summary:
+        timing = axes[-1]
+        _axes_style(timing, "Selected - FILTERED crossing (us)", zero=False)
+        timing.set_xlabel("Accepted measured home")
+        for source, color, marker, label in (("raw_threshold_crossing", "#1769aa", "o", "Associated RAW position"),
+                ("filtered_threshold_crossing_fallback", "#b45e18", "x", "Actual FILTERED fallback")):
+            selected = [(i, item) for i, item in enumerate(report["position_selections"], 1) if item["actual_source"] == source]
+            if selected:
+                timing.plot([i for i, _item in selected],
+                            [(item["selected_time_s"] - item["filtered_crossing_time_s"]) * 1e6 for _i, item in selected],
+                            marker, color=color, markersize=5, label=label)
+        timing.axhline(0., color="#666666", linewidth=.7)
+        timing.legend(fontsize=8, loc="best")
+        _axes_summary(timing, ["Original causal position timestamps only. FILTERED confirmation/stop and response anchor are unchanged.",
+                              "Finite association within accepted candidate gate region through confirmation; fallback is zero; no physical contact label."])
     _finish_layout(figure, "Commanded travel only; not physical stop accuracy. Qualifier excluded. Population statistics. "
                    + ("Explicit successful baseline receipt; independent runs are not pooled." if baseline else
                       "A/B baseline unavailable unless BASELINE=<completed run ID> is supplied."), payload.get("reason"))

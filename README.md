@@ -1,12 +1,18 @@
 # Accelerometer Homing
 
 **Development / experimental: `codex/accuracy-filters`.** This branch adds an
-opt-in causal `FILTERED` detector and explicit RAW controls. Software tests and
+opt-in causal `FILTERED` detector, explicit RAW controls and experimental
+`HYBRID` position timing. HYBRID keeps FILTERED confirmation and uses an
+associated RAW XYZ threshold crossing as the reported position timestamp when
+that crossing is unambiguous. Software tests and
 synthetic plots do not establish a physical improvement. Existing RAW models
 remain RAW until an explicit FILTERED calibration succeeds and is saved.
 Use the [filter comparison procedure](docs/FILTERS.md) to collect a RAW baseline,
 calibrate FILTERED, inspect the same-trace diagnostic and compare independent
 completed accuracy runs across the calibration restart.
+Existing compatible RAW and FILTERED profiles can also be used directly for
+[independent 30-sample RAW, pure FILTERED and HYBRID runs](docs/ACCURACY.md#compare-30-raw-pure-filtered-and-hybrid-homes),
+without another calibration.
 
 Use a configured accelerometer as an X/Y impact endstop in Klipper or Kalico.
 This experimental plugin deliberately contacts mechanical stops. Supervise
@@ -107,6 +113,17 @@ silently reused. `ACCURACY ... BASELINE=<completed_raw_run_id>` compares two
 actual independent completed runs. The compact baseline receipt is inside the
 successful PNG and survives restart; no JSON sidecar is required. Reprepare XY
 before **every** moving command. See [the exact sequence](docs/FILTERS.md#operator-sequence).
+
+TEST, ordinary CHARTS and ACCURACY also accept explicit `DETECTOR=HYBRID`.
+This requires the native Beacon packet path and both compatible saved profiles
+before movement. It accepts no temporary threshold override, preserves the
+selected model and uses the
+saved FILTERED profile to confirm a stop. Its position timestamp uses the
+associated RAW crossing or an explicitly reported FILTERED fallback. The
+accuracy PNG and JSON distinguish HYBRID from pure FILTERED and count selected
+RAW positions and fallback reasons. HYBRID early-quality failure aborts for
+manual inspection/recentering; it does not start automatic return or calibration.
+See [HYBRID limits and diagnostics](docs/FILTERS.md#hybrid-position-timing).
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.

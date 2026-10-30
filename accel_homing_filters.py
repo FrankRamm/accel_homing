@@ -17,6 +17,8 @@ DETECTOR_VERSION = 2
 SUPPORTED_DETECTOR_VERSIONS = (1, 2)
 FILTERED_POSITION_POLICY = "accepted_threshold_crossing_v1"
 LEGACY_FILTERED_POSITION_POLICY = "filtered_lookback_v1"
+HYBRID_POSITION_POLICY = "associated_raw_threshold_crossing_v1"
+MAX_HYBRID_ROWS = 256
 MAX_REFERENCE_SAMPLES = 65536
 MAX_HISTORY_SAMPLES = 128
 MAX_MOVING_SAMPLES = 256
@@ -71,6 +73,10 @@ def prepare_accuracy_home_telemetry(capture, record, check_running=None):
             "threshold_g": record.get("threshold_g"), "impact_metric": record.get("impact_metric"),
             "direction": record.get("direction"), "selected_machine_axis": record.get("axis"),
             "detector_type": record.get("detector_type", "raw"), "detector_version": record.get("detector_version"),
+            "control_detector": record.get("control_detector", record.get("detector_type", "raw")),
+            "requested_detector": record.get("requested_detector", record.get("detector_type", "raw")),
+            "position_selection": copy.deepcopy(record.get("position_selection")),
+            "position_capture_time_s": record.get("position_time_s"),
             "decision_semantics": "causal_temporal_confirmation" if record.get("detector_type") == "filtered" else "immediate_raw_threshold_decision",
             "detector_config": record.get("detector_config"), "sensor_context": record.get("sensor_context"),
             "geometry_context": record.get("geometry_context"),
@@ -104,6 +110,8 @@ def prepare_accuracy_home_telemetry(capture, record, check_running=None):
         if filtered_position_policy(detector) != home["position_policy"]:
             raise ValueError("accuracy telemetry position policy differs from its actual detector")
         home["lookback_onset_time_s"] = record.get("lookback_onset_time_s")
+        if home["position_policy"] == HYBRID_POSITION_POLICY:
+            validate_position_selection(home["position_selection"], record)
     sources = capture.get("_accuracy_native_sources", capture.get("_native_source_batches"))
     mapping = capture.get("_accuracy_native_mapping", capture.get("_native_mapping"))
     if sources:
@@ -254,6 +262,12 @@ def validate_accuracy_home_telemetry(encoded, record):
         raise ValueError("accuracy diagnostic window/state exceeds its limits")
     if record.get("detector_type") == "filtered" and filtered_position_policy(home) != filtered_position_policy(record):
         raise ValueError("accuracy telemetry position policy differs from its home record")
+    if filtered_position_policy(record) == HYBRID_POSITION_POLICY:
+        validate_position_selection(home.get("position_selection"), record)
+        if home.get("position_selection") != record.get("position_selection"):
+            # JSON roundtrips reference-bound tuples into lists.
+            if json.dumps(home.get("position_selection"), sort_keys=True) != json.dumps(record.get("position_selection"), sort_keys=True):
+                raise ValueError("accuracy telemetry changed its frozen HYBRID selection")
     return home
 
 
@@ -349,7 +363,7 @@ def signal_mode(config):
 def filtered_position_policy(metadata):
     """Absent persisted identity denotes the historical lookback attribution."""
     policy = metadata.get("position_policy", LEGACY_FILTERED_POSITION_POLICY)
-    if policy not in (FILTERED_POSITION_POLICY, LEGACY_FILTERED_POSITION_POLICY):
+    if policy not in (FILTERED_POSITION_POLICY, LEGACY_FILTERED_POSITION_POLICY, HYBRID_POSITION_POLICY):
         raise ValueError("unsupported filtered position policy")
     return policy
 
@@ -474,7 +488,9 @@ class CausalImpactDetector:
                 if old[1] < gate:
                     break
                 lookback = old
-            onset = row if self.position_policy == FILTERED_POSITION_POLICY else lookback
+            # HYBRID keeps every FILTERED control event unchanged. Its separate
+            # RAW position receipt must never replace the control onset here.
+            onset = lookback if self.position_policy == LEGACY_FILTERED_POSITION_POLICY else row
             self.candidate = {"crossing_time_s": when, "crossing_identity": identity,
                               "onset_time_s": onset[0], "onset_identity": onset[3],
                               "lookback_onset_time_s": lookback[0], "lookback_onset_identity": lookback[3],
@@ -533,6 +549,220 @@ class CausalImpactDetector:
                 "history_samples": len(self.history), "moving_samples": len(self.moving)}
 
 
+class AssociatedRawPosition:
+    """Bounded observation only; FILTERED alone accepts and dispatches the stop.
+
+    The RAW comparison is the production unweighted squared count-space XYZ
+    metric about QuietReference.baseline(), not the FILTERED robust reference.
+    A position requires one observed below-to-above threshold edge inside the
+    accepted candidate's contiguous above-gate region. Rejected candidates,
+    marker substitutions, missing brackets, and multiple edges cannot supply it.
+    Association is evaluated after dispatch, on this frozen pre-confirmation
+    state. No row after FILTERED confirmation is ever observed.
+    """
+    def __init__(self, threshold_g, baseline_counts, count_g, config, arm_time_s, profile=None,
+                 reference_original_valid=True, clip_values=None):
+        if (type(threshold_g) not in (int, float) or not math.isfinite(threshold_g) or threshold_g <= 0
+                or type(count_g) not in (int, float) or not math.isfinite(count_g) or count_g <= 0
+                or type(arm_time_s) not in (int, float) or not math.isfinite(arm_time_s)):
+            raise ValueError("invalid hybrid RAW reference/threshold")
+        self.baseline_counts = _xyz(baseline_counts)
+        self.threshold_g, self.count_g = threshold_g, count_g
+        self.limit_squared = (threshold_g / count_g) ** 2
+        if not math.isfinite(self.limit_squared):
+            raise ValueError("invalid hybrid RAW squared threshold")
+        self.config = detector_config(config)
+        self.arm_time = arm_time_s
+        self.profile = copy.deepcopy(profile)
+        self.reference_original_valid = bool(reference_original_valid)
+        self.clip_values = None if clip_values is None else native_clip_limits(clip_values)
+        self.rows = collections.deque(maxlen=MAX_HYBRID_ROWS)
+        self.previous = None
+        self.last_rejection_time = None
+        self.rejected_candidates = 0
+        self.evicted_through_time = None
+        self.frozen = False
+        self.receipt = None
+
+    def observe(self, when, xyz_counts, identity, engine, original_valid=True, original_counts=None):
+        if self.frozen:
+            return
+        level2 = sum((value - base) ** 2 for value, base in zip(xyz_counts, self.baseline_counts))
+        time_valid = bool(math.isfinite(level2) and type(when) in (int, float)
+                          and math.isfinite(when) and identity is not None)
+        amplitude_valid = bool(original_valid and time_valid)
+        marker_proven_above = False
+        if not original_valid and original_counts is not None and self.clip_values is not None:
+            # This is a bound on possible native RAW decoded endpoint codes,
+            # never an observed amplitude or a mechanical acceleration bound.
+            minimum2 = sum(min((endpoint - base) ** 2 for endpoint in self.clip_values)
+                           if value == 32767 else (value - base) ** 2
+                           for value, base in zip(original_counts, self.baseline_counts))
+            marker_proven_above = bool(time_valid and 32767 in original_counts and minimum2 >= self.limit_squared)
+        valid = amplitude_valid or marker_proven_above
+        above = valid and (marker_proven_above or level2 >= self.limit_squared)
+        previous = self.previous
+        crossing = bool(above and previous is not None and previous[3] and not previous[1])
+        row = (when, above, identity, valid, level2, crossing,
+               None if previous is None else previous[2], None if previous is None else previous[0],
+               tuple(xyz_counts), None if previous is None else previous[4],
+               None if previous is None else previous[8], amplitude_valid, marker_proven_above)
+        if len(self.rows) == MAX_HYBRID_ROWS:
+            self.evicted_through_time = self.rows[0][0]
+        self.rows.append(row)
+        self.previous = row
+        if engine.rejected_candidates != self.rejected_candidates:
+            self.last_rejection_time = when
+            self.rejected_candidates = engine.rejected_candidates
+        if engine.decision is not None:
+            self.frozen = True
+
+    def select(self, decision):
+        if self.receipt is not None:
+            return copy.deepcopy(self.receipt)
+        crossing = None if decision is None else decision["crossing_time_s"]
+        confirmation = None if decision is None else decision["confirmation_time_s"]
+        lower = (None if decision is None else max(self.arm_time, decision["lookback_onset_time_s"],
+                    crossing - self.config["onset_lookback_s"],
+                    self.last_rejection_time if self.last_rejection_time is not None else self.arm_time))
+        rows = [] if lower is None else [row for row in self.rows if lower <= row[0] <= confirmation
+            and (self.last_rejection_time is None or row[0] > self.last_rejection_time)]
+        edges = [row for row in rows if row[5]]
+        reason = ("filtered_not_accepted" if decision is None else
+                  "raw_reference_contains_marker_estimates" if not self.reference_original_valid else
+                  "raw_association_history_truncated" if self.evicted_through_time is not None
+                    and self.evicted_through_time >= lower else
+                  "raw_window_has_unverifiable_samples" if any(not row[3] for row in rows) else
+                  "multiple_raw_threshold_crossings" if len(edges) > 1 else
+                  "no_associated_raw_threshold_crossing" if not edges else
+                  "raw_crossing_has_unverifiable_amplitude" if not edges[0][11] else None)
+        selected = edges[0] if reason is None else None
+        result = {"version": 1, "policy": HYBRID_POSITION_POLICY,
+            "control_detector": "filtered", "control_position_policy": FILTERED_POSITION_POLICY,
+            "actual_source": "raw_threshold_crossing" if selected else "filtered_threshold_crossing_fallback",
+            "fallback_reason": reason, "raw_crossing_count": len(edges), "ambiguous": len(edges) > 1,
+            "selected_time_s": selected[0] if selected else crossing,
+            "selected_sample": list(selected[2]) if selected else
+                None if decision is None else list(decision["crossing_identity"]),
+            "selected_raw_level_g": math.sqrt(selected[4]) * self.count_g if selected else None,
+            "selected_raw_sensor_counts": list(selected[8]) if selected else None,
+            "selected_filtered_level_g": None if selected or decision is None else decision["onset_level_g"],
+            "raw_previous_time_s": selected[7] if selected else None,
+            "raw_previous_sample": list(selected[6]) if selected else None,
+            "raw_previous_level_g": math.sqrt(selected[9]) * self.count_g if selected else None,
+            "raw_previous_sensor_counts": list(selected[10]) if selected else None,
+            "filtered_crossing_time_s": crossing, "filtered_confirmation_time_s": confirmation,
+            "filtered_crossing_sample": None if decision is None else list(decision["crossing_identity"]),
+            "arm_time_s": self.arm_time,
+            "raw_minus_filtered_time_s": None if selected is None else selected[0] - crossing,
+            "association_window_s": [lower, confirmation], "association_lookback_limit_s": self.config["onset_lookback_s"],
+            "association_rule": "unique_observed_raw_rise_within_accepted_filtered_contiguous_gate_region_through_confirmation",
+            "rejected_candidate_cutoff_s": self.last_rejection_time, "rejected_cutoff_exclusive": True,
+            "observed_rows_in_window": len(rows), "history_limit_rows": MAX_HYBRID_ROWS,
+            "marker_rows_with_proven_above_code_state": sum(row[12] for row in rows),
+            "marker_crossings_ineligible_for_position": sum(not row[11] for row in edges),
+            "raw_threshold_g": self.threshold_g, "raw_threshold_source": "saved_compatible_raw_xyz_profile",
+            "raw_metric": "unweighted_xyz_squared_counts_about_arithmetic_quiet_baseline",
+            "raw_reference": {"method": "quiet_reference_arithmetic_mean_counts_v1",
+                "baseline_sensor_counts": list(self.baseline_counts), "count_g": self.count_g,
+                "admission": "shared_filtered_qualified_prearm_window",
+                "original_reference_values_verified": self.reference_original_valid,
+                "standalone_raw_lifecycle_equivalent": False},
+            "raw_profile": copy.deepcopy(self.profile),
+            "marker_policy": "marker_cannot_supply_position_or_amplitude;native_endpoint_bound_may_prove_continuation_above",
+            "native_clip_values": None if self.clip_values is None else list(self.clip_values),
+            "time_source": "original_online_packet_snapshot", "physical_position_verified": False}
+        self.receipt = result
+        return copy.deepcopy(result)
+
+
+def validate_position_selection(selection, record):
+    """Check public receipt semantics; native capture validation also replays it."""
+    if filtered_position_policy(record) != HYBRID_POSITION_POLICY:
+        if selection is not None or record.get("requested_detector") == "hybrid":
+            raise ValueError("hybrid receipt requires its explicit position policy")
+        return None
+    finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+    if (not isinstance(selection, dict) or selection.get("version") != 1
+            or selection.get("policy") != HYBRID_POSITION_POLICY
+            or selection.get("control_detector") != "filtered"
+            or selection.get("control_position_policy") != FILTERED_POSITION_POLICY
+            or record.get("detector_type") != "filtered" or record.get("requested_detector") != "hybrid"
+            or record.get("control_detector") != "filtered"
+            or selection.get("actual_source") not in ("raw_threshold_crossing", "filtered_threshold_crossing_fallback")
+            or not finite(selection.get("raw_threshold_g")) or selection["raw_threshold_g"] <= 0
+            or selection.get("raw_threshold_source") != "saved_compatible_raw_xyz_profile"
+            or type(selection.get("raw_crossing_count")) is not int or selection["raw_crossing_count"] < 0
+            or selection.get("ambiguous") is not (selection["raw_crossing_count"] > 1)
+            or selection.get("history_limit_rows") != MAX_HYBRID_ROWS
+            or not isinstance(selection.get("raw_reference"), dict)):
+        raise ValueError("invalid HYBRID position receipt")
+    profile = selection.get("raw_profile")
+    reference = selection["raw_reference"]
+    if (not isinstance(profile, dict) or profile.get("threshold_g") != selection["raw_threshold_g"]
+            or profile.get("source") != "saved_compatible_raw_xyz_profile"
+            or profile.get("detector_type") != "raw" or profile.get("impact_metric") != "xyz_magnitude"
+            or not isinstance(profile.get("model_context"), dict)
+            or reference.get("method") != "quiet_reference_arithmetic_mean_counts_v1"
+            or reference.get("admission") != "shared_filtered_qualified_prearm_window"
+            or reference.get("standalone_raw_lifecycle_equivalent") is not False
+            or type(reference.get("original_reference_values_verified")) is not bool
+            or selection.get("time_source") != "original_online_packet_snapshot"):
+        raise ValueError("HYBRID position receipt contradicts its saved RAW XYZ threshold/reference source")
+    if record.get("result") != "impact":
+        if selection.get("fallback_reason") != "filtered_not_accepted" or selection.get("selected_time_s") is not None:
+            raise ValueError("unaccepted HYBRID home cannot claim a position")
+        return selection
+    crossing = record.get("trigger_crossing_time_s", record.get("crossing_time_s"))
+    confirmation = record.get("trigger_confirmation_time_s", record.get("confirmation_time_s"))
+    bounds = selection.get("association_window_s")
+    if (not isinstance(bounds, (list, tuple)) or len(bounds) != 2
+            or not all(finite(value) for value in (*bounds, crossing, confirmation, selection.get("selected_time_s"), record.get("arm_time_s")))
+            or not record.get("arm_time_s") <= bounds[0] <= crossing <= confirmation == bounds[1]
+            or selection.get("filtered_crossing_time_s") != crossing
+            or selection.get("filtered_confirmation_time_s") != confirmation
+            or not bounds[0] <= selection["selected_time_s"] <= confirmation
+            or _stamp(selection.get("selected_sample")) is None):
+        raise ValueError("HYBRID position is outside its accepted causal candidate")
+    if selection["actual_source"] == "raw_threshold_crossing":
+        if (selection.get("fallback_reason") is not None or selection["raw_crossing_count"] != 1
+                or not finite(selection.get("selected_raw_level_g"))
+                or selection["selected_raw_level_g"] + 1e-12 < selection["raw_threshold_g"]
+                or selection.get("selected_filtered_level_g") is not None
+                or _stamp(selection.get("raw_previous_sample")) is None
+                or not finite(selection.get("raw_previous_level_g"))
+                or not selection["raw_previous_level_g"] < selection["raw_threshold_g"]
+                or not finite(selection.get("raw_previous_time_s"))
+                or not selection["raw_previous_time_s"] < selection["selected_time_s"]
+                or selection.get("raw_minus_filtered_time_s") != selection["selected_time_s"] - crossing):
+            raise ValueError("HYBRID RAW position lacks its unique observed threshold bracket")
+        reference = selection["raw_reference"]
+        baseline = _xyz(reference.get("baseline_sensor_counts"))
+        scale = reference.get("count_g")
+        if not finite(scale) or scale <= 0 or reference.get("original_reference_values_verified") is not True:
+            raise ValueError("HYBRID RAW position lacks its original arithmetic reference")
+        level2 = []
+        for key in ("raw_previous_sensor_counts", "selected_raw_sensor_counts"):
+            values = _xyz(selection.get(key))
+            if any(type(value) is not int or value == 32767 for value in values):
+                raise ValueError("HYBRID cannot substitute marker amplitudes for original RAW samples")
+            level2.append(sum((value - base) ** 2 for value, base in zip(values, baseline)))
+        if not level2[0] < (selection["raw_threshold_g"] / scale) ** 2 <= level2[1]:
+            raise ValueError("HYBRID RAW receipt does not cross its exact squared count-space threshold")
+        if any(not math.isclose(selection[key], math.sqrt(value) * scale, rel_tol=1e-12, abs_tol=1e-12)
+               for key, value in zip(("raw_previous_level_g", "selected_raw_level_g"), level2)):
+            raise ValueError("HYBRID RAW amplitudes differ from original count-space norms")
+    elif (selection.get("fallback_reason") not in (
+            "raw_reference_contains_marker_estimates", "raw_association_history_truncated",
+            "raw_window_has_unverifiable_samples", "multiple_raw_threshold_crossings", "no_associated_raw_threshold_crossing",
+            "raw_crossing_has_unverifiable_amplitude")
+            or selection["selected_time_s"] != crossing
+            or _stamp(selection["selected_sample"]) != _stamp(record.get("crossing_sample"))
+            or selection.get("selected_raw_level_g") is not None or selection.get("raw_minus_filtered_time_s") is not None):
+        raise ValueError("HYBRID fallback must retain the current FILTERED crossing")
+    return selection
+
+
 def _stamp(value):
     if (not isinstance(value, (tuple, list)) or len(value) != 4
             or any(type(v) is not int for v in value) or not 0 <= value[0] <= 0xffffffff
@@ -588,6 +818,8 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
     decoded = (isinstance(decoding, dict) and detector.get("detector_type") == "filtered"
                and detector.get("backend") == "beacon_raw" and summary is None)
     if summary is None and not decoded:
+        if detector.get("position_policy") == HYBRID_POSITION_POLICY:
+            raise ValueError("HYBRID requires retained original native count-space provenance")
         if detector.get("detector_type") == "filtered" and integrity.get("clipped_axis_values", 0):
             raise ValueError("native marker rows require their frozen decoder provenance")
         if (detector.get("detector_type") == "filtered" and integrity.get("raw_samples_validated") is False):
@@ -620,6 +852,7 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
             or not finite(full_scale) or full_scale <= 0):
         raise ValueError("censored capture lacks bounded original native data/reference")
     rows, identities, online_times = [], [], []
+    hybrid_counts, hybrid_original_valid, hybrid_original_counts = [], [], []
     scope = capture.get("_native_capture_scope")
     bounds = detector.get("reference_sample_bounds")
     if (not isinstance(scope, dict) or type(scope.get("version")) is not int or scope["version"] != 1
@@ -739,6 +972,9 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
                 if len(rows) >= len(samples) or tuple(samples[len(rows)]) != expected:
                     raise ValueError("exported valid prefix differs from original native rows")
             rows.append(tuple(value * scale for value in xyz))
+            hybrid_counts.append(xyz)
+            hybrid_original_valid.append(32767 not in original_xyz)
+            hybrid_original_counts.append(original_xyz)
             identities.append(stamp)
             a, b = source.get("filter_start_time_s"), source.get("filter_end_time_s")
             online_times.append(None if not finite(a) or not finite(b) else a + (b - a) * position / (count - 1))
@@ -823,6 +1059,14 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
     if online_times[start_index] is None:
         raise ValueError("censored prefix lacks original online filter timing")
     engine.previous_time = online_times[start_index] - period
+    hybrid = None
+    if filtered_position_policy(detector) == HYBRID_POSITION_POLICY:
+        supplied = validate_position_selection(detector.get("position_selection"), detector)
+        raw_baseline = tuple(sum(row[axis] for row in hybrid_counts[ref_indices[0]:ref_indices[1] + 1])
+                             / detector["reference_sample_count"] for axis in range(3))
+        hybrid = AssociatedRawPosition(supplied["raw_threshold_g"], raw_baseline, sources[0]["count_g"],
+            config, detector["arm_time_s"], supplied.get("raw_profile"),
+            reference_original_valid=all(hybrid_original_valid[ref_indices[0]:ref_indices[1] + 1]), clip_values=clips)
     decision = None
     for i in range(start_index, index):
         if check_running is not None and i % 256 == 0:
@@ -830,6 +1074,13 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
         if online_times[i] is None:
             raise ValueError("censored prefix lost an online packet timestamp")
         decision = engine.feed(online_times[i], rows[i], i)
+        if hybrid is not None:
+            original = hybrid_counts[i] if hybrid_original_valid[i] else None
+            if original is None:
+                # Original marker positions must remain separate from decoded
+                # endpoints; finite channels retain their exact source codes.
+                original = hybrid_original_counts[i]
+            hybrid.observe(online_times[i], hybrid_counts[i], identities[i], engine, hybrid_original_valid[i], original)
         if decision is not None:
             break
     if decision is None or any(decision[event + "_identity"] != positions[event] for event in ("onset", "crossing", "confirmation")):
@@ -838,6 +1089,19 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
         trigger_time = detector.get("trigger_" + event + "_time_s")
         if trigger_time != decision[event + "_time_s"]:
             raise ValueError("original trigger timestamp differs from online prefix replay")
+    if hybrid is not None:
+        mapped = dict(decision, crossing_identity=identities[decision["crossing_identity"]])
+        expected_selection = hybrid.select(mapped)
+        expected_selection["raw_reference"].update(sample_count=detector["reference_sample_count"],
+            sample_bounds=detector["reference_sample_bounds"], interval_s=detector["trigger_reference_interval_s"])
+        canonical = lambda value: json.dumps(value, sort_keys=True, allow_nan=False, separators=(",", ":"))
+        if canonical(expected_selection) != canonical(detector["position_selection"]):
+            raise ValueError("HYBRID RAW position differs from exact original count-space candidate replay")
+        if record is not None:
+            validate_position_selection(record.get("position_selection"), record)
+            if (canonical(record["position_selection"]) != canonical(expected_selection)
+                    or record.get("returned_trigger_time_s") != expected_selection["selected_time_s"]):
+                raise ValueError("HYBRID returned position differs from its frozen accepted receipt")
     if not decoded and (summary.get("confirmation_sample_index") != positions["confirmation"] or _stamp(summary.get("confirmation_sample")) != identities[positions["confirmation"]] \
             or summary.get("confirmation_time_s") != detector["confirmation_time_s"]):
         raise ValueError("censor summary changed its retained confirmation")

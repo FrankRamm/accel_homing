@@ -26,12 +26,14 @@ try:
     from .accel_homing_filters import (detector_config, CausalImpactDetector,
                                        robust_reference, signal_mode, validate_detector_identity,
                                        validate_filtered_capture_prefix, validate_censored_peak_record,
-                                       prepare_accuracy_home_telemetry, filtered_position_policy)
+                                       prepare_accuracy_home_telemetry, filtered_position_policy,
+                                       validate_position_selection, HYBRID_POSITION_POLICY)
 except ImportError:
     from accel_homing_filters import (detector_config, CausalImpactDetector,
                                       robust_reference, signal_mode, validate_detector_identity,
                                       validate_filtered_capture_prefix, validate_censored_peak_record,
-                                      prepare_accuracy_home_telemetry, filtered_position_policy)
+                                      prepare_accuracy_home_telemetry, filtered_position_policy,
+                                      validate_position_selection, HYBRID_POSITION_POLICY)
 
 try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
@@ -842,14 +844,60 @@ class AccelHomingWorkflows:
         profile = self._profile(axis, "filtered")
         return detector_config(None if profile is None else profile["metadata"].get("detector_config"))
 
+    def hybrid_raw_profile(self, axis):
+        session = self.session
+        if not isinstance(session, dict):
+            return None
+        return session.get("hybrid_raw_profiles", {}).get(axis)
+
     def _select_detectors(self, gcmd, mode, axes):
         requested = gcmd.get("DETECTOR", None)
         requested = None if requested is None else str(requested).strip().lower()
-        if requested is not None and requested not in ("raw", "filtered"):
-            raise gcmd.error("DETECTOR must be RAW or FILTERED")
+        if requested is not None and requested not in ("raw", "filtered", "hybrid"):
+            raise gcmd.error("DETECTOR must be RAW, FILTERED or HYBRID")
+        hybrid_profiles = {}
+        if requested == "hybrid":
+            if mode not in ("test", "charts", "accuracy"):
+                raise gcmd.error("DETECTOR=HYBRID supports TEST, CHARTS and ACCURACY only; it cannot calibrate")
+            allowed = {"CENTERED", "DETECTOR"} | ({"AXIS"} if mode != "test" else set())
+            if mode == "accuracy":
+                allowed |= {"SAMPLES", "BASELINE"}
+            unsupported = set(gcmd.get_command_parameters()) - allowed
+            if unsupported:
+                raise gcmd.error("Unsupported HYBRID option(s): %s; HYBRID requires saved profiles without threshold overrides"
+                                 % ", ".join(sorted(unsupported)))
+            if getattr(self.owner, "backend", None) is not None:
+                raise gcmd.error("HYBRID currently requires native Beacon original sample provenance")
+            for axis in axes:
+                context = self._model_context(axis)
+                for kind in ("raw", "filtered"):
+                    profile = self._profile(axis, kind)
+                    if profile is None or not isinstance(profile.get("metadata"), dict):
+                        raise gcmd.error("HYBRID requires compatible saved RAW XYZ and FILTERED profiles for %s; no automatic calibration"
+                                         % axis.upper())
+                    metadata = profile["metadata"]
+                    self._validate_calibration_threshold(profile["threshold_g"], "HYBRID " + kind.upper(), gcmd.error)
+                    if metadata.get("detector_type", "raw") != kind or metadata.get("impact_metric") != "xyz_magnitude":
+                        raise gcmd.error("HYBRID requires a saved %s XYZ profile; selected-axis RAW profiles are incompatible"
+                                         % kind.upper())
+                    for key, current in context.items():
+                        if metadata.get(key) != current:
+                            raise gcmd.error("HYBRID %s profile context changed: %s; no automatic calibration"
+                                             % (kind.upper(), key))
+                    if kind == "filtered":
+                        try:
+                            validate_detector_identity(metadata.get("detector_version"), metadata.get("detector_config"), metadata)
+                        except ValueError as exc:
+                            raise gcmd.error("HYBRID FILTERED profile identity is incompatible: %s" % exc)
+                        if metadata.get("filter_sensor_context") != self.owner.noise_sensor_context():
+                            raise gcmd.error("HYBRID FILTERED sensor/range/rate context changed; no automatic calibration")
+                    else:
+                        hybrid_profiles[axis] = {"threshold_g": profile["threshold_g"],
+                            "detector_type": "raw", "impact_metric": "xyz_magnitude", "model_context": context,
+                            "source": "saved_compatible_raw_xyz_profile"}
         types, thresholds, configs, metrics = {}, {}, {}, {}
         for axis in axes:
-            kind = requested or self.detector_type(axis)
+            kind = "filtered" if requested == "hybrid" else requested or self.detector_type(axis)
             if mode == "calibration" and kind == "filtered" and axis in self.manual_axes:
                 raise gcmd.error("FILTERED calibration requires removing the explicit threshold and/or %s_threshold "
                                  "configuration override before restart; existing manual thresholds retain RAW semantics" % axis)
@@ -891,6 +939,7 @@ class AccelHomingWorkflows:
                                              else profile["metadata"].get("detector_config"))
         return {"detector_types": types, "detector_configs": configs,
                 "detector_metrics": metrics,
+                "hybrid_raw_profiles": hybrid_profiles,
                 "detector_explicit": requested is not None, "workflow_thresholds": thresholds}
 
     def _calibration_grid(self, gcmd, session=None):
@@ -1369,6 +1418,8 @@ class AccelHomingWorkflows:
         session.pop("sensor_token", None)
 
     def cmd_NOISE(self, gcmd):
+        if str(gcmd.get("DETECTOR", "")).strip().lower() == "hybrid":
+            raise gcmd.error("DETECTOR=HYBRID is not supported by ACCEL_HOMING_CALIBRATE_NOISE")
         self._clear_noise_seeds()
         self._preflight_noise()
         self._chart_preflight()
@@ -1492,6 +1543,13 @@ class AccelHomingWorkflows:
                       geometry_context=self._model_context(axis)["geometry"])
         if record["detector_type"] != session.get("detector_types", {}).get(axis, "raw"):
             raise self._error("homing result detector does not match the selected profile")
+        hybrid_profile = session.get("hybrid_raw_profiles", {}).get(axis)
+        if hybrid_profile is not None:
+            if (record.get("position_policy") != HYBRID_POSITION_POLICY
+                    or (record.get("position_selection") or {}).get("raw_profile") != hybrid_profile):
+                raise self._error("HYBRID result does not match its saved RAW position profile")
+        elif record.get("requested_detector") == "hybrid":
+            raise self._error("unexpected HYBRID position result in a pure detector workflow")
         calibration_quality, calibration_reason = (self._quality(axis, record)
                                                    if session["mode"] == "calibration" else (None, None))
         early_calibration = calibration_quality == "early"
@@ -1714,6 +1772,14 @@ class AccelHomingWorkflows:
                           confirmation_time_s=detector.get("confirmation_time_s"),
                           stop_request_time_s=detector.get("stop_request_time_s"),
                           stop_request_interval_s=detector.get("stop_request_interval_s"))
+            if record["position_policy"] == HYBRID_POSITION_POLICY:
+                validate_position_selection(record.get("position_selection"), record)
+                if (detector.get("position_sample_matches") != 1
+                        or detector.get("position_sample") != record["position_selection"]["selected_sample"]
+                        or detector.get("position_time_s") is None):
+                    raise self._error("HYBRID selected position row was not retained exactly once")
+                record["position_time_s"] = detector["position_time_s"]
+                record["position_sample_index"] = detector["position_sample_index"]
             if censor is not None:
                 record.update(response_censoring=censor, response_censored=True, decision_prefix_validated=True,
                               observed_valid_prefix_peak_g=censor["observed_valid_prefix_peak_g"],
@@ -2975,6 +3041,8 @@ class AccelHomingWorkflows:
         self._start_xy(gcmd, "charts", axes=axes)
 
     def cmd_FILTER_CHARTS(self, gcmd):
+        if str(gcmd.get("DETECTOR", "")).strip().lower() == "hybrid":
+            raise gcmd.error("FILTER_CHARTS does not support HYBRID; use CHARTS or ACCURACY DETECTOR=HYBRID")
         requested = str(gcmd.get("AXIS", "XY")).strip().lower()
         if requested not in ("x", "y", "xy"):
             raise gcmd.error("AXIS must be X, Y or XY")
@@ -3105,6 +3173,9 @@ class AccelHomingWorkflows:
     def _prepare_accuracy_recovery(self, session, axis, record, reason):
         """Return to the confirmed start using current step/halt evidence only."""
         self._check_running(session)
+        if axis in session.get("hybrid_raw_profiles", {}):
+            raise self._error("HYBRID accuracy rejected this home: %s; saved profiles retained, no automatic return or calibration"
+                              % reason)
         finite = lambda value: type(value) in (int, float) and math.isfinite(value)
         threshold = session.get("workflow_thresholds", session["saved_thresholds"])[axis]
         candidate = float(Decimal(str(threshold)) + Decimal("0.25"))
