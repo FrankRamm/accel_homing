@@ -2416,8 +2416,10 @@ class BeaconAccelHoming:
                     attempt.onset_sample = stamp
                     attempt.onset_batch = stamp
                     attempt.onset_raw = decision["onset_level_g"] / attempt.count_g
-                    onset_clock = self.sensor_clock.print_time_to_clock(decision["onset_time_s"])
-                    attempt.impact_until = (onset_clock + self.impact_window) & 0xFFFFFFFF
+                    # Position attribution changes independently of the original
+                    # lookback-anchored diagnostic response collection window.
+                    response_clock = self.sensor_clock.print_time_to_clock(decision["lookback_onset_time_s"])
+                    attempt.impact_until = (response_clock + self.impact_window) & 0xFFFFFFFF
                     self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
                     self._track_impact(attempt, params, raw, count,
                                        source_params=source_params, source_skip=source_skip)
@@ -3422,6 +3424,10 @@ class BeaconAccelHoming:
                         "homing_speed_mm_s": attempt.effective_speed,
                         "homing_accel_mm_s2": attempt.effective_accel,
                         "attempt_count": attempt_count}
+            if attempt.filter_engine is not None:
+                detector["position_policy"] = attempt.filter_engine.position_policy
+                detector["lookback_onset_time_s"] = (None if attempt.filter_decision is None else
+                                                       attempt.filter_decision["lookback_onset_time_s"])
             if attempt.filter_reference is not None:
                 ref = dict(attempt.filter_reference)
                 ref["offset_g"] = [attempt.filter_reference["offset_g"][index] * sign for index, sign in mapping]
@@ -3796,6 +3802,10 @@ class BeaconAccelHoming:
             "backend": "beacon_raw" if self.backend is None else self.backend.kind,
             "trigger_after_arm_s": round(recorded_onset - attempt.arm_time, 4) if onset else None,
         }
+        if attempt.filter_engine is not None:
+            result["position_policy"] = attempt.filter_engine.position_policy
+            result["lookback_onset_time_s"] = (None if attempt.filter_decision is None else
+                                                 attempt.filter_decision["lookback_onset_time_s"])
         if attempt.motion_deadline is not None or self.backend is not None:
             result["motion_proof"] = self._motion_proof_status(attempt)
         with self.lock:

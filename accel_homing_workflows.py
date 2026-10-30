@@ -26,12 +26,12 @@ try:
     from .accel_homing_filters import (detector_config, CausalImpactDetector,
                                        robust_reference, signal_mode, validate_detector_identity,
                                        validate_filtered_capture_prefix, validate_censored_peak_record,
-                                       prepare_accuracy_home_telemetry)
+                                       prepare_accuracy_home_telemetry, filtered_position_policy)
 except ImportError:
     from accel_homing_filters import (detector_config, CausalImpactDetector,
                                       robust_reference, signal_mode, validate_detector_identity,
                                       validate_filtered_capture_prefix, validate_censored_peak_record,
-                                      prepare_accuracy_home_telemetry)
+                                      prepare_accuracy_home_telemetry, filtered_position_policy)
 
 try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
@@ -1706,6 +1706,8 @@ class AccelHomingWorkflows:
             if config != self.filter_config(axis):
                 raise self._error("filtered capture configuration does not match selected detector")
             record.update(detector_version=config["version"], detector_config=detector["detector_config"],
+                          position_policy=filtered_position_policy(detector),
+                          lookback_onset_time_s=detector.get("lookback_onset_time_s"),
                           signal_mode=signal_mode(config),
                           filter_reference=detector.get("filter_reference"),
                           crossing_time_s=detector.get("crossing_time_s"),
@@ -2096,7 +2098,8 @@ class AccelHomingWorkflows:
                         moving_noise_policy="bounded_observation_only_frozen_on_first_candidate",
                         reference_policy="stationary_median_mad_frozen_before_arm" if kind == "filtered" else "mean")
         if kind == "filtered":
-            metadata.update(filter_sensor_context=self.owner.noise_sensor_context(),
+            metadata.update(position_policy=filtered_position_policy(qualified[0]),
+                            filter_sensor_context=self.owner.noise_sensor_context(),
                             filter_reference_summaries=[r.get("filter_reference") for r in qualified],
                             moving_noise_summaries=[r.get("filter_diagnostics", {}).get("moving_noise")
                                                     if isinstance(r.get("filter_diagnostics"), dict) else None

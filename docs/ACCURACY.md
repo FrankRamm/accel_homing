@@ -30,7 +30,13 @@ the [profile preparation sequence](FILTERS.md#operator-sequence) first. Explicit
 `DETECTOR` selects that mode's own saved threshold for the command. A successful
 ACCURACY run restores the previously selected mode instead of changing it.
 
-Manually prepare XY before the RAW command:
+After a FILTERED position-policy update, collect a **fresh** RAW control followed
+by a fresh FILTERED series. Both FILTERED versions now use the accepted
+threshold-crossing sample for the position timestamp, rather than the older
+lower-level lookback. Confirmation and stop-request timing are unchanged.
+The saved RAW and FILTERED thresholds remain usable without recalibration.
+
+Manually prepare XY before the fresh RAW command:
 
 ```gcode
 ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=RAW SAMPLES=30 CENTERED=1
@@ -58,8 +64,25 @@ population standard deviations, threshold/mode/config differences and required
 context mismatches. It does not pool trials, infer paired physical measurements
 or use shadow replay as a baseline. A baseline from another axis, an incomplete
 run or a synthetic figure is refused. Existing PNG baselines with a valid compact
-receipt remain usable without a JSON companion; their receipt schema is unchanged.
+receipt remain usable without a JSON companion and retain their historical schema.
 A PNG without a valid completed-run receipt still requires a new baseline.
+
+For a before/after FILTERED comparison instead, the second command can select
+the verified original completed FILTERED PNG as its alternative baseline:
+
+```gcode
+ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=FILTERED SAMPLES=30 CENTERED=1 BASELINE=ID_PREVIOUS_FILTERED
+```
+
+Replace `ID_PREVIOUS_FILTERED` with that original run's actual 32-character ID.
+Use one baseline ID per command. Choosing this alternative compares that new
+FILTERED series to the old FILTERED series; it does not also make a RAW A/B plot.
+The preserved files can be inspected separately without collecting a third
+physical series solely for another graph. A historical FILTERED receipt without
+an explicit position policy retains `filtered_lookback_v1`; new FILTERED receipts
+use version 4 with `accepted_threshold_crossing_v1`. The report lists this policy
+change as a treatment difference. Preserve the old files and interpret their
+position statistics separately instead of pooling or relabelling them.
 
 ## Sequence and statistics
 
@@ -159,7 +182,10 @@ Collision suffixes can differ between files. Use the announced paths and the
 JSON's `png_sha256` to associate the exact PNG, and preserve the original files
 and PNG metadata. The JSON has its own version 1 schema and
 `kind=completed_accuracy_telemetry`; it does not replace or change the compact
-baseline receipt embedded in the PNG. It cannot recreate diagnostics for older runs.
+baseline receipt embedded in the PNG. New FILTERED PNG receipts use version 4 to
+identify the position policy; the separate JSON schema remains version 1.
+Historical PNG receipts remain readable without rewriting them. JSON cannot
+recreate diagnostics for older runs.
 The header also distinguishes actual runs (`simulated=false`) from synthetic QA.
 
 The JSON separates `discovery` from the measured `trials` and retains run/axis,

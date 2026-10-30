@@ -15,6 +15,8 @@ import struct
 
 DETECTOR_VERSION = 2
 SUPPORTED_DETECTOR_VERSIONS = (1, 2)
+FILTERED_POSITION_POLICY = "accepted_threshold_crossing_v1"
+LEGACY_FILTERED_POSITION_POLICY = "filtered_lookback_v1"
 MAX_REFERENCE_SAMPLES = 65536
 MAX_HISTORY_SAMPLES = 128
 MAX_MOVING_SAMPLES = 256
@@ -97,6 +99,11 @@ def prepare_accuracy_home_telemetry(capture, record, check_running=None):
                                  if record.get("detector_type") == "filtered" else "actual_controller_has_no_filter_state"},
             "window": {"available": False, "reason": "original_native_packets_not_retained",
                        "limit_rows": ACCURACY_EVENT_ROWS, "downsampled": False, "rows": []}}
+    if home["detector_type"] == "filtered":
+        home["position_policy"] = filtered_position_policy(record)
+        if filtered_position_policy(detector) != home["position_policy"]:
+            raise ValueError("accuracy telemetry position policy differs from its actual detector")
+        home["lookback_onset_time_s"] = record.get("lookback_onset_time_s")
     sources = capture.get("_accuracy_native_sources", capture.get("_native_source_batches"))
     mapping = capture.get("_accuracy_native_mapping", capture.get("_native_mapping"))
     if sources:
@@ -145,7 +152,8 @@ def prepare_accuracy_home_telemetry(capture, record, check_running=None):
             config = validate_detector_identity(home["detector_version"], home["detector_config"])
             home["effective_onset_gate_g"] = max(config["onset_ratio"] * home["threshold_g"],
                 3. * math.sqrt(sum((s * w) ** 2 for s, w in zip(reference["noise_sigma_g"], reference["weights_xyz"]))))
-            engine = CausalImpactDetector(home["threshold_g"], reference["offset_g"], reference["noise_sigma_g"], reference["weights_xyz"], config)
+            engine = CausalImpactDetector(home["threshold_g"], reference["offset_g"], reference["noise_sigma_g"],
+                                          reference["weights_xyz"], config, home["position_policy"])
             engine.previous_time = armed_time - detector["sample_period_s"]
         offset = 0
         for source_number, source in enumerate(sources):
@@ -244,6 +252,8 @@ def validate_accuracy_home_telemetry(encoded, record):
             or not isinstance(window.get("rows"), list) or len(window["rows"]) > ACCURACY_EVENT_ROWS
             or len(state.get("history", ())) > MAX_HISTORY_SAMPLES):
         raise ValueError("accuracy diagnostic window/state exceeds its limits")
+    if record.get("detector_type") == "filtered" and filtered_position_policy(home) != filtered_position_policy(record):
+        raise ValueError("accuracy telemetry position policy differs from its home record")
     return home
 
 
@@ -336,6 +346,14 @@ def signal_mode(config):
     return "signed" if config["version"] == 1 else config["signal_mode"]
 
 
+def filtered_position_policy(metadata):
+    """Absent persisted identity denotes the historical lookback attribution."""
+    policy = metadata.get("position_policy", LEGACY_FILTERED_POSITION_POLICY)
+    if policy not in (FILTERED_POSITION_POLICY, LEGACY_FILTERED_POSITION_POLICY):
+        raise ValueError("unsupported filtered position policy")
+    return policy
+
+
 def validate_detector_identity(version, config, metadata=None):
     """Persisted models/receipts require a complete exact versioned config."""
     if type(version) is not int or version not in SUPPORTED_DETECTOR_VERSIONS or not isinstance(config, dict):
@@ -346,6 +364,8 @@ def validate_detector_identity(version, config, metadata=None):
     if metadata is not None and (not isinstance(metadata, dict)
             or ("signal_mode" in metadata and metadata["signal_mode"] != signal_mode(canonical))):
         raise ValueError("filtered detector signal-mode label contradicts its configuration")
+    if metadata is not None:
+        filtered_position_policy(metadata)
     return canonical
 
 
@@ -381,9 +401,10 @@ def robust_reference(rows_xyz_g, config=None):
 class CausalImpactDetector:
     """O(1) processing/sample and bounded history; no learning during contact."""
     def __init__(self, threshold_g, offset_g, noise_sigma_g=(0., 0., 0.),
-                 weights_xyz=(1., 1., 1.), config=None):
+                 weights_xyz=(1., 1., 1.), config=None, position_policy=FILTERED_POSITION_POLICY):
         self.config = detector_config(config)
         self.signal_mode = signal_mode(self.config)
+        self.position_policy = filtered_position_policy({"position_policy": position_policy})
         if type(threshold_g) not in (int, float) or not math.isfinite(threshold_g) or threshold_g <= 0.:
             raise ValueError("filtered threshold must be finite and positive")
         self.threshold_g = threshold_g
@@ -447,14 +468,17 @@ class CausalImpactDetector:
             self.moving_frozen = True
             gate = max(self.config["onset_ratio"] * threshold,
                        3. * math.sqrt(sum((s*w)**2 for s, w in zip(self.noise_sigma_g, self.weights_xyz))))
-            onset = row
+            lookback = row
             # Search only the final contiguous rising region, at most .75 ms.
             for old in reversed(self.history):
                 if old[1] < gate:
                     break
-                onset = old
+                lookback = old
+            onset = row if self.position_policy == FILTERED_POSITION_POLICY else lookback
             self.candidate = {"crossing_time_s": when, "crossing_identity": identity,
                               "onset_time_s": onset[0], "onset_identity": onset[3],
+                              "lookback_onset_time_s": lookback[0], "lookback_onset_identity": lookback[3],
+                              "lookback_onset_level_g": lookback[1],
                               "onset_level_g": onset[1], "energy": 0., "support_samples": 0,
                               "peak_level_g": self.level_g}
         candidate = self.candidate
@@ -793,7 +817,8 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
     threshold, period = detector.get("threshold_g"), detector.get("sample_period_s")
     if not finite(threshold) or threshold <= 0 or not finite(period) or period <= 0:
         raise ValueError("invalid censored detector threshold/period")
-    engine = CausalImpactDetector(threshold, reference["offset_g"], reference["noise_sigma_g"], reference["weights_xyz"], config)
+    engine = CausalImpactDetector(threshold, reference["offset_g"], reference["noise_sigma_g"], reference["weights_xyz"],
+                                  config, filtered_position_policy(detector))
     start_index = positions["first_armed"]
     if online_times[start_index] is None:
         raise ValueError("censored prefix lacks original online filter timing")
@@ -826,6 +851,7 @@ def validate_filtered_capture_prefix(capture, record=None, check_running=None):
     if record is not None:
         if (record.get("result") != "impact" or record.get("detector_type") != "filtered"
                 or record.get("detector_config") != config
+                or filtered_position_policy(record) != filtered_position_policy(detector)
                 or type(record.get("detector_version")) is not int or record["detector_version"] != detector["detector_version"]
                 or record.get("axis") != detector.get("axis") or record.get("arm_time_s") != detector.get("arm_time_s")
                 or record.get("arm_clock") != arm_clock
@@ -914,10 +940,11 @@ def _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, filt
                           a + (b - a) * position / (count - 1))
                 native_inputs.append((online, tuple(v * source["count_g"] for v in raw[position * 3:position * 3 + 3])))
     engine_reference = native_reference if native_inputs else reference
+    policy = filtered_position_policy(detector)
     engine = CausalImpactDetector(filtered_threshold_g, engine_reference["offset_g"],
-                                  engine_reference["noise_sigma_g"], engine_reference["weights_xyz"], config)
+                                  engine_reference["noise_sigma_g"], engine_reference["weights_xyz"], config, policy)
     diagnostic = CausalImpactDetector(filtered_threshold_g, reference["offset_g"],
-                                      reference["noise_sigma_g"], reference["weights_xyz"], config)
+                                      reference["noise_sigma_g"], reference["weights_xyz"], config, policy)
     diagnostic_reset = False
     interval = detector.get("stop_request_interval_s")
     stop = detector.get("stop_request_time_s")
@@ -967,7 +994,7 @@ def _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, filt
         if decision is None:
             return None
         result = dict(decision)
-        for event in ("onset", "crossing", "confirmation"):
+        for event in ("onset", "crossing", "confirmation", "lookback_onset"):
             index = decision.get(event + "_identity")
             if type(index) is int and 0 <= index < len(samples):
                 result["original_" + event + "_time_s"] = decision.get(event + "_time_s")
@@ -993,7 +1020,7 @@ def _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, filt
         else:
             if when >= reference_interval[0] and not diagnostic_reset:
                 diagnostic = CausalImpactDetector(filtered_threshold_g, reference["offset_g"],
-                                                  reference["noise_sigma_g"], reference["weights_xyz"], config)
+                                                  reference["noise_sigma_g"], reference["weights_xyz"], config, policy)
                 diagnostic_reset = True
             if diagnostic.previous_time is None:
                 diagnostic.previous_time = when - period
@@ -1049,7 +1076,7 @@ def _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, filt
             "filtered_threshold_g": filtered_threshold_g,
             "raw_decision": verdict(raw_decision), "filtered_decision": filtered_verdict,
             "reference_interval_s": list(reference_interval),
-            "reference": reference, "filter_config": config,
+            "reference": reference, "filter_config": config, "position_policy": policy,
             "actual_onset_time_s": detector.get("onset_time_s"),
             "actual_crossing_time_s": detector.get("crossing_time_s"),
             "actual_confirmation_time_s": detector.get("confirmation_time_s"),
@@ -1093,6 +1120,7 @@ def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filte
     for key, analysis in ((selected_key, selected), (alternate_key, other)):
         current = analysis["filter_config"]
         variants[key] = {"detector_version": current["version"], "signal_mode": signal_mode(current),
+                         "position_policy": analysis["position_policy"],
                          "config": current, "trace": analysis["filtered_trace"],
                          "level": analysis["filtered_level"], "weighted_level": analysis["weighted_level"],
                          "decision": analysis["filtered_decision"], "reference": analysis["reference"],
@@ -1106,5 +1134,6 @@ def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filte
                          "decision_cutoff_reason": analysis["decision_cutoff_reason"]}
     selected.update(version=2, variants=variants, selected_variant=selected_key, actual_variant=actual_key,
                     actual_detector_version=None if actual_config is None else actual_config["version"],
+                    actual_position_policy=None if actual_config is None else filtered_position_policy(detector),
                     actual_signal_mode=None if actual_config is None else signal_mode(actual_config))
     return selected

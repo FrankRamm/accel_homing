@@ -272,8 +272,8 @@ class RectifiedAccuracyReceiptTests(unittest.TestCase):
             charts.write_accuracy(temporary, "synthetic_rectified_actual", {"x": current}, "complete",
                 simulated=True, renderer=renderer, baseline_run_id="synthetic_signed_actual")
         payload = renderer.payloads[0]
-        self.assertEqual(payload["baseline"]["version"], 2)
-        self.assertEqual(payload["report"]["version"], 3)
+        self.assertEqual(payload["baseline"]["version"], 4)
+        self.assertEqual(payload["report"]["version"], 4)
         self.assertTrue(payload["comparison"]["independent_runs"])
         self.assertTrue(payload["comparison"]["comparable_context"])
         self.assertIn("detector_version", payload["comparison"]["treatment_differences"])

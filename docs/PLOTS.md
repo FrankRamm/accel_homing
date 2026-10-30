@@ -58,6 +58,16 @@ threshold and detected onset when available. New vector-model captures label
 XYZ magnitude; legacy captures retain their detector context. The measured
 onset/peak can differ from the threshold used to request stopping.
 
+Current actual FILTERED control uses onset markers at the threshold crossing of
+the candidate that actually confirms (`accepted_threshold_crossing_v1`). RAW
+control retains legacy lookback markers for its FILTERED diagnostic shadows,
+labelled `Estimated filtered lookback onset`. Confirmation and the host
+stop-request interval remain distinct and unchanged, and the original lookback
+still anchors the existing 15 ms impact-response window. Historical FILTERED
+baselines without a policy retain `filtered_lookback_v1`; new FILTERED PNG receipts
+use version 4 and list policy differences in actual-run comparisons. Existing
+images are not rewritten or reinterpreted as new-policy measurements.
+
 Traces retain bounded summaries and signed extrema instead of every sample.
 A diagnostic chart cannot establish that all vector peaks or physical
 transients were preserved, nor measure end-to-end stopping latency. Synthetic

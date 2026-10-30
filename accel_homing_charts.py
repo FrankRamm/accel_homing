@@ -270,6 +270,22 @@ def _algorithm_label(context):
     return "FILTERED v%d %s" % (version, "signed" if version == 1 else "rectified")
 
 
+def _position_policy(context):
+    # Kept local because the isolated chart worker has no runtime import path.
+    if context.get("detector_type", "raw") != "filtered":
+        return "raw_threshold_crossing"
+    policy = context.get("position_policy", "filtered_lookback_v1")
+    if policy not in ("accepted_threshold_crossing_v1", "filtered_lookback_v1"):
+        raise ValueError("Invalid frozen filtered position policy")
+    return policy
+
+
+def _position_label(context):
+    return {"raw_threshold_crossing": "Raw threshold crossing",
+            "filtered_lookback_v1": "Estimated filtered lookback onset",
+            "accepted_threshold_crossing_v1": "Accepted filtered threshold crossing"}[_position_policy(context)]
+
+
 def _capture_data(capture, record):
     if not isinstance(capture, dict) or capture.get("dropped", 0) \
             or capture.get("fault") or capture.get("error"):
@@ -551,9 +567,9 @@ _FILTER_VARIANTS = ("signed_v1", "rectified_v2")
 def _filter_variants(analysis):
     """Require two honest algorithm identities on one ordered source trace."""
     try:
-        from .accel_homing_filters import validate_detector_identity, signal_mode
+        from .accel_homing_filters import validate_detector_identity, signal_mode, filtered_position_policy
     except ImportError:
-        from accel_homing_filters import validate_detector_identity, signal_mode
+        from accel_homing_filters import validate_detector_identity, signal_mode, filtered_position_policy
     variants = analysis.get("variants")
     raw = analysis["raw_trace"]
     if not isinstance(variants, dict) or set(variants) != set(_FILTER_VARIANTS):
@@ -564,6 +580,8 @@ def _filter_variants(analysis):
         if not isinstance(item, dict):
             raise ValueError("Invalid filter comparison variant")
         config = validate_detector_identity(item.get("detector_version"), item.get("config"), item)
+        if filtered_position_policy(item) != filtered_position_policy(analysis):
+            raise ValueError("Filter variants must share their recorded position policy")
         trace = item.get("trace")
         if (item["detector_version"] != version or item.get("signal_mode") != mode or signal_mode(config) != mode
                 or not isinstance(trace, (list, tuple)) or len(trace) != len(raw)
@@ -606,7 +624,8 @@ def _filter_variants(analysis):
            for key, item in variants.items()):
         raise ValueError("Filter comparison mislabels the actual controlling detector")
     if actual is not None and (analysis.get("actual_detector_version") != variants[actual]["detector_version"]
-                               or analysis.get("actual_signal_mode") != variants[actual]["signal_mode"]):
+                               or analysis.get("actual_signal_mode") != variants[actual]["signal_mode"]
+                               or analysis.get("actual_position_policy", "filtered_lookback_v1") != filtered_position_policy(variants[actual])):
         raise ValueError("Actual filter version and signal mode do not match its variant")
     primary = "signed_v1" if analysis["filter_config"]["version"] == 1 else "rectified_v2"
     selected = variants[primary]
@@ -742,6 +761,8 @@ def prepare_filter_capture(run_id, axis, capture, record, raw_threshold_g,
         raise ValueError("Filter replay does not match the validated response prefix")
     if record.get("detector_type") == "filtered":
         actual_config = _filter_identity(record.get("detector_version"), record.get("detector_config"), record)
+        if _position_policy(record) != analysis["actual_position_policy"]:
+            raise ValueError("Filter comparison position policy does not match its captured record")
         actual_item = (analysis.get("variants") or {}).get(analysis.get("actual_variant"))
         if not isinstance(actual_item, dict) or actual_config != actual_item.get("config"):
             raise ValueError("Filter comparison actual version does not match its captured record")
@@ -921,16 +942,22 @@ def _accuracy_telemetry_report(report, item, prepared, png_bytes):
             "statistics": report["statistics"], "discovery": discovery, "trials": trials}
 
 
+def _accuracy_context(record):
+    context = {key: record.get(key) for key in _ACCURACY_CONTEXT_KEYS}
+    context["detector_type"] = context["detector_type"] or "raw"
+    if context["detector_type"] == "filtered":
+        context["position_policy"] = _position_policy(record)
+    return context
+
+
 def _accuracy_report(run_id, axis, item, simulated):
     _baseline_identity(run_id, axis)
     trials = item["trials"]
-    context = {key: trials[0].get(key) for key in _ACCURACY_CONTEXT_KEYS}
-    context["detector_type"] = context["detector_type"] or "raw"
+    context = _accuracy_context(trials[0])
     config = (_filter_identity(context["detector_version"], context["detector_config"], context)
               if context["detector_type"] == "filtered" else None)
     for trial in trials[1:]:
-        other = {key: trial.get(key) for key in _ACCURACY_CONTEXT_KEYS}
-        other["detector_type"] = other["detector_type"] or "raw"
+        other = _accuracy_context(trial)
         if other != context:
             raise ValueError("Accuracy detector/sensor/geometry/speed context changed during the run")
     censored_responses = []
@@ -944,7 +971,7 @@ def _accuracy_report(run_id, axis, item, simulated):
                     "cause", "first_invalid_sample", "first_invalid_sample_index", "first_invalid_time_s",
                     "original_sample_count", "valid_prefix_sample_count", "censored_sample_count",
                     "confirmation_sample", "confirmation_sample_index", "confirmation_time_s", "observed_valid_prefix_peak_g")}})
-    report = {"version": 3 if config and config["version"] == 2 else 2 if censored_responses else 1,
+    report = {"version": 4 if config else 1,
               "kind": "completed_accuracy", "run_id": run_id, "axis": axis,
               "result": "complete", "measurement": "commanded_homing_travel",
               "physical_position_verified": False, "simulated": bool(simulated),
@@ -969,13 +996,14 @@ def _validate_accuracy_report(report):
     _baseline_identity(report.get("run_id"), report.get("axis"))
     count, requested = report.get("count"), report.get("requested")
     context, travels = report.get("context"), report.get("travels_mm")
-    if (type(report.get("version")) is not int or report["version"] not in (1, 2, 3)
+    if (type(report.get("version")) is not int or report["version"] not in (1, 2, 3, 4)
             or report.get("kind") != "completed_accuracy"
             or report.get("result") != "complete" or report.get("measurement") != "commanded_homing_travel"
             or report.get("physical_position_verified") is not False or type(report.get("simulated")) is not bool
             or type(count) is not int or not 2 <= count <= 50 or requested != count
             or not _finite(report.get("threshold_g")) or report["threshold_g"] <= 0
-            or not isinstance(context, dict) or set(context) != set(_ACCURACY_CONTEXT_KEYS)
+            or not isinstance(context, dict)
+            or set(context) != set(_ACCURACY_CONTEXT_KEYS) | ({"position_policy"} if report["version"] == 4 else set())
             or context.get("detector_type") not in ("raw", "filtered")
             or not isinstance(travels, list) or len(travels) != count
             or any(not _finite(value) or value <= 0 for value in travels)):
@@ -984,7 +1012,11 @@ def _validate_accuracy_report(report):
               if context["detector_type"] == "filtered" else None)
     if config is not None:
         _filter_identity(context["detector_version"], config, report)
-    if (report["version"] == 3) != bool(config and config["version"] == 2):
+    if report["version"] == 4:
+        if config is None:
+            raise ValueError("Position-policy accuracy receipts require a FILTERED detector")
+        _position_policy(context)
+    elif (report["version"] == 3) != bool(config and config["version"] == 2):
         raise ValueError("Rectified FILTERED v2 requires accuracy receipt version 3; historical identities stay unchanged")
     _validate_accuracy_censoring(report, context, count)
     computed = _accuracy_statistics([{"travel_mm": value} for value in travels])
@@ -1135,6 +1167,8 @@ def _compare_accuracy_reports(current, baseline):
     mismatched = [key for key in required if current["context"].get(key) != baseline["context"].get(key)]
     treatment = [key for key in _ACCURACY_CONTEXT_KEYS if key not in required
                  and current["context"].get(key) != baseline["context"].get(key)]
+    if _position_policy(current["context"]) != _position_policy(baseline["context"]):
+        treatment.append("position_policy")
     if current["threshold_g"] != baseline["threshold_g"]:
         treatment.append("threshold_g")
     return {"comparable_context": not missing and not mismatched, "missing_context": missing,
@@ -1821,7 +1855,7 @@ def _plot_capture(figure, payload):
         elapsed = onset - captured["first_sample_time_s"]
         if trace[0][0] <= elapsed <= trace[-1][0]:
             axis.axvline(elapsed, color="#5e4c77", linestyle=":", linewidth=1.1,
-                         label="Estimated filtered onset" if filtered_control else "Detected onset")
+                         label=_position_label(record) if filtered_control else "Detected onset")
         else:
             elapsed = None
     channel = {"x": 1, "y": 2}[payload["axis"]]
@@ -2018,8 +2052,9 @@ def _plot_filter(figure, payload):
         observed = decision.get("decision_observed")
         times = [_number((decision[field] - arm) * 1000. if _finite(decision.get(field)) else None, 5)
                  for field in ("onset_time_s", "crossing_time_s", "confirmation_time_s")]
-        lines.append("%s [%s]: estimated onset / candidate / confirmation %s / %s / %s ms; %s." % (
-            names[key], role(key), *times, "observed before cutoff" if observed else "CENSORED: no confirmation before " + cutoff_reason))
+        lines.append("%s [%s]: %s / candidate / confirmation %s / %s / %s ms; %s." % (
+            names[key], role(key), _position_label(dict(variants[key], detector_type="filtered")), *times,
+            "observed before cutoff" if observed else "CENSORED: no confirmation before " + cutoff_reason))
     lines.append("Same numeric filtered threshold %s g; the alternative signal metric has no independent calibration in this capture." %
                  _number(analysis["filtered_threshold_g"], 5))
     if noise.get("available"):
@@ -2166,6 +2201,9 @@ def _plot_accuracy(figure, payload):
     if report:
         summary.append("Actual %s | threshold %s g | Run ID: %s" % (
             _algorithm_label(report["context"]), _number(report["threshold_g"], 5), report["run_id"]))
+        if report["context"]["detector_type"] == "filtered":
+            summary.append("Position attribution: %s; confirmation and response-window policies are separate." %
+                           _position_label(report["context"]))
     summary.append("Censored responses: %d / %d | Commanded-travel repeatability remains measurable" % (
         censored_count, len(trials)))
     if censored_count:
@@ -2223,6 +2261,8 @@ def _plot_accuracy(figure, payload):
             baseline["run_id"], _algorithm_label(baseline["context"]), _number(baseline["threshold_g"], 5), baseline["count"]),
             "CURRENT: %s | %s | threshold %s g | N=%d" % (
             report["run_id"], _algorithm_label(report["context"]), _number(report["threshold_g"], 5), report["count"]),
+            "Position attribution: baseline %s; current %s." % (
+                _position_label(baseline["context"]), _position_label(report["context"])),
             "Censored responses: baseline %s; current %d. Full response peaks are unavailable for censored homes." % (
                 str(baseline["censored_response_count"]) if "censored_response_count" in baseline else "unknown (legacy receipt)",
                 censored_count),

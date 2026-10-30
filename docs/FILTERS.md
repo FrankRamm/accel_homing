@@ -26,6 +26,18 @@ It retains transverse components; it does not project onto one axis or use
 future samples. Moving-noise characterization is observation only and never
 raises the threshold or changes weights after arming.
 
+For both saved FILTERED versions, the position timestamp now uses the existing
+threshold-crossing sample of the candidate that actually confirms. Its policy is
+`accepted_threshold_crossing_v1`; onset time, level and sample identity come from
+that crossing. The earlier lower-level lookback no longer supplies the returned
+position timestamp. Temporal confirmation, candidate rejection and the host
+stop-request dispatch are unchanged: crossing alone does not authorize a stop.
+The original lookback still anchors the existing 15 ms impact-response window.
+This changes the position reference, not the filter coefficients, response
+capture window or calibrated threshold. Compatible saved RAW and FILTERED v1/v2
+profiles remain usable without recalibration or a model rewrite. RAW detection
+is unchanged.
+
 The versioned initial configuration uses a 0.2 ms time constant, confirmation
 between 0.3 and 1.5 ms, and a minimum XYZ weight of 0.75. These are development
 defaults, not measured optimal values. Timing, sample age, sensor health,
@@ -92,6 +104,10 @@ Repeat preparation after every successful saving calibration/restart.
    explicit control using the archived RAW profile, or `DETECTOR=FILTERED` for
    explicit filtered control. Nonactive algorithms are diagnostic shadow
    replays and do not operate another physical home.
+
+   RAW-controlled captures retain legacy lookback attribution for their FILTERED
+   diagnostic shadows, labelled `Estimated filtered lookback onset`; actual
+   FILTERED control uses the accepted threshold-crossing position policy.
 
    If no compatible saved RAW XYZ profile is available, an explicit RAW
    comparison threshold is supported. For an operator-chosen 4.25 g example:
@@ -180,7 +196,8 @@ Successful RAW and FILTERED ACCURACY commands now automatically publish a
 per-axis JSON diagnostic beside the existing PNG. `discovery` is separate from
 the measured `trials`; a 30-home report therefore retains one discovery record
 and 30 measured records. The JSON does not change detector/control parameters,
-calibrated thresholds, statistics or the compact PNG baseline schema. Existing
+calibrated thresholds or statistics. The PNG position-policy receipt versions
+are described below. Existing
 valid PNG baselines remain usable without JSON. Failed workflows publish neither
 accuracy artifact. See [the files and timing limits](ACCURACY.md#per-home-json-diagnostics).
 
@@ -227,13 +244,16 @@ the machine before drawing a hardware conclusion.
 The compact validated receipt is embedded in the completed PNG. Keep its
 original filename and metadata on the host; image editors/recompression can
 strip that metadata. Old PNGs without this development receipt cannot serve
-as a baseline. Every rectified-v2 actual run uses receipt version 3, with or
-without censored responses, so older code cannot accept it as a signed run.
-Historical signed-filter receipt versions 1 and 2 remain readable with their
-exact original detector configuration; version 2 records censored responses.
-Existing valid version 1 RAW baselines remain readable. A/B labels distinguish
-FILTERED v1 signed from FILTERED v2 rectified, and list algorithm/configuration
-differences explicitly. Absent censor metadata is displayed as unknown
+as a baseline. New FILTERED actual runs use receipt version 4 and explicitly
+record `context.position_policy=accepted_threshold_crossing_v1`, separately from
+the numerical detector configuration. Historical receipt versions 1 through 3
+remain readable with their original identities and detector configurations;
+an absent FILTERED position policy means `filtered_lookback_v1`. Existing valid
+RAW baselines remain readable. A/B labels distinguish FILTERED v1 signed from
+FILTERED v2 rectified and report position-policy differences as a treatment
+difference. Old and new FILTERED series may be compared, but remain separate
+measurements; their position references must not be treated as equivalent.
+Absent censor metadata is displayed as unknown
 legacy evidence, not zero censored responses. Lookup accepts bounded safe IDs,
 never filesystem paths; rejects symlinks, duplicate IDs,
 malformed/incomplete/oversized receipts, another axis,

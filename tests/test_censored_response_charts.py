@@ -297,7 +297,7 @@ class CensoredNativeChartTests(unittest.TestCase):
                                            simulated=True, renderer=renderer)
             report = charts.read_accuracy_baseline(temporary, run_id, "x", simulated=True)
             self.assertEqual(list(Path(temporary).iterdir()), [Path(paths["x_png"])])
-        self.assertEqual(report["version"], 3)
+        self.assertEqual(report["version"], 4)
         self.assertEqual(report["censored_response_count"], 2)
         self.assertEqual([entry["trial_index"] for entry in report["censored_responses"]], [1, 3])
         self.assertTrue(all(entry["impact_peak_g"] is None for entry in report["censored_responses"]))

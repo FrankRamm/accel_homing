@@ -16,6 +16,7 @@ or a hard real-time endstop.
 | --- | --- |
 | New simple calibration | Fresh XYZ resting offset; magnitude at each sample; no quiet-range gate or integrated motion proof. |
 | New saved model with `impact_metric: xyz_magnitude` | Same vector detector during ordinary homing, TEST, CHARTS and ACCURACY after reload, unless explicit config thresholds take precedence. |
+| Development FILTERED model | Versioned causal XYZ filtering and temporal confirmation; the accepted candidate's threshold crossing supplies the position timestamp. |
 | Explicit config thresholds / older models | Legacy machine-axis detector with fresh quiet reference and its motion/pressed policies. |
 | Beta calibration | Isolated moving-noise experiment and proposal; does not replace or save the ordinary model. |
 
@@ -25,6 +26,15 @@ The first sample reaching the threshold requests stopping; a later peak does
 not delay that request. Channel permutations/sign reversals do not change the
 magnitude. Motion, vibration, binding and intended stop contact can all produce
 the same threshold crossing. The full-move deadline and data-fault checks remain.
+
+Development FILTERED v1/v2 models use the existing threshold crossing of the
+candidate that actually confirms as onset time/level/sample identity under
+`accepted_threshold_crossing_v1`. Confirmation, rejection, stop-request dispatch
+and the original lookback-anchored 15 ms response window retain their behavior.
+Saved calibrated thresholds and both profiles remain compatible without
+recalibration. Historical FILTERED measurements retain `filtered_lookback_v1`
+when their receipt has no explicit position policy; comparisons name that
+difference. See [filter policies and baseline receipts](FILTERS.md).
 
 Changing a threshold through temporary SET does not save a new detector/model.
 Persistent manual overrides take precedence over saved model values on reload.
