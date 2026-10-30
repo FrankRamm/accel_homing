@@ -216,7 +216,9 @@ def _identity(run_id, axis):
 
 
 def _envelope(samples, buckets=512):
-    """Keep every bucket's first/last and all signed XYZ extrema."""
+    """Signed display rows retain extrema and absolute-value troughs."""
+    budget = min(_MAX_CAPTURE_TRACE_POINTS, buckets * 8)
+    buckets = max(1, budget // 11)  # endpoints + signed min/max + min(abs), each XYZ axis
     stride = max(1, int(math.ceil(len(samples) / float(buckets))))
     result = []
     for offset in range(0, len(samples), stride):
@@ -224,7 +226,8 @@ def _envelope(samples, buckets=512):
         chosen = {0, len(bucket) - 1}
         for channel in (1, 2, 3):
             chosen.update((min(range(len(bucket)), key=lambda i: bucket[i][channel]),
-                           max(range(len(bucket)), key=lambda i: bucket[i][channel])))
+                           max(range(len(bucket)), key=lambda i: bucket[i][channel]),
+                           min(range(len(bucket)), key=lambda i: abs(bucket[i][channel]))))
         result.extend(tuple(bucket[index]) for index in sorted(chosen))
     return tuple(result)
 
@@ -681,7 +684,8 @@ def _filter_display_rows(analysis):
         return rows
     # Joint extrema selection keeps raw and filtered curves on the same times.
     # Every metric/statistic/decision was already computed at full resolution.
-    stride = max(1, int(math.ceil(len(rows) / 128.)))
+    buckets = (_MAX_CAPTURE_TRACE_POINTS - 9) // 39  # reserve all three detectors' event rows
+    stride = max(1, int(math.ceil(len(rows) / float(buckets))))
     selected = set()
     for offset in range(0, len(rows), stride):
         indices = range(offset, min(offset + stride, len(rows)))
@@ -689,6 +693,8 @@ def _filter_display_rows(analysis):
         for channel in range(1, 15):
             selected.add(min(indices, key=lambda index: rows[index][channel]))
             selected.add(max(indices, key=lambda index: rows[index][channel]))
+            if channel in (1, 2, 3, 4, 5, 6, 10, 11, 12):
+                selected.add(min(indices, key=lambda index: abs(rows[index][channel])))
     for decision in [analysis.get("raw_decision")] + [item.get("decision") for item in variants.values()]:
         for key in ("onset_time_s", "crossing_time_s", "confirmation_time_s"):
             when = (decision or {}).get(key)
@@ -1642,11 +1648,22 @@ def _number(value, significant=3):
     return ("%.*g" % (significant, value)) if _finite(value) else "n/a"
 
 
+def _display_difference(value, unit, positive="increase", negative="decrease"):
+    if not _finite(value):
+        return "n/a"
+    direction = positive if value > 0 else negative if value < 0 else "unchanged"
+    return "%s %s (%s)" % (_number(abs(value), 5), unit, direction)
+
+
 def _axes_summary(axis, lines):
     axis.set_title("\n".join(lines), loc="left", fontsize=8, pad=6)
 
 
 def _finish_layout(figure, footer, reason=None):
+    for axis in figure.axes:
+        if getattr(axis, "_absolute_acceleration_display", False):
+            axis.set_ylim(bottom=0.)  # after normal data autoscaling; leave time/travel/PSD untouched
+    footer = "Absolute component display only; source processing, statistics and time signs are unchanged. " + footer
     lines = textwrap.wrap(footer, 100)
     if reason:
         reason_lines = textwrap.wrap(" ".join(str(reason).split()), 100)
@@ -1658,7 +1675,7 @@ def _finish_layout(figure, footer, reason=None):
     figure.tight_layout(pad=1.1, h_pad=1.4, rect=(0, bottom, 1, 1))
 
 
-def _axes_style(axis, ylabel="Acceleration (g)", zero=True):
+def _axes_style(axis, ylabel="|Acceleration| (g)", zero=True):
     axis.minorticks_on()
     axis.grid(which="major", color="grey", linewidth=.6, alpha=.4)
     axis.grid(which="minor", color="lightgrey", linewidth=.4, alpha=.4)
@@ -1666,14 +1683,15 @@ def _axes_style(axis, ylabel="Acceleration (g)", zero=True):
     axis.set_ylabel(ylabel)
     axis.set_xlabel("Time (s)")
     if zero:
+        axis._absolute_acceleration_display = True
         axis.axhline(0, color="grey", linewidth=.5)
     axis.margins(x=.02, y=.12)
 
 
 def _traces(axis, trace, alpha=1.0, labels=True):
     for index, (letter, color) in enumerate(zip("XYZ", ("red", "green", "blue")), 1):
-        axis.plot([row[0] for row in trace], [row[index] for row in trace], color=color,
-                  linewidth=.75, alpha=alpha, label=letter if labels else None)
+        axis.plot([row[0] for row in trace], [abs(row[index]) for row in trace], color=color,
+                  linewidth=.75, alpha=alpha, label="|%s|" % letter if labels else None)
 
 
 def _threshold(axis, record, label=True):
@@ -1686,11 +1704,10 @@ def _threshold(axis, record, label=True):
         return
     direction = record.get("direction", 0)
     vector = record.get("impact_metric") == "xyz_magnitude"
-    limits = ([threshold] if vector else
-              [direction * threshold] if direction in (-1, 1) else [-threshold, threshold])
+    limits = [threshold]
+    polarity = "positive only" if direction == 1 else "negative only" if direction == -1 else "either polarity"
     name = ("XYZ magnitude trigger %s g" % _number(threshold, 4) if vector else
-            "Trigger %+.4g g" % limits[0] if len(limits) == 1 else
-            "Trigger ±%s g" % _number(threshold, 4))
+            "Trigger magnitude %s g (%s)" % (_number(threshold, 4), polarity))
     for index, value in enumerate(limits):
         axis.axhline(value, color="#744b98", linestyle="--", linewidth=1.1,
                      label=name if label and index == 0 else None)
@@ -1764,14 +1781,14 @@ def _plot_capture(figure, payload):
             max(trace, key=lambda row: abs(row[channel])))
     peak_value = peak[1] if vector else peak[channel]
     peak_name = "XYZ magnitude" if vector else "|%s|" % payload["axis"].upper()
-    axis.plot([peak[0]], [peak_value], "o", color="#192d45", markersize=4)
+    axis.plot([peak[0]], [abs(peak_value)], "o", color="#192d45", markersize=4)
     peak_line = ("Observed valid-prefix peak: %s g  |  Displayed-prefix %s maximum: %s g" % (
                     _number(record.get("observed_valid_prefix_peak_g")), peak_name, _number(abs(peak_value)))
                  if censoring else "Recorded peak: %s g  |  Captured %s peak: %s g" % (
                     _number(record.get("impact_peak_g")), peak_name, _number(abs(peak_value))))
-    _axes_summary(axis, ["Samples: %d  |  Travel: %s mm  |  Onset: %s s / %s g" % (
+    _axes_summary(axis, ["Samples: %d  |  Travel: %s mm  |  Onset time / |level|: %s s / %s g" % (
                             captured["sample_count"], _number(_measured_travel(record), 6),
-                            _number(elapsed, 4), _number(record.get("onset_g"))),
+                            _number(elapsed, 4), _number(abs(record["onset_g"]) if _finite(record.get("onset_g")) else None)),
                          peak_line] + _range_observation_lines(captured) +
                          _response_censoring_lines(censoring, captured["first_sample_time_s"]) +
                          (["%s threshold %s g applies to causal weighted level; sensor input shown here" % (
@@ -1841,12 +1858,13 @@ def _plot_filter(figure, payload):
                              (analysis["sample_count"], "Validated-prefix" if censoring else "Full-trace", payload["run_id"])])
     overview.legend(loc="upper left", ncol=3, fontsize=7)
     for channel, (axis, letter, color) in enumerate(zip(xyz_axes, "XYZ", ("#c34a45", "#278356", "#3678b7")), 1):
-        _axes_style(axis, "%s acceleration (g)" % letter)
-        axis.plot(milliseconds, [row[channel] for row in trace], color=color, linewidth=.65,
-                  alpha=.6, label="Raw %s" % letter)
+        _axes_style(axis, "|%s acceleration| (g)" % letter)
+        axis.plot(milliseconds, [abs(row[channel]) for row in trace], color=color, linewidth=.65,
+                  alpha=.6, label="|Raw %s|" % letter)
         for key, style in (("signed_v1", "--"), ("rectified_v2", "-.")):
-            axis.plot(milliseconds, [row[columns[key]["xyz"][channel - 1]] for row in trace],
-                      color=colors[key], linewidth=1.05, linestyle=style, label="%s %s" % (names[key], letter))
+            axis.plot(milliseconds, [abs(row[columns[key]["xyz"][channel - 1]]) for row in trace],
+                      color=colors[key], linewidth=1.05, linestyle=style,
+                      label="|%s output %s|" % (names[key], letter))
         stop_region(axis, origin, 1000.)
         axis.set_xlim(*event_limits)
         axis.set_xlabel("Time from raw crossing / actual event reference (ms)")
@@ -1883,8 +1901,9 @@ def _plot_filter(figure, payload):
     for key in _FILTER_VARIANTS:
         decision = variants[key]["decision"]
         if raw_decision.get("decision_observed") and decision.get("decision_observed"):
-            timings.append("%s confirmation minus raw crossing: %+.4g ms" % (
-                names[key], (decision["confirmation_time_s"] - raw_decision["crossing_time_s"]) * 1000.))
+            timings.append("%s confirmation relative to raw crossing: %s" % (
+                names[key], _display_difference((decision["confirmation_time_s"] - raw_decision["crossing_time_s"]) * 1000.,
+                                                "ms", "later", "earlier")))
         else:
             timings.append("%s: %s; paired delay unavailable" % (
                 names[key], "CENSORED / no confirmation before cutoff" if not decision.get("decision_observed")
@@ -1902,6 +1921,7 @@ def _plot_filter(figure, payload):
         noise_axis.set_xticks(list(keys))
         noise_axis.set_xticklabels(labels, fontsize=8)
         noise_axis.set_ylabel("Acceleration (g)")
+        noise_axis._absolute_acceleration_display = True
         noise_axis.grid(axis="y", alpha=.3)
         noise_axis.legend(fontsize=7)
         first, last = noise["interval_s"]
@@ -1936,7 +1956,7 @@ def _plot_filter(figure, payload):
         _axes_summary(spectrum_axis, ["Contiguous reference only; Hann periodogram",
                                       "%d samples | %.3g Hz bin width | %.4g s" %
                                       (count, sample_rate / count, spectrum["duration_s"]),
-                                      "abs() is nonlinear: spectral peaks may move or double"])
+                                      "v2 input rectification is nonlinear; display abs does not enter the PSD"])
     else:
         spectrum_axis.axis("off")
         spectrum_axis.text(.02, .85, "Spectrum unavailable\n" + spectrum["reason"], va="top", fontsize=9,
@@ -2046,7 +2066,7 @@ def _plot_beta(figure, payload):
                              _number(item.get("workflow_attempt")), str(item.get("beta_reason") or item.get("result"))[:160])
                           for item in payload.get("incomplete_homes", [])[:2]])
     for channel, (axis, letter, color) in enumerate(zip(axes[4:], "XYZ", ("red", "green", "blue")), 1):
-        _axes_style(axis, "%s acceleration (g)" % letter)
+        _axes_style(axis, "|%s acceleration| (g)" % letter)
         axis.set_xlabel("Time from each beta home's exact first crossing (s)")
         for number, item in enumerate(homes):
             record, captured = item["record"], item["capture"]
@@ -2054,7 +2074,7 @@ def _plot_beta(figure, payload):
             trace = captured.get("event_trace") or captured["trace"]
             last = number == len(homes) - 1
             axis.plot([row[0] + captured["first_sample_time_s"] - onset for row in trace],
-                      [row[channel] for row in trace], color=color,
+                      [abs(row[channel]) for row in trace], color=color,
                       linewidth=1.0 if last else .6, alpha=.95 if last else .23,
                       label="Last beta home" if last else None)
         axis.axvline(0, color="#2462a6", linestyle=":", linewidth=.8, label="Exact first crossing")
@@ -2144,10 +2164,12 @@ def _plot_accuracy(figure, payload):
         bars.set_ylabel("Commanded-travel variation (mm)")
         bars.grid(axis="y", alpha=.3)
         bars.margins(y=.3)
+        bars._absolute_acceleration_display = True  # nonnegative variation, including all-zero bars
         bars.legend(fontsize=8)
         _axes_summary(bars, ["Actual independent completed runs; neither curve is shadow replay",
-                             "Current minus baseline: range %+.5g mm; std dev %+.5g mm" %
-                             (comparison["spread_change_mm"], comparison["stddev_change_mm"])])
+                             "Range change: %s; std dev change: %s" %
+                             (_display_difference(comparison["spread_change_mm"], "mm"),
+                              _display_difference(comparison["stddev_change_mm"], "mm"))])
         context_axis.axis("off")
         context_lines = ["BASELINE: %s | %s | threshold %s g | N=%d" % (
             baseline["run_id"], _algorithm_label(baseline["context"]), _number(baseline["threshold_g"], 5), baseline["count"]),
@@ -2169,16 +2191,16 @@ def _plot_accuracy(figure, payload):
     trace_start = 3 if baseline else 1
     def truncated_endpoint(axis, trace, index, value, labelled):
         if index < len(trials) and trials[index].get("response_censoring"):
-            axis.plot([trace[-1][0]], [value], "x", color="#ad5d00", markersize=5,
+            axis.plot([trace[-1][0]], [abs(value)], "x", color="#ad5d00", markersize=5,
                       label="Truncated capture: last valid XYZ sample" if not labelled else None)
             return True
         return labelled
     for channel, (axis, color, letter) in enumerate(zip(axes[trace_start:],
                     ("red", "green", "blue"), "XYZ"), 1):
-        _axes_style(axis, "%s acceleration (g)" % letter)
+        _axes_style(axis, "|%s acceleration| (g)" % letter)
         endpoint_labelled = False
         for index, trace in enumerate(traces):
-            axis.plot([row[0] for row in trace], [row[channel] for row in trace], color=color,
+            axis.plot([row[0] for row in trace], [abs(row[channel]) for row in trace], color=color,
                       alpha=.35 if len(traces) > 1 else 1., linewidth=.7,
                       label="%s (%d homes)" % (letter, len(traces)) if index == 0 else None)
             endpoint_labelled = truncated_endpoint(axis, trace, index, trace[-1][channel], endpoint_labelled)
@@ -2227,7 +2249,7 @@ def _plot_noise(figure, payload):
     peak = max(.001, max((abs(value) for trace in traces for row in trace for value in row[1:]), default=0.)) * 1.1
     for index, axis in enumerate(axes):
         _axes_style(axis)
-        axis.set_ylim(-peak, peak)
+        axis.set_ylim(0., peak)
         if index >= len(traces):
             axis.set_title("Window %d - no valid data" % (index + 1), fontsize=10)
             continue
@@ -2244,7 +2266,8 @@ def _plot_noise(figure, payload):
         axis.legend(loc="best", ncol=3, fontsize=8)
     for axis in axes[:-1]:
         axis.set_xlabel("")
-    _finish_layout(figure, "Window means removed. " + note, payload.get("reason"))
+    _finish_layout(figure, "Window means removed before absolute display. RMS/peaks use the original centered samples. " + note,
+                   payload.get("reason"))
 
 
 if __name__ == "__main__":

@@ -198,11 +198,16 @@ class PortablePNGTests(unittest.TestCase):
         self.assertEqual(value["created_local"], local.isoformat())
         self.assertEqual(value["created_utc"], "2026-10-28T02:59:42.987654+00:00")
 
-    def test_compact_threshold_legend_preserves_small_signed_limits_and_exact_positions(self):
+    def test_compact_threshold_legend_preserves_small_magnitude_and_eligible_polarity(self):
         axis = mock.Mock()
         charts._threshold(axis, {"threshold_g": .001, "direction": 0})
-        self.assertEqual([call.args[0] for call in axis.axhline.call_args_list], [-.001, .001])
-        self.assertEqual([call.kwargs["label"] for call in axis.axhline.call_args_list], ["Trigger ±0.001 g", None])
+        self.assertEqual([call.args[0] for call in axis.axhline.call_args_list], [.001])
+        self.assertEqual([call.kwargs["label"] for call in axis.axhline.call_args_list], ["Trigger magnitude 0.001 g (either polarity)"])
+        for direction, polarity in ((1, "positive only"), (-1, "negative only")):
+            axis.reset_mock()
+            charts._threshold(axis, {"threshold_g": .001, "direction": direction})
+            self.assertEqual(axis.axhline.call_args.args[0], .001)
+            self.assertIn(polarity, axis.axhline.call_args.kwargs["label"])
 
     def test_faults_nonfinite_baselines_and_unserializable_records_leave_no_chart(self):
         original = {"samples": [(1., 0., 0., 1.), (1.1, .2, .1, 1.)], "baseline_g": (0., 0., 1.)}
@@ -528,6 +533,9 @@ class AccuracyPNGTests(unittest.TestCase):
         figure = mock.Mock()
         figure.get_figheight.return_value = 7.
         axes = [mock.Mock() for _ in range(4)]
+        figure.axes = axes
+        for axis in axes:
+            axis._absolute_acceleration_display = False
         figure.subplots.return_value = axes
         trials = [{"travel_mm": 175., "travel_mm_exact": 175.000244140625},
                   {"travel_mm": 175.}]
@@ -537,6 +545,8 @@ class AccuracyPNGTests(unittest.TestCase):
         for exact, label in ((175.004, "175.004"), (0., "0"), (None, "n/a")):
             with self.subTest(exact=exact):
                 axis = mock.Mock()
+                figure.axes = [axis]
+                axis._absolute_acceleration_display = False
                 figure.subplots.return_value = axis
                 charts._plot_capture(figure, {"axis": "x", "timestamp": "SIMULATED", "simulated": True,
                                               "record": {"travel_mm": 175., "travel_mm_exact": exact},

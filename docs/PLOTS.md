@@ -5,6 +5,24 @@ JSON, SVG or HTML chart sidecars and no full-resolution raw-sample export.
 Only successful workflows publish plots. Rejected, failed, aborted or cancelled
 measurements retain console diagnostics without saving a partial PNG anywhere.
 
+All acceleration-component curves are displayed as absolute values after their
+existing processing: `|X|`, `|Y|`, `|Z|`, and the magnitude of signed v1 output.
+This includes home/capture, Accuracy overlays, filter comparisons, Beta and
+stationary-noise plots. Component peaks, truncated endpoints and directional
+threshold lines use positive display magnitudes. A directional RAW threshold
+still names its eligible polarity; the folded curve does not make the opposite
+polarity eligible. Amplitude and variation panels start at zero. Travel panels
+retain their useful positive zoom, and relative time keeps its sign.
+
+This is a display change. Original signed captures, detector inputs/decisions,
+calibration, saved models, Accuracy receipts and baseline statistics remain
+unchanged. RMS/P99 and other metrics use the original processed samples; PSD
+uses original raw/signed-v1 or existing rectified-v2 outputs, never the absolute
+display curves. V2 input rectification and display folding are separate steps.
+Display reduction retains signed extrema and per-component minimum absolute
+values within the existing point limit, so near-zero troughs remain visible.
+Comparison text reports a positive change magnitude with its direction.
+
 ## Where files are saved
 
 By default, `accel_homing_charts/` is beside the main `printer.cfg`. Set
@@ -57,7 +75,8 @@ or display-reduced trace. The signed-v1 and rectified-v2 variants share the
 same source/reference/weights and numerical comparison threshold; only the
 declared actual version controlled that home. Nonactive variants are diagnostic
 and do not have an independently calibrated threshold in this capture. Original
-signed XYZ remain visible, while rectified per-axis envelopes are nonnegative.
+signed XYZ remain retained; their plotted components use absolute display values,
+as do the rectified per-axis envelopes.
 Known native Beacon marker rows remain at their original times but use bounded
 configured-endpoint estimates selected by prior sensor sign. Their trace,
 marker count and unknown true sign/peak are labelled explicitly; `32767` is

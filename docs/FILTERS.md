@@ -171,6 +171,13 @@ weighted threshold is stated separately rather than drawn over the raw norm.
 
 ## Read the actual A/B report
 
+Acceleration components in every plot use absolute display values, including
+the signed v1 filter output. The v1 detector still filters signed centered XYZ;
+only its plotted Y coordinates are folded. Stored display rows retain their
+signs, and original timing, confirmation, RMS/P99 and genuine PSD calculations
+are unchanged. Relative time remains signed. See [PLOTS.md](PLOTS.md) for display
+and directional-threshold details.
+
 `BASELINE` selects one explicit successful run ID from the same chart root and
 axis. It never chooses the newest run, scans for a convenient control, pools
 trials or combines a replay with real homes. Both series are independent;
