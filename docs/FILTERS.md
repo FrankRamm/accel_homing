@@ -163,6 +163,33 @@ Every generated figure is prominently **SYNTHETIC / SIMULATED / NOT PRINTER
 MEASUREMENT**. The generated pulse, noise and independent travel series are
 visual/software fixtures, not printer measurements or results.
 
+## Sample-fault diagnostics
+
+`invalid_data` is a general stop result, not proof of a repeated timestamp.
+For the instrumented native Beacon homing rejection paths, the same command
+error and `ACCEL_HOMING_STATUS` now include the first bounded `sample_fault`
+record. Generic backend and Beta acquisition faults may still provide only
+their broader fault result. `native_clip_sentinel` means Beacon reported `0x7FFF`;
+`axis_full_scale` means an individual raw sensor axis reached its range limit.
+An XYZ vector magnitude of 14–16 g, or even above the individual-axis range,
+does not itself prove clipping. `nonmonotonic_packet_clock`,
+`filter_nonmonotonic_time` and `filter_sample_gap` identify different timestamp
+rejections. The record includes the phase, packet clocks/count, and relevant
+sample position, axis, value or time difference; it does not retain raw history.
+
+Stop dispatch occurs before optional diagnostic conversion or logging. The
+rejection rules, watchdogs and clipping protections are unchanged. A failed
+workflow still publishes no PNG or raw scratch capture. Copy the exact command
+error or status record for diagnosis; an earlier run without this detail cannot
+establish which rejection occurred.
+
+Stationary acquisition retains its strict cadence guard and bounded complete
+window retries. Its `sample_gap` diagnostic now distinguishes `interval_change`
+from `actual_gap`, with both periods and their numerical limits. A changed
+packet span alone does not establish benign timing variation or internal sample
+loss. These stationary observations do not establish the cause of a later
+homing fault.
+
 ## Returning to stable code
 
 **A source-only switch to main is incompatible after a FILTERED model was

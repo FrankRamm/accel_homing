@@ -28,6 +28,13 @@ DEFAULT_CONFIG = {
 }
 
 
+class FilteredSampleError(ValueError):
+    """Precise rejection reason without changing ValueError compatibility."""
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
 def detector_config(config=None):
     """Validate the entire versioned configuration; unknown fields fail closed."""
     result = dict(DEFAULT_CONFIG)
@@ -106,12 +113,16 @@ class CausalImpactDetector:
 
     def feed(self, when, xyz_g, identity=None):
         if type(when) not in (int, float) or not math.isfinite(when):
-            raise ValueError("invalid filtered sample timestamp")
-        xyz = _xyz(xyz_g)
+            raise FilteredSampleError("invalid_time", "invalid filtered sample timestamp")
+        try:
+            xyz = _xyz(xyz_g)
+        except ValueError:
+            raise FilteredSampleError("invalid_xyz", "invalid finite XYZ values")
         previous = self.previous_time
         dt = None if previous is None else when - previous
         if dt is not None and (dt <= 0 or dt > .00625):
-            raise ValueError("noncontiguous filtered sample timestamps")
+            raise FilteredSampleError("nonmonotonic_time" if dt <= 0 else "sample_gap",
+                                      "noncontiguous filtered sample timestamps")
         self.previous_time = when
         delta = tuple(v - b for v, b in zip(xyz, self.offset_g))
         tau = self.config["lowpass_tau_s"]

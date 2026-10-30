@@ -340,6 +340,7 @@ class Attempt:
         self.reference_sample_bounds = None
         self.reference_interval = None
         self.reference_sample_count = None
+        self.sample_fault = None
         self.confirmation_time = self.crossing_time = None
         self.stop_request_lower = self.stop_request_upper = None
         self.vector_unchanged_since = None
@@ -1446,6 +1447,9 @@ class BeaconAccelHoming:
         if attempt is not None and attempt.reason in FAILURES:
             detail = ("; " + describe_motion_proof(self._motion_proof_status(attempt))
                       if attempt.reason == "no_motion" else "")
+            sample_fault = getattr(attempt, "sample_fault", None)
+            if sample_fault is not None:
+                detail += "; sample fault " + json.dumps(sample_fault, sort_keys=True, allow_nan=False)
             raise self.printer.command_error(
                 "beacon_accel_homing: %s on %s, homing stopped%s"
                 % (FAILURES[attempt.reason], endstop.axis.upper(), detail))
@@ -1738,6 +1742,73 @@ class BeaconAccelHoming:
             attempt.request_time = None
             attempt.stop_request_lower = attempt.stop_request_upper = None
 
+    def _reject_homing_sample(self, attempt, phase, cause, params=None, raw=None,
+                              source_skip=0, error=None, **details):
+        """Stop first; retain only bounded first-fault provenance afterwards."""
+        self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+        # No formatting, scans, clock conversion or logging may precede the
+        # emergency dispatch. Telemetry failures must never affect that stop.
+        try:
+            if attempt.reason != "invalid_data" or attempt.sample_fault is not None:
+                return
+            fault = {"version": 1, "phase": phase, "cause": cause,
+                     "detector_type": attempt.detector_type,
+                     "backend": "beacon_raw" if self.backend is None else self.backend.kind}
+            if error is not None:
+                fault["exception_type"] = type(error).__name__
+                try:
+                    fault["exception_message"] = str(error)
+                except Exception:
+                    fault["exception_message"] = "unavailable"
+                if phase == "homing_filter" and isinstance(getattr(error, "reason", None), str):
+                    fault["cause"] = "filter_" + error.reason
+            if isinstance(params, dict):
+                fault.update(batch_start_clock=params.get("start_clock"),
+                             batch_delta_clock=params.get("delta_clock"))
+                try:
+                    fault["batch_sample_count"] = sample_count(params.get("data"))
+                except Exception:
+                    fault["packet_metadata_unavailable"] = True
+            if raw is not None:
+                for index, value in enumerate(raw):
+                    finite = math.isfinite(value)
+                    sentinel = self.backend is None and value == CLIPPED
+                    saturated = (finite and self.full_scale_g is not None
+                                 and abs(value * attempt.count_g) >= self.full_scale_g)
+                    rejected = (not finite if cause == "nonfinite_axis_value" else sentinel or saturated)
+                    if rejected:
+                        fault.update(cause="nonfinite_axis_value" if not finite else
+                                     "native_clip_sentinel" if sentinel else "axis_full_scale",
+                                     sample_position=index // 3 + source_skip,
+                                     sensor_axis="xyz"[index % 3], raw_value=value,
+                                     axis_value_g=None if not finite or sentinel else value * attempt.count_g,
+                                     full_scale_g=self.full_scale_g)
+                        break
+            fault.update(details)
+            summary = {"native_clip_sentinel": "sensor reported a clipped axis sample (0x7FFF)",
+                       "axis_full_scale": "an individual sensor axis reached full-scale",
+                       "nonfinite_axis_value": "sensor axis value is not finite",
+                       "filter_nonmonotonic_time": "filtered sample timestamp repeated or went backward",
+                       "filter_sample_gap": "filtered sample timestamp gap exceeds its bound",
+                       "nonmonotonic_packet_clock": "packet clock repeated or went backward"}
+            if fault["cause"] in summary:
+                fault["summary"] = summary[fault["cause"]]
+            # Whitelisted primitives only, with finite JSON and short strings.
+            # No packet/raw history is retained by this diagnostic.
+            fault = {key: (value if math.isfinite(value) else None)
+                     if isinstance(value, float) else value[:160]
+                     if isinstance(value, str) else value
+                     for key, value in fault.items() if value is None or type(value) in (int, float, str, bool)}
+            json.dumps(fault, allow_nan=False)
+            attempt.sample_fault = fault
+            if attempt.record is not None:
+                attempt.record["sample_fault"] = dict(fault)
+            logging.info("accel_homing: homing sample fault %s", json.dumps(fault, sort_keys=True))
+        except Exception:
+            # An already-dispatched safety stop takes priority over all optional
+            # telemetry, including a failing logging handler.
+            pass
+
     def _watchdog(self, eventtime):
         """Data-independent safety net: stops the move if the stream dies or travel runs out."""
         attempt = self.attempt
@@ -1802,9 +1873,16 @@ class BeaconAccelHoming:
     def _batch_hook(self, params):
         try:
             self._inspect(params)
-        except Exception:
-            logging.exception("beacon_accel_homing: batch inspection failed")
+        except Exception as exc:
+            attempt = self.attempt
             self._sensor_fault("invalid_data")
+            if attempt is not None:
+                self._reject_homing_sample(attempt, "batch_callback", "inspection_exception", params,
+                                           error=exc)
+            try:
+                logging.exception("beacon_accel_homing: batch inspection failed")
+            except Exception:
+                pass
         if self.helper._stream_en:
             self.saved_handler(params)
 
@@ -1907,7 +1985,8 @@ class BeaconAccelHoming:
         expanded_native = self.backend is None and attempt.proof_noise is not None
         strict_native = self.backend is None and (expanded_native or attempt.vector_mode)
         if strict_native and (not math.isfinite(interval) or interval <= 0.0):
-            self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+            self._reject_homing_sample(attempt, "homing_packet", "nonpositive_or_nonfinite_interval",
+                                       params, packet_interval_clock=interval)
             return
         if not clock_after(start_clock, attempt.arm_clock):
             # A delivered batch can contain both a pre-enable transient and
@@ -1928,7 +2007,9 @@ class BeaconAccelHoming:
             end_time = self.clock_to_time(start_clock + params["delta_clock"])
             sensor_now = self.main_mcu.estimated_print_time(now)
             if not all(math.isfinite(value) for value in (start_time, end_time, sensor_now)):
-                self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+                self._reject_homing_sample(attempt, "homing_packet", "nonfinite_packet_time", params,
+                                           first_sample_time_s=start_time, last_sample_time_s=end_time,
+                                           sensor_now_s=sensor_now)
                 return
             if (sensor_now - start_time > self.stream_timeout
                     or end_time - sensor_now > 0.005):
@@ -1937,7 +2018,9 @@ class BeaconAccelHoming:
             advance = (None if attempt.last_end_clock is None else
                        (start_clock - attempt.last_end_clock) & 0xFFFFFFFF)
             if advance is not None and not 0 < advance < 0x80000000:
-                self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+                self._reject_homing_sample(attempt, "homing_packet", "nonmonotonic_packet_clock", params,
+                                           previous_end_clock=attempt.last_end_clock,
+                                           clock_advance=advance)
                 return
         if attempt.first_clock is None:
             if attempt.bases is None:
@@ -1966,12 +2049,14 @@ class BeaconAccelHoming:
         raw = (data if isinstance(data, tuple) else memoryview(data).cast("h") if NATIVE_LE
                else [v for sample in SAMPLE.iter_unpack(data) for v in sample])
         if strict_native and not all(math.isfinite(value) for value in raw):
-            self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+            self._reject_homing_sample(attempt, "homing_xyz", "nonfinite_axis_value", source_params,
+                                       raw=raw, source_skip=source_skip)
             return
         if (attempt.detector_type == "filtered" and self.backend is None
                 and (CLIPPED in raw or (self.full_scale_g is not None and any(
                     abs(value * attempt.count_g) >= self.full_scale_g for value in raw)))):
-            self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+            self._reject_homing_sample(attempt, "homing_xyz", "clipped_or_full_scale", source_params,
+                                       raw=raw, source_skip=source_skip)
             return
         if self.backend is None and CLIPPED in raw:
             raw = decode_clips(raw, attempt.last_samples, self.clip_values)
@@ -2049,7 +2134,8 @@ class BeaconAccelHoming:
     def _inspect_vector(self, attempt, params, raw, count, source_params, source_skip):
         """XYZ acceleration magnitude about a fixed resting offset, in raw units."""
         if not all(math.isfinite(value) for value in raw):
-            self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+            self._reject_homing_sample(attempt, "homing_xyz", "nonfinite_axis_value", source_params,
+                                       raw=raw, source_skip=source_skip)
             return
         limit2 = attempt.limit_raw * attempt.limit_raw
         peak = 0.0
@@ -2073,10 +2159,16 @@ class BeaconAccelHoming:
                 when = batch_start_time + (batch_end_time - batch_start_time) * (position + source_skip) / max(1, source_count - 1)
                 identity = (source_params["start_clock"], source_params["delta_clock"],
                             position + source_skip, sample_count(source_params["data"]))
+                previous_time = filtered.previous_time
                 try:
                     decision = filtered.feed(when, tuple(v * attempt.count_g for v in xyz), identity)
-                except ValueError:
-                    self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+                except ValueError as exc:
+                    self._reject_homing_sample(
+                        attempt, "homing_filter", "filter_sample_rejection", source_params,
+                        sample_position=position + source_skip, sample_time_s=when,
+                        previous_sample_time_s=previous_time,
+                        sample_dt_s=None if previous_time is None else when - previous_time,
+                        error=exc)
                     return
                 if decision is not None:
                     attempt.filter_decision = decision
@@ -2471,9 +2563,12 @@ class BeaconAccelHoming:
                             quality["gap_observations"] += 1
                         window["fault_details"] = {
                             "phase": "noise_batch", "backend": "beacon_raw" if self.backend is None else self.backend.kind,
+                            "cause": "actual_gap" if gap > 5.0 * interval + 0.000003 else "interval_change",
                             "gap_s": gap, "gap_limit_s": 5.0 * interval + 0.000003,
                             "sample_interval_s": interval,
                             "previous_sample_interval_s": window["interval"],
+                            "interval_change_s": (None if window["interval"] is None else
+                                                  abs(interval - window["interval"])),
                             "interval_change_limit_s": max(0.000003, interval * 0.10),
                             "rejected_sample_time_s": when, "sensor_now_s": sensor_now,
                             "batch_start_clock": params["start_clock"],
@@ -3088,6 +3183,7 @@ class BeaconAccelHoming:
                                          else [attempt.stop_request_lower, attempt.stop_request_upper]),
             "filter_diagnostics": None if attempt.filter_engine is None else attempt.filter_engine.diagnostics(),
             "filter_reference": attempt.filter_reference,
+            "sample_fault": None if attempt.sample_fault is None else dict(attempt.sample_fault),
             "physical_position_verified": False,
             "direction": 0 if attempt.vector_mode else attempt.direction or attempt.auto_direction,
             "onset_g": round(attempt.onset_raw * to_g, 2) if onset else None,
@@ -3227,6 +3323,9 @@ class BeaconAccelHoming:
             return
         gcmd.respond_info("\n".join(describe(r) for r in self.history))
         for axis, record in sorted(self.last.items()):
+            if record.get("sample_fault") is not None:
+                gcmd.respond_info("accel_homing: %s sample fault %s" % (
+                    axis.upper(), json.dumps(record["sample_fault"], sort_keys=True, allow_nan=False)))
             proof = record.get("motion_proof")
             if proof is not None:
                 if proof.get("backend") != "beacon_raw":
