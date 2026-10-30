@@ -207,6 +207,17 @@ RESPONSE TRUNCATED / FULL PEAK UNAVAILABLE** and omit the unknown tail.
 Original native packets remain bounded private validation evidence in memory;
 they are not serialized to a PNG or raw scratch file.
 
+Native `FILTERED` capture starts at the exact accepted stationary-reference
+row and ends at host stream close or explicit capture seal. Earlier enable/
+settle data and later flush packets belong outside that scope. A partial first
+packet retains its original row position, count and clock interval. The scope identifies host
+callback admission, not a firmware stream acknowledgment. Already admitted
+callbacks finish before capture is sealed; a bounded drain also completes
+before trigger dispatch starts. A timeout aborts with `capture_inflight_timeout`
+and no output. Gaps, repeats, malformed data and other faults within the
+accepted reference and response still reject the workflow. An empty native
+packet contributes no rows and refreshes no reference or watchdog.
+
 A failed or incomplete workflow still publishes no chart. This exception does
 not establish that an earlier failed calibration would have passed: without
 its original valid prefix and confirmation evidence, that conclusion cannot
@@ -225,6 +236,9 @@ does not itself prove clipping. `nonmonotonic_packet_clock`,
 `filter_nonmonotonic_time` and `filter_sample_gap` identify different timestamp
 rejections. The record includes the phase, packet clocks/count, and relevant
 sample position, axis, value or time difference; it does not retain raw history.
+An in-scope prefix timing rejection also reports its packet index, previous
+and next timestamps, measured gap and limit. These numbers identify the actual
+rejected pair; an error from an older run cannot establish that pair.
 
 Stop dispatch occurs before optional diagnostic conversion or logging. Apart
 from the validated post-confirmation FILTERED saturation case above, the

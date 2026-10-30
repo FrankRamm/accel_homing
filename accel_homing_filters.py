@@ -297,10 +297,23 @@ def validate_filtered_capture_prefix(capture, record=None):
             or not finite(full_scale) or full_scale <= 0):
         raise ValueError("censored capture lacks bounded original native data/reference")
     rows, identities, online_times = [], [], []
+    scope = capture.get("_native_capture_scope")
+    bounds = detector.get("reference_sample_bounds")
+    if (not isinstance(scope, dict) or type(scope.get("version")) is not int or scope["version"] != 1
+            or scope.get("kind") != "accepted_reference_through_stream_close"
+            or type(scope.get("admission_epoch")) is not int or scope["admission_epoch"] <= 0
+            or type(detector.get("capture_admission_epoch")) is not int
+            or detector.get("capture_admission_epoch") != scope["admission_epoch"]
+            or scope.get("closed_by") not in ("stream_stop", "capture_seal")
+            or not isinstance(bounds, (list, tuple)) or len(bounds) != 2
+            or _stamp(scope.get("first_sample")) != _stamp(bounds[0])
+            or any(type(scope.get(key)) is not int or scope[key] < 0 for key in (
+                "excluded_pre_reference_samples", "excluded_previous_epoch_samples"))):
+        raise ValueError("censored capture lacks its exact current reference/stream scope")
     found = None
     counts = {"clipped_axis_values": 0, "saturated_axis_values": 0, "nonfinite_axis_values": 0}
     last, last_clock, original_last = None, None, None
-    for source in sources:
+    for source_index, source in enumerate(sources):
         data = source.get("data")
         if isinstance(data, tuple):
             if len(data) % 3:
@@ -311,30 +324,48 @@ def validate_filtered_capture_prefix(capture, record=None):
         else:
             raise ValueError("malformed original native response packet")
         count = len(raw) // 3
+        first = source.get("first_sample_position")
+        if (type(first) is not int or not 0 <= first < count
+                or type(source.get("admission_epoch")) is not int
+                or source["admission_epoch"] != scope["admission_epoch"]
+                or (source_index and first != 0)):
+            raise ValueError("native response changed its admitted sample scope")
         start_clock, delta = source.get("start_clock"), source.get("delta_clock")
         start, end, received = (source.get(key) for key in ("start_time_s", "end_time_s", "received_time_s"))
         scale = source.get("count_g")
         if (type(start_clock) is not int or not 0 <= start_clock <= 0xffffffff or type(delta) is not int
-                or not 0 < delta <= 0xffffffff or count < 2 or len(rows) + count > 200000
+                or not 0 < delta <= 0xffffffff or not 2 <= count <= 200000 or len(rows) + count - first > 200000
                 or not all(finite(v) for v in (start, end, received, scale)) or scale <= 0 or end <= start):
             raise ValueError("invalid original native packet metadata")
         period = (end - start) / (count - 1)
-        if period > 1. / 800. or received - start > capture.get("_native_max_age_s", .05) or end - received > .005:
+        if (not source_index and (start_clock, delta, first, count) != _stamp(scope["first_sample"])):
+            raise ValueError("native response did not start at its accepted reference identity")
+        if period > 1. / 800. or received - (start + first * period) > capture.get("_native_max_age_s", .05) or end - received > .005:
             raise ValueError("stale/future/low-rate native response cannot be censored")
         original_start, original_end = source.get("filter_start_time_s"), source.get("filter_end_time_s")
         if not finite(original_start) or not finite(original_end) or original_end <= original_start:
             raise ValueError("invalid original response timing cannot be censored")
         original_period = (original_end - original_start) / (count - 1)
-        if original_last is not None and (original_start <= original_last or original_start - original_last > 5. * original_period + .000003):
-            raise ValueError("original response has a sample gap or repeated timestamp")
+        retained_start = original_start + first * original_period
+        if original_last is not None and (retained_start <= original_last or retained_start - original_last > 5. * original_period + .000003):
+            raise ValueError("original response has a sample gap or repeated timestamp"
+                             " (packet=%d, previous_end=%.9f, next_start=%.9f, gap=%.9f, limit=%.9f, epoch=%d, phase=%s)"
+                             % (source_index, original_last, retained_start, retained_start - original_last,
+                                5. * original_period + .000003, scope["admission_epoch"],
+                                "reference" if len(rows) < detector.get("reference_sample_count", 0) else "response"))
         original_last = original_end
         if last_clock is not None and not 0 < ((start_clock - last_clock) & 0xffffffff) < 0x80000000:
-            raise ValueError("repeated/backward packet in censored response")
+            raise ValueError("repeated/backward packet in censored response"
+                             " (packet=%d, previous_end_clock=%d, next_start_clock=%d, epoch=%d)"
+                             % (source_index, last_clock, start_clock, scope["admission_epoch"]))
         last_clock = (start_clock + delta) & 0xffffffff
-        for position in range(count):
+        for position in range(first, count):
             when = start + position * period
             if last is not None and (when <= last or when - last > 5. * period + .000003):
-                raise ValueError("missing/repeated response samples cannot be censored")
+                raise ValueError("missing/repeated response samples cannot be censored"
+                                 " (packet=%d, position=%d, previous=%.9f, next=%.9f, gap=%.9f, limit=%.9f, epoch=%d)"
+                                 % (source_index, position, last, when, when - last,
+                                    5. * period + .000003, scope["admission_epoch"]))
             last = when
             xyz = tuple(raw[3 * position:3 * position + 3])
             if any(type(v) not in (int, float) or not math.isfinite(v) for v in xyz):
@@ -401,6 +432,7 @@ def validate_filtered_capture_prefix(capture, record=None):
             or not 0 <= ref_indices[0] < ref_indices[1] < positions["first_armed"]
             or detector.get("reference_sample_matches") != [1, 1]
             or detector.get("reference_sample_count") != ref_indices[1] - ref_indices[0] + 1
+            or ref_indices[0] != 0
             or identities[ref_indices[0]] != _stamp(bounds[0]) or identities[ref_indices[1]] != _stamp(bounds[1])
             or detector.get("reference_interval_s") != [samples[ref_indices[0]][0], samples[ref_indices[1]][0]]):
         raise ValueError("censored impact reference provenance changed")
@@ -527,7 +559,7 @@ def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filte
             raw = (source["data"] if isinstance(source["data"], tuple) else
                    tuple(v for row in struct.iter_unpack("<hhh", source["data"]) for v in row))
             count = len(raw) // 3
-            for position in range(count):
+            for position in range(source.get("first_sample_position", 0), count):
                 if len(native_inputs) >= len(samples):
                     break
                 a, b = source.get("filter_start_time_s"), source.get("filter_end_time_s")

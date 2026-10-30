@@ -35,6 +35,7 @@ def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_
                              "algorithm": "impact20_vector_v2", "detector_types": {axis: "filtered"}}
     obj.workflows.in_home, obj.workflows.home_axis = True, axis
     obj.start_capture()
+    obj._start_stream()
     if clock_hz == 1000.:
         acquire_reference(obj, endstop)
     else:
