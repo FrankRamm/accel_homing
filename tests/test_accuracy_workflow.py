@@ -209,7 +209,8 @@ class AccuracyWorkflowTests(unittest.TestCase):
             result = rig.workflow.last_result
             self.assertEqual(result["paths"], [])
             self.assertEqual(set(result["summary_paths"]), {"x_png"})
-            self.assertEqual(set(output.iterdir()), {previous, Path(result["summary_paths"]["x_png"])})
+            self.assertEqual(set(output.iterdir()), {previous, *map(Path, result["summary_paths"].values()),
+                                                   *map(Path, result["telemetry_paths"].values())})
             self.assertEqual(previous.read_bytes(), b"previous user chart")
             self.assertFalse((config / "tmp").exists())
             self.assert_restored(rig)

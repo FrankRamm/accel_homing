@@ -404,8 +404,10 @@ class FailedWorkflowPublicationTests(PublicationFixture):
                 self.assertEqual(result["result"], "beta_proposed" if mode == "beta" else "complete")
                 self.assertIn("preview failure", result["display_error"])
                 files = list(Path(directory).iterdir())
-                self.assertEqual(len(files), 1)
-                self.assertEqual(charts._check_png(files[0].read_bytes()), (24, 16) if mode == "beta" else (2, 1))
+                self.assertEqual(len(files), 2 if mode == "accuracy" else 1)
+                images = [path for path in files if path.suffix == ".png"]
+                self.assertEqual(len(images), 1)
+                self.assertEqual(charts._check_png(images[0].read_bytes()), (24, 16) if mode == "beta" else (2, 1))
 
 
 if __name__ == "__main__":

@@ -361,6 +361,8 @@ class Attempt:
         self.capture_token = self.capture_reference = None
         self.filter_packet_times = {}
         self.confirmation_time = self.crossing_time = None
+        self.crossing_sample = self.confirmation_sample = None
+        self.returned_trigger_time = None
         self.stop_request_lower = self.stop_request_upper = None
         self.vector_unchanged_since = None
         self.proof_noise = None    # measured uncertainty for calibration/expanded references
@@ -477,7 +479,15 @@ class BeaconAccelEndstop:
         finally:
             attempt = self._owner.disarm()
         result = self._dispatch.stop()
-        return self._owner.finish(self, attempt, result)
+        trigger_time = self._owner.finish(self, attempt, result)
+        # Preserve the exact evaluated value returned to Klipper. RAW's clock
+        # conversion may differ from the earlier disarm record's conversion.
+        if attempt is not None:
+            with self._owner.lock:
+                attempt.returned_trigger_time = trigger_time
+                if attempt.record is not None:
+                    attempt.record["returned_trigger_time_s"] = trigger_time
+        return trigger_time
 
     def query_endstop(self, print_time):
         return 0
@@ -2355,7 +2365,8 @@ class BeaconAccelHoming:
             for offset in range(0, len(prefix), 3):
                 decoded_previous = decode_native_row(tuple(prefix[offset:offset + 3]), decoded_previous, self._native_decode_context(source_params)[1])
         filtered = attempt.filter_engine
-        if (filtered is not None and self.capture_batches is not None
+        if ((filtered is not None or self.workflows.session is not None
+                and self.workflows.session.get("mode") == "accuracy") and self.capture_batches is not None
                 and self.capture_samples < self.capture_limit):
             attempt.filter_packet_times[(source_params["start_clock"], source_params["delta_clock"], source_count)] = (
                 batch_start_time, batch_end_time)
@@ -2399,6 +2410,8 @@ class BeaconAccelHoming:
                     attempt.filter_decision = decision
                     attempt.confirmation_time = decision["confirmation_time_s"]
                     attempt.crossing_time = decision["crossing_time_s"]
+                    attempt.crossing_sample = decision["crossing_identity"]
+                    attempt.confirmation_sample = decision["confirmation_identity"]
                     stamp = decision["onset_identity"]
                     attempt.onset_sample = stamp
                     attempt.onset_batch = stamp
@@ -2416,6 +2429,7 @@ class BeaconAccelHoming:
                 attempt.onset_batch = (params["start_clock"], params["delta_clock"], position, count)
                 attempt.onset_sample = (source_params["start_clock"], source_params["delta_clock"],
                                         position + source_skip, sample_count(source_params["data"]))
+                attempt.crossing_sample = attempt.confirmation_sample = attempt.onset_sample
                 attempt.onset_raw = math.sqrt(level2)
                 interval = params["delta_clock"] / max(1, count - 1)
                 onset_clock = params["start_clock"] + int(round(position * interval))
@@ -2449,6 +2463,7 @@ class BeaconAccelHoming:
         source = params if source_params is None else source_params
         attempt.onset_sample = (source["start_clock"], source["delta_clock"],
                                 position + source_skip, sample_count(source["data"]))
+        attempt.crossing_sample = attempt.confirmation_sample = attempt.onset_sample
         attempt.onset_raw = value
         attempt.impact_until = (start_clock + self.impact_window) & 0xFFFFFFFF
         self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
@@ -3383,10 +3398,8 @@ class BeaconAccelHoming:
                         "confirmation_time_s": attempt.confirmation_time,
                         "trigger_crossing_time_s": attempt.crossing_time,
                         "trigger_confirmation_time_s": attempt.confirmation_time,
-                        "crossing_sample": (None if attempt.filter_decision is None else
-                                            attempt.filter_decision["crossing_identity"]),
-                        "confirmation_sample": (None if attempt.filter_decision is None else
-                                                attempt.filter_decision["confirmation_identity"]),
+                        "crossing_sample": attempt.crossing_sample,
+                        "confirmation_sample": attempt.confirmation_sample,
                         "first_armed_sample": attempt.first_armed_sample,
                         "stop_request_time_s": attempt.stop_request_upper,
                         "stop_request_interval_s": (None if attempt.stop_request_lower is None
@@ -3418,6 +3431,8 @@ class BeaconAccelHoming:
                 detector["filter_diagnostics"] = attempt.filter_engine.diagnostics()
         samples, previous = [], [0, 0, 0]
         native_filtered = attempt is not None and attempt.detector_type == "filtered" and self.backend is None
+        accuracy_native = (self.backend is None and self.workflows.session is not None
+                           and self.workflows.session.get("mode") == "accuracy")
         first_position, scope = 0, None
         if native_filtered:
             bounds = attempt.reference_sample_bounds
@@ -3503,7 +3518,7 @@ class BeaconAccelHoming:
             previous = raw[-3:]
             start, end = self.clock_to_time(start_clock), self.clock_to_time(start_clock + delta_clock)
             dt = (end - start) / (count - 1)
-            if native_filtered:
+            if native_filtered or accuracy_native:
                 online = online_packet_times.get((start_clock, delta_clock, count))
                 if online is None and batch_index < len(arrival_times):
                     online = arrival_times[batch_index]
@@ -3511,10 +3526,15 @@ class BeaconAccelHoming:
                                       "first_sample_position": first_row,
                                       "admission_epoch": None if scope is None else scope["admission_epoch"],
                                       "data": tuple(data) if isinstance(data, tuple) else bytes(data), "count_g": count_g,
-                                      "decode_previous_raw": list(seed), "clip_values": list(limits),
+                                      "decode_previous_raw": list(seed), "clip_values": None if limits is None else list(limits),
+                                      "control_decode_previous_raw": (None if len(packet_context) < 6 or packet_context[4] is None
+                                                                      else list(packet_context[4])),
+                                      "control_first_sample_position": None if len(packet_context) < 6 else packet_context[5],
                                       "start_time_s": start, "end_time_s": end,
                                       "received_time_s": (None if batch_index >= len(received) else
                                                           self.main_mcu.estimated_print_time(received[batch_index])),
+                                      "time_origin": "detector_packet_snapshot" if (start_clock, delta_clock, count) in online_packet_times
+                                                     else "capture_packet_snapshot_after_inspection",
                                       "filter_start_time_s": None if online is None else online[0],
                                       "filter_end_time_s": None if online is None else online[1]})
             for number in range(first_row, count):
@@ -3599,6 +3619,12 @@ class BeaconAccelHoming:
                 # Used only for in-process provenance; workflows remove this
                 # reference before exporting metadata or publishing status.
                 "_record": None if attempt is None else attempt.record}
+        if accuracy_native:
+            # Original packet storage already belongs to this capture. This
+            # private view is consumed off the motion path, never sent to plots.
+            captured.update(_accuracy_native_sources=native_source,
+                            _accuracy_native_mapping=list(mapping),
+                            _accuracy_sensor_reference=sensor_reference)
         if native_filtered:
             captured.update(_native_source_batches=native_source, _native_mapping=list(mapping),
                             _native_filter_reference=sensor_reference,
@@ -3751,6 +3777,8 @@ class BeaconAccelHoming:
             "observed_valid_prefix_peak_g": (attempt.impact_peak * to_g if attempt.response_censoring is not None else None),
             "trigger_crossing_time_s": attempt.crossing_time,
             "trigger_confirmation_time_s": attempt.confirmation_time,
+            "crossing_sample": attempt.crossing_sample,
+            "confirmation_sample": attempt.confirmation_sample,
             "noise_pos_g": round(attempt.noise_pos * to_g, 2),
             "noise_neg_g": round(attempt.noise_neg * to_g, 2),
             "noise_g": round(attempt.noise_checked * to_g, 2),
@@ -3759,6 +3787,7 @@ class BeaconAccelHoming:
             "motion_seen": attempt.motion_seen or attempt.moving,
             "arm_time_s": attempt.arm_time,
             "arm_clock": attempt.arm_clock,
+            "returned_trigger_time_s": attempt.returned_trigger_time,
             "onset_time_s": recorded_onset,
             "trigger_onset_time_s": recorded_onset,
             "onset_sample": attempt.onset_sample,

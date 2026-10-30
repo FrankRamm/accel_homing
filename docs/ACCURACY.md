@@ -22,24 +22,44 @@ Do not add `SAVE_CONFIG`: ACCURACY rejects the parameter, including zero.
 A successful measurement alone does not save/restart. An early-trigger recovery
 can start a separate normal calibration that saves and restarts on success.
 
-## Development RAW/FILTERED A/B control
+## Compare 30 RAW and 30 FILTERED homes
 
-Use explicit `DETECTOR=RAW` for the first completed control and keep its printed
-run ID and original PNG. After separately calibrating FILTERED and repreparing
-XY, compare the new independent series:
+When both compatible calibrated profiles already exist, compare them directly;
+another calibration is not required just to collect this pair. Otherwise follow
+the [profile preparation sequence](FILTERS.md#operator-sequence) first. Explicit
+`DETECTOR` selects that mode's own saved threshold for the command. A successful
+ACCURACY run restores the previously selected mode instead of changing it.
+
+Manually prepare XY before the RAW command:
 
 ```gcode
-ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=FILTERED SAMPLES=10 CENTERED=1 BASELINE=<raw_run_id>
+ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=RAW SAMPLES=30 CENTERED=1
 ```
 
-Replace the placeholder with the successful control's actual 32-character ID.
-Both profiles and the compact PNG baseline receipt survive the saving
-calibration/restart. The report shows both actual series, counts, ranges,
+Keep its successful original PNG and JSON, and copy the console's **Completed
+accuracy run ID**. Manually prepare XY again before the FILTERED command:
+
+```gcode
+ACCEL_HOMING_ACCURACY AXIS=X DETECTOR=FILTERED SAMPLES=30 CENTERED=1 BASELINE=ID_RAW
+```
+
+Replace `ID_RAW` with the successful RAW control's actual 32-character run ID.
+Each command has one excluded discovery home followed by 30 measured homes.
+Use the same sensor/mount/axes map, geometry, homing speed/acceleration, currents,
+fan state and physical setup. Repeat separately for Y with that axis's baseline.
+If an early trigger starts automatic recovery, the accuracy run is incomplete;
+the separate recovery calibration can save and restart. Reprepare after that
+restart and follow the printed rerun command; see
+[early-trigger recovery](#early-trigger-automatic-recalibration).
+
+Both saved detector profiles and the compact PNG baseline receipt survive a
+saving calibration/restart. The report shows both actual series, counts, ranges,
 population standard deviations, threshold/mode/config differences and required
 context mismatches. It does not pool trials, infer paired physical measurements
 or use shadow replay as a baseline. A baseline from another axis, an incomplete
-run or a synthetic figure is refused. Old PNGs without the new receipt need a
-new baseline. See [the full supervised sequence and limits](FILTERS.md).
+run or a synthetic figure is refused. Existing PNG baselines with a valid compact
+receipt remain usable without a JSON companion; their receipt schema is unchanged.
+A PNG without a valid completed-run receipt still requires a new baseline.
 
 ## Sequence and statistics
 
@@ -118,18 +138,94 @@ The return uses commanded steps and assumes no slip, skipped steps or blocked
 travel. Its recorded completion does not independently verify physical center.
 Unexpected physical behavior requires the emergency stop and manual review.
 
-## PNG and cleanup
+## Per-home JSON diagnostics
 
-A successful ACCURACY run keeps one final overview PNG per requested axis in
-the configured chart directory. It includes accepted traces and travel/statistics,
-with the actual detector threshold. Any failed, rejected or cancelled run saves
-no accuracy PNG, including when another requested axis already completed.
+Every successful RAW or FILTERED ACCURACY run automatically writes a diagnostic
+JSON beside each axis's overview PNG. No new option or calibration is needed,
+and diagnostics do not change thresholds, filtering, returned trigger decisions
+or the number of homes. The console prints the JSON path as `Accuracy telemetry
+X: ... (schema 1; discovery + N measured homes)`.
+Workflow/status keeps `summary_paths` PNG-only and reports JSON paths separately
+in `telemetry_paths` as `x_json`/`y_json`; it does not dump sample rows repeatedly.
 
-Per-home traces and their current-run provenance stay bounded in memory; no
-per-home PNG or scratch capture file is written. Required cleanup and every
-axis's rendering complete before final publication starts. A later publication
-error attempts to remove only this run's new files. Existing chart-directory
-outputs are preserved. Partial statistics remain available in console/status.
+For example, the normal output names share a run/axis/local-timestamp prefix:
+
+```text
+Accel Homing Accuracy X - Run <id> - <timestamp>.png
+Accel Homing Accuracy X - Run <id> - <timestamp>.json
+```
+
+Collision suffixes can differ between files. Use the announced paths and the
+JSON's `png_sha256` to associate the exact PNG, and preserve the original files
+and PNG metadata. The JSON has its own version 1 schema and
+`kind=completed_accuracy_telemetry`; it does not replace or change the compact
+baseline receipt embedded in the PNG. It cannot recreate diagnostics for older runs.
+The header also distinguishes actual runs (`simulated=false`) from synthetic QA.
+
+The JSON separates `discovery` from the measured `trials` and retains run/axis,
+threshold/configuration, sensor/geometry context and statistics. Each home's
+native event window contains at most **50 consecutive original rows**, beginning
+up to 16 rows before the recorded onset. It is not a downsampled plot trace or a
+full capture export. A FILTERED window starts no earlier than its first armed
+sample; unavailable pre-onset context is flagged as edge-truncated. RAW can retain
+original pre-arm rows without claiming an IIR state. The window labels omitted
+rows and events outside its bounds. Unsupported/generic capture paths mark native data unavailable
+with a reason instead of manufacturing sensor counts or packet identities.
+Diagnostics are bounded to 128 KiB per home and 8 MiB per axis, with at most one
+discovery and 50 measured homes.
+
+Retained native rows keep signed sensor-frame counts, packet/sample identities,
+per-packet sample intervals, marker flags and bounded decoded endpoint estimates.
+Original acquisition-snapshot times and origins are separate from capture/remapped
+times. Event records retain the actual recorded onset/crossing/confirmation times
+and the exact trigger time returned to Klipper. In RAW, disarm-time conversions,
+acquisition snapshots and the returned trigger value can differ numerically;
+use their labelled origins and sample identities rather than silently treating
+them as one clock snapshot. Unrecorded legacy event times remain `null` with an
+unavailable reason even when their original sample identities are retained.
+`returned_trigger_time_s` is the timestamp value returned by `home_wait`, not
+the host time when that function finished.
+
+For FILTERED, diagnostics include the frozen reference offsets/noise weights,
+the effective onset gate and actual candidate/rejection counters. When native
+provenance is available, `state_before_window` is
+**post-stop deterministic replay** of the retained exact prefix, verified against
+the actual original event decisions. It is explicitly not an online state
+snapshot. Replay counters and whether they match the actual counters are labelled
+separately. RAW marks filter state unavailable; an unsupported FILTERED capture
+reports missing native proof as its unavailable reason. Rows identify whether
+the filter processed them; post-confirmation values are not additional online
+filtering.
+
+Planned movement-start and first-step timestamps are explicitly `null` with an
+unavailable reason: the existing homing interface does not expose them. Do not
+call onset-minus-arm detector reaction latency or substitute a rounded console
+value for a missing event time. The host stop-request interval bounds dispatch,
+not MCU halt or physical contact. Trigger travel and signed start-to-halt travel
+are separate commanded-step measurements; neither independently measures carriage
+position. The JSON retains `physical_position_verified=false`.
+
+Rows label their relation to the host stop-request bounds. Only original times
+strictly before the lower bound are proven before dispatch; later response data
+cannot validate a new pre-stop decision. Native markers retain their estimate
+and unknown true sign/peak semantics; a numeric endpoint is not a recovered
+beyond-range amplitude. These limits apply even when the JSON contains more
+precision than the plot or console.
+
+## PNG, JSON and cleanup
+
+A successful ACCURACY run keeps one final overview PNG and diagnostic JSON per
+requested axis in the configured chart directory. Failed, rejected, aborted or
+cancelled runs publish neither accuracy artifact, including when another
+requested axis already completed.
+
+Full per-home traces and current-run provenance stay bounded in memory; only the
+diagnostic window above is serialized. No per-home PNG or scratch capture file is
+written. Required cleanup, every axis's rendering and JSON validation complete
+before publication starts. Handled publication errors/cancellation attempt to
+remove only this run's newly owned files; existing outputs are preserved. This
+group rollback is not crash-atomic or a guarantee against power loss. Partial
+statistics remain available in console/status, without recurring sample dumps.
 
 See [plot locations and access](PLOTS.md) and
 [troubleshooting](TROUBLESHOOTING.md). `ACCEL_HOMING_CANCEL` is not an immediate

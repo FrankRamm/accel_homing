@@ -1,9 +1,11 @@
 # PNG plots and stationary noise
 
-All newly generated plots are completed **PNG** images. There are no CSV,
-JSON, SVG or HTML chart sidecars and no full-resolution raw-sample export.
-Only successful workflows publish plots. Rejected, failed, aborted or cancelled
-measurements retain console diagnostics without saving a partial PNG anywhere.
+All newly generated plots are completed **PNG** images. Successful ACCURACY
+also publishes a per-axis bounded JSON diagnostic; other plot workflows do not
+gain a JSON sidecar. There are no CSV, SVG or HTML charts or full-capture
+raw-sample exports. Only successful workflows publish measurement artifacts.
+Rejected, failed, aborted or cancelled runs retain console diagnostics without
+saving partial accuracy PNG/JSON outputs.
 
 All acceleration-component curves are displayed as absolute values after their
 existing processing: `|X|`, `|Y|`, `|Z|`, and the magnitude of signed v1 output.
@@ -47,7 +49,7 @@ are retained; the plugin does not rotate or delete old final chart outputs.
 | `ACCEL_HOMING_CALIBRATE_NOISE` | None | Three-window stationary-noise overview. |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Yes | Fresh stationary-noise summary after calibration, cleanup and required save succeed; its hints exclude the final 0.5 g saving margin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Yes | Measured acceleration capture for that home; omit AXIS for X then Y. |
-| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final accuracy overview per requested axis after every axis succeeds; optional explicit `BASELINE=<run_id>` adds independent actual-run A/B statistics. |
+| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final overview PNG and bounded per-home JSON per requested axis after every axis succeeds; optional explicit `BASELINE=<run_id>` adds independent actual-run A/B statistics. |
 | `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Yes | Same original signed capture compared with signed-v1 and rectified-v2 filtering; actual control, diagnostic shadows, thresholds, timing, noise/DC and censoring are labelled separately. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Yes | Combined **Beta** moving-noise/trial diagnostic and suggestion report. |
 
@@ -63,8 +65,11 @@ fixtures are marked **SIMULATED / NOT PRINTER MEASUREMENT**.
 
 Development accuracy PNGs include a bounded compact successful-run receipt in
 PNG text metadata and the run ID in the filename. It survives calibration and
-restart so a later explicit BASELINE can compare actual independent series;
-there is no JSON sidecar. Keep the original host filename and metadata.
+restart so a later explicit BASELINE can compare actual independent series.
+The separate [per-home diagnostic JSON](ACCURACY.md#per-home-json-diagnostics)
+links to the exact PNG by SHA256; it does not replace or change that embedded
+receipt. Existing valid baselines need no JSON companion. Keep the original
+host filenames, contents and PNG metadata.
 Missing sensor/geometry/speed/acceleration context or a mismatch prevents an
 attribution to filtering. A replay trace is never used as a physical baseline.
 Read [the comparison procedure and interpretation](FILTERS.md).
@@ -151,7 +156,7 @@ otherwise completed measurement.
 
 Successful measurement/publication is committed before optional console preview
 announcement. A later preview/link error is reported as `display_error` and
-keeps the valid saved PNG; it does not convert that measurement into a failure.
+keeps the valid saved outputs; it does not convert that measurement into a failure.
 
 ## Plot dependencies and errors
 

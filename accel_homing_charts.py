@@ -41,6 +41,7 @@ _FilterReceipt = collections.namedtuple("_FilterReceipt", (
 _MAX_FILTER_RECEIPT_BYTES = 2 * 1024 * 1024
 _ACCURACY_REPORT_KEY = b"AccelHomingAccuracy"
 _MAX_ACCURACY_REPORT_BYTES = 32768
+_MAX_ACCURACY_TELEMETRY_BYTES = 8 * 1024 * 1024
 _ACCURACY_CONTEXT_KEYS = ("sensor_context", "geometry_context", "homing_speed_mm_s",
                           "configured_homing_speed_mm_s", "homing_accel_mm_s2", "direction", "detector_type", "impact_metric",
                           "detector_version", "detector_config")
@@ -315,8 +316,22 @@ def _capture_data(capture, record):
     return _envelope(delta), metadata
 
 
-def _publish(directory, label, clock, data, check_running=None, _owned_paths=None):
-    _check_png(data, decode_pixels=False)
+def _check_artifact(data, extension):
+    if extension == ".png":
+        _check_png(data, decode_pixels=False)
+    elif extension == ".json":
+        if not isinstance(data, bytes) or not 2 <= len(data) <= _MAX_ACCURACY_TELEMETRY_BYTES:
+            raise ValueError("Invalid or oversized accuracy telemetry JSON")
+        report = json.loads(data.decode("utf-8"))
+        if (not isinstance(report, dict) or report.get("kind") != "completed_accuracy_telemetry"
+                or type(report.get("version")) is not int or report["version"] != 1 or _json(report).encode("utf-8") != data):
+            raise ValueError("Invalid canonical accuracy telemetry JSON")
+    else:
+        raise ValueError("Unsupported chart artifact extension")
+
+
+def _publish(directory, label, clock, data, check_running=None, _owned_paths=None, _extension=".png"):
+    _check_artifact(data, _extension)
     _check_running(check_running)
     destination = Path(directory).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -341,7 +356,7 @@ def _publish(directory, label, clock, data, check_running=None, _owned_paths=Non
         for collision in range(100):
             _check_running(check_running)
             name = stem if collision == 0 else stem + "_%02d" % collision
-            published = destination / (name + ".png")
+            published = destination / (name + _extension)
             try:
                 # Staging and final files share a directory/filesystem. link()
                 # atomically exposes completed bytes and refuses an existing
@@ -391,11 +406,15 @@ def _publish(directory, label, clock, data, check_running=None, _owned_paths=Non
 
 
 def _publish_group(directory, images, check_running=None):
-    """Publish already-rendered outputs; roll back only this group's inodes."""
+    """Handled-error rollback of owned outputs; not crash/power-loss atomicity."""
     paths, owned_paths = [], []
+    for item in images:
+        _check_artifact(item[2], ".png" if len(item) == 3 else item[3])
     try:
-        for label, clock, data in images:
-            path = _publish(directory, label, clock, data, check_running, _owned_paths=owned_paths)
+        for item in images:
+            label, clock, data = item[:3]
+            extension = ".png" if len(item) == 3 else item[3]
+            path = _publish(directory, label, clock, data, check_running, _owned_paths=owned_paths, _extension=extension)
             paths.append(path)
         _check_running(check_running)
         return paths
@@ -841,7 +860,7 @@ def validate_accuracy(directory, run_id, axis_results, result="complete", reason
 
 def write_accuracy(directory, run_id, axis_results, result, reason=None, simulated=False,
                    renderer=None, check_running=None, capture_directory=None,
-                   published_paths=None, baseline_run_id=None):
+                    published_paths=None, baseline_run_id=None, telemetry=None):
     if result != "complete":
         raise ValueError("Only a complete accuracy measurement can publish a PNG")
     axes = validate_accuracy(directory, run_id, axis_results, result, reason, simulated,
@@ -869,8 +888,37 @@ def write_accuracy(directory, run_id, axis_results, result, reason=None, simulat
         _check_png(data, decode_pixels=False)
         rendered.append(("Accel Homing Accuracy %s - Run %s" % (axis.upper(), run_id), clock, data))
         keys.append(axis + "_png")
+        if telemetry is not None:
+            diagnostic = _accuracy_telemetry_report(report, item, telemetry.get(axis), data)
+            encoded = _json(diagnostic).encode("utf-8")
+            _check_artifact(encoded, ".json")
+            rendered.append(("Accel Homing Accuracy %s - Run %s" % (axis.upper(), run_id), clock, encoded, ".json"))
+            keys.append(axis + "_json")
     paths.update(zip(keys, _publish_group(directory, rendered, check_running)))
     return paths
+
+
+def _accuracy_telemetry_report(report, item, prepared, png_bytes):
+    try:
+        from .accel_homing_filters import validate_accuracy_home_telemetry
+    except ImportError:
+        from accel_homing_filters import validate_accuracy_home_telemetry
+    if (not isinstance(prepared, dict) or set(prepared) != {"discovery", "trials"}
+            or not isinstance(prepared["trials"], list) or len(prepared["trials"]) != len(item["trials"])):
+        raise ValueError("Accuracy telemetry requires discovery and every measured home")
+    discovery = validate_accuracy_home_telemetry(prepared["discovery"], item["discovery"])
+    trials = [validate_accuracy_home_telemetry(encoded, record) for encoded, record in zip(prepared["trials"], item["trials"])]
+    return {"version": 1, "kind": "completed_accuracy_telemetry", "run_id": report["run_id"], "axis": report["axis"],
+            "result": "complete", "measurement": "commanded_homing_travel", "physical_position_verified": False,
+            "simulated": report["simulated"],
+            "units": {"time": "seconds in separately labelled print-time snapshots", "acceleration": "g",
+                      "native_values": "signed sensor counts; 32767 is a marker, not acceleration",
+                      "travel": "commanded millimetres", "sample_identity": "start_clock32,delta_clock,row_zero_based,original_row_count"},
+            "causal_cutoff": "only original times strictly before stop_request_interval_s[0] are proven before host dispatch",
+            "publication": "owned-file rollback on handled error/cancellation; not crash-atomic",
+            "png_sha256": hashlib.sha256(png_bytes).hexdigest(), "context": report["context"],
+            "threshold_g": report["threshold_g"], "requested": report["requested"], "count": len(trials),
+            "statistics": report["statistics"], "discovery": discovery, "trials": trials}
 
 
 def _accuracy_report(run_id, axis, item, simulated):

@@ -9,7 +9,7 @@ from unittest import mock
 
 from accel_homing_filters import (validate_filtered_capture_prefix, validate_censored_peak_record,
                                   compare_filter_capture, detector_config)
-from harness import FakeEndstop, acquire_reference, batch, counts, make_homing
+from harness import FakeEndstop, acquire_reference, batch, counts, make_homing, plugin
 from test_session import FakeRail, info
 from test_filter_engine import FilteredRig
 
@@ -17,7 +17,8 @@ from test_filter_engine import FilteredRig
 def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_size=8,
                             split=None, clock_shift=0., axes_map=((0, 1), (1, 1), (2, 1)),
                             time_offset=0., arm_straddle=0, clock_hz=1000., sample_period=.001,
-                            post_clip_g=3., filter_config=None, row_values=None, reference_rows=None):
+                            post_clip_g=3., filter_config=None, row_values=None, reference_rows=None,
+                            detector_type="filtered", mode="calibration", finish_home_wait=False):
     """Exercise real prepare/filter/capture callbacks, with no real hardware."""
     obj = make_homing(threshold=1., axes_map=axes_map)
     obj.reactor.now = time_offset
@@ -31,8 +32,9 @@ def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_
     endstop.get_steppers = lambda: []
     rail = FakeRail(endstop, info(speed=100., retract=0., second=100.))
     obj.session_axes = obj.rails_by_axis = {axis: rail}
-    obj.workflows.session = {"mode": "calibration", "state": "running", "axis": axis,
-                             "algorithm": "impact20_vector_v2", "detector_types": {axis: "filtered"},
+    obj.workflows.session = {"mode": mode, "state": "running", "axis": axis,
+                             "algorithm": "impact20_vector_v2", "detector_types": {axis: detector_type},
+                             "detector_metrics": {axis: "xyz_magnitude"},
                              "detector_configs": {axis: detector_config(filter_config)}}
     obj.workflows.in_home, obj.workflows.home_axis = True, axis
     obj.start_capture()
@@ -68,7 +70,13 @@ def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_
         obj.reactor.now = when + (last - 1) * sample_period + .001
         obj._inspect(batch(start, current, receive_time=obj.reactor.now,
                            delta_clock=round((len(current) - 1) * sample_period * clock_hz)))
-    obj.disarm()
+    if finish_home_wait:
+        returning_endstop = plugin.BeaconAccelEndstop(obj, axis)
+        returning_endstop._dispatch = types.SimpleNamespace(wait_end=lambda _time: None,
+            stop=lambda: plugin.mcu.MCU_trsync.REASON_ENDSTOP_HIT)
+        returning_endstop.home_wait(attempt.deadline)
+    else:
+        obj.disarm()
     if clock_shift:
         original = obj.clock_to_time
         obj.clock_to_time = lambda clock: original(clock) + clock_shift

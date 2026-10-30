@@ -25,11 +25,13 @@ import uuid
 try:
     from .accel_homing_filters import (detector_config, CausalImpactDetector,
                                        robust_reference, signal_mode, validate_detector_identity,
-                                       validate_filtered_capture_prefix, validate_censored_peak_record)
+                                       validate_filtered_capture_prefix, validate_censored_peak_record,
+                                       prepare_accuracy_home_telemetry)
 except ImportError:
     from accel_homing_filters import (detector_config, CausalImpactDetector,
                                       robust_reference, signal_mode, validate_detector_identity,
-                                      validate_filtered_capture_prefix, validate_censored_peak_record)
+                                      validate_filtered_capture_prefix, validate_censored_peak_record,
+                                      prepare_accuracy_home_telemetry)
 
 try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
@@ -3055,6 +3057,7 @@ class AccelHomingWorkflows:
 
     def _cleanup_accuracy_captures(self, temporary, session, error_active):
         if session is not None:
+            session.pop("accuracy_telemetry", None)
             session.pop("capture_directory", None)
             for item in session.get("axis_results", {}).values():
                 for key in ("capture_paths", "discovery_capture_paths", "rejection_capture_paths"):
@@ -3295,6 +3298,7 @@ class AccelHomingWorkflows:
             session = self.session
             session.update(state="running", axes=axes, samples_requested=samples,
                            baseline_run_id=baseline_run_id,
+                            accuracy_telemetry={axis: {"discovery": None, "trials": []} for axis in axes},
                            attempt_limit=len(axes) * (samples + 1), sample_index=0,
                            configured_speeds={axis: self.owner.rails_by_axis[axis].get_homing_info().speed
                                               for axis in axes},
@@ -3353,6 +3357,14 @@ class AccelHomingWorkflows:
         return accuracy_statistics(records)
 
     def _accuracy_trials(self, session):
+        last_yield = [self.reactor.monotonic()]
+        def cooperate():
+            self._chart_check(session)
+            now = self.reactor.monotonic()
+            if now - last_yield[0] >= 0.025:
+                self.reactor.pause(now + 0.001)
+                last_yield[0] = self.reactor.monotonic()
+            self._chart_check(session)
         for axis_index, axis in enumerate(session["axes"]):
             session["axis"] = axis
             axis_result = session["axis_results"][axis]
@@ -3380,6 +3392,13 @@ class AccelHomingWorkflows:
                                 raise self._error("%s; no automatic move follows this error; manually recenter" % exc) from exc
                             return
                         raise self._error(reason + "; no automatic move follows this result; manually recenter")
+                    diagnostic = prepare_accuracy_home_telemetry(
+                        capture, record, check_running=cooperate)
+                    target = session.setdefault("accuracy_telemetry", {}).setdefault(axis, {"discovery": None, "trials": []})
+                    if sample_index == 0:
+                        target["discovery"] = diagnostic
+                    else:
+                        target["trials"].append(diagnostic)
                     paths = prepare_capture(
                                           "%s_a%03d" % (session["run_id"], session["attempts"]),
                                           axis, capture, record,
@@ -3448,6 +3467,7 @@ class AccelHomingWorkflows:
                            session["axis_results"], result["result"], result.get("reason"),
                            published_paths=paths,
                            baseline_run_id=session.get("baseline_run_id"),
+                            telemetry=session.get("accuracy_telemetry"),
                            **self._chart_options(session))
         except Exception as exc:
             logging.exception("accel_homing: unable to export accuracy summary")
@@ -3456,8 +3476,13 @@ class AccelHomingWorkflows:
                 result["result"] = "aborted"
                 result["reason"] = "accuracy summary export failed: %s" % exc
         if paths:
-            result["summary_paths"] = dict(paths)
-            self._announce_pngs(paths, "Accuracy", result)
+            result["summary_paths"] = {key: path for key, path in paths.items() if key.endswith("_png")}
+            result["telemetry_paths"] = {key: path for key, path in paths.items() if key.endswith("_json")}
+            self._announce_pngs(result["summary_paths"], "Accuracy", result)
+            for key, path in paths.items():
+                if key.endswith("_json"):
+                    self._info("Accuracy telemetry %s: %s (schema 1; discovery + %d measured homes)" % (
+                        key.split("_")[0].upper(), path, session["samples_requested"]))
         self._info("Accuracy run %s: %s. Commanded travel is reported to 0.001 mm; "
                    "these measurements do not certify physical stop position" % (
                        session["run_id"], result["result"]))

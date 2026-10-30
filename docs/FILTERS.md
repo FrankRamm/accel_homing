@@ -39,6 +39,11 @@ the successful result. Those ten homes do not test the higher saved threshold.
 
 ## Operator sequence
 
+If both compatible saved profiles are already available, use the
+[30-home RAW then FILTERED comparison](ACCURACY.md#compare-30-raw-and-30-filtered-homes)
+without recalibrating just for that comparison. The sequence below also covers
+creating a missing FILTERED profile and inspecting a separate same-capture chart.
+
 Before **each** moving command below, follow the
 [manual preparation](COMMANDS.md#prepare-every-moving-workflow): printer idle
 and unpaused, both XY axes unhomed and physically centered, Z supported,
@@ -170,6 +175,28 @@ labelled bounded endpoint estimates when native markers occur; their causal
 weighted threshold is stated separately rather than drawn over the raw norm.
 
 ## Read the actual A/B report
+
+Successful RAW and FILTERED ACCURACY commands now automatically publish a
+per-axis JSON diagnostic beside the existing PNG. `discovery` is separate from
+the measured `trials`; a 30-home report therefore retains one discovery record
+and 30 measured records. The JSON does not change detector/control parameters,
+calibrated thresholds, statistics or the compact PNG baseline schema. Existing
+valid PNG baselines remain usable without JSON. Failed workflows publish neither
+accuracy artifact. See [the files and timing limits](ACCURACY.md#per-home-json-diagnostics).
+
+Each native event window keeps at most 50 consecutive original signed sensor
+rows, with packet identities, original acquisition times, separately labelled
+capture times and marker/endpoint-estimate flags. It is not the chart's reduced
+display trace. FILTERED diagnostics retain its reference offsets/noise weights,
+effective onset gate and actual candidate/rejection counters; replay counters
+and their match to the actual counts are reported separately. Its window starts
+no earlier than the first armed sample. The bounded
+pre-window FILTERED state is reconstructed after stopping and replay-verified
+against the original decisions, not captured online. Planned movement-start and
+first-step times remain explicitly unavailable. Host stop-request bounds,
+returned trigger time and commanded trigger/halt travel do not measure physical
+contact or MCU halt. After-cutoff rows and marker estimates retain the same
+interpretation limits as the comparison chart.
 
 Acceleration components in every plot use absolute display values, including
 the signed v1 filter output. The v1 detector still filters signed centered XYZ;
@@ -317,6 +344,8 @@ response, or evidence that contact was correct. Charts state **SATURATED /
 RESPONSE TRUNCATED / FULL PEAK UNAVAILABLE** and omit the unknown tail.
 Original native packets remain bounded private validation evidence in memory;
 they are not serialized to a PNG or raw scratch file.
+The successful Accuracy JSON retains only its explicitly bounded event rows,
+not that full packet history.
 
 Native `FILTERED` capture starts at the exact accepted stationary-reference
 row and ends at host stream close or explicit capture seal. Earlier enable/

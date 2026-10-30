@@ -6,6 +6,9 @@ miss narrow contacts and add stopping latency. Thresholds belong to this metric
 and must never be borrowed implicitly from a raw-magnitude calibration.
 """
 import collections
+import copy
+import hashlib
+import json
 import math
 import statistics
 import struct
@@ -16,6 +19,232 @@ MAX_REFERENCE_SAMPLES = 65536
 MAX_HISTORY_SAMPLES = 128
 MAX_MOVING_SAMPLES = 256
 NATIVE_CLIP_POLICY = "beacon_previous_sensor_sign_v1"
+ACCURACY_EVENT_ROWS = 50
+MAX_HOME_TELEMETRY_BYTES = 128 * 1024
+
+
+def _stop_relation(when, bounds):
+    if (type(when) not in (int, float) or not math.isfinite(when)
+            or not isinstance(bounds, (list, tuple)) or len(bounds) != 2
+            or any(type(v) not in (int, float) or not math.isfinite(v) for v in bounds)):
+        return "unknown"
+    return "before_lower" if when < bounds[0] else "after_upper" if when > bounds[1] else "within_request_interval"
+
+
+def _filter_state(engine):
+    return {"previous_time_s": engine.previous_time, "filtered_sensor_xyz_g": list(engine.filtered_xyz),
+            "history": [list(row) for row in engine.history], "candidate": copy.deepcopy(engine.candidate),
+            "candidate_count": engine.candidates, "rejected_candidates": engine.rejected_candidates,
+            "rejection_reasons": dict(engine.rejection_reasons), "moving_learning_frozen": engine.moving_frozen}
+
+
+def prepare_accuracy_home_telemetry(capture, record, check_running=None):
+    """Freeze <=50 original consecutive rows after the completed home, never during motion.
+
+    FILTERED state is reconstructed from the retained exact prefix and checked
+    against the actual decision. It is not an online snapshot. Unsupported
+    captures retain explicit unavailable fields instead of inventing input data.
+    The canonical JSON string owns no capture/attempt references.
+    """
+    if record.get("result") != "impact" or record.get("capture_valid") is False:
+        raise ValueError("only qualified impact captures have accuracy telemetry")
+    if check_running is not None:
+        check_running()
+    detector = capture.get("detector") or {}
+    original_times = {event: record.get("trigger_" + event + "_time_s", record.get(event + "_time_s"))
+                      for event in ("onset", "crossing", "confirmation")}
+    events = {event: {"sample": detector.get(event + "_sample", record.get(event + "_sample")),
+                      "original_time_s": original_times[event],
+                      "original_time_origin": ("filtered_online_decision" if record.get("detector_type") == "filtered" else
+                          "raw_disarm_trigger_time_conversion" if event == "onset" else "raw_controller_threshold_crossing_conversion"),
+                      "capture_time_s": detector.get(event + "_time_s"),
+                      "unavailable_reason": None if original_times[event] is not None else "not_recorded_by_actual_controller"}
+              for event in original_times}
+    record_json = json.dumps(record, sort_keys=True, allow_nan=False, separators=(",", ":"))
+    home = {"version": 1, "kind": "accuracy_home_telemetry", "run_id": record.get("run_id"),
+            "record_sha256": hashlib.sha256(record_json.encode("utf-8")).hexdigest(),
+            "axis": record.get("axis"), "workflow_attempt": record.get("workflow_attempt"),
+            "phase": record.get("workflow_phase"), "measurement_index": record.get("accuracy_sample"),
+            "result": record["result"], "physical_position_verified": False,
+            "threshold_g": record.get("threshold_g"), "impact_metric": record.get("impact_metric"),
+            "direction": record.get("direction"), "selected_machine_axis": record.get("axis"),
+            "detector_type": record.get("detector_type", "raw"), "detector_version": record.get("detector_version"),
+            "decision_semantics": "causal_temporal_confirmation" if record.get("detector_type") == "filtered" else "immediate_raw_threshold_decision",
+            "detector_config": record.get("detector_config"), "sensor_context": record.get("sensor_context"),
+            "geometry_context": record.get("geometry_context"),
+            "homing_speed_mm_s": record.get("homing_speed_mm_s"),
+            "homing_accel_mm_s2": record.get("homing_accel_mm_s2"),
+            "arm_time_s": record.get("arm_time_s"), "arm_clock": record.get("arm_clock"),
+            "planned_movement_start_time_s": None, "first_step_time_s": None,
+            "movement_time_unavailable_reason": "not_exposed_by_existing_homing_interface",
+            "returned_trigger_time_s": record.get("returned_trigger_time_s"),
+            "returned_trigger_time_unavailable_reason": None if record.get("returned_trigger_time_s") is not None else "not_recorded",
+            "events": events, "stop_request_interval_s": record.get("stop_request_interval_s"),
+            "stop_request_is_mcu_halt": False,
+            "travel_mm_exact": record.get("travel_mm_exact", record.get("travel_mm")),
+            "trigger_travel_mm_signed": record.get("trigger_travel_mm_signed"),
+            "halt_travel_mm_signed": record.get("halt_travel_mm_signed"),
+            "native_clip_decode": capture.get("native_clip_decode"),
+            "amplitude_limited": capture.get("amplitude_limited", False),
+            "response_censoring": capture.get("response_censoring"),
+            "filter_reference_sensor_frame": capture.get("_accuracy_sensor_reference", capture.get("_native_filter_reference")),
+            "baseline_machine_xyz_g": capture.get("baseline_g"),
+            "reference_sample_count": detector.get("reference_sample_count"),
+            "reference_sample_bounds": detector.get("reference_sample_bounds"),
+            "filter_diagnostics": record.get("filter_diagnostics"),
+            "effective_onset_gate_g": None, "state_before_window": None,
+            "state_provenance": {"available": False, "reason": "original_native_packets_not_retained_for_verified_state_replay"
+                                 if record.get("detector_type") == "filtered" else "actual_controller_has_no_filter_state"},
+            "window": {"available": False, "reason": "original_native_packets_not_retained",
+                       "limit_rows": ACCURACY_EVENT_ROWS, "downsampled": False, "rows": []}}
+    sources = capture.get("_accuracy_native_sources", capture.get("_native_source_batches"))
+    mapping = capture.get("_accuracy_native_mapping", capture.get("_native_mapping"))
+    if sources:
+        filtered = home["detector_type"] == "filtered"
+        if filtered:
+            validate_filtered_capture_prefix(capture, record, check_running)
+        # First locate packet identities arithmetically. Do not expand the full
+        # capture into rich diagnostic row dictionaries before selecting 50.
+        total, found = 0, {event: [] for event in events}
+        armed_index, armed_time = None, None
+        for source in sources:
+            count = len(source["data"]) // (3 if isinstance(source["data"], tuple) else 6)
+            first_row = source["first_sample_position"]
+            packet = (source["start_clock"], source["delta_clock"], count)
+            for event, value in events.items():
+                stamp = value["sample"]
+                if stamp is not None and (stamp[0], stamp[1], stamp[3]) == packet:
+                    found[event].append(total + stamp[2] - first_row)
+                    value["row_acquisition_snapshot_time_s"] = source["filter_start_time_s"] + (source["filter_end_time_s"] - source["filter_start_time_s"]) * stamp[2] / (count - 1)
+                    value["row_time_origin"] = source.get("time_origin", "detector_or_capture_packet_snapshot")
+            stamp = detector.get("first_armed_sample")
+            if stamp is not None and (stamp[0], stamp[1], stamp[3]) == packet:
+                armed_index = total + stamp[2] - first_row
+                armed_time = source["filter_start_time_s"] + (source["filter_end_time_s"] - source["filter_start_time_s"]) * stamp[2] / (count - 1)
+            total += count - first_row
+        if len(found["onset"]) != 1:
+            raise ValueError("accuracy telemetry lost the unique original onset row")
+        onset_index = found["onset"][0]
+        first = max(armed_index if filtered else 0, onset_index - 16)
+        last = min(total, first + ACCURACY_EVENT_ROWS)
+        selected = []
+        home["window"] = {"available": True, "limit_rows": ACCURACY_EVENT_ROWS,
+            "selection": "up_to_16_rows_before_onset_excluding_filtered_prearm_then_consecutive_until_limit_or_capture_end",
+            "downsampled": False, "source_frame": "sensor_xyz", "source_row_count": total,
+            "first_source_row_index": first, "last_source_row_index": last - 1,
+            "omitted_before": first, "omitted_after": total - last,
+            "pre_onset_rows_requested": 16, "pre_onset_rows_retained": onset_index - first,
+            "edge_truncated": onset_index - first < 16 or last - first < ACCURACY_EVENT_ROWS,
+            "events_outside_window": [event for event in events if found[event] and not first <= found[event][0] < last],
+            "axes_map": mapping, "rows": selected}
+        for event, value in events.items():
+            value["retained_matches"] = len(found[event])
+        engine = decision = None
+        if filtered:
+            reference = home["filter_reference_sensor_frame"]
+            config = validate_detector_identity(home["detector_version"], home["detector_config"])
+            home["effective_onset_gate_g"] = max(config["onset_ratio"] * home["threshold_g"],
+                3. * math.sqrt(sum((s * w) ** 2 for s, w in zip(reference["noise_sigma_g"], reference["weights_xyz"]))))
+            engine = CausalImpactDetector(home["threshold_g"], reference["offset_g"], reference["noise_sigma_g"], reference["weights_xyz"], config)
+            engine.previous_time = armed_time - detector["sample_period_s"]
+        offset = 0
+        for source_number, source in enumerate(sources):
+            if check_running is not None:
+                check_running()
+            data = source["data"]
+            count = len(data) // (3 if isinstance(data, tuple) else 6)
+            raw_rows = (zip(*[iter(data)] * 3) if isinstance(data, tuple) else struct.iter_unpack("<hhh", data))
+            seed, limits = tuple(source["decode_previous_raw"]), source.get("clip_values")
+            control_seed, control_first = source.get("control_decode_previous_raw"), source.get("control_first_sample_position")
+            a, b = source["filter_start_time_s"], source["filter_end_time_s"]
+            period = (b - a) / (count - 1)
+            previous_decoded = seed
+            for position, raw in enumerate(raw_rows):
+                if check_running is not None and position % 256 == 0:
+                    check_running()
+                if not filtered and control_seed is not None and position == control_first:
+                    previous_decoded = tuple(control_seed)
+                prior = previous_decoded
+                decoded_xyz = decode_native_row(raw, prior, limits) if limits is not None else raw
+                previous_decoded = decoded_xyz
+                if position < source["first_sample_position"]:
+                    continue
+                index = offset + position - source["first_sample_position"]
+                if index >= last and (engine is None or decision is not None):
+                    break
+                when = a + (b - a) * position / (count - 1)
+                stamp = [source["start_clock"], source["delta_clock"], position, count]
+                if engine is not None and index == first:
+                    home["state_before_window"] = _filter_state(engine)
+                processed = engine is not None and index >= armed_index and decision is None
+                if processed:
+                    decision = engine.feed(when, tuple(v * source["count_g"] for v in decoded_xyz), tuple(stamp))
+                if not first <= index < last:
+                    continue
+                full_scale = (record.get("sensor_context") or {}).get("full_scale_g")
+                unknown_decode = limits is None and 32767 in raw
+                row = {"sample": stamp, "original_time_s": when, "time_origin": source.get("time_origin", "detector_or_capture_packet_snapshot"),
+                       "capture_time_s": source["start_time_s"] + (source["end_time_s"] - source["start_time_s"]) * position / (count - 1),
+                       "raw_sensor_xyz_counts": raw, "marker_axes": [v == 32767 for v in raw],
+                       "valid_original_axes": [v != 32767 and math.isfinite(v) for v in raw],
+                       "range_limit_axes": [bool(full_scale is not None and v != 32767 and abs(v * source["count_g"]) >= full_scale) for v in raw],
+                       "decoded_sensor_xyz_counts": None if unknown_decode else list(decoded_xyz),
+                       "decoded_sensor_xyz_g": None if unknown_decode else [v * source["count_g"] for v in decoded_xyz],
+                       "stop_relation": _stop_relation(when, home["stop_request_interval_s"]),
+                       "processed_by_actual_filter": processed, "filtered_sensor_xyz_g": list(engine.filtered_xyz) if processed else None,
+                       "weighted_filtered_level_g": engine.level_g if processed else None, "decoder_previous_sensor_counts": list(prior),
+                       "period_s": period, "clip_values": limits,
+                       "control_seed_convention": "continuous_sensor_seed" if filtered else "legacy_raw_controller_seed_where_recorded"}
+                selected.append(row)
+            offset += count - source["first_sample_position"]
+            if offset >= last and (engine is None or decision is not None):
+                break
+        if filtered:
+            if decision is None or any(tuple(events[event]["sample"]) != decision[event + "_identity"]
+                    or original_times[event] != decision[event + "_time_s"] for event in events):
+                raise ValueError("accuracy telemetry replay does not match actual original decision")
+            home["state_provenance"] = {"available": True, "origin": "post_stop_exact_prefix_replay",
+                "actual_decision_verified": True, "online_snapshot": False,
+                "initial_filtered_sensor_xyz_g": [0., 0., 0.],
+                "first_armed_sample": detector["first_armed_sample"],
+                "first_armed_previous_time_s": armed_time - detector["sample_period_s"],
+                "reference_sample_bounds": detector.get("reference_sample_bounds"),
+                "reference_sample_count": detector.get("reference_sample_count")}
+            replay_counts = {"candidate_count": engine.candidates, "rejected_candidates": engine.rejected_candidates,
+                             "rejection_reasons": dict(engine.rejection_reasons)}
+            actual_counts = record.get("filter_diagnostics")
+            home["state_provenance"].update(replay_candidate_summary=replay_counts,
+                replay_candidate_summary_matches_actual=(None if not isinstance(actual_counts, dict) else
+                    all(actual_counts.get(key) == value for key, value in replay_counts.items())))
+    encoded = json.dumps(home, sort_keys=True, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_HOME_TELEMETRY_BYTES:
+        raise ValueError("accuracy home telemetry exceeds bounded metadata limit")
+    if check_running is not None:
+        check_running()
+    return encoded
+
+
+def validate_accuracy_home_telemetry(encoded, record):
+    """Bind an immutable, bounded diagnostic receipt to its actual home record."""
+    if not isinstance(encoded, str) or len(encoded.encode("utf-8")) > MAX_HOME_TELEMETRY_BYTES:
+        raise ValueError("invalid bounded accuracy home telemetry")
+    home = json.loads(encoded)
+    canonical = json.dumps(home, sort_keys=True, allow_nan=False, separators=(",", ":"))
+    expected = hashlib.sha256(json.dumps(record, sort_keys=True, allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if (canonical != encoded or type(home.get("version")) is not int or home["version"] != 1
+            or home.get("kind") != "accuracy_home_telemetry" or home.get("record_sha256") != expected
+            or any(home.get(key) != record.get(other) for key, other in (
+                ("run_id", "run_id"), ("axis", "axis"), ("workflow_attempt", "workflow_attempt"),
+                ("phase", "workflow_phase"), ("measurement_index", "accuracy_sample"),
+                ("threshold_g", "threshold_g"), ("detector_type", "detector_type")))):
+        raise ValueError("accuracy telemetry does not belong to the current home")
+    window = home.get("window") or {}
+    state = home.get("state_before_window") or {}
+    if (window.get("limit_rows") != ACCURACY_EVENT_ROWS or window.get("downsampled") is not False
+            or not isinstance(window.get("rows"), list) or len(window["rows"]) > ACCURACY_EVENT_ROWS
+            or len(state.get("history", ())) > MAX_HISTORY_SAMPLES):
+        raise ValueError("accuracy diagnostic window/state exceeds its limits")
+    return home
 
 
 def native_clip_limits(values):
@@ -171,6 +400,7 @@ class CausalImpactDetector:
         self.moving_frozen = False
         self.candidate = self.decision = None
         self.candidates = self.rejected_candidates = 0
+        self.rejection_reasons = {"timeout": 0, "release": 0}
         self.raw_level_g = self.level_g = self.magnitude_g = 0.
 
     def feed(self, when, xyz_g, identity=None):
@@ -232,6 +462,7 @@ class CausalImpactDetector:
             elapsed = when - candidate["crossing_time_s"]
             if elapsed > self.config["confirmation_max_s"] + 1e-12:
                 self.rejected_candidates += 1
+                self.rejection_reasons["timeout"] += 1
                 self.candidate = None
             else:
                 candidate["peak_level_g"] = max(candidate["peak_level_g"], self.level_g)
@@ -254,6 +485,7 @@ class CausalImpactDetector:
                     return self.decision
                 if self.level_g < self.config["release_ratio"] * threshold:
                     self.rejected_candidates += 1
+                    self.rejection_reasons["release"] += 1
                     self.candidate = None
         # Moving-noise characterization is deliberately observation only. It
         # never updates the frozen offset, weights, or threshold. The first
@@ -271,6 +503,7 @@ class CausalImpactDetector:
                           accepted_below_g=self.config["support_ratio"] * self.threshold_g,
                           censored=True, used_for_detection=False)
         return {"candidate_count": self.candidates, "rejected_candidates": self.rejected_candidates,
+                "rejection_reasons": dict(self.rejection_reasons),
                 "moving_noise": moving, "moving_learning_frozen": self.moving_frozen,
                 "learning_policy": "frozen_before_arm", "threshold_adaptation": False,
                 "history_samples": len(self.history), "moving_samples": len(self.moving)}
@@ -316,7 +549,7 @@ def validate_censored_peak_record(record):
     return True
 
 
-def validate_filtered_capture_prefix(capture, record=None):
+def validate_filtered_capture_prefix(capture, record=None, check_running=None):
     """Prove a native confirmation from original raw rows before saturation.
 
     Whole-capture integrity remains false. The private bounded original batches
@@ -381,6 +614,8 @@ def validate_filtered_capture_prefix(capture, record=None):
     counts = {"clipped_axis_values": 0, "saturated_axis_values": 0, "nonfinite_axis_values": 0}
     last, last_clock, original_last = None, None, None
     for source_index, source in enumerate(sources):
+        if check_running is not None:
+            check_running()
         data = source.get("data")
         if isinstance(data, tuple):
             if len(data) % 3:
@@ -402,7 +637,16 @@ def validate_filtered_capture_prefix(capture, record=None):
                     or (last_decoded is not None and seed != last_decoded)
                     or (last_decoded is None and seed != _xyz(scope.get("decode_previous_raw")))):
                 raise ValueError("native decoder limits/seed/epoch provenance changed")
-            raw = decode_native_values(raw, seed, clips)
+            if check_running is None:
+                raw = decode_native_values(raw, seed, clips)
+            else:
+                decoded_rows, previous_decoded = [], seed
+                for offset in range(0, len(raw), 768):
+                    check_running()
+                    chunk = decode_native_values(raw[offset:offset + 768], previous_decoded, clips)
+                    previous_decoded = tuple(chunk[-3:])
+                    decoded_rows.extend(chunk)
+                raw = decoded_rows
             last_decoded = tuple(raw[-3:])
         first = source.get("first_sample_position")
         if (type(first) is not int or not 0 <= first < count
@@ -442,6 +686,8 @@ def validate_filtered_capture_prefix(capture, record=None):
                              % (source_index, last_clock, start_clock, scope["admission_epoch"]))
         last_clock = (start_clock + delta) & 0xffffffff
         for position in range(first, count):
+            if check_running is not None and position % 256 == 0:
+                check_running()
             when = start + position * period
             if last is not None and (when <= last or when - last > 5. * period + .000003):
                 raise ValueError("missing/repeated response samples cannot be censored"
@@ -554,6 +800,8 @@ def validate_filtered_capture_prefix(capture, record=None):
     engine.previous_time = online_times[start_index] - period
     decision = None
     for i in range(start_index, index):
+        if check_running is not None and i % 256 == 0:
+            check_running()
         if online_times[i] is None:
             raise ValueError("censored prefix lost an online packet timestamp")
         decision = engine.feed(online_times[i], rows[i], i)
