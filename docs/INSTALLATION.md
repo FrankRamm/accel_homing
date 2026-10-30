@@ -89,7 +89,19 @@ across both generations while preserving unrelated later edits. Retain the
 complete backup journal. Matching existing native manual Moonraker stanzas can
 receive a reversible branch-only edit; conflicting ownership is refused.
 
-Before returning to main **after saving any FILTERED axis**, keep the
+Default HYBRID CALIBRATE writes paired model schema 3. Installing/updating this
+branch alone preserves existing schema 1/2 models; only a later operator-run
+paired calibration creates schema 3. Older code without schema-3 support cannot
+load it, even when ordinary homing is selected RAW. A later explicit pure
+ten-check calibration can retain the archived five-check profile's paired
+certificate and schema 3. Do not infer compatibility from the selected mode,
+edit the schema number or relabel its qualification count. Restore a verified
+compatible pre-pair baseline through the reviewed development uninstall or
+exact unchanged transaction rollback below before switching to an older target.
+The RAW-recalibration route in the next paragraph applies only to legacy schema
+1/2 models that have never used schema 3.
+
+For those legacy models, before returning to main **after saving any FILTERED axis**, keep the
 development code active and restore a valid selected RAW model for every
 affected axis. The supported operator route is normal supervised calibration:
 reprepare XY, run `ACCEL_HOMING_CALIBRATE AXIS=X DETECTOR=RAW CENTERED=1`, let it

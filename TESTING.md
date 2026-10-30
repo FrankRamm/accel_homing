@@ -61,17 +61,29 @@ full suite run establish different things; identify which were actually done.
 ## Current behavior to verify
 
 - Calibration discovers an impact after more than 20 mm inside the configured
-  midpoint-to-stop band, excludes discovery and needs ten validation homes with
-  max-minus-min travel at most 2.00 mm. A running spread above that rejects the
+  midpoint-to-stop band and excludes discovery. Explicit pure RAW/FILTERED
+  needs ten validation homes; default/explicit HYBRID needs five RAW and five
+  FILTERED valid checks in one automatic command, with separate discovery and
+  no manual transition. Each series requires max-minus-min travel at most
+  2.00 mm. A running spread above that rejects the
   candidate immediately. Only after qualification, the staged/saved threshold
   receives a single 0.5 g margin. Trial thresholds stay unchanged; the final
   value must fit sensor headroom without clamping, and metadata reports that
   the higher value was not tested by those homes.
+- A paired HYBRID recoverable early-hit/spread failure in either series discards
+  both private results, resets both valid counts to zero and restarts from RAW,
+  adjusting only the failing detector's candidate. Global attempts never reset;
+  a new complete pair needs at least twelve remaining attempts. No incomplete
+  first-stage result is reused/saved. Fatal context/stream/geometry/cancellation
+  faults abort. Both successful series and cleanup precede the only final save.
+  Schema 3 retains honest five-per-profile and ten-total evidence; legacy schema
+  1/2 models remain readable without rewriting. Ordinary G28's selected type is
+  preserved, while explicit pure calibration keeps its ten-check contract.
 - Premature calibration returns reverse current signed start-to-halt commanded
   travel before the next candidate; faults/failed returns do not count as
   completed recovery.
 - ACCURACY uses the active threshold and bounded in-memory capture receipts.
-  Only a complete workflow publishes final summaries. Early-trigger recovery
+  Only a complete workflow publishes final summaries. RAW/FILTERED early-trigger recovery
   requires current evidence, reports failure without a PNG and completes cleanup,
   then starts standard calibration at the failed
   threshold plus exactly 0.25 g. Only successful calibration saves/restarts.
@@ -96,12 +108,21 @@ full suite run establish different things; identify which were actually done.
   bounded validated successful PNG receipt from the same root/axis and keeps
   actual independent-run statistics separate from replay. Required missing or
   mismatched acceleration/speed/geometry/sensor context prevents attribution.
-- Explicit HYBRID preflights both saved compatible profiles for every requested
+- CALIBRATE and ACCURACY default to HYBRID only when DETECTOR is omitted;
+  explicit RAW/FILTERED/HYBRID overrides remain. SAMPLES and every other command
+  default remain unchanged; no global default setting is added.
+- Native live RAW uses sign-independent centered absolute acceleration or XYZ
+  norm; configured impact_sign/automatic direction does not gate impacts. Live
+  native FILTERED/HYBRID requires rectified v2. Legacy/unknown saved selected-axis
+  RAW qualification is rejected even with impact_sign zero; compatible XYZ/v2
+  remains usable. Original signed native counts/JSON and historical signed-v1
+  replay/receipts remain unchanged and labelled. Generic behavior is unchanged.
+- HYBRID measurement preflights both saved compatible profiles for every requested
   axis before movement. FILTERED confirmation/rejection and the response anchor
   retain their behavior; an independent RAW XYZ observer supplies only the
   associated position timestamp. Missing/ambiguous RAW evidence falls back with
   explicit provenance and measured counts. Rejected candidates cannot donate a
-  timestamp, unsupported commands/overrides fail, and HYBRID early-quality
+  timestamp, unsupported commands/overrides fail, and HYBRID ACCURACY early-quality
   failure cannot enter automatic return/recalibration. Historical RAW/FILTERED
   receipts remain readable with their recorded position policy.
 - Combined packaging regression installs six modules on main, upgrades the

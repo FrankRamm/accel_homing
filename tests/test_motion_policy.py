@@ -1487,7 +1487,7 @@ class WorkflowMotionProofIntegrationTests(unittest.TestCase):
         rig = Rig()
         rig.home_results.append(CommandError("toolhead motion was not verified"))
         with self.assertRaisesRegex(CommandError, "motion was not verified"):
-            rig.calibrate()
+            rig.calibrate(DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.workflow.last_result["result"], "aborted")
         self.assertEqual(rig.toolhead.moves, [])

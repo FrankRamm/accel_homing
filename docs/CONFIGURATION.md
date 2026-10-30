@@ -66,36 +66,67 @@ The raw trigger representation must also remain finite and positive. Sensor
 saturation/data faults are separate checks. Do not paste an 8 g threshold for
 an 8 g MPU9250 sensor.
 
-To use calibration, comment out both axis overrides **and** the shared
-`threshold`, then issue console `RESTART` while idle. An explicit manual
-threshold retains the legacy selected-axis detector; a newly calibrated model
+To activate saved model thresholds for ordinary homing, comment out both axis
+overrides **and** the shared `threshold`, then issue console `RESTART` while idle. An explicit manual
+threshold retains the selected-axis metric (absolute centered values on native
+Beacon); a newly calibrated model
 uses XYZ magnitude. Values calibrated for one metric are not interchangeable
 with the other. The detector in use is part of the model/status context.
 
 `model: default` selects `[accel_homing_model default]` in the generated
 SAVE_CONFIG block. Leave the generated **DO NOT EDIT** block alone. Models keep
-each axis independently, ten-success qualification and sensor/geometry metadata.
+each axis independently, actual qualification counts and sensor/geometry metadata.
 Changed context can prevent a model from being accepted; recalibrate after
 reviewing the reported mismatch rather than editing generated metadata.
 
 The development `codex/accuracy-filters` branch preserves RAW/FILTERED profiles
 independently per axis, including each metric, threshold and versioned
 configuration. `CALIBRATE ... DETECTOR=FILTERED` explicitly creates/selects the
-filtered profile and archives the previous RAW profile. The RAW profile remains
+filtered profile with ten checks and archives the previous RAW profile. The RAW profile remains
 available after saving/restart for `ACCURACY ... DETECTOR=RAW` and other explicit
 control workflows. Installing the branch alone does not convert an existing
 RAW model or change threshold units. A FILTERED profile must be recalibrated
 when its version/configuration or required sensor/context differs.
 
-Explicit manual thresholds retain RAW semantics. FILTERED calibration refuses
-those overrides before movement; remove the relevant explicit shared/axis
-values and restart while idle first. There is no separate `x_detector` or
+Omitted DETECTOR means HYBRID on CALIBRATE and ACCURACY. HYBRID CALIBRATE always
+obtains a fresh five-check RAW series followed automatically by a fresh
+five-check FILTERED series, each with excluded discovery. A recoverable
+early-hit/spread failure in either series discards both results and restarts
+both counts at zero; the shared attempt budget never resets. Only the complete
+pair is staged/saved. This uses model schema 3 with honest five-per-profile,
+ten-total qualification evidence and preserves ordinary G28's selected
+RAW/FILTERED type. Existing schema 1/2 models remain loadable and are not
+automatically rewritten by source updates. No global default config key is
+added; TEST, CHARTS, FILTER_CHARTS, NOISE, Beta and ordinary G28 retain their
+existing defaults. Explicit pure RAW/FILTERED calibration keeps ten checks.
+Schema 3 retains the original paired certificate when a later pure ten-check
+calibration replaces one profile while another archived profile still has five
+checks. Selected RAW ordinary homing therefore does not imply compatibility
+with an older model reader. See [rollback limits](FILTERS.md#returning-to-stable-code).
+
+Explicit manual thresholds retain RAW semantics and restart-time precedence.
+Pure FILTERED calibration refuses those overrides before movement; remove the
+relevant explicit shared/axis values and restart while idle first. Paired HYBRID
+calibration permits and preserves configured manual RAW threshold values; they
+still override model thresholds for ordinary G28 afterward. Its two saved
+profile thresholds remain available to explicit-mode/HYBRID measurements.
+There is no separate `x_detector` or
 `y_detector` configuration option. See the [operator sequence](FILTERS.md).
+
+Native Beacon RAW uses absolute acceleration after reference subtraction or
+the centered XYZ norm, regardless of impact_sign/automatic direction. Native
+live FILTERED/HYBRID requires rectified v2. Saved selected-axis RAW profiles with
+unknown/legacy polarity proof cannot silently qualify the new decision, even
+if their old impact_sign is zero. New calibration records
+`native_polarity_policy=absolute_after_reference_subtraction_v1`; existing
+compatible RAW XYZ/v2 profiles need no rewrite. See [migration](FILTERS.md#native-legacy-profile-migration).
 
 Successful normal calibration defaults to `SAVE_CONFIG=1`: it writes the
 selected axis model and restarts Klipper. `SAVE_CONFIG=0` stages the model only.
-Its threshold is the qualified candidate plus a fixed 0.5 g final margin; the
-ten qualification homes test the candidate before that addition. Both values
+Each saved threshold is the qualified candidate plus a fixed 0.5 g final margin;
+the five paired-mode or ten pure-mode qualification homes test the candidate
+before that addition. Paired retries derive the margin from final successful
+candidates instead of repeatedly adding it. Both values
 must satisfy known-range headroom. Saving or reloading never adds the margin again.
 The former active thresholds are restored when that workflow ends; saving and
 reloading are still required to activate the staged model. An ordinary restart
@@ -112,7 +143,7 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `model` | `default` | Saved model name; letters, numbers, underscore and hyphen only. |
 | `x_threshold`, `y_threshold` | Model/sensor default | Manual independent thresholds in g; finite positive with known-range headroom. |
 | `threshold` | Native default 8 g | Historical shared manual fallback; omit when using saved models. |
-| `x_impact_sign`, `y_impact_sign` | `0` | Legacy detector: automatic direction; `1`/`-1` are expert machine-mapped sign overrides. |
+| `x_impact_sign`, `y_impact_sign` | `0` | Retained generic/legacy sign settings. Native Beacon live impact decisions ignore these as direction gates and use centered absolute acceleration/XYZ magnitude. |
 | `homing_accel` | `5000` | Homing/release/early-return acceleration cap in mm/s²; nonnegative; `0` leaves the live limit unchanged. Never raises a lower live acceleration. |
 | `back_off_dist` | `5` | Final successful XY release and cross-axis release in mm; 0–20, zero disables. Not a second touch. |
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |

@@ -219,7 +219,7 @@ class RuntimeAndPublicationTests(unittest.TestCase):
     def test_successful_accuracy_automatically_saves_separate_discovery_and_30_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = AccuracyRig({"charts_directory": directory})
-            rig.accuracy(samples=30)
+            rig.accuracy(samples=30, DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "complete")
             data = json.loads(Path(result["telemetry_paths"]["x_json"]).read_text())
@@ -244,7 +244,7 @@ class RuntimeAndPublicationTests(unittest.TestCase):
                 return original(source, target)
             with mock.patch.object(charts.os, "link", side_effect=fail_json):
                 with self.assertRaises(Exception):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
             self.assertEqual(list(Path(directory).iterdir()), [old])
             self.assertEqual(old.read_text(), "user data")
             self.assertEqual(rig.workflow.last_result["result"], "aborted")
@@ -254,13 +254,13 @@ class RuntimeAndPublicationTests(unittest.TestCase):
             rig = AccuracyRig({"charts_directory": directory})
             rig.home_results.extend([{}, {"result": "invalid_data"}])
             with self.assertRaises(Exception):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_two_axes_fifty_measurements_stay_out_of_status_payloads(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = AccuracyRig({"charts_directory": directory})
-            rig.accuracy(axis="XY", samples=50)
+            rig.accuracy(axis="XY", samples=50, DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "complete")
             self.assertEqual(set(result["summary_paths"]), {"x_png", "y_png"})
@@ -282,7 +282,7 @@ class RuntimeAndPublicationTests(unittest.TestCase):
                 return original(*args, **kwargs)
             with mock.patch.object(charts, "_publish", side_effect=cancel_json):
                 with self.assertRaises(Exception):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_invalid_diagnostic_builder_aborts_actual_workflow_without_artifacts(self):
@@ -291,7 +291,7 @@ class RuntimeAndPublicationTests(unittest.TestCase):
             rig = AccuracyRig({"charts_directory": directory})
             with mock.patch.object(workflow_module, "prepare_accuracy_home_telemetry", side_effect=ValueError("native provenance mismatch")):
                 with self.assertRaises(Exception):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
             self.assertEqual(list(Path(directory).iterdir()), [])
             self.assertEqual(rig.workflow.last_result["result"], "aborted")
 

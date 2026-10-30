@@ -336,7 +336,7 @@ class BetaCalibrationTests(unittest.TestCase):
 
     def test_ordinary_calibration_retains_legacy_capture_and_save_semantics(self):
         rig = BetaRig()
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertTrue(rig.configfile.saved)
         self.assertTrue(all(event[1] is False for event in rig.beta_events if event[0] == "home_capture"))
         self.assertFalse(any("Beta diagnostic" in line for line in rig.output))

@@ -9,7 +9,7 @@ from accel_homing_filters import (CausalImpactDetector, compare_filter_capture, 
                                   robust_reference, signal_mode, validate_detector_identity,
                                   validate_filtered_capture_prefix)
 from accel_homing_model import AccelHomingModel
-from harness import ConfigError, plugin
+from harness import ConfigError, CommandError, plugin
 from test_chronological_clipping import native_filtered_capture
 from test_filter_engine import FilteredRig, comparison_capture
 import test_filter_engine
@@ -251,18 +251,18 @@ class RectifiedProfileTests(unittest.TestCase):
         rig.workflow._begin(GCmd(SAVE_CONFIG=0), "calibration", "x")
         self.assertEqual(rig.workflow.session["detector_types"]["x"], "raw")
 
-    def test_saved_legacy_accuracy_uses_signed_algorithm_and_reports_it(self):
+    def test_saved_legacy_signed_accuracy_is_rejected_without_reinterpreting_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = FilteredRig({"charts_directory": directory})
             self.model(rig, 1)
-            rig.accuracy(DETECTOR="FILTERED")
-            trials = rig.workflow.last_result["axis_results"]["x"]["trials"]
-            self.assertEqual({trial["detector_version"] for trial in trials}, {1})
-            self.assertTrue(all(trial["detector_config"] == detector_config({"version": 1}) for trial in trials))
-            self.assertTrue(any("FILTERED v1 (signed)" in line for line in rig.output))
+            original = copy.deepcopy(rig.workflow.model.metadata)
+            with self.assertRaisesRegex(CommandError, "rectified v2"):
+                rig.accuracy(DETECTOR="FILTERED")
+            self.assertEqual(rig.home_calls, [])
+            self.assertEqual(rig.workflow.model.metadata, original)
 
     def test_accuracy_recovery_preserves_source_algorithm_and_single_margin(self):
-        for version in (1, 2):
+        for version in (2,):
             with tempfile.TemporaryDirectory() as directory:
                 rig = FilteredRig({"charts_directory": directory})
                 self.model(rig, version)

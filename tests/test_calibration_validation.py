@@ -27,7 +27,7 @@ class ImmediateValidationTests(unittest.TestCase):
                     saved()
 
                 with mock.patch.object(rig.workflow, "_save_model", side_effect=saving):
-                    rig.calibrate(axis.upper(), save=0)
+                    rig.calibrate(axis.upper(), save=0, DETECTOR="RAW")
                 self.assertEqual([call["threshold"] for call in rig.home_calls],
                                  [1.] * rejected_count + [1.25] * 11)
                 restarted = rig.home_calls[rejected_count]
@@ -46,7 +46,7 @@ class ImmediateValidationTests(unittest.TestCase):
                     rig.owner.full_scale_g = 1.25
                 rig.home_results.extend([{}, {"travel_mm": 150.}, {"travel_mm": 152.0001}])
                 with self.assertRaisesRegex(CommandError, "headroom|attempt budget"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 3)
                 self.assertEqual(len(rig.toolhead.moves), 2)
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [1.] * 3)
@@ -102,7 +102,7 @@ class CalibrationTravelPlausibilityTests(unittest.TestCase):
                 rig.home_results.extend(prefix + [{"travel_mm": expected * 1.3}])
                 with mock.patch.object(rig.workflow, "_return_early_calibration") as reverse, \
                         self.assertRaisesRegex(CommandError, "Manually recenter XY.*new ACCEL_HOMING_CALIBRATE"):
-                    rig.calibrate(axis.upper(), save=0)
+                    rig.calibrate(axis.upper(), save=0, DETECTOR="RAW")
                 reverse.assert_not_called()
                 self.assertEqual(len(rig.home_calls), len(prefix) + 1)
                 self.assertEqual(len(rig.toolhead.moves), len(prefix))
@@ -146,7 +146,7 @@ class CalibrationTravelPlausibilityTests(unittest.TestCase):
                 else:
                     patch = mock.patch.object(rig.toolhead, "wait_moves", side_effect=lambda: fail_once(wait))
                 with patch, self.assertRaisesRegex(CommandError, "cleanup fault|empty or incomplete"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(rig.toolhead.kin.limits, [(1., -1.), other_limits, z_limits])
@@ -158,7 +158,7 @@ class CalibrationTravelPlausibilityTests(unittest.TestCase):
     def test_plausible_and_repeatable_calibration_still_does_not_prove_contact(self):
         rig = Rig()
         rig.home_results.extend([{"travel_mm": 145.}] + [{"travel_mm": 130.}] * 10)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
         self.assertTrue(metadata["travel_plausibility_required"])
         self.assertFalse(metadata["physical_position_verified"])

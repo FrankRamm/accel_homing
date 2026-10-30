@@ -18,7 +18,7 @@ class CalibrationRecoveryLimitTests(unittest.TestCase):
             with self.subTest(axis=axis, positive=positive, cartesian=cartesian):
                 rig = machine(axis, positive, cartesian)
                 rig.home_results.extend([{"travel_mm": 4.}] * 12 + [{}] * 11)
-                rig.calibrate(axis.upper(), save=0)
+                rig.calibrate(axis.upper(), save=0, DETECTOR="RAW")
                 result = rig.workflow.last_result
                 self.assertEqual([item["threshold"] for item in rig.home_calls],
                                  [1. + .25 * number for number in range(12)] + [4.] * 11)
@@ -69,13 +69,13 @@ class CalibrationRecoveryLimitTests(unittest.TestCase):
                 rig = Rig({"calibration_max_attempts": 12})
                 rig.home_results.extend([{"travel_mm": 4.}] * early_count + [{}] * 11)
                 if early_count == 1:
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(rig.workflow.last_result["result"], "calibrated")
                     self.assertEqual(rig.workflow.last_result["attempts"], 12)
                     self.assertEqual([item["threshold"] for item in rig.home_calls], [1.] + [1.25] * 11)
                 else:
                     with self.assertRaisesRegex(CommandError, "10 attempts remain, 11 required"):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(len(rig.home_calls), 2)
                     self.assertEqual(len(rig.toolhead.moves), 1)
                     self.assertEqual(rig.workflow.last_result["attempts_remaining"], 10)
@@ -93,13 +93,13 @@ class CalibrationRecoveryLimitTests(unittest.TestCase):
                 rig = Rig()
                 rig.home_results.extend([{"travel_mm": 0.}] * early_count + [{}] * 11)
                 if early_count == 29:
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 8.25)
                     self.assertEqual(rig.workflow.last_result["threshold_g"], 8.75)
                     self.assertEqual(len(rig.home_calls), 40)
                 else:
                     with self.assertRaisesRegex(CommandError, "10 attempts remain, 11 required"):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(len(rig.home_calls), 30)
                     self.assertEqual(rig.toolhead.moves, [])
                     self.assertEqual(rig.workflow.last_result["candidate_g"], 8.25)
@@ -115,7 +115,7 @@ class CalibrationThresholdLimitTests(unittest.TestCase):
             with self.subTest(axis=axis, configured=configured, threshold=threshold):
                 rig = Rig({"calibration_start_threshold": threshold} if configured else {})
                 rig.owner.full_scale_g = sensor_range
-                rig.calibrate(axis.upper(), save=0, **({} if configured else {"START_THRESHOLD": threshold}))
+                rig.calibrate(axis.upper(), save=0, DETECTOR="RAW", **({} if configured else {"START_THRESHOLD": threshold}))
                 self.assertEqual([item["threshold"] for item in rig.home_calls], [threshold] * 11)
                 options = {key: value for (_section, key), value in rig.configfile.saved.items()}
                 sections = {"printer": {"kinematics": "corexy"}, "accel_homing_model default": options}
@@ -136,7 +136,7 @@ class CalibrationThresholdLimitTests(unittest.TestCase):
             recommendation = rig.workflow.last_result["recommendation"]
             self.assertEqual(recommendation["threshold_limit_g"], 25.6)
             self.assertEqual(recommendation["start_threshold_g"]["x"], 15.75)
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
             self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 15.75)
             self.assertEqual(rig.workflow.last_result["threshold_g"], 16.25)
             metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
@@ -152,7 +152,7 @@ class CalibrationThresholdLimitTests(unittest.TestCase):
                 self.assertFalse(hasattr(rig.workflow, "max_threshold"))
                 self.assertNotIn("calibration_max_threshold", rig.workflow._noise_context())
                 rig.home_results.append({"travel_mm": 4.})
-                rig.calibrate(save=0)
+                rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
                 self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
 
@@ -160,14 +160,14 @@ class CalibrationThresholdLimitTests(unittest.TestCase):
         rig = Rig()
         before = rig.effects()
         with self.assertRaisesRegex(CommandError, "sensor-range headroom.*80%"):
-            rig.calibrate(save=0, START_THRESHOLD=12.800001)
+            rig.calibrate(save=0, START_THRESHOLD=12.800001, DETECTOR="RAW")
         self.assertEqual(rig.effects(), before)
         self.assertIsNone(rig.workflow.session)
 
     def test_unknown_range_explicit_start_and_model_use_none_without_fixed_g_cap(self):
         rig = Rig()
         rig.owner.full_scale_g = None
-        rig.calibrate(save=0, START_THRESHOLD=100.)
+        rig.calibrate(save=0, START_THRESHOLD=100., DETECTOR="RAW")
         self.assertIsNone(rig.workflow._threshold_limit())
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 100.)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 100.5)

@@ -8,7 +8,13 @@ The operator performs every physical home/calibration and checks the result.
 
 ## What changes
 
-`RAW` retains the existing detector and its threshold semantics. New
+Native Beacon live RAW decisions use `abs(a - reference)` for a selected-axis
+metric or the centered XYZ magnitude, independently of sign. Configured
+`impact_sign`/automatic direction no longer gate native impacts. Original signed
+protocol counts remain untouched for decoding, references, JSON and provenance;
+absolute value is applied after stationary-reference subtraction.
+
+New
 `FILTERED` calibrations use detector version 2, `signal_mode=rectified`:
 subtract the frozen signed stationary reference from each sensor axis, take
 the absolute value of each centered axis, then apply the causal first-order
@@ -16,17 +22,18 @@ low-pass filter before the weighted XYZ decision norm. Original signed samples
 are retained. Absolute value is applied before filtering, not to a filtered
 signed signal or to the raw sensor reading before gravity/offset removal.
 
-Saved version 1 FILTERED profiles retain their original signed-axis filtering
-until a new FILTERED calibration replaces that profile. Version 1 serialized
-configurations remain unchanged and contain no `signal_mode` field. Both
-versions use a frozen robust stationary median/MAD reference, bounded XYZ
+Live native Beacon FILTERED/HYBRID requires rectified version 2. A saved signed
+version-1 profile remains readable as historical/offline evidence but is
+rejected before live movement with recalibration guidance. Its serialized
+configuration remains unchanged and contains no `signal_mode` field. Historical
+v1 and current v2 diagnostics use a frozen robust stationary median/MAD reference, bounded XYZ
 noise weights, and a short confirmation window with excess-energy and multiple
 raw-support requirements.
 It retains transverse components; it does not project onto one axis or use
 future samples. Moving-noise characterization is observation only and never
 raises the threshold or changes weights after arming.
 
-For both saved FILTERED versions in pure FILTERED mode, the position timestamp
+For live pure FILTERED rectified-v2 control, the position timestamp
 uses the existing threshold-crossing sample of the candidate that actually
 confirms. Its policy is
 `accepted_threshold_crossing_v1`; onset time, level and sample identity come from
@@ -35,9 +42,30 @@ position timestamp. Temporal confirmation, candidate rejection and the host
 stop-request dispatch are unchanged: crossing alone does not authorize a stop.
 The original lookback still anchors the existing 15 ms impact-response window.
 This changes the position reference, not the filter coefficients, response
-capture window or calibrated threshold. Compatible saved RAW and FILTERED v1/v2
-profiles remain usable without recalibration or a model rewrite. RAW detection
-is unchanged.
+capture window or calibrated threshold. Compatible sign-independent RAW XYZ and
+rectified-v2 profiles remain usable without recalibration or a model rewrite.
+Historical signed-v1 receipts remain readable without being promoted to live v2.
+
+### Native legacy-profile migration
+
+Native signed-v1 FILTERED profiles need a new rectified-v2 calibration before
+live FILTERED/HYBRID operation. Saved selected-axis RAW profiles with legacy or
+unknown native polarity provenance are likewise rejected, even when their
+configured impact_sign is zero; that value cannot prove compatible historical
+qualification. Existing RAW XYZ profiles already use a sign-independent norm
+and remain compatible. New calibration records
+`native_polarity_policy=absolute_after_reference_subtraction_v1`. After normal manual
+preparation, one `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` refreshes both
+profiles automatically. Use explicit `DETECTOR=RAW` or `FILTERED` for a pure
+ten-check replacement when that individual mode is intended. Do not edit saved
+metadata to declare an old profile newly qualified. Current compatible XYZ/v2
+profiles require no recalibration merely to install this update. Other backend
+policies and original encoded sample signs are outside this native-only change.
+Explicit configured or valid temporary native RAW manual thresholds are
+unqualified values, not inherited saved-model qualification. Temporary SET
+provenance belongs only to its successfully supplied current threshold and
+preserves detector selection; IMPACT_SIGN-only/invalid SET cannot authorize
+it, and it never bypasses native signed-v1 FILTERED rejection.
 
 The versioned initial configuration uses a 0.2 ms time constant, confirmation
 between 0.3 and 1.5 ms, and a minimum XYZ weight of 0.75. These are development
@@ -46,14 +74,18 @@ overflow, sample-integrity and cleanup checks remain required. No new Python
 dependency is added to the armed detector.
 
 Thresholds belong to their detector metric. A RAW component/XYZ threshold is
-not automatically a FILTERED weighted-level threshold. CALIBRATE qualifies ten
-homes at the candidate and adds the existing **0.5 g once** only when staging
-the successful result. Those ten homes do not test the higher saved threshold.
+not automatically a FILTERED weighted-level threshold. Explicit pure RAW or
+FILTERED calibration qualifies ten homes. Default HYBRID calibration obtains
+five valid RAW checks and five valid FILTERED checks in one automatic command,
+with separate discovery and actual mode-specific control. Each final candidate
+receives **0.5 g once** when the complete result is staged. Qualification homes
+do not test the higher saved thresholds.
 
 ## HYBRID position timing
 
-Explicit `DETECTOR=HYBRID` is an experimental position policy for TEST,
-ordinary CHARTS and ACCURACY. The saved FILTERED detector still confirms the
+HYBRID is an experimental position policy for TEST, ordinary CHARTS and
+ACCURACY. ACCURACY uses it when DETECTOR is omitted; TEST and ordinary CHARTS
+require an explicit HYBRID request. The saved FILTERED detector still confirms the
 impact and requests stopping. When the bounded evidence identifies one eligible
 RAW XYZ crossing associated with that accepted FILTERED candidate, HYBRID uses
 the RAW crossing's original sample time and identity as its reported position.
@@ -63,7 +95,7 @@ within the association interval. Complete RAW selection coverage can therefore
 produce exactly the same timestamps as pure FILTERED. Coverage alone establishes
 neither an earlier position timestamp nor improved measured or physical accuracy.
 
-HYBRID requires the native Beacon packet path; unsupported backends are rejected
+HYBRID measurement requires the native Beacon packet path; unsupported backends are rejected
 before movement. Both saved profiles must be present and compatible for every
 requested axis before movement. The RAW profile must use XYZ magnitude, with
 matching sensor,
@@ -146,11 +178,42 @@ cannot be selected for position. Per-home evidence also records
 `marker_crossings_ineligible_for_position` and the native decoded clip endpoints
 used for the code-state bound.
 
-Request HYBRID explicitly each time. It does not create a saved HYBRID model or
-change the selected ordinary detector after a completed workflow. CALIBRATE,
-CALIBRATE_NOISE and FILTER_CHARTS reject HYBRID. An early-quality HYBRID failure
+HYBRID measurement does not change the selected ordinary detector after a
+completed workflow. CALIBRATE_NOISE and FILTER_CHARTS reject HYBRID.
+An early-quality HYBRID ACCURACY failure
 aborts with diagnostics and requires manual inspection/recentering; automatic
 return and recovery calibration are disabled for that path.
+
+## Default paired HYBRID calibration
+
+CALIBRATE and ACCURACY use HYBRID when `DETECTOR` is omitted. Explicit
+`DETECTOR=RAW|FILTERED|HYBRID` remains available; no global default config key is
+added. Ordinary G28 and the defaults of TEST, CHARTS, FILTER_CHARTS, NOISE and
+Beta keep their existing behavior.
+
+One default or explicit HYBRID CALIBRATE always obtains a fresh RAW discovery
+plus five valid RAW checks, automatically recenters, then obtains a fresh
+FILTERED discovery plus five valid FILTERED checks. No existing RAW profile is
+reused to skip qualification, and no user action is required between series.
+Actual controls are RAW for the first series and FILTERED for the second;
+there is no third HYBRID-position validation series. Discovery, rejected homes
+and retries do not contribute to either five-check result.
+
+A recoverable early hit or excessive spread in either series discards both
+series, resets both counts to zero, increases only the failing detector's
+candidate and restarts from RAW. Fatal stream/context/geometry/cancellation
+errors abort. The same 40-attempt default budget covers all series and retries;
+it never resets, and a complete new pair needs at least 12 remaining attempts.
+The first qualified profile remains private. Only both qualified series and
+successful cleanup permit one final save/restart, with +0.5 g applied once to
+each final candidate. No partial-success series is saved or reused.
+
+This creates paired qualification evidence in model schema 3 while preserving
+the pre-calibration ordinary G28 selected RAW/FILTERED type. Existing schema
+1/2 profiles remain loadable and are not automatically rewritten by an update.
+HYBRID ACCURACY can use compatible existing profiles without a new calibration.
+See [the complete calibration algorithm](SIMPLE_CALIBRATION.md) for candidate,
+attempt, saving and failure details.
 
 Use the [three independent 30-sample commands](ACCURACY.md#compare-30-raw-pure-filtered-and-hybrid-homes)
 for the full RAW/pure FILTERED/HYBRID comparison. Each command can optionally
@@ -161,8 +224,10 @@ cannot substitute for an independent physical series.
 
 If both compatible saved profiles are already available, use the
 [30-home RAW, pure FILTERED and HYBRID comparison](ACCURACY.md#compare-30-raw-pure-filtered-and-hybrid-homes)
-without recalibrating just for that comparison. The sequence below also covers
-creating a missing FILTERED profile and inspecting a separate same-capture chart.
+without recalibrating just for that comparison. A single automatic paired
+command can create or refresh both profiles. The numbered pure-mode sequence
+is an alternative for individual profile preparation and a separate
+same-capture diagnostic, rather than manual stages required by HYBRID.
 
 Before **each** moving command below, follow the
 [manual preparation](COMMANDS.md#prepare-every-moving-workflow): printer idle
@@ -170,6 +235,17 @@ and unpaused, both XY axes unhomed and physically centered, Z supported,
 nozzle/bed clearance, suitable motor enables/currents, accessible emergency
 stop. `CENTERED=1` authorizes movement and does not center the toolhead.
 Repeat preparation after every successful saving calibration/restart.
+
+To create or refresh both profiles in one command:
+
+```gcode
+ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1
+```
+
+It performs RAW five and FILTERED five automatically, with separate discovery,
+whole-pair retry and one final save/restart. Manually prepare again after the
+restart. Skip calibration when compatible saved profiles already exist and no
+refresh is intended.
 
 1. Collect the RAW control at its own calibrated threshold:
 
@@ -246,7 +322,8 @@ calibration preserves the prior RAW threshold and metadata across restart;
 `DETECTOR=RAW` can select that archived profile without changing the saved
 selected mode. Reloading/staging does not add the 0.5 g margin again. A later
 successful calibration of a mode replaces that mode's profile. An omitted
-DETECTOR uses the selected model/manual mode; choose it explicitly for A/B work.
+DETECTOR uses HYBRID on CALIBRATE/ACCURACY and the selected model/manual mode on
+other commands; choose it explicitly for A/B work.
 The X/Y config does not gain an independent persistent detector switch.
 
 ## Read the same-trace chart
@@ -529,6 +606,18 @@ homing fault.
 
 ## Returning to stable code
 
+New paired HYBRID calibration writes model schema 3. Older code without that
+schema cannot load it, even if ordinary homing is selected RAW. A later pure
+ten-check calibration can replace one profile while retaining the original
+paired certificate for an archived five-check profile; it does not establish a
+schema downgrade. Do not relabel five checks as ten or edit the version number.
+Before selecting an older target, restore a verified model/configuration
+baseline compatible with that target using the reviewed development
+uninstall/transaction recovery procedure, preserving later unrelated edits.
+See [the host procedure](INSTALLATION.md#explicit-development-branch). The
+RAW-recalibration route below applies only to legacy schema 1/2 models that
+have never used schema 3.
+
 Older development code from before rectified v2 rejects a v2 FILTERED profile,
 including one archived inside an otherwise RAW-selected model. Selecting or
 calibrating RAW alone does not make that model readable by such an older
@@ -541,7 +630,7 @@ saved.** A model with an active/staged FILTERED selection uses schema version
 2. Current stable main supports version 1 and rejects that model at startup;
 this prevents it from silently using a filtered threshold with RAW detection.
 
-While still on development code, use normal operator-supervised
+For those legacy schema 1/2 models, while still on development code, use normal operator-supervised
 `ACCEL_HOMING_CALIBRATE AXIS=X DETECTOR=RAW CENTERED=1` for each affected axis.
 Reprepare before every command and after each successful saving restart.
 Repeat with Y if Y was filtered; verify all selected models are RAW and the

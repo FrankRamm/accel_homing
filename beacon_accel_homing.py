@@ -2309,7 +2309,7 @@ class BeaconAccelHoming:
         base = attempt.baseline
         above, below = top - base, base - bottom
         pos, neg = (above, below) if attempt.map_sign > 0 else (below, above)
-        direction = attempt.direction or attempt.auto_direction
+        direction = 0 if self.backend is None else attempt.direction or attempt.auto_direction
         level = pos if direction > 0 else neg if direction < 0 else max(pos, neg)
         if level <= attempt.limit_raw:
             # Quiet batch: keep the cheap statistics only. Noise peaks count one
@@ -2483,7 +2483,7 @@ class BeaconAccelHoming:
 
     def _onset(self, attempt, params, values, count, source_params=None, source_skip=0):
         base, map_sign = attempt.baseline, attempt.map_sign
-        direction = attempt.direction or attempt.auto_direction
+        direction = 0 if self.backend is None else attempt.direction or attempt.auto_direction
         # Clips are already decoded, so they pass the same direction check.
         for position, raw in enumerate(values):
             value = (raw - base) * map_sign
@@ -2500,7 +2500,7 @@ class BeaconAccelHoming:
         attempt.onset_sample = (source["start_clock"], source["delta_clock"],
                                 position + source_skip, sample_count(source["data"]))
         attempt.crossing_sample = attempt.confirmation_sample = attempt.onset_sample
-        attempt.onset_raw = value
+        attempt.onset_raw = abs(value) if self.backend is None else value
         attempt.impact_until = (start_clock + self.impact_window) & 0xFFFFFFFF
         self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
         self._track_impact(attempt, params, None, count, values)
@@ -3453,7 +3453,7 @@ class BeaconAccelHoming:
                                     if attempt.onset_batch is not None else None),
                         "impact_peak_g": (attempt.impact_peak * attempt.count_g
                                           if attempt.onset_batch is not None else None),
-                        "direction": 0 if attempt.vector_mode else attempt.direction or attempt.auto_direction,
+                        "direction": 0 if attempt.vector_mode or self.backend is None else attempt.direction or attempt.auto_direction,
                         "impact_metric": "xyz_magnitude" if attempt.vector_mode else "selected_axis",
                         "homing_speed_mm_s": attempt.effective_speed,
                         "homing_accel_mm_s2": attempt.effective_accel,
@@ -3810,9 +3810,9 @@ class BeaconAccelHoming:
             "filter_reference": attempt.filter_reference,
             "sample_fault": None if attempt.sample_fault is None else dict(attempt.sample_fault),
             "physical_position_verified": False,
-            "direction": 0 if attempt.vector_mode else attempt.direction or attempt.auto_direction,
+            "direction": 0 if attempt.vector_mode or self.backend is None else attempt.direction or attempt.auto_direction,
             "onset_g": round(attempt.onset_raw * to_g, 2) if onset else None,
-            "impact_sign": (1 if attempt.onset_raw > 0 else -1 if attempt.onset_raw < 0 else None)
+            "impact_sign": (0 if self.backend is None else (1 if attempt.onset_raw > 0 else -1 if attempt.onset_raw < 0 else None))
                            if onset else None,
             "impact_peak_g": (round(attempt.impact_peak * to_g, 2) if onset and attempt.response_censoring is None else None),
             "peak_semantics": "observed_code_magnitude" if attempt.detector_type == "filtered" else "reported_sensor_derived",
@@ -4036,10 +4036,13 @@ class BeaconAccelHoming:
             full_scale = self._full_scale_g(scale) if self.helper is not None else None
             validate_threshold(threshold, "THRESHOLD", gcmd.error, full_scale)
             self.threshold_g[axis] = threshold
+            self.workflows.note_manual_threshold(axis, threshold)
         if sign is not None:
             self.impact_sign[axis] = sign
         gcmd.respond_info("beacon_accel_homing %s: threshold %.12g g, impact_sign %d (until restart)"
                           % (axis.upper(), self.threshold_g[axis], self.impact_sign[axis]))
+        if self.backend is None:
+            gcmd.respond_info("Native Beacon evaluates absolute acceleration after reference subtraction; IMPACT_SIGN does not gate detection. Threshold updates are temporary manual values, not new calibration")
 
 
 def load_config(config):

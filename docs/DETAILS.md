@@ -17,7 +17,8 @@ or a hard real-time endstop.
 | New simple calibration | Fresh XYZ resting offset; magnitude at each sample; no quiet-range gate or integrated motion proof. |
 | New saved model with `impact_metric: xyz_magnitude` | Same vector detector during ordinary homing, TEST, CHARTS and ACCURACY after reload, unless explicit config thresholds take precedence. |
 | Development FILTERED model | Versioned causal XYZ filtering and temporal confirmation; the accepted candidate's threshold crossing supplies the position timestamp. |
-| Explicit development HYBRID workflow | FILTERED confirmation with an associated RAW XYZ threshold crossing for position; explicit FILTERED fallback when RAW selection is unavailable or ambiguous. Both compatible saved profiles are required. |
+| HYBRID measurement | FILTERED confirmation with an associated RAW XYZ threshold crossing for position; explicit FILTERED fallback when RAW selection is unavailable or ambiguous. Both compatible saved profiles are required. Default for ACCURACY, explicit on TEST/CHARTS. |
+| Default or explicit HYBRID CALIBRATE | One automatic fresh RAW series with five valid checks, then FILTERED with five, each with excluded discovery. Both results are discarded on recoverable qualification failure; no manual transition or HYBRID-controlled third series. |
 | Explicit config thresholds / older models | Legacy machine-axis detector with fresh quiet reference and its motion/pressed policies. |
 | Beta calibration | Isolated moving-noise experiment and proposal; does not replace or save the ordinary model. |
 
@@ -28,7 +29,7 @@ not delay that request. Channel permutations/sign reversals do not change the
 magnitude. Motion, vibration, binding and intended stop contact can all produce
 the same threshold crossing. The full-move deadline and data-fault checks remain.
 
-Development FILTERED v1/v2 models use the existing threshold crossing of the
+Live native rectified-v2 FILTERED models use the existing threshold crossing of the
 candidate that actually confirms as onset time/level/sample identity under
 `accepted_threshold_crossing_v1`. Confirmation, rejection, stop-request dispatch
 and the original lookback-anchored 15 ms response window retain their behavior.
@@ -37,7 +38,16 @@ recalibration. Historical FILTERED measurements retain `filtered_lookback_v1`
 when their receipt has no explicit position policy; comparisons name that
 difference. See [filter policies and baseline receipts](FILTERS.md).
 
-Explicit HYBRID TEST/ordinary CHARTS/ACCURACY uses
+All native Beacon live RAW impact decisions are sign-independent after
+reference subtraction: absolute centered acceleration for a selected axis or
+centered XYZ magnitude. Native `impact_sign`/automatic direction is not an
+eligibility gate. Live native FILTERED/HYBRID requires rectified v2; signed-v1
+and identifiable incompatible sign-gated RAW qualifications need operator
+recalibration before live use. Historical/offline signed-v1 diagnostics and
+original signed protocol counts remain labelled and readable. Generic-backend
+policies are unchanged. See [migration](FILTERS.md#native-legacy-profile-migration).
+
+HYBRID TEST/ordinary CHARTS/ACCURACY measurement uses
 `associated_raw_threshold_crossing_v1` for position selection while retaining
 FILTERED confirmation and the original response-window anchor. A separate
 bounded RAW observer uses the saved XYZ threshold and its own arithmetic
@@ -140,16 +150,24 @@ and finite derived raw trigger limits/deadlines are required.
 
 Current simple calibration uses fresh three-window stationary noise to select
 an initial candidate, then requires an impact beyond 20 mm inside the
-midpoint-to-endstop travel band. It excludes discovery and requires ten fresh
-validation homes at the candidate threshold with travel range at most 2 mm.
-After qualification, the saved threshold is that candidate plus 0.5 g once,
+midpoint-to-endstop travel band. Explicit pure RAW/FILTERED excludes discovery
+and requires ten fresh validation homes. Default HYBRID calibration requires
+five RAW and five FILTERED checks, with separate excluded discovery and travel
+range at most 2 mm for each series. Its stage controls are actual RAW/FILTERED;
+paired HYBRID preserves ordinary G28's previously selected type, while explicit
+pure calibration selects its requested detector. After qualification, each
+saved threshold is its candidate plus 0.5 g once,
 subject to sensor headroom. Metadata distinguishes the tested candidate from
 the higher saved value, which those homes did not test.
 
 Premature impacts reverse recorded signed **start-to-halt** command travel,
 not merely trigger travel; the workflow then settles, increases the candidate
 and starts a new discovery. A running spread above 2 mm likewise rejects the
-candidate. A new candidate needs eleven remaining monitored homes.
+candidate. A new pure-mode candidate needs eleven remaining monitored homes.
+Paired HYBRID rejects both series on any recoverable early-hit/spread failure,
+adjusts only the failing mode's candidate and starts both counts again at zero.
+The shared attempt count never resets; at least twelve homes are needed for a
+new complete pair. No partial pair is saved or reused.
 No encoder verifies those returns or the intended stop.
 
 SAVE_CONFIG stores a named per-axis model and normal calibration defaults to

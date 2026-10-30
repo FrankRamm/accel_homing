@@ -49,7 +49,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                     self.assertEqual(active["stationary_noise"]["impact_metric"], "xyz_magnitude")
 
                 rig.on_noise, rig.on_home = observe_noise, observe_home
-                rig.calibrate(axis, save=0, STEP=.2)
+                rig.calibrate(axis, save=0, STEP=.2, DETECTOR="RAW")
                 self.assertEqual(len(set(identities)), 1)
                 self.assertTrue(all(item["purpose"] == "calibration_preflight" for item in active_status))
                 self.assertTrue(all(item["calibration_axis"] == axis.lower() for item in active_status))
@@ -69,7 +69,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
     def test_explicit_start_below_noise_is_preserved_but_still_requires_measurement(self):
         with tempfile.TemporaryDirectory() as temp:
             rig = NoiseRig({"charts_directory": temp}, amplitudes=(2., 2., 0.))
-            rig.calibrate(save=0, START_THRESHOLD=.5, STEP=.2)
+            rig.calibrate(save=0, START_THRESHOLD=.5, STEP=.2, DETECTOR="RAW")
             self.assertEqual(rig.noise_calls, ["start", 1, 2, 3, "stop"])
             self.assertEqual([call["threshold"] for call in rig.home_calls], [.5] * 11)
             measurement = rig.workflow.last_result["stationary_noise"]
@@ -85,7 +85,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
             with self.subTest(configured=configured, step=step), tempfile.TemporaryDirectory() as temp:
                 rig = NoiseRig({"charts_directory": temp, "calibration_start_threshold": configured},
                                amplitudes=(peak, 0., 0.))
-                rig.calibrate(save=0, STEP=step)
+                rig.calibrate(save=0, STEP=step, DETECTOR="RAW")
                 self.assertEqual(rig.home_calls[0]["threshold"], expected)
                 self.assertEqual(rig.workflow.last_result["threshold_step_g"], step)
                 self.assertEqual(rig.workflow.start_threshold, configured)
@@ -97,11 +97,11 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                                amplitudes=(2., 2., 0.))
                 rig.owner.full_scale_g = None if kind == "unknown-range" else 2.5
                 if explicit:
-                    rig.calibrate(save=0, START_THRESHOLD=.5)
+                    rig.calibrate(save=0, START_THRESHOLD=.5, DETECTOR="RAW")
                     self.assertEqual(rig.home_calls[0]["threshold"], .5)
                 else:
                     with self.assertRaisesRegex(CommandError, "known sensor range|sensor-range headroom"):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     self.assert_no_motion_or_config(rig)
                     self.assertEqual(rig.workflow.last_result["purpose"], "calibration_preflight")
                 self.assertEqual(rig.noise_calls[:4], ["start", 1, 2, 3])
@@ -110,7 +110,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             rig = NoiseRig({"charts_directory": temp}, amplitudes=(.01, .01, .01))
             rig.home_results.extend([{"travel_mm": 8.}, {"travel_mm": 10.}] + [{}] * 11)
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
             first_run = rig.workflow.last_result["run_id"]
             self.assertEqual(rig.noise_calls, ["start", 1, 2, 3, "stop"])
             self.assertEqual(rig.workflow.last_result["successes"], 10)
@@ -120,7 +120,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
             self.assertEqual(rig.workflow.last_result["repeatability_limit_mm"], 2.)
             rig.toolhead.kin.limits[:2] = [(1., -1.)] * 2
             rig.idle_state = "Ready"
-            rig.calibrate("Y", save=0)
+            rig.calibrate("Y", save=0, DETECTOR="RAW")
             self.assertEqual(rig.noise_calls, ["start", 1, 2, 3, "stop"] * 2)
             self.assertNotEqual(rig.workflow.last_result["run_id"], first_run)
 
@@ -131,7 +131,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
             old_run = rig.workflow.last_result["run_id"]
             self.assertGreater(rig.workflow.noise_seeds["x"], 1.)
             rig.amplitudes = (.01, .01, .01)
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
             self.assertEqual(rig.home_calls[0]["threshold"], 1.)
             self.assertNotEqual(rig.workflow.last_result["stationary_noise"]["run_id"], old_run)
             self.assertEqual(rig.workflow.noise_seeds, {})
@@ -154,7 +154,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             rig = NoiseRig({"charts_directory": temp}, amplitudes=(.01, .01, .01))
             with mock.patch.object(rig.workflow, "cmd_NOISE", side_effect=AssertionError("nested command")):
-                rig.calibrate(save=1)
+                rig.calibrate(save=1, DETECTOR="RAW")
             self.assertEqual(rig.scripts[-1], "SAVE_CONFIG")
 
     def test_sensor_and_export_faults_abort_before_first_home(self):
@@ -174,7 +174,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                 exporter = mock.patch.object(workflow_module, target, side_effect=OSError("synthetic export failure")) \
                     if fault.endswith("export") else contextlib.nullcontext()
                 with exporter, mock.patch.object(workflow_module.logging, "exception"), self.assertRaises(Exception):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assert_no_motion_or_config(rig)
                 self.assertEqual(rig.workflow.noise_seeds, {})
 
@@ -216,7 +216,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                 wrapper = mock.patch.object(target, method, side_effect=after_call(getattr(target, method))) \
                     if target is not None else contextlib.nullcontext()
                 with wrapper, mock.patch.object(workflow_module.logging, "exception"), self.assertRaises(Exception):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertTrue(interrupted[0])
                 self.assert_no_motion_or_config(rig)
                 self.assertEqual(rig.workflow.noise_seeds, {})
@@ -239,7 +239,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
 
                 rig.workflow.renderer.on_render = rendered
                 with mock.patch.object(workflow_module.logging, "exception"), self.assertRaises(Exception):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertIsNone(rig.workflow.session)
                 self.assertEqual(list(Path(temp).rglob("*.png")), [])

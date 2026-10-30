@@ -344,7 +344,7 @@ class AccuracyStationaryRecoveryTests(unittest.TestCase):
                     return capture
 
                 rig.owner.collect_noise_window = observed
-                rig.accuracy(axis="Y")
+                rig.accuracy(axis="Y", DETECTOR="RAW")
                 result = rig.workflow.last_result
                 self.assertEqual(result["result"], "calibrated")
                 self.assertEqual(result["successes"], 10)

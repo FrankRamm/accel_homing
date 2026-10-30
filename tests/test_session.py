@@ -529,7 +529,7 @@ class EnablePreparationTest(unittest.TestCase):
                            [(counts(-15), 0, counts(1))] * 7
                            + [(counts(-0.6), 0, counts(1))]))
         self.assertEqual(obj.attempt.reason, "impact")
-        self.assertAlmostEqual(obj.attempt.onset_raw * obj.attempt.count_g, -0.6,
+        self.assertAlmostEqual(obj.attempt.onset_raw * obj.attempt.count_g, 0.6,
                                delta=obj.attempt.count_g / 2)
         self.assertAlmostEqual(obj.onset_time(obj.attempt), when)
 

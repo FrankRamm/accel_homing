@@ -321,13 +321,14 @@ class ProfileTests(unittest.TestCase):
             rig.workflow.cmd_FILTER_CHARTS(GCmd(AXIS="X", CENTERED=1))
         self.assertEqual(rig.home_calls, [])
 
-    def test_raw_legacy_profile_retains_selected_axis_metric(self):
+    def test_raw_legacy_selected_axis_profile_requires_absolute_requalification(self):
         rig = Rig()
         meta = self.metadata(rig, "raw")
         meta["impact_metric"] = "selected_axis"
         rig.workflow.model = types.SimpleNamespace(thresholds={"x": 3.}, metadata={"x": meta})
-        rig.workflow._begin(GCmd(DETECTOR="RAW"), "test", axes=["x"])
-        self.assertFalse(rig.workflow.simple_detection("x"))
+        with self.assertRaisesRegex(CommandError, "legacy/unknown sign-gated"):
+            rig.workflow._begin(GCmd(DETECTOR="RAW"), "test", axes=["x"])
+        self.assertEqual(rig.home_calls, [])
 
     def test_manual_config_override_blocks_filtered_calibration_before_motion(self):
         rig = Rig({"x_threshold": 3.})
@@ -448,7 +449,7 @@ class FilteredWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             rig = FilteredRig({"charts_directory": directory})
             with self.assertRaisesRegex(CommandError, "BASELINE is not an available completed"):
-                rig.accuracy(BASELINE="a" * 32)
+                rig.accuracy(BASELINE="a" * 32, DETECTOR="RAW")
             self.assertEqual(rig.home_calls, [])
 
 

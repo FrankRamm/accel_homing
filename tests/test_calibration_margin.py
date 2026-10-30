@@ -20,7 +20,7 @@ class CalibrationMarginTests(unittest.TestCase):
             with self.subTest(axis=axis, save=save, tested=tested):
                 rig = Rig()
                 before = dict(rig.owner.threshold_g)
-                rig.calibrate(axis.upper(), save=save, START_THRESHOLD=tested)
+                rig.calibrate(axis.upper(), save=save, START_THRESHOLD=tested, DETECTOR="RAW")
                 expected = 1.5 if tested == 1. else 1.255
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [tested] * 11)
                 self.assertEqual(rig.scripts.count("SAVE_CONFIG"), save)
@@ -51,7 +51,7 @@ class CalibrationMarginTests(unittest.TestCase):
         rig = Rig()
         rig.home_results.extend([{"travel_mm": 8.}, {}, {"travel_mm": 150.},
                                  {"travel_mm": 152.001}] + [{}] * 11)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual([call["threshold"] for call in rig.home_calls],
                          [1.] + [1.25] * 3 + [1.5] * 11)
         self.assertEqual(rig.workflow.last_result["restarts"], 2)
@@ -63,7 +63,7 @@ class CalibrationMarginTests(unittest.TestCase):
         rig = Rig()
         rig.save_error = True
         with self.assertRaisesRegex(CommandError, "SAVE_CONFIG"):
-            rig.calibrate(save=1)
+            rig.calibrate(save=1, DETECTOR="RAW")
         staged = dict(rig.configfile.saved)
         self.assertEqual(rig.workflow.last_result["result"], "save_failed")
         self.assertEqual(float(staged[("accel_homing_model default", "x_threshold")]), 1.5)
@@ -76,26 +76,26 @@ class CalibrationMarginTests(unittest.TestCase):
         rig = Rig()
         rig.configfile.saved[("accel_homing_model default", "y_threshold")] = "4.5"
         rig.configfile.saved[("accel_homing_model default", "y_metadata")] = '{"existing":true}'
-        rig.calibrate("X", save=0)
+        rig.calibrate("X", save=0, DETECTOR="RAW")
         self.assertEqual(rig.configfile.saved[("accel_homing_model default", "y_threshold")], "4.5")
         self.assertEqual(self.metadata(rig, "y"), {"existing": True})
         x_saved = {key: value for key, value in rig.configfile.saved.items() if key[1].startswith("x_")}
         rig.workflow._disable_xy()
         rig.idle_state = "Ready"
-        rig.calibrate("Y", save=0, START_THRESHOLD=2.)
+        rig.calibrate("Y", save=0, START_THRESHOLD=2., DETECTOR="RAW")
         self.assertEqual({key: value for key, value in rig.configfile.saved.items() if key[1].startswith("x_")},
                          x_saved)
         y_saved = {key: value for key, value in rig.configfile.saved.items() if key[1].startswith("y_")}
         rig.workflow._disable_xy()
         rig.idle_state = "Ready"
-        rig.calibrate("X", save=0)
+        rig.calibrate("X", save=0, DETECTOR="RAW")
         self.assertEqual(float(rig.configfile.saved[("accel_homing_model default", "x_threshold")]), 1.5)
         self.assertEqual({key: value for key, value in rig.configfile.saved.items() if key[1].startswith("y_")},
                          y_saved)
 
     def test_exact_sensor_ceiling_round_trips_without_adding_another_margin(self):
         rig = Rig()
-        rig.calibrate(save=0, START_THRESHOLD=12.3)
+        rig.calibrate(save=0, START_THRESHOLD=12.3, DETECTOR="RAW")
         value = float(rig.configfile.saved[("accel_homing_model default", "x_threshold")])
         self.assertEqual(value, 12.8)
         plugin.validate_threshold(value, "x_threshold", ConfigError, 16.)
@@ -117,7 +117,7 @@ class CalibrationMarginTests(unittest.TestCase):
                                        wraps=rig.workflow._release_terminal_home) as release, \
                         mock.patch.object(workflow_module, "prepare_noise") as render, \
                         self.assertRaisesRegex(CommandError, "saved calibration threshold.*headroom"):
-                    rig.calibrate(save=save, START_THRESHOLD=tested)
+                    rig.calibrate(save=save, START_THRESHOLD=tested, DETECTOR="RAW")
                 release.assert_called_once()
                 render.assert_not_called()
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [tested] * 11)
@@ -139,7 +139,7 @@ class CalibrationMarginTests(unittest.TestCase):
 
         with mock.patch.object(rig.workflow, "_release_terminal_home", side_effect=reduced_range), \
                 self.assertRaisesRegex(CommandError, "saved calibration threshold.*headroom"):
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.configfile.saved, {})
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
         self.assertEqual(rig.workflow.last_result["candidate_g"], 1.)
@@ -150,7 +150,7 @@ class CalibrationMarginTests(unittest.TestCase):
                 rig = Rig()
                 rig.owner.full_scale_g = None
                 with self.assertRaisesRegex(CommandError, "preserve the full finite.*0.5 g margin"):
-                    rig.calibrate(save=0, START_THRESHOLD=tested)
+                    rig.calibrate(save=0, START_THRESHOLD=tested, DETECTOR="RAW")
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertNotIn("SAVE_CONFIG", rig.scripts)
                 self.assertEqual(rig.workflow.last_result["result"], "aborted")
@@ -173,7 +173,7 @@ class CalibrationMarginTests(unittest.TestCase):
 
                     rig.owner.stop_capture = cancel_after_last_capture
                 with self.assertRaises(CommandError):
-                    rig.calibrate(save=1)
+                    rig.calibrate(save=1, DETECTOR="RAW")
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertNotIn("SAVE_CONFIG", rig.scripts)
                 self.assertNotIn("saved_threshold_g", rig.workflow.last_result)
@@ -185,7 +185,7 @@ class CalibrationMarginTests(unittest.TestCase):
                                    axis + "_threshold": 2.25})
                 rig.owner.threshold_g[axis] = 2.25
                 rig.home_results.extend([{"travel_mm": 51.175}, {"travel_mm": 8.}] + [{}] * 11)
-                rig.accuracy(axis=axis.upper())
+                rig.accuracy(axis=axis.upper(), DETECTOR="RAW")
                 self.assertEqual([call["threshold"] for call in rig.home_calls],
                                  [2.25, 2.5] + [3.] * 11)
                 result = rig.workflow.last_result

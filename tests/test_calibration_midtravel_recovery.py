@@ -50,7 +50,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
                         mock.patch.object(rig.toolhead, "manual_move", side_effect=moving), \
                         mock.patch.object(rig.toolhead, "set_position", side_effect=AssertionError("coordinate rebase")), \
                         mock.patch.object(rig.workflow, "_save_model", side_effect=saving):
-                    rig.calibrate(axis.upper(), save=0, START_THRESHOLD=2.25, STEP=.25)
+                    rig.calibrate(axis.upper(), save=0, START_THRESHOLD=2.25, STEP=.25, DETECTOR="RAW")
                 before, coordinates = moves[len(prefix)]
                 self.assertAlmostEqual(coordinates[index] - before[index], -sign * halt)
                 self.assertEqual(coordinates[index], rail.info.position_endstop - sign * 51.175)
@@ -98,7 +98,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
 
                 rig.home_results.extend([{"travel_mm": 51.175}] * 2 + [{}] * 11)
                 with mock.patch.object(rig.workflow, "_home", side_effect=home_with_other_axis_state):
-                    rig.calibrate(axis.upper(), save=0, START_THRESHOLD=2.25, STEP=.25)
+                    rig.calibrate(axis.upper(), save=0, START_THRESHOLD=2.25, STEP=.25, DETECTOR="RAW")
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [2.25, 2.5] + [2.75] * 11)
                 self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 2.75)
                 self.assertEqual(rig.workflow.last_result["threshold_g"], 3.25)
@@ -119,7 +119,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
                 rig = machine("y")
                 rig.home_results.extend([{"travel_mm": 45.},
                                          {"travel_mm": 45., "halt_travel_mm_signed": -45. - extra}] + [{}] * 11)
-                rig.calibrate("Y", save=0)
+                rig.calibrate("Y", save=0, DETECTOR="RAW")
                 self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
                 self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
                 self.assertEqual(rig.workflow.last_result["recovery"]["count"], 2)
@@ -128,7 +128,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
     def test_twelve_zero_halts_have_no_independent_return_count_limit(self):
         rig = Rig()
         rig.home_results.extend([{"travel_mm": 0.}] * 12 + [{}] * 11)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual([call["threshold"] for call in rig.home_calls],
                          [1. + .25 * i for i in range(12)] + [4.] * 11)
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 4.)
@@ -145,7 +145,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
                                  {"travel_mm": 150.}, {"travel_mm": 152.0001}, {"travel_mm": 80.}] + [{}] * 11)
         states = []
         rig.on_home = lambda axis: states.append(rig.workflow.get_status(0)["active"])
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual([call["threshold"] for call in rig.home_calls],
                          [1., 1.25, 1.5, 1.5, 1.5, 1.75] + [2.] * 11)
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 2.)
@@ -189,7 +189,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
         self.assertIs(workflow.session, session)
         self.assertEqual(workflow.get_status(0)["active"]["recovery"]["count"], 1)
         rig.home_results.extend([{"travel_mm": 90.}] + [{}] * 11)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
         self.assertEqual(rig.workflow.last_result["restarts"], 2)
@@ -207,7 +207,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
                     rig.workflow.max_attempts = 1
                 rig.home_results.append({"travel_mm": 51.175, "halt_travel_mm_signed": -51.175})
                 with self.assertRaises(CommandError):
-                    rig.calibrate(save=0, START_THRESHOLD=2.25, STEP=.25)
+                    rig.calibrate(save=0, START_THRESHOLD=2.25, STEP=.25, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.toolhead.moves, [])
                 result = rig.workflow.last_result
@@ -249,7 +249,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
 
                 with mock.patch.object(target, method, side_effect=fail_after_halt), \
                         self.assertRaisesRegex(CommandError, "cleanup fault|empty or incomplete"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(checked, [True])
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.toolhead.moves, [])

@@ -7,6 +7,7 @@ the recorded signed start-to-halt commanded travel, assuming no skipped steps
 or slip. Qualified homes return to the configured midpoint.
 """
 import datetime
+import copy
 import configparser
 from decimal import Decimal
 import html
@@ -203,6 +204,8 @@ class AccelHomingWorkflows:
             self.manual_axes.update(AXES)
         self.model = None
         self.staged_detector_profiles = {}
+        self.staged_pair_certificates = {}
+        self.temporary_manual_thresholds = {}
         self.staged_detector_types = {}
         if config.has_section(self.model_section):
             self.model = self.printer.load_object(config, self.model_section)
@@ -548,15 +551,55 @@ class AccelHomingWorkflows:
     def _calibration_attempt_status(self, session):
         return {"attempt_limit": self.max_attempts,
                 "attempts_remaining": max(0, self.max_attempts - session["attempts"]),
-                "candidate_attempts_required": REQUIRED_SUCCESSES + 1}
+                "candidate_attempts_required": 12 if session.get("paired_calibration") else REQUIRED_SUCCESSES + 1}
 
     def _require_calibration_candidate_attempts(self, session):
         budget = self._calibration_attempt_status(session)
         if budget["attempts_remaining"] < budget["candidate_attempts_required"]:
+            if session.get("paired_calibration"):
+                raise self._error("HYBRID calibration attempt budget needs 12 remaining for a fresh complete pair (RAW discovery+5, FILTERED discovery+5); no automatic return or threshold increase")
             raise self._error(
                 "calibration attempt budget cannot complete another candidate: %d attempts remain, "
                 "%d required for fresh impact discovery and ten checks. No automatic return or "
                 "threshold increase" % (budget["attempts_remaining"], budget["candidate_attempts_required"]))
+
+    def _paired_config_snapshot(self):
+        configfile = self.printer.lookup_object("configfile")
+        parser = getattr(getattr(configfile, "autosave", None), "fileconfig", None)
+        if (not isinstance(parser, configparser.RawConfigParser)
+                or not isinstance(getattr(configfile, "status_save_pending", None), dict)
+                or type(getattr(configfile, "save_config_pending", None)) is not bool):
+            raise self._error("HYBRID paired calibration requires transactional native SAVE_CONFIG staging; select DETECTOR=RAW or FILTERED")
+        return (configfile, copy.deepcopy(parser), copy.deepcopy(configfile.status_save_pending), configfile.save_config_pending)
+
+    @staticmethod
+    def _restore_paired_config(snapshot):
+        configfile, parser, pending, flag = snapshot
+        configfile.autosave.fileconfig = parser
+        configfile.status_save_pending = pending
+        configfile.save_config_pending = flag
+
+    def _check_paired_context(self, session, finished=False):
+        if not finished:
+            self._check_running(session)
+        elif session.get("finish_interrupted") or self._printing() or self.printer.is_shutdown():
+            raise self._error("HYBRID paired cleanup was interrupted; pair pending changes discarded")
+        axis = session["axis"]
+        if (self._model_context(axis) != session["paired_context"]
+                or self.owner.noise_sensor_context() != session["paired_sensor_context"]
+                or self.owner.operation_generation != session["paired_generation"]
+                or self.preflight_generation != session["paired_preflight_generation"]):
+            raise self._error("HYBRID paired calibration context changed; both series discarded")
+
+    @staticmethod
+    def _calibration_checks(session):
+        return 5 if session.get("paired_calibration") else REQUIRED_SUCCESSES
+
+    @staticmethod
+    def _paired_valid_counts(session):
+        return {"raw": 5 if "raw" in session.get("paired_profiles", {}) else
+                session["successes"] if session["paired_stage"] == "raw" else 0,
+                "filtered": session["successes"] if session["paired_stage"] == "filtered" else 0}
 
     def _model_context(self, axis):
         rail = self.owner.rails_by_axis[axis]
@@ -639,6 +682,14 @@ class AccelHomingWorkflows:
                 result.update(candidate_g=session["candidate"], restarts=session["restarts"],
                               attempts=session["attempts"], **self._calibration_attempt_status(session),
                               recovery=self._calibration_recovery_status(session))
+                if session.get("paired_calibration"):
+                    result.update(requested_detector="hybrid", calibration_mode="paired_profiles",
+                        actual_series_detector=session["paired_stage"], pair_id=session["pair_id"],
+                        paired_restarts=session["paired_restarts"], paired_candidates=dict(session["paired_candidates"]),
+                        qualification_counts=self._paired_valid_counts(session), required_checks_per_detector=5)
+                    result["actual_series_candidate_g"] = session["candidate"]
+                    if result.get("result") == "calibrated":
+                        result["candidate_g"] = result["tested_threshold_g"]
                 if session.get("beta"):
                     result.update(beta=True, beta_phase=session.get("beta_phase"),
                                   motion_noise=session.get("beta_motion_summary"),
@@ -719,6 +770,34 @@ class AccelHomingWorkflows:
         if self.session is not None and (not self.in_home or set(axes) != {self.home_axis}):
             raise self._error("a supervised workflow is active; resume calibration with its "
                               "command or use CANCEL")
+        if getattr(self.owner, "backend", None) is None:
+            for axis in axes:
+                kind = self.detector_type(axis)
+                profile = self._profile(axis, kind)
+                calibrating = bool(self.session and self.session.get("mode") == "calibration")
+                effective_xyz = bool(self.session and self.session.get("detector_metrics", {}).get(axis) == "xyz_magnitude")
+                self._validate_native_polarity(axis, kind, None if profile is None else profile["metadata"],
+                    self.filter_config(axis) if kind == "filtered" else None,
+                    manual=(calibrating or effective_xyz or axis in self.manual_axes
+                            or self._temporary_manual_threshold(axis) or profile is None))
+
+    def _temporary_manual_threshold(self, axis):
+        return (axis in self.temporary_manual_thresholds
+                and self.temporary_manual_thresholds[axis] == self.owner.threshold_g[axis])
+
+    def note_manual_threshold(self, axis, threshold):
+        self.temporary_manual_thresholds[axis] = threshold
+
+    def _validate_native_polarity(self, axis, kind, metadata, config=None, manual=False, error=None):
+        if getattr(self.owner, "backend", None) is not None:
+            return
+        error = error or self._error
+        if kind == "filtered" and (config is None or config.get("version") != 2 or signal_mode(config) != "rectified"):
+            raise error("Native Beacon live FILTERED/HYBRID requires rectified v2 (absolute axes after reference subtraction); signed v1 is historical only. Run ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1 to qualify a fresh pair" % axis.upper())
+        if (kind == "raw" and not manual and metadata is not None
+                and metadata.get("impact_metric", "selected_axis") == "selected_axis"
+                and metadata.get("native_polarity_policy") != "absolute_after_reference_subtraction_v1"):
+            raise error("Saved native selected-axis RAW profile has legacy/unknown sign-gated qualification; recalibrate with ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1. Explicit manual thresholds remain unqualified absolute thresholds" % axis.upper())
 
     def check_home_result(self, record):
         # Single-touch geometry is enforced before any workflow motion. Record
@@ -850,25 +929,34 @@ class AccelHomingWorkflows:
             return None
         return session.get("hybrid_raw_profiles", {}).get(axis)
 
-    def _select_detectors(self, gcmd, mode, axes):
-        requested = gcmd.get("DETECTOR", None)
+    def _select_detectors(self, gcmd, mode, axes, default_detector=None):
+        requested = gcmd.get("DETECTOR", default_detector)
         requested = None if requested is None else str(requested).strip().lower()
         if requested is not None and requested not in ("raw", "filtered", "hybrid"):
             raise gcmd.error("DETECTOR must be RAW, FILTERED or HYBRID")
         hybrid_profiles = {}
+        paired = requested == "hybrid" and mode == "calibration"
         if requested == "hybrid":
-            if mode not in ("test", "charts", "accuracy"):
+            if mode not in ("test", "charts", "accuracy", "calibration"):
                 raise gcmd.error("DETECTOR=HYBRID supports TEST, CHARTS and ACCURACY only; it cannot calibrate")
             allowed = {"CENTERED", "DETECTOR"} | ({"AXIS"} if mode != "test" else set())
             if mode == "accuracy":
                 allowed |= {"SAMPLES", "BASELINE"}
+            if paired:
+                allowed |= {"AXIS", "START_THRESHOLD", "STEP", "SAVE_CONFIG"}
             unsupported = set(gcmd.get_command_parameters()) - allowed
             if unsupported:
                 raise gcmd.error("Unsupported HYBRID option(s): %s; HYBRID requires saved profiles without threshold overrides"
                                  % ", ".join(sorted(unsupported)))
             if getattr(self.owner, "backend", None) is not None:
-                raise gcmd.error("HYBRID currently requires native Beacon original sample provenance")
+                raise gcmd.error("HYBRID requires native Beacon; select DETECTOR=RAW or FILTERED for this backend")
+            if paired:
+                self._paired_config_snapshot()
+                if self.max_attempts < 12:
+                    raise gcmd.error("HYBRID calibration needs at least 12 total attempts for discovery plus five RAW and five FILTERED checks")
             for axis in axes:
+                if paired:
+                    continue
                 context = self._model_context(axis)
                 for kind in ("raw", "filtered"):
                     profile = self._profile(axis, kind)
@@ -897,7 +985,7 @@ class AccelHomingWorkflows:
                             "source": "saved_compatible_raw_xyz_profile"}
         types, thresholds, configs, metrics = {}, {}, {}, {}
         for axis in axes:
-            kind = "filtered" if requested == "hybrid" else requested or self.detector_type(axis)
+            kind = "raw" if paired else "filtered" if requested == "hybrid" else requested or self.detector_type(axis)
             if mode == "calibration" and kind == "filtered" and axis in self.manual_axes:
                 raise gcmd.error("FILTERED calibration requires removing the explicit threshold and/or %s_threshold "
                                  "configuration override before restart; existing manual thresholds retain RAW semantics" % axis)
@@ -937,9 +1025,15 @@ class AccelHomingWorkflows:
                              else "selected_axis")
             configs[axis] = detector_config(None if mode == "calibration" or profile is None
                                              else profile["metadata"].get("detector_config"))
+            if mode != "calibration":
+                self._validate_native_polarity(axis, kind, None if profile is None else profile["metadata"],
+                    configs[axis] if kind == "filtered" else None,
+                    manual=(profile is None or explicit is not None or requested is None
+                            and (axis in self.manual_axes or self._temporary_manual_threshold(axis))), error=gcmd.error)
         return {"detector_types": types, "detector_configs": configs,
                 "detector_metrics": metrics,
                 "hybrid_raw_profiles": hybrid_profiles,
+                "paired_calibration": paired,
                 "detector_explicit": requested is not None, "workflow_thresholds": thresholds}
 
     def _calibration_grid(self, gcmd, session=None):
@@ -962,7 +1056,7 @@ class AccelHomingWorkflows:
         return grid
 
     def _begin(self, gcmd, mode, axis=None, axes=None, calibration_grid=None, save_config_default=1,
-               previous_accuracy=None):
+               previous_accuracy=None, default_detector=None):
         if self.session is not None and self.session is not previous_accuracy:
             raise gcmd.error("A workflow is already active; use ACCEL_HOMING_CANCEL first")
         if previous_accuracy is not None:
@@ -970,7 +1064,8 @@ class AccelHomingWorkflows:
         if mode == "calibration" and calibration_grid is None:
             calibration_grid = self._calibration_grid(gcmd)
         axes = axes if axes is not None else [axis] if axis else ["x", "y"]
-        selection = self._select_detectors(gcmd, mode, axes)
+        selected_before = {a: self.detector_type(a) for a in axes}
+        selection = self._select_detectors(gcmd, mode, axes, default_detector)
         if previous_accuracy is not None:
             # Automatic recovery retains the exact algorithm that failed its
             # accuracy series; a user calibration deliberately selects v2.
@@ -1009,11 +1104,20 @@ class AccelHomingWorkflows:
                                 quiet_range_enforced=False,
                                 calibration_settle_time_s=self.calibration_settle_time,
                                 recovery={"count": 0, "last_return_mm_signed": None})
+            if selection["paired_calibration"]:
+                self.session.update(paired_stage="raw", pair_id=uuid.uuid4().hex, pair_stage_id=uuid.uuid4().hex,
+                    paired_selected_type=selected_before[axis], paired_candidates={"raw": calibration_grid["start_threshold_g"],
+                    "filtered": calibration_grid["start_threshold_g"]}, paired_profiles={}, paired_restarts=0,
+                    paired_context=self._model_context(axis), paired_sensor_context=self.owner.noise_sensor_context(),
+                    paired_generation=self.owner.operation_generation, paired_preflight_generation=self.preflight_generation)
             self._clear_noise_seeds()
         else:
             self.owner.threshold_g.update(selection["workflow_thresholds"])
 
     def _announce_calibration(self, session):
+        if session.get("paired_calibration"):
+            self._info("HYBRID calibration automatically qualifies RAW 5/5 and FILTERED 5/5 in one command; each discovery is excluded. Recoverable failure discards BOTH series; total %d-attempt budget never resets. Actual series use their own RAW/FILTERED control; HYBRID position is evaluated by ACCURACY after the pair is saved" % self.max_attempts)
+            return
         self._info("%s calibration starts at %.6g g with %.6g g steps; XYZ magnitude; "
                    "impact after >20 mm then ten centered endstop checks with spread <= 2 mm; "
                    "no quietness or acceleration-derived motion proof; returns settle for %.3f s; "
@@ -1185,7 +1289,7 @@ class AccelHomingWorkflows:
                                                 for index, axis in enumerate("xyz", 1)))
                              for row in samples)
         filtered_noise = {}
-        if "filtered" in session.get("detector_types", {}).values():
+        if session.get("paired_calibration") or "filtered" in session.get("detector_types", {}).values():
             config = detector_config(session.get("detector_configs", {}).get(session.get("axis")))
             reference = robust_reference([row[1:] for row in samples], config)
             engine = CausalImpactDetector(1e9, reference["offset_g"], reference["noise_sigma_g"],
@@ -1390,6 +1494,23 @@ class AccelHomingWorkflows:
         session["stationary_noise"].update(detector_type=session.get("detector_types", {}).get(session["axis"], "raw"),
                                             decision_noise_metric=noise_metric)
         session["deferred_noise_result"] = noise_result
+        if session.get("paired_calibration"):
+            candidates = {}
+            hints = {}
+            for kind, metric in (("raw", "noise_magnitude_peak_g"), ("filtered", "filtered_noise_peak_g")):
+                measured = max(item["record"][metric] for item in session["iterations"])
+                required_kind = max(start_decimal, Decimal("1.2") * Decimal(str(measured)), Decimal(str(measured)) + Decimal("0.1"))
+                selected = start if explicit else float(start_decimal + math.ceil((required_kind - start_decimal) / step_decimal) * step_decimal)
+                self._validate_calibration_threshold(selected, kind.upper() + " initial candidate")
+                candidates[kind] = selected
+                hints[kind] = {"run_id": session["run_id"], "source": "shared_initial_stationary_measurement",
+                    "detector_type": kind, "decision_noise_metric": metric, "decision_noise_peak_g": measured,
+                    "configured_start_g": start, "start_threshold_g": selected, "candidate_step_g": step,
+                    "initial_threshold_source": "explicit_start_threshold" if explicit else "stationary_noise",
+                    "shared_original_windows": 3, "used_for_initial_candidate_only": True}
+            session["paired_candidates"] = candidates
+            session["paired_initial_candidates"] = dict(candidates)
+            session["paired_noise_hints"] = hints
         if not explicit:
             if limit is None:
                 raise self._error("stationary XYZ-magnitude noise cannot select a calibration start "
@@ -1407,7 +1528,7 @@ class AccelHomingWorkflows:
                 "margin_factor": 1.2, "margin_g": 0.1}
             session.update(start_threshold_g=candidate, candidate=candidate)
             self._info("Fresh stationary XYZ-magnitude peak %.6g g selects initial candidate %.6g g; "
-                       "ten-home qualification remains required" % (peak, candidate))
+                       "%s qualification remains required" % (peak, candidate, "paired 5+5" if session.get("paired_calibration") else "ten-home"))
         else:
             self._info("Fresh stationary XYZ-magnitude peak %.6g g measured; explicit START_THRESHOLD "
                        "%.6g g remains the initial candidate" % (peak, start))
@@ -1415,6 +1536,8 @@ class AccelHomingWorkflows:
         self._check_running(session)
         self._check_stopped_noise_context(session)
         session.update(mode="calibration", state="running")
+        if session.get("paired_calibration"):
+            self._reset_pair_series("raw")
         session.pop("sensor_token", None)
 
     def cmd_NOISE(self, gcmd):
@@ -1467,6 +1590,8 @@ class AccelHomingWorkflows:
         if session["attempts"] >= session.get("attempt_limit", self.max_attempts):
             raise self._error("maximum homing attempts reached")
         self._check_running(session)
+        if session.get("paired_calibration"):
+            self._check_paired_context(session)
         if threshold is not None:
             self._validate_calibration_threshold(threshold, "candidate")
         session["attempts"] += 1
@@ -1536,6 +1661,9 @@ class AccelHomingWorkflows:
                                           else self.owner.threshold_g[axis])
         record["workflow_phase"] = ("validation" if session["candidate_qualified"] else "discovery") \
             if session["mode"] == "calibration" else session["mode"]
+        if session.get("paired_calibration"):
+            record.update(calibration_requested_detector="hybrid", calibration_series=session["paired_stage"],
+                          calibration_pair_id=session["pair_id"], calibration_stage_id=session["pair_stage_id"])
         record.update(detector_type=record.get("detector_type", "raw"),
                       detector_profile=session.get("detector_types", {}).get(axis, "raw"),
                       model_context=self._model_context(axis),
@@ -1911,6 +2039,10 @@ class AccelHomingWorkflows:
             raise self._error(reason + "; next calibration candidate must be finite and increase the threshold")
         self._validate_calibration_threshold(candidate, "next calibration candidate")
         self._require_calibration_candidate_attempts(session)
+        if session.get("paired_calibration"):
+            if apply:
+                self._restart_calibration_pair(candidate, reason)
+            return candidate
         if apply:
             session.update(candidate=candidate, successes=0, candidate_qualified=False,
                            candidate_attempt=None, validation_records=[], repeatability_spread_mm=None,
@@ -1979,10 +2111,51 @@ class AccelHomingWorkflows:
         session["recovery"].update(count=session["recovery"]["count"] + 1,
                                    last_return_mm_signed=-signed_halt)
 
+    def _reset_pair_series(self, kind):
+        session = self.session
+        session.update(paired_stage=kind, pair_stage_id=uuid.uuid4().hex, successes=0,
+            candidate=session["paired_candidates"][kind], start_threshold_g=session["paired_candidates"][kind],
+            candidate_qualified=False, candidate_attempt=None, validation_records=[], repeatability_spread_mm=None)
+        session["detector_types"][session["axis"]] = kind
+        session["stationary_noise"] = dict(session["stationary_noise"], detector_type=kind,
+            decision_noise_metric="noise_magnitude_peak_g" if kind == "raw" else "filtered_noise_peak_g",
+            start_threshold_g=session["paired_candidates"][kind], shared_acquisition=True)
+        session["noise_seed"] = copy.deepcopy(session["paired_noise_hints"][kind])
+        session["stationary_noise"]["decision_noise_peak_g"] = session["noise_seed"]["decision_noise_peak_g"]
+        self._info("HYBRID paired calibration automatically collecting %s: discovery plus 5 valid checks; RAW/FILTERED counts reset for this series; %d total attempts remain" %
+                   (kind.upper(), self.max_attempts - session["attempts"]))
+
+    def _restart_calibration_pair(self, next_candidate, reason):
+        session = self.session
+        self._check_paired_context(session)
+        failed = session["paired_stage"]
+        session["paired_candidates"][failed] = next_candidate
+        session.update(paired_profiles={}, pair_id=uuid.uuid4().hex,
+            paired_restarts=session["paired_restarts"] + 1, restarts=session["restarts"] + 1)
+        self._info("HYBRID paired calibration rejected %s: %s. Discarding BOTH series; RAW 0/5, FILTERED 0/5. %s next candidate %.6g g; global attempt budget does not reset" %
+                   (failed.upper(), reason, failed.upper(), next_candidate))
+        self._reset_pair_series("raw")
+
+    def _complete_raw_calibration_series(self):
+        session = self.session
+        self._check_paired_context(session)
+        qualified = self._qualified_validation_records()
+        threshold = self._calibration_saved_threshold(session["candidate"])
+        profile = {"threshold_g": threshold, "metadata": self._calibration_metadata(qualified, threshold)}
+        self._recenter(session["axis"])
+        self._check_paired_context(session)
+        self._qualified_validation_records()
+        self._calibration_saved_threshold(session["candidate"])
+        session["paired_candidates"]["raw"] = session["candidate"]
+        session["paired_profiles"]["raw"] = copy.deepcopy(profile)
+        self._reset_pair_series("filtered")
+
     def _calibrate_trials(self):
         session = self.session
         axis = session["axis"]
         while True:
+            if session.get("paired_calibration"):
+                self._check_paired_context(session)
             discovery = not session["candidate_qualified"]
             record, _capture = self._home(axis, session["candidate"])
             quality, reason = self._quality(axis, record)
@@ -2011,16 +2184,16 @@ class AccelHomingWorkflows:
                 session["candidate_qualified"] = True
                 session["candidate_attempt"] = record["workflow_attempt"]
                 self._info("%s %.2f g candidate selected by impact after %.3f mm (>20 mm); "
-                           "centering this axis for ten endstop checks; discovery hit is excluded" % (
+                           "centering this axis for %d endstop checks; discovery hit is excluded" % (
                                axis.upper(), session["candidate"],
-                               record.get("travel_mm_exact", record["travel_mm"])))
+                               record.get("travel_mm_exact", record["travel_mm"]), self._calibration_checks(session)))
                 self._recenter(axis)
                 continue
             session["validation_records"].append(record)
             session["successes"] = len(session["validation_records"])
             spread = session["repeatability_spread_mm"] = self._repeatability_spread(session["validation_records"])
-            self._info("%s calibration %.2f g: %d/10 endstop checks; commanded travel spread %s mm" % (
-                axis.upper(), session["candidate"], session["successes"], spread))
+            self._info("%s calibration %.2f g: %d/%d endstop checks; commanded travel spread %s mm" % (
+                axis.upper(), session["candidate"], session["successes"], self._calibration_checks(session), spread))
             if spread > CALIBRATION_REPEATABILITY_MM:
                 # No later trial can reduce this running max-min spread.
                 # Reject immediately, then require fresh discovery and ten checks.
@@ -2031,8 +2204,11 @@ class AccelHomingWorkflows:
                 self._info(reason + "; restart from impact discovery at %.2f g" % candidate)
                 self._recenter(axis)
                 continue
-            if session["successes"] < REQUIRED_SUCCESSES:
+            if session["successes"] < self._calibration_checks(session):
                 self._recenter(axis)
+                continue
+            if session.get("paired_calibration") and session["paired_stage"] == "raw":
+                self._complete_raw_calibration_series()
                 continue
             self._save_model()
             return
@@ -2040,6 +2216,7 @@ class AccelHomingWorkflows:
     def _qualified_validation_records(self):
         """Recheck the entire current-candidate window before any config writes."""
         session = self.session
+        required = self._calibration_checks(session or {})
         message = ("cannot save calibration without a discovery impact after 20 mm and ten distinct "
                    "current-candidate validation homes with commanded travel spread "
                    "<= %.2f mm" % CALIBRATION_REPEATABILITY_MM)
@@ -2052,25 +2229,30 @@ class AccelHomingWorkflows:
         if session.get("mode") != "calibration" or session.get("state") != "running" \
                 or not isinstance(axis, str) or axis not in AXES \
                 or session.get("candidate_qualified") is not True \
-                or session.get("successes") != REQUIRED_SUCCESSES \
+                or session.get("successes") != required \
                 or not isinstance(threshold, (int, float)) or isinstance(threshold, bool) \
                 or not math.isfinite(threshold) or threshold < 0.5 \
                 or (threshold_limit is not None and threshold > threshold_limit) \
                 or type(candidate_attempt) is not int or candidate_attempt < 1 \
                 or type(session.get("attempts")) is not int \
-                or session.get("attempts") != candidate_attempt + REQUIRED_SUCCESSES \
+                or session.get("attempts") != candidate_attempt + required \
                 or not isinstance(records, list) or len(records) != session["attempts"] \
-                or not isinstance(qualified, list) or len(qualified) != REQUIRED_SUCCESSES \
+                or not isinstance(qualified, list) or len(qualified) != required \
                 or not isinstance(session.get("run_id"), str) or not session["run_id"] \
                 or type(session.get("save_config")) is not bool:
             raise self._error(message)
         discovery = records[candidate_attempt - 1]
         window = [discovery] + qualified
-        if len({id(record) for record in window}) != REQUIRED_SUCCESSES + 1 \
+        if len({id(record) for record in window}) != required + 1 \
                 or any(actual is not expected for actual, expected in
-                       zip(qualified, records[-REQUIRED_SUCCESSES:])):
+                       zip(qualified, records[-required:])):
             raise self._error(message)
         for index, record in enumerate(window):
+            if session.get("paired_calibration") and (record.get("calibration_pair_id") != session["pair_id"]
+                    or record.get("calibration_stage_id") != session["pair_stage_id"]
+                    or record.get("calibration_series") != session["paired_stage"]
+                    or record.get("detector_type") != session["paired_stage"]):
+                raise self._error("paired calibration cannot reuse another series/pair's qualification")
             if not isinstance(record, dict) or record.get("axis") != axis \
                     or record.get("run_id") != session["run_id"] \
                     or type(record.get("workflow_attempt")) is not int \
@@ -2083,39 +2265,12 @@ class AccelHomingWorkflows:
             raise self._error(message)
         return qualified
 
-    def _save_model(self):
-        qualified = self._qualified_validation_records()
+    def _calibration_metadata(self, qualified, threshold):
         session = self.session
         axis, tested_threshold = session["axis"], session["candidate"]
         minimum = min(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
         maximum = max(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
         spread = self._repeatability_spread(qualified)
-        self._release_terminal_home(axis, qualified[-1])
-        # Final release may yield while its motion completes. Recheck all ten
-        # accepted trials before staging any model settings.
-        self._qualified_validation_records()
-        threshold = self._calibration_saved_threshold(tested_threshold)
-        noise_png = None
-        if session.get("deferred_noise_result") is not None:
-            generation, preflight = self.owner.operation_generation, self.preflight_generation
-            snapshot, context = self._noise_snapshot(), self._noise_context()
-
-            def current_noise_report():
-                self._check_running(session)
-                self._noise_idle_queue()
-                if (self.owner.operation_generation != generation
-                        or self.preflight_generation != preflight
-                        or self._noise_snapshot() != snapshot or self._noise_context() != context):
-                    raise self._error("calibration context changed while preparing its stationary noise PNG")
-
-            noise_png = prepare_noise(session["run_id"], session["iterations"],
-                                      session["recommendation"], "complete",
-                                      renderer=self.renderer, check_running=current_noise_report)
-            current_noise_report()
-            self._qualified_validation_records()
-            # Rendering can yield; the final value must still fit the current
-            # sensor headroom, not just the lower threshold used by the trials.
-            threshold = self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
                     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "expected_center_travel_mm": self._geometry(axis)[1],
@@ -2170,13 +2325,76 @@ class AccelHomingWorkflows:
                             moving_noise_summaries=[r.get("filter_diagnostics", {}).get("moving_noise")
                                                     if isinstance(r.get("filter_diagnostics"), dict) else None
                                                     for r in qualified])
+        metadata["qualification_successes"] = self._calibration_checks(session)
+        if getattr(self.owner, "backend", None) is None:
+            metadata["native_polarity_policy"] = "absolute_after_reference_subtraction_v1"
+        if session.get("paired_calibration"):
+            metadata["paired_qualification"] = {
+                "pair_id": session["pair_id"], "stage_id": session["pair_stage_id"],
+                "detector_type": kind, "valid_checks": 5, "discovery_excluded": True,
+                "discovery_attempt": session["candidate_attempt"],
+                "validation_attempts": [record["workflow_attempt"] for record in qualified],
+                "tested_threshold_g": tested_threshold, "saved_threshold_g": threshold,
+                "threshold_margin_g": .5, "saved_threshold_tested": False,
+                "repeatability_spread_mm": spread, "model_context": copy.deepcopy(session["paired_context"]),
+                "sensor_context": copy.deepcopy(session["paired_sensor_context"]), "run_id": session["run_id"],
+                "detector_config": copy.deepcopy(metadata["detector_config"])}
+            metadata["calibration_sensor_context"] = copy.deepcopy(session["paired_sensor_context"])
+        return metadata
+
+    def _save_model(self):
+        if self.session is not None and self.session.get("paired_calibration"):
+            return self._save_paired_model()
+        qualified = self._qualified_validation_records()
+        session = self.session
+        axis, tested_threshold = session["axis"], session["candidate"]
+        minimum = min(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
+        maximum = max(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
+        spread = self._repeatability_spread(qualified)
+        self._release_terminal_home(axis, qualified[-1])
+        # Final release may yield while its motion completes. Recheck all ten
+        # accepted trials before staging any model settings.
+        self._qualified_validation_records()
+        threshold = self._calibration_saved_threshold(tested_threshold)
+        noise_png = None
+        if session.get("deferred_noise_result") is not None:
+            generation, preflight = self.owner.operation_generation, self.preflight_generation
+            snapshot, context = self._noise_snapshot(), self._noise_context()
+
+            def current_noise_report():
+                self._check_running(session)
+                self._noise_idle_queue()
+                if (self.owner.operation_generation != generation
+                        or self.preflight_generation != preflight
+                        or self._noise_snapshot() != snapshot or self._noise_context() != context):
+                    raise self._error("calibration context changed while preparing its stationary noise PNG")
+
+            noise_png = prepare_noise(session["run_id"], session["iterations"],
+                                      session["recommendation"], "complete",
+                                      renderer=self.renderer, check_running=current_noise_report)
+            current_noise_report()
+            self._qualified_validation_records()
+            # Rendering can yield; the final value must still fit the current
+            # sensor headroom, not just the lower threshold used by the trials.
+            threshold = self._calibration_saved_threshold(tested_threshold)
+        metadata = self._calibration_metadata(qualified, threshold)
+        kind = session.get("detector_types", {}).get(axis, "raw")
         profiles = {}
         if self.model is not None and axis in self.model.thresholds:
             old = dict(self.model.metadata[axis])
             profiles.update(old.pop("detector_profiles", {}))
+            old.pop("paired_calibrations", None)
             profiles[old.get("detector_type", "raw")] = {"threshold_g": self.model.thresholds[axis], "metadata": old}
         profiles.update(self.staged_detector_profiles.get(axis, {}))
         profiles[kind] = {"threshold_g": threshold, "metadata": dict(metadata)}
+        certificates = ({} if self.model is None or axis not in self.model.thresholds else
+                        copy.deepcopy(self.model.metadata[axis].get("paired_calibrations", {})))
+        certificates.update(self.staged_pair_certificates.get(axis, {}))
+        referenced = {profile["metadata"]["paired_qualification"]["pair_id"] for profile in profiles.values()
+                      if profile["metadata"].get("paired_qualification")}
+        certificates = {key: value for key, value in certificates.items() if key in referenced}
+        if certificates:
+            metadata["paired_calibrations"] = copy.deepcopy(certificates)
         metadata["detector_profiles"] = profiles
         encoded_metadata = json.dumps(metadata, separators=(",", ":"), allow_nan=False)
         configfile = self.printer.lookup_object("configfile")
@@ -2190,7 +2408,7 @@ class AccelHomingWorkflows:
         # partially failed native config staging must not allow a later RAW
         # axis save to make an earlier FILTERED threshold load on old code.
         self.staged_detector_types.update(selected_types)
-        model_version = 2 if "filtered" in selected_types.values() else 1
+        model_version = 3 if certificates or any(self.staged_pair_certificates.values()) or getattr(self.model, "version", 1) == 3 else 2 if "filtered" in selected_types.values() else 1
         configfile.set(self.model_section, "version", str(model_version))
         configfile.set(self.model_section, axis + "_threshold", encoded_threshold)
         configfile.set(self.model_section, axis + "_successes", str(REQUIRED_SUCCESSES))
@@ -2253,6 +2471,91 @@ class AccelHomingWorkflows:
                 self.last_result["chart_error"] = str(exc)
                 logging.exception("accel_homing: qualified calibration noise PNG publication failed")
 
+    def _save_paired_model(self):
+        session = self.session
+        axis = session["axis"]
+        self._check_paired_context(session)
+        qualified = self._qualified_validation_records()
+        threshold = self._calibration_saved_threshold(session["candidate"])
+        profiles = copy.deepcopy(session["paired_profiles"])
+        profiles["filtered"] = {"threshold_g": threshold, "metadata": self._calibration_metadata(qualified, threshold)}
+        certificate = {"pair_id": session["pair_id"], "total_valid_checks": 10,
+                       **{kind: profiles[kind]["metadata"]["paired_qualification"] for kind in ("raw", "filtered")}}
+        try:
+            from .accel_homing_model import validate_paired_certificates, _validate_detector_metadata
+        except ImportError:
+            from accel_homing_model import validate_paired_certificates, _validate_detector_metadata
+        certificates = {session["pair_id"]: certificate}
+        validate_paired_certificates(certificates)
+        selected = session["paired_selected_type"]
+        metadata = copy.deepcopy(profiles[selected]["metadata"])
+        metadata.update(paired_calibrations=certificates, detector_profiles=profiles,
+                        calibration_requested_detector="hybrid", qualification_total_successes=10)
+        _validate_detector_metadata(metadata)
+        self._release_terminal_home(axis, qualified[-1])
+        self._check_paired_context(session)
+        self._qualified_validation_records()
+        for kind in ("raw", "filtered"):
+            saved = self._calibration_saved_threshold(profiles[kind]["metadata"]["tested_threshold_g"])
+            if saved != profiles[kind]["threshold_g"]:
+                raise self._error("HYBRID paired saved threshold changed before staging")
+        noise_png = prepare_noise(session["run_id"], session["iterations"], session["recommendation"], "complete",
+                                  renderer=self.renderer, check_running=lambda: self._check_paired_context(session))
+        self._check_paired_context(session)
+        for kind in ("raw", "filtered"):
+            self._calibration_saved_threshold(profiles[kind]["metadata"]["tested_threshold_g"])
+        snapshot = self._paired_config_snapshot()
+        previous_profiles, previous_types = copy.deepcopy(self.staged_detector_profiles), dict(self.staged_detector_types)
+        previous_certificates = copy.deepcopy(self.staged_pair_certificates)
+        configfile = snapshot[0]
+        result = {"result": "calibrated", "axis": axis, "requested_detector": "hybrid",
+            "calibration_mode": "paired_profiles", "detector_type": selected, "model_version": 3,
+            "detector_config": metadata.get("detector_config"), "threshold_g": profiles[selected]["threshold_g"],
+            "tested_threshold_g": profiles[selected]["metadata"]["tested_threshold_g"],
+            "saved_threshold_g": profiles[selected]["threshold_g"], "threshold_margin_g": .5, "saved_threshold_tested": False,
+            "qualification_counts": {"raw": 5, "filtered": 5}, "successes": 10, "selected_profile_successes": 5,
+            "pair_id": session["pair_id"], "paired_restarts": session["paired_restarts"],
+            "profiles": copy.deepcopy(profiles), "model": self.model_name, "run_id": session["run_id"],
+            "save_config": session["save_config"], "restarts": session["restarts"],
+            "repeatability_spread_mm": max(profile["metadata"]["repeatability_spread_mm"] for profile in profiles.values()),
+            "repeatability_limit_mm": CALIBRATION_REPEATABILITY_MM, "algorithm": SIMPLE_CALIBRATION}
+        save_started = False
+        try:
+            for option, value in (("version", "3"), (axis + "_threshold", "%.17g" % profiles[selected]["threshold_g"]),
+                    (axis + "_successes", "5"), (axis + "_metadata", json.dumps(metadata, separators=(",", ":"), allow_nan=False))):
+                self._check_paired_context(session)
+                configfile.set(self.model_section, option, value)
+            self._check_paired_context(session)
+            self._finish(result)
+            self._check_paired_context(session, finished=True)
+            if self.last_result.get("result") != "calibrated":
+                raise self._error("HYBRID paired cleanup failed before persistence")
+            self.staged_detector_profiles[axis] = copy.deepcopy(profiles)
+            self.staged_detector_types[axis] = selected
+            self.staged_pair_certificates[axis] = copy.deepcopy(certificates)
+            if session["save_config"]:
+                self._info("HYBRID pair qualified: RAW 5/5 and FILTERED 5/5, discovery excluded; each saved threshold is tested candidate +0.5 g (margin untested). Saving both together; Klipper will restart")
+                save_started = True
+                self.gcode.run_script_from_command("SAVE_CONFIG")
+            else:
+                self._info("HYBRID pair qualified and staged together: RAW 5/5, FILTERED 5/5; each +0.5 g margin untested. Ordinary G28 retains %s selection. Run SAVE_CONFIG to persist" % selected.upper())
+        except Exception as exc:
+            self._restore_paired_config(snapshot)
+            self.staged_detector_profiles, self.staged_detector_types = previous_profiles, previous_types
+            self.staged_pair_certificates = previous_certificates
+            if self.session is None and self.last_result.get("run_id") == session["run_id"] and self.last_result.get("result") == "calibrated":
+                self.last_result.update(result="save_failed" if save_started else "aborted", save_config=False,
+                    reason=("Native SAVE_CONFIG failed; pair pending changes rolled back; disk persistence/restart unconfirmed"
+                            if save_started else "HYBRID cleanup/staging interrupted; pair pending changes rolled back: %s" % exc))
+            raise
+        if noise_png is not None:
+            try:
+                paths = publish_noise(self.charts_directory, noise_png)
+                self.last_result["stationary_noise"]["summary_paths"] = dict(paths)
+                self._announce_pngs(paths, "Stationary noise", self.last_result)
+            except Exception as exc:
+                self.last_result["chart_error"] = str(exc)
+
     def _calibration_saved_threshold(self, tested_threshold):
         # Always derive from the qualified candidate, never from an earlier
         # saved/staged value. Trial records continue to describe that candidate.
@@ -2283,12 +2586,12 @@ class AccelHomingWorkflows:
             self._calibration_grid(gcmd, session)
             requested_detector = gcmd.get("DETECTOR", None)
             if (requested_detector is not None and str(requested_detector).strip().lower()
-                    != session.get("detector_types", {}).get(axis, "raw")):
+                    != ("hybrid" if session.get("paired_calibration") else session.get("detector_types", {}).get(axis, "raw"))):
                 raise gcmd.error("DETECTOR cannot change while resuming calibration")
             self._continue_calibration()
             return
         grid = self._calibration_grid(gcmd)
-        self._begin(gcmd, "calibration", axis, calibration_grid=grid)
+        self._begin(gcmd, "calibration", axis, calibration_grid=grid, default_detector="hybrid")
         self._run_calibration()
 
     def _run_calibration(self):
@@ -3368,7 +3671,7 @@ class AccelHomingWorkflows:
         session = None
         recovery = False
         try:
-            self._begin(gcmd, "accuracy", axes=axes)
+            self._begin(gcmd, "accuracy", axes=axes, default_detector="hybrid")
             session = self.session
             session.update(state="running", axes=axes, samples_requested=samples,
                            baseline_run_id=baseline_run_id,
@@ -3670,6 +3973,11 @@ class AccelHomingWorkflows:
                               minimum_impact_travel_mm=CALIBRATION_MIN_TRAVEL_MM,
                               discovery_impact_required=True, recenter_policy="selected_axis_midpoint",
                               phase="validation" if session["candidate_qualified"] else "discovery")
+                if session.get("paired_calibration"):
+                    active.update(requested_detector="hybrid", actual_series_detector=session["paired_stage"],
+                        pair_id=session["pair_id"], paired_restarts=session["paired_restarts"],
+                        paired_candidates=dict(session["paired_candidates"]),
+                        qualification_counts=self._paired_valid_counts(session), required_checks_per_detector=5)
                 if session.get("stationary_noise") is not None:
                     active["stationary_noise"] = dict(session["stationary_noise"])
         return {"model": self.model_name, "manual_threshold_overrides": sorted(self.manual_axes),

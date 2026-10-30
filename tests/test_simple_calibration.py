@@ -199,7 +199,7 @@ class ImpactDiscoveryTests(unittest.TestCase):
                     rig.home_results.append({"result": result, "travel_mm": travel,
                                              "screen_completed": True, "screen_target_mm": 20.})
                     with self.assertRaisesRegex(CommandError, "failure"):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(len(rig.home_calls), 1)
                     self.assertEqual(rig.toolhead.moves, [])
                     self.assertEqual(rig.configfile.saved, {})
@@ -229,7 +229,7 @@ class ImpactDiscoveryTests(unittest.TestCase):
                 rig.toolhead.position[:2] = [12., 19.]
                 center = rig.workflow._geometry(axis)[0]
                 rig.home_results.extend([{"travel_mm": center * .95}] + [{"travel_mm": center}] * 10)
-                rig.calibrate(axis.upper(), save=0)
+                rig.calibrate(axis.upper(), save=0, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 11)
                 self.assertEqual(rig.home_calls[0]["position"][:2], [12., 19.])
                 for call in rig.home_calls[1:]:
@@ -279,13 +279,13 @@ class ImpactDiscoveryTests(unittest.TestCase):
             save()
         with mock.patch.object(rig.workflow, "_save_model", side_effect=tamper_then_save):
             with self.assertRaisesRegex(CommandError, "cannot save"):
-                rig.calibrate(save=0)
+                rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.configfile.saved, {})
 
     def test_exactly_twenty_mm_hit_returns_and_retries_in_the_same_command(self):
         rig = Rig()
         rig.home_results.append({"travel_mm": 20.})
-        rig.calibrate(save=0, START_THRESHOLD=1, STEP=.25)
+        rig.calibrate(save=0, START_THRESHOLD=1, STEP=.25, DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.toolhead.moves[0], ([20., None, None], 50.))
         self.assertEqual(rig.home_calls[1]["homed_axes"], "z")
@@ -298,7 +298,7 @@ class ImpactDiscoveryTests(unittest.TestCase):
         rig.home_results.extend([{"travel_mm": 145.}] + [{"travel_mm": 150.}] * 9 +
                                 [{"travel_mm": 152.001}, {"result": "no_trigger", "travel_mm": 150.}])
         with self.assertRaisesRegex(CommandError, "failure"):
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual([c["threshold"] for c in rig.home_calls], [1.] * 11 + [1.25])
         self.assertFalse(rig.home_calls[-1]["candidate_qualified"])
         self.assertEqual(rig.home_calls[-1]["successes"], 0)
@@ -307,7 +307,7 @@ class ImpactDiscoveryTests(unittest.TestCase):
     def test_exactly_two_mm_passes_after_ten_checks_without_retry(self):
         rig = Rig()
         rig.home_results.extend([{"travel_mm": 145.}] + [{"travel_mm": 150.}] * 9 + [{"travel_mm": 152.}])
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(len(rig.home_calls), 11)
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.5)
@@ -321,7 +321,7 @@ class SimpleWorkflowTests(unittest.TestCase):
         # repeatable but materially short hit on the default 300 mm axis.
         rig.owner.rails_by_axis["x"].bounds = (0., 212.376)
         rig.home_results.extend([{}] + [{"moving": False, "motion_seen": False, "travel_mm": 106.188}] * 10)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(len(rig.home_calls), 11)
         metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
         self.assertEqual(metadata["impact_metric"], "xyz_magnitude")
@@ -335,7 +335,7 @@ class SimpleWorkflowTests(unittest.TestCase):
         for _ in range(2):
             rig.home_results.extend([{}] + [{"travel_mm": 150.}] * 9 + [{"travel_mm": 152.001}])
         rig.home_results.extend([{}] + [{"travel_mm": 153.}] * 10)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual([c["threshold"] for c in rig.home_calls],
                          [1.] * 11 + [1.25] * 11 + [1.5] * 11)
         for offset in (0, 11, 22):
@@ -352,14 +352,14 @@ class SimpleWorkflowTests(unittest.TestCase):
                 rig.owner.full_scale_g = 1.25
             rig.home_results.extend([{}] + [{"travel_mm": 150.}] * 9 + [{"travel_mm": 153.}])
             with self.assertRaisesRegex(CommandError, "headroom|attempt budget"):
-                rig.calibrate(save=0)
+                rig.calibrate(save=0, DETECTOR="RAW")
             self.assertEqual(rig.configfile.saved, {})
             self.assertLessEqual(len(rig.home_calls), rig.workflow.max_attempts)
 
     def test_same_command_automatically_raises_threshold_after_early_impact(self):
         rig = Rig()
         rig.home_results.append({"travel_mm": 19.999})
-        rig.calibrate(save=0, START_THRESHOLD=1, STEP=.25)
+        rig.calibrate(save=0, START_THRESHOLD=1, STEP=.25, DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
@@ -389,7 +389,7 @@ class SimpleWorkflowTests(unittest.TestCase):
         rig = Rig()
         rig.owner.rails_by_axis["x"].bounds = (0., 40.)
         with self.assertRaisesRegex(CommandError, "exceed 20"):
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.home_calls, [])
 
@@ -397,7 +397,7 @@ class SimpleWorkflowTests(unittest.TestCase):
         rig = Rig()
         rig.home_results.extend([{}] + [{"travel_mm": 150., "travel_mm_exact": 150.}] * 9 +
                                 [{"travel_mm": 152., "travel_mm_exact": 152.0001}])
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
         self.assertEqual(rig.workflow.last_result["restarts"], 1)

@@ -11,14 +11,16 @@ All acceleration-component curves are displayed as absolute values after their
 existing processing: `|X|`, `|Y|`, `|Z|`, and the magnitude of signed v1 output.
 This includes home/capture, Accuracy overlays, filter comparisons, Beta and
 stationary-noise plots. Component peaks, truncated endpoints and directional
-threshold lines use positive display magnitudes. A directional RAW threshold
-still names its eligible polarity; the folded curve does not make the opposite
-polarity eligible. Amplitude and variation panels start at zero. Travel panels
+threshold lines use positive display magnitudes. Generic/historical directional
+RAW diagnostics retain their labelled polarity; native Beacon live decisions
+use sign-independent centered absolute acceleration/XYZ magnitude. Native
+impact_sign/automatic direction no longer gates impacts. Amplitude and variation panels start at zero. Travel panels
 retain their useful positive zoom, and relative time keeps its sign.
 
-This is a display change. Original signed captures, detector inputs/decisions,
-calibration, saved models, Accuracy receipts and baseline statistics remain
-unchanged. RMS/P99 and other metrics use the original processed samples; PSD
+Display folding preserves original signed captures, encoded JSON samples,
+saved metadata, Accuracy receipts and baseline statistics. The separate native
+live absolute-decision policy is described in [FILTERS.md](FILTERS.md#what-changes).
+RMS/P99 and other metrics use the original processed samples; PSD
 uses original raw/signed-v1 or existing rectified-v2 outputs, never the absolute
 display curves. V2 input rectification and display folding are separate steps.
 Display reduction retains signed extrema and per-component minimum absolute
@@ -125,8 +127,8 @@ reprepare and physically recenter before
 `ACCEL_HOMING_FILTER_CHARTS AXIS=X DETECTOR=FILTERED CENTERED=1`: it performs
 another real home. A compatible RAW XYZ profile or explicitly chosen
 `RAW_THRESHOLD` is required for the RAW shadow. Failed/incomplete workflows
-still publish no comparison PNG. Rectified-v2 actual accuracy runs use embedded
-receipt version 3; historical RAW and signed-filter receipts retain their
+still publish no comparison PNG. Historical rectified-v2 accuracy receipts can
+use version 3; new pure FILTERED uses 4 and HYBRID uses 5. Historical RAW and signed-filter receipts retain their
 original version/configuration and remain usable under the documented checks.
 
 ## Stationary noise
@@ -155,10 +157,13 @@ grid. Unknown physical range or a result above known sensor headroom makes
 an automatic hint unavailable. A displayed hint is not a calibrated impact
 threshold or a measured minimum.
 
-Each new CALIBRATE measures its own fresh **XYZ-magnitude** noise before movement.
-A previous standalone NOISE result is not reused. Fresh acquisition is required
-even when START_THRESHOLD is explicit. Its summary is rendered only after the
-calibration qualifies and published after required cleanup and saving succeed.
+Each new CALIBRATE acquires its own three-window stationary capture before
+movement. Paired HYBRID computes independent RAW and FILTERED starting hints
+from that initial capture; pure mode uses its actual detector metric. A previous
+standalone NOISE result is not reused. Fresh acquisition is required even when
+START_THRESHOLD is explicit. Its summary is rendered only after the complete
+calibration qualifies, including both five-check series for paired HYBRID, and
+published after required cleanup and saving succeed.
 Stationary measurement does not cover motor enabling, first-step
 transients, acceleration or moving vibration. See [calibration](SIMPLE_CALIBRATION.md).
 

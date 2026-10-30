@@ -54,7 +54,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig = RecoveryRig({"charts_directory": directory})
             rig.owner.threshold_g["x"] = 2.25
             rig.home_results.extend([{"travel_mm": 51.175, "halt_travel_mm_signed": -53.175}] + [{}] * 11)
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             self.assertEqual([item["threshold"] for item in rig.home_calls], [2.25] + [2.5] * 11)
             self.assertEqual(rig.scripts.count("SAVE_CONFIG"), 1)
             self.assertEqual(rig.workflow.last_result["result"], "calibrated")
@@ -84,7 +84,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                     return move(coordinates, speed)
                 with mock.patch.object(rig.toolhead, "manual_move", side_effect=moving), \
                         mock.patch.object(rig.toolhead, "set_position", side_effect=AssertionError("coordinate rebase")):
-                    rig.accuracy(axis=axis.upper(), samples=4)
+                    rig.accuracy(axis=axis.upper(), samples=4, DETECTOR="RAW")
                 before, coordinates, speed = returns[prior]
                 self.assertAlmostEqual(coordinates[index] - before[index], -halt)
                 self.assertEqual(coordinates[index], rig.owner.rails_by_axis[axis].info.position_endstop - sign * 51.175)
@@ -115,13 +115,13 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig = self.rig(directory, axis)
                 prefix = [{}] * ((3 if axis == "y" else 0) + prior)
                 rig.home_results.extend(prefix + [{"travel_mm": 51.175}] + [{}] * 11)
-                rig.accuracy(axis="XY")
+                rig.accuracy(axis="XY", DETECTOR="RAW")
                 result = rig.workflow.last_result
                 partial = result["source_accuracy"]
                 self.assertEqual(result["axis"], axis)
                 self.assertEqual([item["axis"] for item in rig.home_calls[-11:]], [axis] * 11)
                 self.assertEqual(result["accuracy_recovery"]["rerun_command"],
-                                 "ACCEL_HOMING_ACCURACY AXIS=XY SAMPLES=2 CENTERED=1")
+                                 "ACCEL_HOMING_ACCURACY AXIS=XY SAMPLES=2 CENTERED=1 DETECTOR=RAW")
                 if axis == "y":
                     self.assertTrue(partial["axis_results"]["x"]["complete"])
                     self.assertEqual(len(partial["axis_results"]["x"]["trials"]), 2)
@@ -134,7 +134,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig = self.rig(directory, calibration_start_threshold=1., calibration_step=.5)
             rig.owner.threshold_g["x"] = 8.123456789
             rig.home_results.extend([{"travel_mm": 51.175}, {"travel_mm": 8.}] + [{}] * 11)
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             thresholds = [item["threshold"] for item in rig.home_calls]
             self.assertEqual(thresholds, [8.123456789, 8.373456789] + [8.873456789] * 11)
             result = rig.workflow.last_result
@@ -157,7 +157,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 if legacy:
                     rig.config.name = "beacon_accel_homing"
                 rig.home_results.extend([{"travel_mm": 51.175}] + [{}] * 11)
-                rig.accuracy(axis=axis.upper())
+                rig.accuracy(axis=axis.upper(), DETECTOR="RAW")
                 saved = rig.configfile.saved
                 value = saved[(rig.config.get_name(), axis + "_threshold")]
                 self.assertEqual(float(value), 3.)
@@ -180,7 +180,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             rig = self.rig(directory)
             rig.home_results.extend([{"travel_mm": 51.175}] + [{}] * 11)
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             sections = {"printer": {"kinematics": "corexy"}, "accel_homing_model default": {
                 option: configured for (section, option), configured in rig.configfile.saved.items()
                 if section == "accel_homing_model default"}}
@@ -195,7 +195,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig.save_error = True
             rig.home_results.extend([{"travel_mm": 51.175}] + [{}] * 11)
             with self.assertRaisesRegex(CommandError, "SAVE_CONFIG include conflict"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "save_failed")
             self.assertFalse(result["save_config"])
@@ -212,7 +212,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig.owner.threshold_g["x"] = threshold
                 rig.home_results.append({"travel_mm": 51.175})
                 with self.assertRaisesRegex(CommandError, "START_THRESHOLD"):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assert_no_calibration(rig)
 
@@ -239,7 +239,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig.home_results.append({"travel_mm": 51.175, "halt_travel_mm_signed": -53.175})
                 rig.capture_mutator = lambda capture: mutation(rig, capture)
                 with self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assert_no_calibration(rig)
 
@@ -253,7 +253,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig.home_results.append({"travel_mm": 51.175})
             with mock.patch.object(rig.workflow, "_home", side_effect=moved_before_home), \
                     self.assertRaisesRegex(CommandError, "confirmed center evidence"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(rig.toolhead.moves, [])
             self.assert_no_calibration(rig)
 
@@ -263,7 +263,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             with mock.patch.object(rig.workflow, "_accuracy_position_reference",
                                    side_effect=OSError("synthetic MCU position read failure")), \
                     self.assertRaisesRegex(OSError, "MCU position read failure"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(rig.home_calls, [])
             self.assertEqual(rig.toolhead.moves, [])
             self.assert_no_calibration(rig)
@@ -273,7 +273,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             rig = self.rig(directory)
             rig.home_results.extend([{"travel_mm": 51.175, "start_position_mm": 450.}] + [{}] * 11)
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 2.5)
             self.assertEqual(rig.workflow.last_result["threshold_g"], 3.0)
 
@@ -283,7 +283,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig.home_results.append({"travel_mm": 51.175})
             rig.configfile.set = None
             with self.assertRaisesRegex(CommandError, "cannot stage"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(rig.toolhead.moves, [])
             self.assert_no_calibration(rig)
 
@@ -299,7 +299,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig.home_results.append({"travel_mm": 51.175})
                 rig.capture_mutator = lambda capture: mutation(rig, capture)
                 with self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assert_no_calibration(rig)
 
@@ -312,7 +312,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig = self.rig(directory)
                 rig.home_results.append(failure)
                 with self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assert_no_calibration(rig)
 
@@ -327,7 +327,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                         capture["detector"].update(onset_g=None, impact_peak_g=None, onset_time_s=None,
                                                    trigger_onset_time_s=None)
                 rig.capture_mutator = no_pressed_onset
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
                 # The first move is the discovery home's ordinary midpoint
                 # return; the rejected zero-step trigger caused only settling.
                 self.assertEqual(rig.toolhead.moves[0][0], [150., None, None])
@@ -348,7 +348,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertEqual(rig.idle_state, "Printing")
             rig.on_noise = inspect_noise
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
 
     def test_cancel_shutdown_motor_off_and_printing_during_finalization_block_handoff(self):
         for ending in ("cancel", "shutdown", "motor-off", "printing", "pause", "sd-active"):
@@ -374,7 +374,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                     return result
                 with mock.patch.object(rig.workflow, "_accuracy_result", side_effect=interrupt), \
                         self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assert_no_calibration(rig)
 
@@ -397,7 +397,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                         rig.owner.last["x"] = copy.copy(rig.owner.last["x"])
                 with mock.patch.object(rig.workflow, "_cleanup_accuracy_captures", side_effect=interrupt), \
                         self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assert_no_calibration(rig)
 
     def test_aborted_accuracy_never_calls_summary_or_temporary_capture_writers(self):
@@ -412,9 +412,9 @@ class AccuracyRecoveryTests(unittest.TestCase):
                         mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=AssertionError("temporary capture")) as directory_writer:
                     if stage == "motion":
                         with self.assertRaises(CommandError) as caught:
-                            rig.accuracy()
+                            rig.accuracy(DETECTOR="RAW")
                     else:
-                        rig.accuracy()
+                        rig.accuracy(DETECTOR="RAW")
                     writer.assert_not_called()
                     directory_writer.assert_not_called()
                 if stage == "motion":
@@ -434,7 +434,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 return create(command, commandline, params)
             with mock.patch.object(rig.gcode, "create_gcode_command", side_effect=cancelling), \
                     self.assertRaises(CommandError):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assert_no_calibration(rig)
 
     def test_cancel_during_return_acceleration_flush_prevents_return_and_handoff(self):
@@ -447,7 +447,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                 rig.workflow.cmd_CANCEL(GCmd())
             with mock.patch.object(rig.owner, "_limit_accel", side_effect=cancelled), \
                     self.assertRaises(CommandError):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(rig.toolhead.moves, [])
             self.assertEqual(rig.toolhead.accel, 50000.)
             self.assert_no_calibration(rig)
@@ -466,7 +466,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                         raise CommandError("fresh stationary sensor fault")
                 rig.on_noise = fail
                 with self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertNotIn("SAVE_CONFIG", rig.scripts)
                 self.assertEqual(len(rig.home_calls), 1)
@@ -478,7 +478,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig = self.rig(directory)
             rig.home_results.extend([{"travel_mm": 51.175}, {"result": "no_data"}])
             with self.assertRaisesRegex(CommandError, "sensor/homing failure"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(len(rig.home_calls), 2)
             self.assertEqual(rig.configfile.saved, {})
             self.assertNotIn("SAVE_CONFIG", rig.scripts)
@@ -497,7 +497,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
                     raise fault
             with mock.patch.object(rig.owner, "_end_session", side_effect=fail_after_staging), \
                     self.assertRaises(OSError) as caught:
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertIs(caught.exception, fault)
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "aborted")
@@ -513,7 +513,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig = self.rig(directory)
             rig.home_results.extend([{"travel_mm": 51.175}, {}, {"travel_mm": 150.},
                                      {"travel_mm": 152.0001}] + [{}] * 11)
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual([item["threshold"] for item in rig.home_calls], [2.25] + [2.5] * 3 + [2.75] * 11)
             self.assertEqual(result["successes"], 10)

@@ -56,7 +56,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
 
                 with mock.patch.object(rig.toolhead, "manual_move", side_effect=moving), \
                         mock.patch.object(rig.toolhead, "set_position", side_effect=AssertionError("coordinate rebase")):
-                    rig.calibrate(axis.upper(), save=0)
+                    rig.calibrate(axis.upper(), save=0, DETECTOR="RAW")
                 before, coordinates, speed = movements[0]
                 index = "xy".index(axis)
                 self.assertAlmostEqual(coordinates[index] - before[index], -sign * 8.375)
@@ -76,7 +76,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
     def test_multiple_early_validation_hits_restart_discovery_and_all_ten_checks(self):
         rig = Rig()
         rig.home_results.extend([{}, {}, {"travel_mm": 8.}, {"travel_mm": 10.}] + [{}] * 11)
-        rig.calibrate(save=0, STEP=.25)
+        rig.calibrate(save=0, STEP=.25, DETECTOR="RAW")
         self.assertEqual([call["threshold"] for call in rig.home_calls], [1.] * 3 + [1.25] + [1.5] * 11)
         for offset in (3, 4):
             self.assertFalse(rig.home_calls[offset]["candidate_qualified"])
@@ -90,7 +90,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
     def test_zero_halt_is_noop_with_settle_and_same_command_retry(self):
         rig = Rig()
         rig.home_results.append({"travel_mm": 0.})
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.toolhead.moves[0][0], [150., None, None])
         self.assertEqual(rig.toolhead.dwells[0], rig.workflow.calibration_settle_time)
         self.assertEqual(rig.home_calls[1]["threshold"], 1.25)
@@ -104,7 +104,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
                 rig = Rig()
                 rig.home_results.append({"travel_mm": 8., **fields})
                 with self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(rig.configfile.saved, {})
@@ -121,7 +121,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
                     rig.workflow.max_attempts = 1
                 rig.home_results.append({"travel_mm": 20., "halt_travel_mm_signed": -20.})
                 with self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(rig.configfile.saved, {})
 
@@ -138,7 +138,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
                 rig = Rig()
                 rig.home_results.append({"travel_mm": travel})
                 with intercept_return(rig, change), self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
@@ -168,7 +168,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
                     return result
 
                 with mock.patch.object(rig.owner, "stop_capture", side_effect=captured), self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(rig.disabled, [])
                 self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
@@ -206,7 +206,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
 
                 with intercept_return(rig, activate), mock.patch.object(obj, method, side_effect=fail), \
                         self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertLessEqual(len(rig.toolhead.moves), 0 if stage == "cap" else 1)
                 self.assertEqual(rig.configfile.saved, {})
@@ -230,7 +230,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
                     return move(coordinates, speed)
 
                 with mock.patch.object(rig.toolhead, "manual_move", side_effect=broken), self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
@@ -240,7 +240,7 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
         rig = machine(cartesian=True)
         rig.lines["stepper_y"].enabled = False
         rig.home_results.append({"travel_mm": 8.})
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertFalse(rig.lines["stepper_y"].enabled)
         self.assertEqual(rig.disabled, [])
         self.assertEqual(rig.workflow.last_result["result"], "calibrated")

@@ -1,15 +1,23 @@
 # Accelerometer Homing
 
-**Development / experimental: `codex/accuracy-filters`.** This branch adds an
-opt-in causal `FILTERED` detector, explicit RAW controls and experimental
+**Development / experimental: `codex/accuracy-filters`.** This branch adds
+causal `FILTERED` detection, explicit RAW controls and experimental
 `HYBRID` position timing. HYBRID keeps FILTERED confirmation and uses an
 associated RAW XYZ threshold crossing as the reported position timestamp when
 that crossing is unambiguous. Software tests and
-synthetic plots do not establish a physical improvement. Existing RAW models
-remain RAW until an explicit FILTERED calibration succeeds and is saved.
-Use the [filter comparison procedure](docs/FILTERS.md) to collect a RAW baseline,
-calibrate FILTERED, inspect the same-trace diagnostic and compare independent
-completed accuracy runs across the calibration restart.
+synthetic plots do not establish a physical improvement. CALIBRATE and ACCURACY
+default to HYBRID when `DETECTOR` is omitted; explicit `RAW`, `FILTERED` and
+`HYBRID` remain available. Ordinary G28 and the defaults of other commands keep
+their selected RAW/FILTERED mode. Installing this branch does not rewrite saved
+profiles.
+
+HYBRID currently requires native Beacon. With another supported accelerometer,
+explicitly choose `DETECTOR=RAW` or `FILTERED` for CALIBRATE and ACCURACY; an
+unsupported HYBRID default is rejected before movement.
+
+Use the [single-command paired calibration](docs/SIMPLE_CALIBRATION.md) to
+refresh both profiles, and the [filter comparison procedure](docs/FILTERS.md)
+for same-trace diagnostics and independent completed accuracy comparisons.
 Existing compatible RAW and FILTERED profiles can also be used directly for
 [independent 30-sample RAW, pure FILTERED and HYBRID runs](docs/ACCURACY.md#compare-30-raw-pure-filtered-and-hybrid-homes),
 without another calibration.
@@ -75,21 +83,31 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | Command | What it does / how to use it |
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Show settings, model, workflow progress, results and PNG paths. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X; use `AXIS=Y` for Y. Measures fresh noise, then qualifies a threshold. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Default HYBRID calibration: qualify a fresh RAW profile with five valid checks, then FILTERED with five. Saves only the complete pair; use `AXIS=Y` for Y. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Measure three stationary one-second noise windows and export a PNG; no movement or threshold change. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both axes must use this plugin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
 | `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Experimental raw/causal-filter comparison of the same valid home; shows actual control, shadow replay, thresholds, noise and censored timing. |
-| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Measure repeated commanded-travel variation and save an accuracy PNG; X, Y or XY, 2–50 samples per axis. |
+| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Default HYBRID measurement using both compatible saved profiles; X, Y or XY, 2–50 samples per axis. Explicit `DETECTOR=RAW|FILTERED|HYBRID` overrides the default. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal; use `AXIS=Y` for Y. Beta PNG and diagnostics only, no saved threshold/model or restart. |
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 | `BEACON_ACCEL_HOMING_STATUS` | Show detector/preparation diagnostics; retained legacy command. |
 | `SET_BEACON_ACCEL_HOMING AXIS=X THRESHOLD=1` | Legacy alias of `SET_ACCEL_HOMING`. |
 
-**CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
-0.5 g once to the candidate after ten checks pass; those homes test the candidate,
-not the higher saved value. The other axis is unchanged. Prepare
+**CALIBRATE saves the selected axis and restarts Klipper by default.** Omitted or
+explicit `DETECTOR=HYBRID` always refreshes RAW and FILTERED: each stage has its
+own excluded discovery and five valid qualification homes, followed by one
+final save after both stages and cleanup succeed. This is one automatic command
+with no manual action between the series. A recoverable early hit or spread
+failure in either series discards both series and restarts both counts at zero,
+increasing only the failing detector's candidate; no successful partial series
+is reused or saved. Each saved threshold receives
+0.5 g once; those homes test its candidate before that margin. Discovery,
+rejected homes and retries do not count toward the five checks. Explicit
+`DETECTOR=RAW` or `FILTERED` retains ten checks for that one mode and selects
+that calibrated detector. The other axis is unchanged. Paired HYBRID calibration
+preserves the pre-calibration ordinary G28 detector type. Prepare
 XY again after restart before calibrating the other axis. Explicit X/Y/shared
 manual thresholds override ordinary saved models; comment them out and issue
 `RESTART` while idle to use calibration. See
@@ -106,22 +124,24 @@ Charts are saved only after the requested workflow and its required cleanup/save
 succeed. Failed, rejected or cancelled runs keep console diagnostics without
 saving a partial PNG, including temporary per-home images.
 
-On this development branch, CALIBRATE, TEST, CHARTS, FILTER_CHARTS and ACCURACY
-accept `DETECTOR=RAW|FILTERED`. Explicit mode selection uses that mode's own
-saved threshold. FILTERED must be calibrated separately; a RAW threshold is not
-silently reused. `ACCURACY ... BASELINE=<completed_raw_run_id>` compares two
+On this development branch, `DETECTOR` is optional. CALIBRATE and ACCURACY use
+HYBRID when it is omitted; TEST, CHARTS and FILTER_CHARTS retain their previous
+selected-mode defaults. Explicit RAW/FILTERED measurement uses that mode's own
+saved threshold. Paired HYBRID calibration creates fresh profiles for both
+metrics instead of borrowing a threshold between them.
+`ACCURACY ... BASELINE=<completed_run_id>` compares two
 actual independent completed runs. The compact baseline receipt is inside the
 successful PNG and survives restart; no JSON sidecar is required. Reprepare XY
 before **every** moving command. See [the exact sequence](docs/FILTERS.md#operator-sequence).
 
-TEST, ordinary CHARTS and ACCURACY also accept explicit `DETECTOR=HYBRID`.
+HYBRID measurement is available on TEST, ordinary CHARTS and ACCURACY.
 This requires the native Beacon packet path and both compatible saved profiles
 before movement. It accepts no temporary threshold override, preserves the
 selected model and uses the
 saved FILTERED profile to confirm a stop. Its position timestamp uses the
 associated RAW crossing or an explicitly reported FILTERED fallback. The
 accuracy PNG and JSON distinguish HYBRID from pure FILTERED and count selected
-RAW positions and fallback reasons. HYBRID early-quality failure aborts for
+RAW positions and fallback reasons. HYBRID ACCURACY early-quality failure aborts for
 manual inspection/recentering; it does not start automatic return or calibration.
 See [HYBRID limits and diagnostics](docs/FILTERS.md#hybrid-position-timing).
 

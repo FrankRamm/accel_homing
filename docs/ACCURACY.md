@@ -18,6 +18,15 @@ Use `AXIS=Y` for Y, or `AXIS=XY`/omit AXIS for X then Y. Each requested axis
 must use this plugin's endstop. `SAMPLES` is an integer from 2 through 50,
 default 10, per axis. `CENTERED=1` authorizes movement without another prompt.
 
+`DETECTOR` is optional and defaults to HYBRID on this development branch.
+Explicit `DETECTOR=RAW`, `FILTERED` or `HYBRID` selects that mode for this
+command. HYBRID requires compatible saved RAW XYZ and FILTERED profiles for
+every requested axis and the native Beacon packet path before movement. It
+does not automatically calibrate a missing profile. If needed, the separate
+[default paired calibration](SIMPLE_CALIBRATION.md) obtains five valid RAW and
+five valid FILTERED checks plus discovery/retries, then saves the complete pair.
+Existing compatible profiles need no recalibration just to run accuracy.
+
 Do not add `SAVE_CONFIG`: ACCURACY rejects the parameter, including zero.
 A successful measurement alone does not save/restart. RAW/FILTERED early-trigger
 recovery can start a separate normal calibration that saves and restarts on
@@ -36,8 +45,9 @@ the accepted FILTERED threshold crossing for its position timestamp. HYBRID
 keeps that FILTERED control/confirmation and selects an associated RAW XYZ
 threshold crossing for position, with an explicit FILTERED fallback when RAW
 selection is unavailable or ambiguous. The saved RAW and FILTERED thresholds
-remain usable without recalibration. HYBRID must be requested explicitly and
-does not become the persisted selected mode.
+remain usable without recalibration. HYBRID is the ACCURACY default and does
+not become the persisted ordinary-homing selected mode. Keep DETECTOR explicit
+when comparing RAW, pure FILTERED and HYBRID so each treatment is unambiguous.
 
 Manually prepare XY before the fresh RAW command:
 
@@ -150,7 +160,9 @@ reports incomplete statistics in the console without saving a chart.
 Travel is reported to 0.001 mm from commanded/firmware steps. Small reported
 variation does not prove correct-stop contact, no missed steps or a physically
 accurate return. This measurement is not a calibration pass criterion. Current
-CALIBRATE requires ten qualified checks with range at most 2.00 mm; an existing
+Pure RAW/FILTERED CALIBRATE requires ten qualified checks with range at most
+2.00 mm; paired HYBRID calibration requires five valid checks per stage at that
+same spread limit. An existing
 1.5 mm advisory in ACCURACY output refers to older qualification behavior.
 
 ## Early-trigger automatic recalibration

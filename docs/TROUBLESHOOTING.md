@@ -33,6 +33,8 @@ installer-created registration, not a pre-existing manual entry it does not own.
 | Invalid geometry/insufficient travel | Correct the actual rail limits, endstop position/direction and midpoint distance. Calibration needs more than 20 mm from configured midpoint to stop. |
 | Threshold exceeds range/headroom | Check actual configured/active sensor range. Use a justified value within the 80% software policy. Native clients can change the stream range. |
 | Saved model mismatch or unexpected active threshold | Inspect selected sensor/model and manual X/Y/shared threshold precedence. Comment manual values to use a calibrated model; do not edit generated model metadata. |
+| Native signed-v1 FILTERED profile rejected before movement | Prepare XY and run the default paired CALIBRATE for fresh RAW and rectified-v2 FILTERED profiles, or explicitly calibrate FILTERED for a pure ten-check replacement. Historical v1 evidence remains readable. |
+| Old native selected-axis RAW qualification rejected | Recalibrate with the default paired command or explicit RAW after manual preparation. Legacy/unknown polarity provenance cannot establish the new absolute qualification, even with impact_sign=0. Current RAW XYZ profiles remain compatible; do not edit metadata to bypass the check. |
 | Printing/paused/busy or competing sensor client | Finish or cancel the competing operation normally and wait for a genuinely idle, stationary machine. Do not bypass the check. |
 
 ## Data and homing faults

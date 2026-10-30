@@ -461,7 +461,7 @@ class NoiseWorkflowTests(unittest.TestCase):
                 self.assertAlmostEqual(item["record"]["noise_peak_g"]["z"], 0.02)
                 self.assertAlmostEqual(item["record"]["baseline_g"]["z"], 1.0)
             rig.toolhead.kin.limits[:2] = [(1.0, -1.0), (1.0, -1.0)]
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
             self.assertEqual([call["threshold"] for call in rig.home_calls], [2.5] * 11)
             self.assertEqual(rig.noise_calls, ["start", 1, 2, 3, "stop"] * 2)
             self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
@@ -478,7 +478,7 @@ class NoiseWorkflowTests(unittest.TestCase):
                 rig.workflow.cmd_NOISE(GCmd())
                 seeds = dict(rig.workflow.noise_seeds)
                 self.assertGreater(seeds["x"], .5)
-                rig.calibrate(save=0, **parameters)
+                rig.calibrate(save=0, DETECTOR="RAW", **parameters)
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [expected_start] * 11)
                 self.assertEqual(rig.workflow.last_result["start_threshold_g"], expected_start)
                 self.assertEqual(rig.workflow.last_result["threshold_step_g"], expected_step)
@@ -532,7 +532,7 @@ class NoiseWorkflowTests(unittest.TestCase):
             rig = NoiseRig({"charts_directory": temp})
             rig.workflow.cmd_NOISE(GCmd())
             rig.owner.rails_by_axis["x"].info.speed = 80.0
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
             self.assertEqual(rig.home_calls[0]["threshold"], 2.5)
             self.assertEqual(rig.workflow.noise_seeds, {})
         with tempfile.TemporaryDirectory() as temp:
@@ -713,7 +713,7 @@ class PNGIntegrationTests(unittest.TestCase):
                     rig.owner.operation_generation += 1
             rig.toolhead.wait_moves = final_wait
             with mock.patch.object(workflow_module.logging, "exception"), self.assertRaises(CommandError):
-                rig.calibrate(save=0)
+                rig.calibrate(save=0, DETECTOR="RAW")
             self.assertEqual(rig.configfile.saved, {})
             self.assertEqual(rig.workflow.last_result["result"], "aborted")
 

@@ -30,7 +30,7 @@ class SimpleRecordedReturnTests(unittest.TestCase):
                     return move(coordinates, speed)
 
                 with mock.patch.object(rig.toolhead, "manual_move", side_effect=moving):
-                    rig.calibrate(axis.upper(), save=0)
+                    rig.calibrate(axis.upper(), save=0, DETECTOR="RAW")
                 self.assertEqual([item["threshold"] for item in rig.home_calls], [1.] + [1.25] * 11)
                 self.assertFalse(rig.home_calls[1]["candidate_qualified"])
                 self.assertEqual(rig.home_calls[1]["successes"], 0)
@@ -42,7 +42,7 @@ class SimpleRecordedReturnTests(unittest.TestCase):
         rig = machine("x")
         rig.owner.rails_by_axis["x"].bounds = (0., 42.)
         rig.home_results.extend([{"travel_mm": 20., "halt_travel_mm_signed": -25.}] + [{}] * 11)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.toolhead.moves[0], ([20., None, None], 50.))
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
@@ -101,7 +101,7 @@ class SimpleRecordedReturnTests(unittest.TestCase):
 
                 with intercept_return(rig, activate), mock.patch.object(target, method, side_effect=failing), \
                         self.assertRaisesRegex(CommandError, "ordinary firmware return failure"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.workflow.last_result["candidate_g"], 1.)
                 self.assertEqual(rig.workflow.last_result["restarts"], 0)
@@ -122,7 +122,7 @@ class SimpleRecordedReturnTests(unittest.TestCase):
                         current.owner.sensor_fault = "stale_data"
 
                 with intercept_return(rig, change), self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.workflow.last_result["candidate_g"], 1.)
@@ -138,7 +138,7 @@ class SimpleRecordedReturnTests(unittest.TestCase):
                             "accel_homing_model default": options})
         rig.workflow._validate_model_connection()
         rig.home_results.extend([{"travel_mm": 2.}] + [{}] * 11)
-        rig.calibrate(save=0, START_THRESHOLD=3.)
+        rig.calibrate(save=0, START_THRESHOLD=3., DETECTOR="RAW")
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 3.25)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 3.75)
         self.assertEqual(rig.workflow.last_result["recovery"], {

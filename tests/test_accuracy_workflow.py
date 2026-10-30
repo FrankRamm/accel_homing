@@ -130,14 +130,14 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 setter(rig)
                 before = rig.effects()
                 with self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(before, rig.effects())
 
     def test_discovery_is_excluded_population_statistics_match_known_values(self):
         with tempfile.TemporaryDirectory() as temp:
             rig = AccuracyRig({"charts_directory": temp})
             rig.home_results.extend({"travel_mm": value} for value in (145.0, 149.0, 150.0, 153.0))
-            rig.accuracy(samples=3)
+            rig.accuracy(samples=3, DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "complete")
             axis = result["axis_results"]["x"]
@@ -168,7 +168,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             exact = (150.000244140625, 150.00048828125)
             rig.home_results.extend([{"travel_mm": 145.}] +
                                     [{"travel_mm": 150., "travel_mm_exact": value} for value in exact])
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "complete")
             axis = result["axis_results"]["x"]
@@ -205,7 +205,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 return paths
             with mock.patch.object(workflow_module.tempfile, "gettempdir", return_value=str(config / "tmp")), \
                     mock.patch.object(workflow_module, "write_accuracy", side_effect=inspect_summary):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["paths"], [])
             self.assertEqual(set(result["summary_paths"]), {"x_png"})
@@ -219,13 +219,13 @@ class AccuracyWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             rig = AccuracyRig({"charts_directory": temp})
             with mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=AssertionError("unexpected temporary capture")) as create:
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             create.assert_not_called()
             self.assert_restored(rig)
             rig = AccuracyRig({"charts_directory": temp})
             rig.policy_error = "synthetic begin failure"
             with self.assertRaisesRegex(CommandError, "begin failure"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(rig.capture_directories, [])
             self.assertEqual(rig.scripts, [])
             self.assert_restored(rig)
@@ -240,9 +240,9 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 with mock.patch.object(rig.workflow, "_accuracy_capture_directory", side_effect=AssertionError("unexpected temporary capture")) as create, motion:
                     if motion_failure:
                         with self.assertRaises(OSError) as caught:
-                            rig.accuracy()
+                            rig.accuracy(DETECTOR="RAW")
                     else:
-                        rig.accuracy()
+                        rig.accuracy(DETECTOR="RAW")
                     create.assert_not_called()
                 if motion_failure:
                     self.assertIs(caught.exception, fault)
@@ -260,7 +260,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     raise ValueError("synthetic Y summary failure")
             rig.workflow.renderer.on_render = fail_y
             with self.assertLogs(level="ERROR"), self.assertRaisesRegex(CommandError, "Y summary failure"):
-                rig.accuracy(axis="XY")
+                rig.accuracy(axis="XY", DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "aborted")
             self.assertNotIn("summary_paths", result)
@@ -274,7 +274,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 rig = AccuracyRig({"charts_directory": temp})
                 rig.home_results.extend([{}, {"travel_mm_exact": 150.25}, {"travel_mm_exact": invalid}])
                 with self.assertRaisesRegex(CommandError, "invalid exact commanded travel"):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 result = rig.workflow.last_result
                 axis = result["axis_results"]["x"]
                 self.assertEqual(result["result"], "aborted")
@@ -295,7 +295,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     if not z_homed:
                         rig.toolhead.kin.limits[2] = (1.0, -1.0)
                     safe = rig.use_safe_z_home()
-                    rig.accuracy(axis=requested)
+                    rig.accuracy(axis=requested, DETECTOR="RAW")
                     self.assertEqual(rig.scripts, ["G28 X"] * 3 + ["G28 Y"] * 3)
                     self.assertEqual(safe.calls, [])
                     self.assertEqual(len(rig.toolhead.moves), 6)
@@ -319,7 +319,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             def exact_values(capture):
                 capture["detector"].update(onset_g=-0.00125, impact_peak_g=0.00175)
             rig.capture_mutator = exact_values
-            rig.accuracy(axis="Y")
+            rig.accuracy(axis="Y", DETECTOR="RAW")
             self.assertEqual([c["axis"] for c in rig.home_calls], ["y"] * 3)
             self.assertEqual([c["threshold"] for c in rig.home_calls], [0.001] * 3)
             for record in rig.workflow.last_result["records"]:
@@ -334,7 +334,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
         for samples, expected in ((None, 22), (50, 102)):
             with self.subTest(samples=samples):
                 rig = AccuracyRig({"calibration_max_attempts": 12})
-                arguments = {"CENTERED": 1}
+                arguments = {"CENTERED": 1, "DETECTOR": "RAW"}
                 if samples is not None:
                     arguments["SAMPLES"] = samples
                 with mock.patch.object(workflow_module, "write_capture", return_value={}), \
@@ -358,7 +358,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     rig = AccuracyRig({"charts_directory": temp})
                     rig.home_results.extend([{}] * preceding + [failure])
                     with self.assertRaisesRegex(CommandError, "no automatic move"):
-                        rig.accuracy(axis="XY", samples=3)
+                        rig.accuracy(axis="XY", samples=3, DETECTOR="RAW")
                     self.assertEqual(len(rig.home_calls), preceding + 1)
                     self.assertEqual(len(rig.toolhead.moves), preceding)
                     result = rig.workflow.last_result
@@ -399,7 +399,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 rig = AccuracyRig({"charts_directory": temp})
                 rig.capture_mutator = mutation
                 with self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.scripts, ["G28 X"])
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(rig.workflow.last_result["result"], "aborted")
@@ -414,7 +414,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     capture["samples"] = [(row[0] + shift,) + row[1:] for row in capture["samples"]]
                     capture["detector"]["onset_time_s"] = capture["samples"][2][0]
                 rig.capture_mutator = adjust_export_clock
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
                 records = rig.workflow.last_result["records"]
                 self.assertEqual(len(records), 3)
                 for record in records:
@@ -438,7 +438,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 capture["detector"].update(onset_sample=stamp, onset_sample_index=3,
                                             trigger_onset_time_s=onset, onset_time_s=last[0])
             rig.capture_mutator = last_row_rounding
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             for record in rig.workflow.last_result["records"]:
                 self.assertTrue(record["capture_valid"])
                 self.assertEqual(record["capture_onset_sample_index"], 3)
@@ -468,7 +468,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 rig = AccuracyRig({"charts_directory": temp})
                 rig.capture_mutator = mutation
                 with self.assertRaisesRegex(CommandError, "lacks the current measured impact"):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.scripts, ["G28 X"])
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertFalse(rig.workflow.last_result["axis_results"]["x"]["complete"])
@@ -483,7 +483,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                                                 onset_time_s=None)
             rig.capture_mutator = missing_third_measurement
             with self.assertRaisesRegex(CommandError, "not retained exactly once.*matches=0"):
-                rig.accuracy(axis="Y", samples=5)
+                rig.accuracy(axis="Y", samples=5, DETECTOR="RAW")
             result = rig.workflow.last_result
             axis_result = result["axis_results"]["y"]
             self.assertEqual(len(axis_result["trials"]), 2)
@@ -505,7 +505,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             rig = AccuracyRig({"charts_directory": temp})
             rig.home_results.extend([{}, {}, {}, CommandError("sensor fault")])
             with self.assertRaisesRegex(CommandError, "sensor fault"):
-                rig.accuracy(axis="XY")
+                rig.accuracy(axis="XY", DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "aborted")
             self.assertTrue(result["axis_results"]["x"]["complete"])
@@ -527,7 +527,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                         original(gcmd)
                 rig.stock_home = stale
                 with self.assertRaisesRegex(CommandError, "new accelerometer|current detector"):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.workflow.last_result["result"], "aborted")
                 self.assertEqual(rig.workflow.last_result["axis_results"]["x"]["trials"], [])
                 self.assertEqual(len(rig.toolhead.moves), 1)
@@ -555,7 +555,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 rig.toolhead.wait_moves = interrupted_wait
                 logs = self.assertLogs(level="ERROR") if ending == "recenter" else contextlib.nullcontext()
                 with logs, self.assertRaises(CommandError):
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertEqual(rig.scripts, ["G28 X"])
                 self.assertEqual(len(rig.toolhead.moves), 1)
                 result = rig.workflow.last_result
@@ -572,7 +572,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 rig.workflow.cmd_CANCEL(GCmd())
             rig.owner.start_capture = cancel_start
             with self.assertRaisesRegex(CommandError, "cancelled or interrupted"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertEqual(rig.scripts, [])
             self.assertEqual(rig.toolhead.moves, [])
             self.assertEqual(rig.workflow.last_result["result"], "cancelled")
@@ -596,7 +596,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                             workflow_module, "write_accuracy", side_effect=error_type("synthetic summary export failure")):
                     logs = self.assertLogs(level="ERROR") if target == "summary" else contextlib.nullcontext()
                     with logs, self.assertRaisesRegex(CommandError, "synthetic %s export failure" % target):
-                        rig.accuracy()
+                        rig.accuracy(DETECTOR="RAW")
                 result = rig.workflow.last_result
                 self.assertEqual(result["result"], "aborted")
                 self.assertEqual(len(result["axis_results"]["x"]["trials"]), 1 if target == "capture" else 2)
@@ -615,7 +615,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                 fault = error_type("synthetic summary validation failure")
                 with mock.patch.object(workflow_module, "validate_accuracy", side_effect=fault), \
                         self.assertRaisesRegex(CommandError, "accuracy summary validation failed") as caught:
-                    rig.accuracy()
+                    rig.accuracy(DETECTOR="RAW")
                 self.assertIs(caught.exception.__cause__, fault)
                 result = rig.workflow.last_result
                 self.assertEqual(result["result"], "aborted")
@@ -644,7 +644,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                         method = "_recenter" if stage == "recenter" else "_release_terminal_home"
                         patch = mock.patch.object(rig.workflow, method, side_effect=fault)
                     with patch, self.assertRaises(error_type) as caught:
-                        rig.accuracy()
+                        rig.accuracy(DETECTOR="RAW")
                     self.assertIs(caught.exception, fault)
                     self.assertEqual(rig.workflow.last_result["result"], "aborted")
                     self.assertIn(str(fault), rig.workflow.last_result["reason"])
@@ -662,7 +662,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             with mock.patch.object(workflow_module, "validate_accuracy", side_effect=ValueError("bad statistics")), \
                     mock.patch.object(rig.owner, "_end_session", side_effect=fail_final_restore), \
                     self.assertRaises(OSError) as caught:
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             self.assertIs(caught.exception, fault)
             self.assertIn("workflow cleanup failed", rig.workflow.last_result["reason"])
             self.assertEqual(rig.workflow.last_result["result"], "aborted")
@@ -678,7 +678,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     raise CommandError("synthetic final restoration failure")
             rig.owner._end_session = fail_final_restore
             with self.assertRaisesRegex(CommandError, "final restoration failure"):
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
             result = rig.workflow.last_result
             self.assertEqual(result["result"], "aborted")
             self.assertIn("cleanup failed", result["reason"])
@@ -693,7 +693,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
             rig.workflow.chart_config_root = Path(temp)
             active = []
             rig.on_home = lambda axis: active.append(rig.workflow.get_status(0)["active"])
-            rig.accuracy()
+            rig.accuracy(DETECTOR="RAW")
             self.assertEqual(active[-1]["sample_index"], 2)
             self.assertEqual(active[-1]["fixed_thresholds_g"], {"x": 8.0})
             self.assertEqual(active[-1]["completed_samples"], {"x": 1})
@@ -844,9 +844,9 @@ class DetectorCaptureProvenanceTests(unittest.TestCase):
         capture = obj.stop_capture()
         detector = capture["detector"]
         self.assertEqual(capture["samples"][0][1], -0.0078125)
-        self.assertEqual(detector["onset_g"], -0.0078125)
+        self.assertEqual(detector["onset_g"], 0.0078125)
         self.assertEqual(detector["impact_peak_g"], 0.0078125)
-        self.assertEqual(detector["direction"], -1)
+        self.assertEqual(detector["direction"], 0)
         self.assertEqual(detector["threshold_g"], 0.001)
         self.assertEqual(detector["homing_speed_mm_s"], 37.0)
         self.assertIsNone(obj.capture_attempt)

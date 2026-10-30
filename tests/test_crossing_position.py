@@ -5,7 +5,7 @@ import json
 import unittest
 from unittest import mock
 
-from harness import counts, plugin
+from harness import counts, plugin, CommandError
 import accel_homing_charts as charts
 import accel_homing_filters as filters
 from accel_homing_model import AccelHomingModel
@@ -200,6 +200,11 @@ class CrossingCompatibilityTests(unittest.TestCase):
             rig.workflow.model = model
             self.assertEqual(rig.workflow._profile("x", "raw")["threshold_g"], 4.25)
             self.assertEqual(rig.workflow._profile("x", "filtered")["threshold_g"], 2.25)
+            if version == 1:
+                with self.assertRaisesRegex(CommandError, "rectified v2"):
+                    rig.workflow._begin(GCmd(DETECTOR="FILTERED"), "test", axes=["x"])
+                self.assertEqual(model.metadata["x"], original)
+                continue
             rig.workflow._begin(GCmd(DETECTOR="FILTERED"), "test", axes=["x"])
             self.assertEqual(rig.owner.threshold_g["x"], 2.25)
             self.assertEqual(rig.workflow.filter_config("x"), filters.detector_config({"version": version}))

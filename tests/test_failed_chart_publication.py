@@ -253,7 +253,7 @@ class FailedWorkflowPublicationTests(PublicationFixture):
             rig.home_results.append(CommandError("synthetic first-home fault"))
             with mock.patch.object(workflow_module, "publish_noise") as publish, \
                     mock.patch.object(charts, "_publish", wraps=charts._publish) as filesystem:
-                with self.assertRaisesRegex(CommandError, "first-home fault"): rig.calibrate(save=0)
+                with self.assertRaisesRegex(CommandError, "first-home fault"): rig.calibrate(save=0, DETECTOR="RAW")
                 publish.assert_not_called()
                 filesystem.assert_not_called()
             self.assertEqual(rig.configfile.saved, {})
@@ -266,7 +266,7 @@ class FailedWorkflowPublicationTests(PublicationFixture):
             with mock.patch.object(workflow_module, "publish_noise") as publish, \
                     mock.patch.object(charts, "_publish", wraps=charts._publish) as filesystem:
                 with self.assertRaisesRegex(CommandError, "SAVE_CONFIG include conflict"):
-                    rig.calibrate(save=1)
+                    rig.calibrate(save=1, DETECTOR="RAW")
                 publish.assert_not_called()
                 filesystem.assert_not_called()
             self.assertEqual(len(rig.home_calls), 11)
@@ -280,7 +280,7 @@ class FailedWorkflowPublicationTests(PublicationFixture):
             with mock.patch.object(workflow_module, "write_capture") as capture_writer, \
                     mock.patch.object(workflow_module, "write_accuracy") as summary_writer, \
                     mock.patch.object(charts, "_publish", wraps=charts._publish) as filesystem:
-                with self.assertRaises(CommandError): rig.accuracy()
+                with self.assertRaises(CommandError): rig.accuracy(DETECTOR="RAW")
                 capture_writer.assert_not_called()
                 summary_writer.assert_not_called()
                 filesystem.assert_not_called()
@@ -295,7 +295,7 @@ class FailedWorkflowPublicationTests(PublicationFixture):
             rig.home_results.extend([{"travel_mm": 1.175, "halt_travel_mm_signed": -1.4}] + [{}] * 11)
             with mock.patch.object(workflow_module, "write_accuracy") as summary_writer, \
                     mock.patch.object(workflow_module, "write_capture") as capture_writer:
-                rig.accuracy()
+                rig.accuracy(DETECTOR="RAW")
                 summary_writer.assert_not_called()
                 capture_writer.assert_not_called()
             result = rig.workflow.last_result
@@ -397,7 +397,7 @@ class FailedWorkflowPublicationTests(PublicationFixture):
                                                       side_effect=OSError("synthetic preview failure")))
                 stack.enter_context(mock.patch.object(workflow_module.logging, "exception"))
                 if mode == "noise": rig.workflow.cmd_NOISE(GCmd())
-                elif mode == "accuracy": rig.accuracy()
+                elif mode == "accuracy": rig.accuracy(DETECTOR="RAW")
                 elif mode == "charts": rig.workflow.cmd_CHARTS(GCmd(AXIS="X", CENTERED=1))
                 else: rig.workflow.cmd_BETA_CALIBRATE(GCmd(AXIS="X", CENTERED=1))
                 result = rig.workflow.last_result

@@ -704,7 +704,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     rig.register_event_handler("homing:home_rails_begin", observer)
                     if mode.startswith("calibrate"):
                         axis = mode[-1]
-                        rig.calibrate(axis.upper(), save=0)
+                        rig.calibrate(axis.upper(), save=0, DETECTOR="RAW")
                         expected = [axis.upper()] * 11
                     else:
                         getattr(rig.workflow, "cmd_TEST" if mode == "test" else "cmd_CHARTS")(GCmd(CENTERED=1))
@@ -774,7 +774,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     del safe.prev_G28
                 before = rig.effects()
                 with self.assertRaisesRegex(CommandError, "G28 predecessor"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.effects(), before)
                 self.assertEqual(safe.calls, [])
 
@@ -803,7 +803,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                 context = mock.patch.object(SafeZHoming, "cmd_G28", lambda obj, gcmd: None) \
                     if kind == "class_method" else contextlib.nullcontext()
                 with context, self.assertRaisesRegex(CommandError, "G28"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.effects(), before)
                 self.assertEqual(safe.calls, [])
 
@@ -828,7 +828,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                 else:
                     context = contextlib.nullcontext()
                 with context, self.assertRaisesRegex(CommandError, "stock G28"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.effects(), before)
 
     def test_missing_or_divergent_handler_registries_fail_closed(self):
@@ -856,7 +856,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                         rig.gcode.ready_gcode_handlers["G28"] = rig.objects["homing"].cmd_G28
                     before = rig.effects()
                     with self.assertRaisesRegex(CommandError, "G28"):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(rig.effects(), before)
 
     def test_chain_changes_during_capture_setup_or_command_creation_abort_before_home(self):
@@ -875,7 +875,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     callback = rig.gcode.create_gcode_command
                     rig.gcode.create_gcode_command = lambda *args: mutate_after(callback, *args)
                 with self.assertRaisesRegex(CommandError, "G28 predecessor"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.home_calls, [])
                 self.assertEqual(safe.calls, [])
                 self.assertEqual(rig.toolhead.moves, [])
@@ -903,13 +903,13 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                         rig.home_results.append({"travel_mm": 2.0})
                         rig.wait_calibration(save=0)
                         mutate()
-                        resume = lambda: rig.calibrate(save=0)
+                        resume = lambda: rig.calibrate(save=0, DETECTOR="RAW")
                     elif mode == "test":
                         rig.on_home = mutate
                         resume = lambda: rig.workflow.cmd_TEST(GCmd(CENTERED=1))
                     else:
                         rig.on_home = mutate
-                        resume = lambda: rig.calibrate(save=0)
+                        resume = lambda: rig.calibrate(save=0, DETECTOR="RAW")
                     with self.assertRaisesRegex(CommandError, "G28"):
                         resume()
                     self.assertEqual(len(rig.home_calls), 1)
@@ -929,7 +929,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                 error = error_type("synthetic stock homing failure")
                 rig.home_results.append(error)
                 with self.assertRaises(error_type) as caught:
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertIs(caught.exception, error)
                 self.assertFalse(rig.capture_active)
                 self.assertEqual(rig.capture_stops, 1)
@@ -972,10 +972,10 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     z_limit = rig.toolhead.kin.limits[2]
                     with mock.patch.object(rig.toolhead, "set_position", wraps=rig.toolhead.set_position) as force:
                         if mode.startswith("calibrate"):
-                            rig.calibrate(mode[-1].upper(), save=0)
+                            rig.calibrate(mode[-1].upper(), save=0, DETECTOR="RAW")
                             expected = [mode[-1].upper()] * 11
                         elif mode == "accuracy":
-                            rig.workflow.cmd_ACCURACY(GCmd(CENTERED=1, SAMPLES=2))
+                            rig.workflow.cmd_ACCURACY(GCmd(CENTERED=1, SAMPLES=2, DETECTOR="RAW"))
                             expected = ["X"] * 3 + ["Y"] * 3
                         else:
                             getattr(rig.workflow, "cmd_TEST" if mode == "test" else "cmd_CHARTS")(
@@ -1052,7 +1052,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     del override.prev_G28
                 before = rig.effects()
                 with self.assertRaisesRegex(CommandError, "stock G28 predecessor"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.effects(), before)
                 self.assertEqual(override.calls, [])
                 override.template.run_gcode_from_command.assert_not_called()
@@ -1088,7 +1088,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     context = contextlib.nullcontext()
                 before = rig.effects()
                 with context, self.assertRaisesRegex(CommandError, "homing_override.*stock G28 predecessor"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.effects(), before)
                 self.assertEqual(override.calls, [])
 
@@ -1103,7 +1103,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                 rig.use_safe_z_home()
             before = rig.effects()
             with self.assertRaisesRegex(CommandError, "cannot combine safe_z_home and homing_override"):
-                rig.calibrate(save=0)
+                rig.calibrate(save=0, DETECTOR="RAW")
             self.assertEqual(rig.effects(), before)
             override.template.run_gcode_from_command.assert_not_called()
 
@@ -1131,7 +1131,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     rig.gcode.gcode_handlers = {"G28": rig.objects["homing"].cmd_G28}
                 before = rig.effects()
                 with self.assertRaisesRegex(CommandError, "G28"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual(rig.effects(), before)
                 self.assertEqual(override.calls, [])
 
@@ -1149,7 +1149,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                         rig.toolhead.kin.limits[:2] = [(0.0, 300.0), (0.0, 200.0)]
                     before = rig.effects()
                     with self.assertRaisesRegex(CommandError, "active or unverifiable homing_override G28 script"):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(rig.effects(), before)
                     override.template.run_gcode_from_command.assert_not_called()
 
@@ -1175,7 +1175,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                         callback = rig.gcode.create_gcode_command
                         rig.gcode.create_gcode_command = lambda *args: mutate_after(callback, *args)
                     with self.assertRaisesRegex(CommandError, "G28"):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     self.assertEqual(rig.home_calls, [])
                     self.assertEqual(override.calls, [])
                     override.template.run_gcode_from_command.assert_not_called()
@@ -1204,11 +1204,11 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                         rig.home_results.append({"travel_mm": 2.0})
                         rig.wait_calibration(save=0)
                         mutate()
-                        resume = lambda: rig.calibrate(save=0)
+                        resume = lambda: rig.calibrate(save=0, DETECTOR="RAW")
                     else:
                         rig.on_home = mutate
                         resume = (lambda: rig.workflow.cmd_TEST(GCmd(CENTERED=1))) \
-                            if mode == "test" else (lambda: rig.calibrate(save=0))
+                            if mode == "test" else (lambda: rig.calibrate(save=0, DETECTOR="RAW"))
                     with self.assertRaisesRegex(CommandError, "G28"):
                         resume()
                     self.assertEqual(len(rig.home_calls), 1)
@@ -1227,7 +1227,7 @@ class CalibrationTests(unittest.TestCase):
         rig = Rig()
         # Unhomed reported coordinates do not establish the physical center.
         rig.toolhead.position[:2] = [12.0, 19.0]
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         first = rig.home_calls[0]
         self.assertEqual(first["threshold"], 1.0)
         self.assertEqual(first["homed_axes"], "z")
@@ -1247,7 +1247,7 @@ class CalibrationTests(unittest.TestCase):
     def test_ten_independent_axis_homes_are_saved_and_original_settings_restored(self):
         for axis in "XY":
             rig = Rig()
-            rig.calibrate(axis)
+            rig.calibrate(axis, DETECTOR="RAW")
             self.assertEqual([call["threshold"] for call in rig.home_calls], [1.0] * 11)
             self.assertEqual(rig.scripts, ["G28 " + axis] * 11 + ["SAVE_CONFIG"])
             self.assertEqual(len(rig.toolhead.moves), 11)
@@ -1278,7 +1278,7 @@ class CalibrationTests(unittest.TestCase):
         for short in (0.0, 10.0, 19.0, 19.999):
             rig = Rig()
             rig.home_results.append({"travel_mm": short})
-            rig.calibrate()
+            rig.calibrate(DETECTOR="RAW")
             self.assertIsNone(rig.workflow.session)
             self.assertEqual(rig.home_calls[0]["threshold"], 1.0)
             self.assertEqual(rig.disabled, [])
@@ -1299,7 +1299,7 @@ class CalibrationTests(unittest.TestCase):
         rig = Rig()
         rig.home_results.append({"result": "pressed", "travel_mm": 150.0, "moving": False})
         with self.assertRaisesRegex(CommandError, "sensor/homing failure"):
-            rig.calibrate()
+            rig.calibrate(DETECTOR="RAW")
         self.assertEqual(rig.configfile.saved, {})
         self.assertEqual(rig.toolhead.moves, [])
         self.assertIsNone(rig.workflow.session)
@@ -1307,7 +1307,7 @@ class CalibrationTests(unittest.TestCase):
     def test_success_count_resets_after_threshold_changes(self):
         rig = Rig()
         rig.home_results.extend([{}, {}, {"travel_mm": 8.0}])
-        rig.calibrate()
+        rig.calibrate(DETECTOR="RAW")
         self.assertEqual(len(rig.toolhead.moves), 14)
         self.assertEqual(rig.home_calls[3]["successes"], 0)
         self.assertFalse(rig.home_calls[3]["candidate_qualified"])
@@ -1322,7 +1322,7 @@ class CalibrationTests(unittest.TestCase):
             rig = Rig()
             rig.home_results.append(bad)
             with self.assertRaises(CommandError):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertIsNone(rig.workflow.session)
             self.assertEqual(rig.toolhead.moves, [])
             self.assertEqual(rig.owner.threshold_g["x"], 8.0)
@@ -1337,7 +1337,7 @@ class CalibrationTests(unittest.TestCase):
                 rig.workflow.max_attempts = 1
             rig.home_results.append({"travel_mm": 2.0})
             with self.assertRaisesRegex(CommandError, "headroom|maximum|attempt budget"):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertIsNone(rig.workflow.session)
             self.assertEqual(rig.toolhead.moves, [])
 
@@ -1349,7 +1349,7 @@ class CalibrationTests(unittest.TestCase):
             else:
                 rig.bad_capture = {"samples": [], "dropped": 0}
             with self.assertRaises(CommandError):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertFalse(rig.capture_active)
             self.assertEqual(rig.owner.back_off_dist, 5.0)
             self.assertIsNone(rig.workflow.session)
@@ -1360,7 +1360,7 @@ class CalibrationTests(unittest.TestCase):
             for positive in (False, True):
                 rig = Rig()
                 rig.owner.rails_by_axis[axis] = Rail(positive=positive, bounds=(-40.0, 220.0))
-                rig.calibrate(axis.upper())
+                rig.calibrate(axis.upper(), DETECTOR="RAW")
                 coords = [None, None, None]
                 coords["xy".index(axis)] = 90.0
                 self.assertEqual(rig.toolhead.moves[0][0], coords)
@@ -1372,7 +1372,7 @@ class CalibrationTests(unittest.TestCase):
         for threshold in (0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 4.0):
             with self.subTest(threshold=threshold):
                 rig = Rig({"calibration_start_threshold": threshold})
-                rig.calibrate(save=0)
+                rig.calibrate(save=0, DETECTOR="RAW")
                 self.assertEqual([call["threshold"] for call in rig.home_calls],
                                  [threshold] * 11)
         for threshold in (0.499, 0.0, -1.0,
@@ -1383,7 +1383,7 @@ class CalibrationTests(unittest.TestCase):
     def test_successful_calibration_keeps_unhomed_z_unhomed(self):
         rig = Rig()
         rig.toolhead.kin.limits[2] = (1.0, -1.0)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "x")
         self.assertEqual(rig.toolhead.kin.limits[2], (1.0, -1.0))
         self.assertEqual(rig.toolhead.position[2:], [40.0, 6.0])
@@ -1392,7 +1392,7 @@ class CalibrationTests(unittest.TestCase):
 
     def test_save_config_opt_out_stages_but_never_restarts(self):
         rig = Rig()
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
         self.assertEqual(rig.workflow.last_result["result"], "calibrated")
         self.assertTrue(any("staged only" in text for text in rig.output))
@@ -1401,7 +1401,7 @@ class CalibrationTests(unittest.TestCase):
         rig = Rig()
         rig.save_error = True
         with self.assertRaisesRegex(CommandError, "SAVE_CONFIG"):
-            rig.calibrate()
+            rig.calibrate(DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.owner.threshold_g["x"], 8.0)
         self.assertEqual(rig.owner.back_off_dist, 5.0)
@@ -1412,7 +1412,7 @@ class CalibrationTests(unittest.TestCase):
         rig = Rig()
         rig.configfile.fail = True
         with self.assertRaisesRegex(CommandError, "staging"):
-            rig.calibrate()
+            rig.calibrate(DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.owner.threshold_g["x"], 8.0)
         self.assertFalse(rig.capture_active)
@@ -1494,7 +1494,7 @@ class CalibrationRecenterTests(unittest.TestCase):
                 Rig({"calibration_settle_time": value})
         self.assertEqual(Rig({"calibration_settle_time": 2.}).workflow.calibration_settle_time, 2.)
         rig = Rig({"calibration_settle_time": .4})
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.toolhead.dwells, [.4] * 10)
         self.assertEqual(rig.workflow.last_result["calibration_settle_time_s"], .4)
         metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
@@ -1547,7 +1547,7 @@ class CalibrationRecenterTests(unittest.TestCase):
                             mock.patch.object(rig.toolhead, "dwell", side_effect=dwelling), \
                             mock.patch.object(rig.owner, "_end_session", side_effect=ending), \
                             self.assertRaises(RuntimeError if failure == "error" else CommandError):
-                        rig.calibrate(save=0)
+                        rig.calibrate(save=0, DETECTOR="RAW")
                     order = ["move", "return_wait", "dwell", "settle_wait"]
                     self.assertEqual(reached, order[:order.index(stage) + 1])
                     self.assertEqual(rig.scripts, ["G28 X"])
@@ -1662,7 +1662,7 @@ class CalibrationGridTests(unittest.TestCase):
                     contexts.append((rig.workflow.calibration_reference(current),
                                      rig.workflow.calibration_reference("y" if current == "x" else "x")))
                 rig.on_home = observe
-                rig.calibrate(axis, save=0, START_THRESHOLD=1, STEP=.25)
+                rig.calibrate(axis, save=0, START_THRESHOLD=1, STEP=.25, DETECTOR="RAW")
                 self.assertIsNone(rig.workflow.session)
                 self.assertEqual([call["threshold"] for call in rig.home_calls],
                                  [1.0, 1.25] + [1.5] * 11)
@@ -1702,7 +1702,7 @@ class CalibrationGridTests(unittest.TestCase):
         rig = Rig()
         rig.owner.full_scale_g = 2.0
         with self.assertRaisesRegex(CommandError, "ceiling"):
-            rig.calibrate(save=0, START_THRESHOLD=1.7)
+            rig.calibrate(save=0, START_THRESHOLD=1.7, DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.scripts, [])
 
@@ -1718,7 +1718,7 @@ class CalibrationGridTests(unittest.TestCase):
                 rig.calibrate(**parameters)
             self.assertEqual(rig.effects(), before)
             self.assertIs(rig.workflow.session, session)
-        rig.calibrate(START_THRESHOLD=1, STEP=.25)
+        rig.calibrate(START_THRESHOLD=1, STEP=.25, DETECTOR="RAW")
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
 
@@ -1746,7 +1746,7 @@ class CalibrationGridTests(unittest.TestCase):
         rig.home_results.append(error)
         rig.on_home = lambda axis: self.assertTrue(rig.workflow.calibration_reference(axis))
         with self.assertRaises(CommandError) as caught:
-            rig.calibrate("Y", save=0, START_THRESHOLD=1, STEP=.25)
+            rig.calibrate("Y", save=0, START_THRESHOLD=1, STEP=.25, DETECTOR="RAW")
         self.assertIs(caught.exception, error)
         self.assertFalse(rig.workflow.calibration_reference("y"))
         self.assertIsNone(rig.workflow.session)
@@ -1765,7 +1765,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
             with self.subTest(axis=axis, low=low, high=high):
                 rig = Rig()
                 rig.home_results.extend([{}] + [{"travel_mm": low}] * 9 + [{"travel_mm": high}])
-                rig.calibrate(axis, save=0)
+                rig.calibrate(axis, save=0, DETECTOR="RAW")
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [1.0] * 11)
                 self.assertEqual(rig.workflow.last_result["repeatability_spread_mm"], 2.0)
                 self.assertEqual(rig.workflow.last_result["restarts"], 0)
@@ -1781,7 +1781,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
             with self.subTest(save=save):
                 rig = Rig()
                 rig.home_results.extend([{}] + [{"travel_mm": 150.0}] * 9 + [{"travel_mm": high}])
-                rig.calibrate(save=save)
+                rig.calibrate(save=save, DETECTOR="RAW")
                 self.assertEqual(len(rig.home_calls), 11)
                 self.assertEqual(len(rig.toolhead.moves), 11)
                 metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
@@ -1803,7 +1803,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
                     rig.home_results.extend([{}] + [{"travel_mm": center}] * 8 +
                                             [{"travel_mm": center + offset}, {}] +
                                             [{"travel_mm": center}] * 10)
-                    rig.calibrate(axis, save=0)
+                    rig.calibrate(axis, save=0, DETECTOR="RAW")
                     self.assertEqual([c["threshold"] for c in rig.home_calls], [1.0] * 10 + [1.25] * 11)
                     self.assertFalse(rig.home_calls[10]["candidate_qualified"])
                     self.assertEqual(rig.home_calls[10]["successes"], 0)
@@ -1822,7 +1822,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
         # 2 mm; the remaining historic samples must never run at this threshold.
         rig.home_results.extend([{}] + [{"travel_mm": value} for value in travels[:7]] +
                                 [{}] + [{"travel_mm": 149.0}] * 10)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(len(rig.home_calls), 19)
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.25)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
@@ -1854,7 +1854,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
                     save_model()
 
                 with mock.patch.object(rig.workflow, "_save_model", side_effect=inspect_then_save):
-                    rig.calibrate(axis, save=0)
+                    rig.calibrate(axis, save=0, DETECTOR="RAW")
                 self.assertEqual(inspected, [True])
                 self.assertEqual([call["successes"] for call in rig.home_calls], [0, 0] + list(range(1, 10)))
                 metadata = json.loads(rig.configfile.saved[("accel_homing_model default", axis.lower() + "_metadata")])
@@ -1865,12 +1865,12 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
     def test_axes_keep_independent_windows_and_saved_repeatability_metadata(self):
         rig = Rig()
         rig.home_results.extend([{}] + [{"travel_mm": 150.0}] * 9 + [{"travel_mm": 151.4}])
-        rig.calibrate("X", save=0)
+        rig.calibrate("X", save=0, DETECTOR="RAW")
         x_metadata = rig.configfile.saved[("accel_homing_model default", "x_metadata")]
         rig.workflow._disable_xy()
         rig.idle_state = "Ready"
         rig.home_results.extend([{}] + [{"travel_mm": 100.0}] * 9 + [{"travel_mm": 100.5}])
-        rig.calibrate("Y", save=0)
+        rig.calibrate("Y", save=0, DETECTOR="RAW")
         self.assertEqual(rig.configfile.saved[("accel_homing_model default", "x_metadata")], x_metadata)
         self.assertEqual(json.loads(x_metadata)["repeatability_spread_mm"], 1.4)
         y_metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "y_metadata")])
@@ -1884,7 +1884,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
                 rig = Rig()
                 rig.home_results.extend([{}, {"travel_mm": 151.0}, {"travel_mm": early}]
                                         + [{"travel_mm": 148.0}] * 11)
-                rig.calibrate(save=0)
+                rig.calibrate(save=0, DETECTOR="RAW")
                 restart = rig.home_calls[3]
                 self.assertEqual(restart["threshold"], 1.25)
                 self.assertEqual(restart["successes"], 0)
@@ -1902,7 +1902,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
         rig = Rig()
         rig.home_results.extend([{}, {"travel_mm": 150.0}, {"travel_mm": 8.0}])
         rig.home_results.extend([{}] + [{"travel_mm": 150.0}] * 9 + [{"travel_mm": 152.01}])
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual([c["threshold"] for c in rig.home_calls],
                          [1.0] * 3 + [1.25] * 11 + [1.5] * 11)
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 1.5)
@@ -1915,7 +1915,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
         states = []
         rig.on_home = lambda axis: states.append(rig.workflow.get_status(0)["active"])
         rig.home_results.extend([{}] + [{"travel_mm": 150.0 + 0.1 * index} for index in range(10)])
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(states[1]["successes"], 0)
         self.assertIsNone(states[1]["repeatability_spread_mm"])
         self.assertEqual(states[2]["successes"], 1)
@@ -1948,7 +1948,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
             with self.subTest(mutation=name):
                 rig = Rig()
                 with mock.patch.object(rig.workflow, "_save_model"):
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 mutate(rig.workflow)
                 before = rig.effects()
                 with self.assertRaisesRegex(CommandError, "cannot save calibration"):
@@ -1960,7 +1960,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
     def test_save_guard_rejects_one_home_reused_as_multiple_validation_records(self):
         rig = Rig()
         with mock.patch.object(rig.workflow, "_save_model"):
-            rig.calibrate(save=0)
+            rig.calibrate(save=0, DETECTOR="RAW")
         session = rig.workflow.session
         session["validation_records"][-1] = session["records"][-1] = session["validation_records"][0]
         with self.assertRaisesRegex(CommandError, "ten distinct"):
@@ -1971,7 +1971,7 @@ class RepeatabilityCalibrationTests(unittest.TestCase):
     def test_exact_workflow_threshold_supports_rounded_sensor_record_threshold(self):
         rig = Rig({"calibration_start_threshold": 0.755})
         rig.home_results.extend([{"threshold_g": 0.76}] * 11)
-        rig.calibrate(save=0)
+        rig.calibrate(save=0, DETECTOR="RAW")
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 0.755)
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.255)
         self.assertEqual(rig.workflow.last_result["repeatability_spread_mm"], 0.0)
@@ -1993,7 +1993,7 @@ class GuardTests(unittest.TestCase):
                     before = rig.effects()
                     params = {} if requested is None else {"AXIS": requested}
                     with self.assertRaisesRegex(CommandError, "unsafe runtime homing policy"):
-                        getattr(rig.workflow, command)(GCmd(CENTERED=1, **params))
+                        getattr(rig.workflow, command)(GCmd(CENTERED=1, DETECTOR="RAW", **params))
                     self.assertEqual(rig.policy_checks, [axes])
                     self.assertEqual(rig.effects(), before)
 
@@ -2003,7 +2003,7 @@ class GuardTests(unittest.TestCase):
         rig.wait_calibration(save=0)
         rig.policy_error = "synthetic runtime policy changed"
         with self.assertRaisesRegex(CommandError, "runtime policy changed"):
-            rig.calibrate()
+            rig.calibrate(DETECTOR="RAW")
         self.assertEqual(rig.policy_checks, [("x",), ("x",)])
         self.assertEqual(rig.scripts, ["G28 X"])
         self.assertEqual(rig.toolhead.moves, [])
@@ -2033,7 +2033,7 @@ class GuardTests(unittest.TestCase):
                                            for a in "xyz"]
                 before = rig.effects()
                 with self.assertRaisesRegex(CommandError, "both X and Y unhomed"):
-                    rig.calibrate(axis)
+                    rig.calibrate(axis, DETECTOR="RAW")
                 self.assertEqual(rig.effects(), before)
 
     def test_release_clears_only_xy_across_integer_and_letter_clear_state_apis(self):
@@ -2066,7 +2066,7 @@ class GuardTests(unittest.TestCase):
             rig.toolhead.kin.limits = limits
             before = rig.effects()
             with self.assertRaisesRegex(CommandError, "invalidate XY"):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertEqual(rig.effects(), before)
 
     def test_nonfinite_workflow_configuration_is_rejected(self):
@@ -2094,7 +2094,7 @@ class GuardTests(unittest.TestCase):
             rig = Rig()
             setup(rig)
             with self.assertRaises(CommandError):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertEqual(rig.scripts, [])
             self.assertEqual(rig.disabled, [])
 
@@ -2103,7 +2103,7 @@ class GuardTests(unittest.TestCase):
         rig.home_results.append({"travel_mm": 2.0})
         rig.wait_calibration()
         self.assertEqual(rig.idle_state, "Printing")
-        rig.calibrate()
+        rig.calibrate(DETECTOR="RAW")
         self.assertEqual(rig.workflow.last_result["result"], "calibrated")
 
     def test_unrecognized_overrides_macros_and_unrelated_g28_wrappers_rejected(self):
@@ -2114,7 +2114,7 @@ class GuardTests(unittest.TestCase):
             else:
                 rig.objects[key] = object()
             with self.assertRaisesRegex(CommandError, "G28"):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertEqual(rig.scripts, [])
 
     def test_retract_or_minimum_second_home_are_rejected_before_initial_g28(self):
@@ -2122,7 +2122,7 @@ class GuardTests(unittest.TestCase):
             rig = Rig()
             setattr(rig.owner.rails_by_axis["x"].info, field, 5.0)
             with self.assertRaisesRegex(CommandError, "homing_retract_dist"):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertEqual(rig.scripts, [])
 
     def test_unsupported_z_coupled_kinematics_and_shared_enable_lines_rejected(self):
@@ -2137,7 +2137,7 @@ class GuardTests(unittest.TestCase):
             else:
                 rig.toolhead.kin.dual_carriage_axis = 0
             with self.assertRaises(CommandError):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertEqual(rig.scripts, [])
             self.assertEqual(rig.disabled, [])
 
@@ -2147,7 +2147,7 @@ class GuardTests(unittest.TestCase):
         rig.wait_calibration()
         before = rig.effects()
         with self.assertRaisesRegex(CommandError, "already active"):
-            rig.calibrate("Y")
+            rig.calibrate("Y", DETECTOR="RAW")
         with self.assertRaisesRegex(CommandError, "already active"):
             rig.workflow.cmd_TEST(GCmd(CENTERED=1))
         with self.assertRaisesRegex(CommandError, "already active"):
@@ -2166,7 +2166,7 @@ class GuardTests(unittest.TestCase):
                 def check_reentrant(axis):
                     rig.on_home = None
                     before = rig.effects()
-                    for callback in (lambda: rig.calibrate(),
+                    for callback in (lambda: rig.calibrate(DETECTOR="RAW"),
                                      lambda: rig.workflow.cmd_TEST(GCmd(CENTERED=1)),
                                      lambda: rig.workflow.cmd_CHARTS(GCmd(CENTERED=1))):
                         with self.assertRaisesRegex(CommandError, "already active"):
@@ -2175,7 +2175,7 @@ class GuardTests(unittest.TestCase):
                     checked.append(axis)
                 rig.on_home = check_reentrant
                 if mode == "calibration":
-                    rig.calibrate(save=0)
+                    rig.calibrate(save=0, DETECTOR="RAW")
                 else:
                     getattr(rig.workflow, "cmd_TEST" if mode == "test" else "cmd_CHARTS")(GCmd(CENTERED=1))
                 self.assertEqual(checked, ["x"])
@@ -2187,9 +2187,9 @@ class GuardTests(unittest.TestCase):
         rig.wait_calibration(save=0)
         before = rig.effects()
         with self.assertRaisesRegex(CommandError, "SAVE_CONFIG cannot change"):
-            rig.calibrate(save=1)
+            rig.calibrate(save=1, DETECTOR="RAW")
         self.assertEqual(rig.effects(), before)
-        rig.calibrate()
+        rig.calibrate(DETECTOR="RAW")
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
         self.assertFalse(rig.workflow.last_result["save_config"])
 
@@ -2208,7 +2208,7 @@ class GuardTests(unittest.TestCase):
             rig.wait_calibration()
             setup(rig)
             with self.assertRaises(CommandError):
-                rig.calibrate()
+                rig.calibrate(DETECTOR="RAW")
             self.assertIsNone(rig.workflow.session)
             self.assertEqual(rig.scripts, ["G28 X"])
             self.assertEqual(rig.toolhead.moves, [])
@@ -2219,7 +2219,7 @@ class GuardTests(unittest.TestCase):
         rig.wait_calibration()
         rig.reactor.now = rig.workflow.session["expires"]
         with self.assertRaisesRegex(CommandError, "expired"):
-            rig.calibrate()
+            rig.calibrate(DETECTOR="RAW")
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.scripts, ["G28 X"])
         self.assertEqual(rig.toolhead.moves, [])
@@ -2248,7 +2248,7 @@ class ModelTests(unittest.TestCase):
                     calibrated = Rig()
                     if early:
                         calibrated.home_results.append({"travel_mm": 2.0})
-                    calibrated.calibrate(axis.upper())
+                    calibrated.calibrate(axis.upper(), DETECTOR="RAW")
                     threshold = 1.75 if early else 1.5
                     self.assertEqual(calibrated.home_calls[0]["threshold"], 1.0)
                     if early:
@@ -2267,7 +2267,7 @@ class ModelTests(unittest.TestCase):
 
     def test_selected_model_rejects_changed_sensor_geometry_speed_or_mapping(self):
         calibrated = Rig()
-        calibrated.calibrate(save=0)
+        calibrated.calibrate(save=0, DETECTOR="RAW")
         options = {key: value for (section, key), value in calibrated.configfile.saved.items()}
         sections = {"printer": {"kinematics": "corexy"},
                     "accel_homing_model default": options}
@@ -2323,7 +2323,7 @@ class ModelTests(unittest.TestCase):
     def test_saving_one_axis_keeps_other_axis_model(self):
         rig = Rig()
         rig.configfile.saved[("accel_homing_model default", "y_threshold")] = "4.5"
-        rig.calibrate()
+        rig.calibrate(DETECTOR="RAW")
         self.assertEqual(rig.configfile.saved[("accel_homing_model default", "y_threshold")], "4.5")
 
 

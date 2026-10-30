@@ -114,8 +114,13 @@ scheduling, USB/CAN transport, MCU dispatch, motor response, belt slip and
 mechanics still matter. Optional travel policies are nominal command
 calculations. Commanded/firmware step counts are not encoder feedback.
 
-Calibration's current criterion is ten qualified validation homes with
-max-minus-min travel **at most 2.00 mm**, after a separate discovery. It is not
+Explicit pure RAW/FILTERED calibration requires ten qualified validation homes
+with max-minus-min travel **at most 2.00 mm**, after a separate discovery.
+Default HYBRID calibration instead requires five valid RAW checks and five
+valid FILTERED checks, each with excluded discovery and the same spread limit.
+One automatic command performs both series; a recoverable early-hit/spread
+failure discards both series and restarts both counts at zero within the same
+bounded attempt budget. Only a complete pair is saved. This is not
 a physical accuracy specification. A wrong obstruction, skipped steps or a
 repeatedly wrong center estimate can still produce plausible results.
 
