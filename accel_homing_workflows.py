@@ -24,11 +24,11 @@ import uuid
 
 try:
     from .accel_homing_filters import (detector_config, CausalImpactDetector,
-                                       robust_reference, DETECTOR_VERSION,
+                                       robust_reference, signal_mode, validate_detector_identity,
                                        validate_filtered_capture_prefix, validate_censored_peak_record)
 except ImportError:
     from accel_homing_filters import (detector_config, CausalImpactDetector,
-                                      robust_reference, DETECTOR_VERSION,
+                                      robust_reference, signal_mode, validate_detector_identity,
                                       validate_filtered_capture_prefix, validate_censored_peak_record)
 
 try:
@@ -885,7 +885,7 @@ class AccelHomingWorkflows:
                              profile["metadata"].get("impact_metric", "selected_axis")
                              if profile is not None and (requested is not None or axis not in self.manual_axes)
                              else "selected_axis")
-            configs[axis] = detector_config(None if profile is None
+            configs[axis] = detector_config(None if mode == "calibration" or profile is None
                                              else profile["metadata"].get("detector_config"))
         return {"detector_types": types, "detector_configs": configs,
                 "detector_metrics": metrics,
@@ -920,6 +920,12 @@ class AccelHomingWorkflows:
             calibration_grid = self._calibration_grid(gcmd)
         axes = axes if axes is not None else [axis] if axis else ["x", "y"]
         selection = self._select_detectors(gcmd, mode, axes)
+        if previous_accuracy is not None:
+            # Automatic recovery retains the exact algorithm that failed its
+            # accuracy series; a user calibration deliberately selects v2.
+            for selected_axis in axes:
+                selection["detector_configs"][selected_axis] = detector_config(
+                    previous_accuracy["detector_configs"][selected_axis])
         self._preflight(axes, continuation=previous_accuracy is not None)
         if mode == "calibration" and self._geometry(axis)[1] <= CALIBRATION_MIN_TRAVEL_MM:
             raise gcmd.error("center-to-endstop travel must exceed 20 mm for impact discovery")
@@ -940,6 +946,12 @@ class AccelHomingWorkflows:
                                                    if mode in ("charts", "accuracy") else None),
                         "save_config": (mode == "calibration" and bool(gcmd.get_int(
                             "SAVE_CONFIG", save_config_default, minval=0, maxval=1)))}
+        filtered = ["%s FILTERED v%d (%s)" % (
+            selected_axis.upper(), selection["detector_configs"][selected_axis]["version"],
+            signal_mode(selection["detector_configs"][selected_axis]))
+            for selected_axis in axes if selection["detector_types"][selected_axis] == "filtered"]
+        if filtered:
+            self._info("Detector selection: " + ", ".join(filtered))
         if mode == "calibration":
             self.session.update(calibration_grid, candidate=calibration_grid["start_threshold_g"],
                                 algorithm=SIMPLE_CALIBRATION, restarts=0,
@@ -1133,7 +1145,8 @@ class AccelHomingWorkflows:
                 engine.feed(row[0], row[1:])
                 filtered_peak = max(filtered_peak, engine.level_g)
             filtered_noise = {"filtered_noise_peak_g": filtered_peak, "filter_reference": reference,
-                              "detector_config": config}
+                              "detector_config": config, "detector_version": config["version"],
+                              "signal_mode": signal_mode(config)}
         return {"run_id": session["run_id"], "noise_iteration": iteration, **filtered_noise,
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
@@ -1674,10 +1687,11 @@ class AccelHomingWorkflows:
         record["homing_accel_mm_s2"] = detector.get("homing_accel_mm_s2")
         record["detector_type"] = detector.get("detector_type", "raw")
         if record["detector_type"] == "filtered":
-            if (detector.get("detector_version") != DETECTOR_VERSION
-                    or detector_config(detector.get("detector_config")) != self.filter_config(axis)):
+            config = validate_detector_identity(detector.get("detector_version"), detector.get("detector_config"), detector)
+            if config != self.filter_config(axis):
                 raise self._error("filtered capture configuration does not match selected detector")
-            record.update(detector_version=DETECTOR_VERSION, detector_config=detector["detector_config"],
+            record.update(detector_version=config["version"], detector_config=detector["detector_config"],
+                          signal_mode=signal_mode(config),
                           filter_reference=detector.get("filter_reference"),
                           crossing_time_s=detector.get("crossing_time_s"),
                           confirmation_time_s=detector.get("confirmation_time_s"),
@@ -2051,8 +2065,10 @@ class AccelHomingWorkflows:
         if session.get("stationary_noise") is not None:
             metadata["stationary_noise_measurement"] = dict(session["stationary_noise"])
         kind = session.get("detector_types", {}).get(axis, "raw")
-        metadata.update(detector_type=kind, detector_version=DETECTOR_VERSION if kind == "filtered" else None,
+        config = self.filter_config(axis) if kind == "filtered" else None
+        metadata.update(detector_type=kind, detector_version=config["version"] if kind == "filtered" else None,
                         detector_config=(self.filter_config(axis) if kind == "filtered" else None),
+                        signal_mode=signal_mode(config) if kind == "filtered" else None,
                         decision_metric="causal_weighted_xyz" if kind == "filtered" else "xyz_magnitude",
                         signal_parameters_experimental=kind == "filtered",
                         moving_noise_policy="bounded_observation_only_frozen_on_first_candidate",

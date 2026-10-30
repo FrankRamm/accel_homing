@@ -30,7 +30,7 @@ are retained; the plugin does not rotate or delete old final chart outputs.
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Yes | Fresh stationary-noise summary after calibration, cleanup and required save succeed; its hints exclude the final 0.5 g saving margin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Yes | Measured acceleration capture for that home; omit AXIS for X then Y. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final accuracy overview per requested axis after every axis succeeds; optional explicit `BASELINE=<run_id>` adds independent actual-run A/B statistics. |
-| `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Yes | Development raw/causal-filter comparison of the same valid trace; actual control, shadow replay, threshold/timing/noise and censoring are labelled separately. |
+| `ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1` | Yes | Same original signed capture compared with signed-v1 and rectified-v2 filtering; actual control, diagnostic shadows, thresholds, timing, noise/DC and censoring are labelled separately. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Yes | Combined **Beta** moving-noise/trial diagnostic and suggestion report. |
 
 The plots show baseline-relative acceleration, the configured detector
@@ -53,10 +53,30 @@ Read [the comparison procedure and interpretation](FILTERS.md).
 
 The filter figure's noise/PSD use only the validated stationary pre-arm
 reference, after filter warmup. No spectrum is drawn from a gapped, undersized
-or display-reduced trace. Confirmations after the actual stop-request cutoff
-are censored; after-cutoff curves are labelled response only. Ordinary FILTERED
+or display-reduced trace. The signed-v1 and rectified-v2 variants share the
+same source/reference/weights and numerical comparison threshold; only the
+declared actual version controlled that home. Nonactive variants are diagnostic
+and do not have an independently calibrated threshold in this capture. Original
+signed XYZ remain visible, while rectified per-axis envelopes are nonnegative.
+Mean-removed XYZ noise metrics are separate from decision-level mean/RMS/P99
+that retain rectification's DC. Absolute value is nonlinear, so spectral peaks
+can move/double; PSD differences do not establish physical vibration removal.
+Confirmations at/after the actual stop-request cutoff or first saturated sample
+are censored; after-cutoff valid curves are labelled response only and the
+unknown saturated tail is omitted. Original acquisition times determine
+eligibility; displayed cutoff markers may be interpolated. Ordinary FILTERED
 accuracy/capture plots show raw measured response, with the causal weighted
 threshold stated separately rather than overlaid on the raw magnitude.
+
+Successful `ACCEL_HOMING_CALIBRATE AXIS=X DETECTOR=FILTERED CENTERED=1` publishes
+its fresh stationary-noise summary, not this comparison. After saving/restart,
+reprepare and physically recenter before
+`ACCEL_HOMING_FILTER_CHARTS AXIS=X DETECTOR=FILTERED CENTERED=1`: it performs
+another real home. A compatible RAW XYZ profile or explicitly chosen
+`RAW_THRESHOLD` is required for the RAW shadow. Failed/incomplete workflows
+still publish no comparison PNG. Rectified-v2 actual accuracy runs use embedded
+receipt version 3; historical RAW and signed-filter receipts retain their
+original version/configuration and remain usable under the documented checks.
 
 ## Stationary noise
 

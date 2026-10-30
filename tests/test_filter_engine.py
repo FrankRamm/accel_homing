@@ -37,12 +37,12 @@ class SignalTests(unittest.TestCase):
 
     def test_filter_is_causal_on_xyz_before_norm_and_ablation_changes_metric(self):
         values = [(2. * (-1 if i % 2 else 1), 0., 1.) for i in range(30)]
-        filtered = run_trace(12500., values)
-        unfiltered = run_trace(12500., values, {"lowpass_tau_s": 0.})
+        filtered = run_trace(12500., values, {"version": 1})
+        unfiltered = run_trace(12500., values, {"version": 1, "lowpass_tau_s": 0.})
         self.assertLess(filtered.level_g, .5)
         self.assertEqual(unfiltered.level_g, 2.)
-        prefix = run_trace(12500., values[:12])
-        alternate = run_trace(12500., values[:12] + [(10., 10., 10.)] * 8)
+        prefix = run_trace(12500., values[:12], {"version": 1})
+        alternate = run_trace(12500., values[:12] + [(10., 10., 10.)] * 8, {"version": 1})
         same_row = next(row for row in alternate.history if row[0] == prefix.history[-1][0])
         self.assertAlmostEqual(prefix.history[-1][1], same_row[1])
 
@@ -81,7 +81,7 @@ class SignalTests(unittest.TestCase):
         self.assertTrue(engine.diagnostics()["moving_noise"]["censored"])
 
     def test_config_rejects_unknown_version_nonfinite_and_unbounded_confirmation(self):
-        for config in ({"version": True}, {"version": 2}, {"lowpass_tau_s": float("nan")},
+        for config in ({"version": True}, {"version": 3}, {"lowpass_tau_s": float("nan")},
                        {"confirmation_max_s": .1}, {"weight_floor": .5}, {"foo": 1}):
             with self.assertRaises(ValueError):
                 detector_config(config)
@@ -256,11 +256,11 @@ class ReplayTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
-    def metadata(self, rig, kind):
+    def metadata(self, rig, kind, version=2):
         data = rig.workflow._model_context("x")
         data.update(detector_type=kind, impact_metric="xyz_magnitude")
         if kind == "filtered":
-            data.update(detector_version=1, detector_config=detector_config(),
+            data.update(detector_version=version, detector_config=detector_config({"version": version}),
                         filter_sensor_context=rig.owner.noise_sensor_context())
         return data
 
@@ -347,8 +347,9 @@ class FilteredRig(RecoveryRig):
                 if self.workflow.simple_detection(axis):
                     self.home_results[0].update(impact_metric="xyz_magnitude", direction=0)
                 if kind == "filtered":
-                    self.home_results[0].update(detector_version=1, detector_config=detector_config(),
-                                                filter_reference=robust_reference([(0., 0., 1.)] * 50))
+                    config = self.workflow.filter_config(axis)
+                    self.home_results[0].update(detector_version=config["version"], detector_config=config,
+                                                filter_reference=robust_reference([(0., 0., 1.)] * 50, config))
         return super().stock_home(gcmd)
 
     def stop_capture(self):
@@ -356,9 +357,10 @@ class FilteredRig(RecoveryRig):
         detector = capture.get("detector")
         if detector and capture["_record"].get("detector_type") == "filtered":
             onset = detector["onset_time_s"]
-            detector.update(detector_type="filtered", detector_version=1,
-                            detector_config=detector_config(),
-                            filter_reference=robust_reference([(0., 0., 1.)] * 50),
+            config = self.workflow.filter_config(capture["_record"]["axis"])
+            detector.update(detector_type="filtered", detector_version=config["version"],
+                            detector_config=config,
+                            filter_reference=robust_reference([(0., 0., 1.)] * 50, config),
                             crossing_time_s=onset + .0001, confirmation_time_s=onset + .0005,
                             stop_request_time_s=onset + .001,
                             stop_request_interval_s=[onset + .0007, onset + .001])

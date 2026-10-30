@@ -6,6 +6,7 @@ from unittest import mock
 
 from test_filter_charts import charts, synthetic_accuracy_axis, synthetic_filter_home
 from test_censored_response_charts import native_filtered_capture, synthetic_native_accuracy_axis
+from test_rectified_filter_charts import synthetic_alternating_filter_home
 
 
 def main():
@@ -21,6 +22,9 @@ def main():
         capture, record = synthetic_filter_home()
         timeline = charts.write_filter_capture(args.output, "synthetic_filter_timeline", "x", capture, record,
                                                 .8, .8, simulated=True, renderer=renderer)
+        capture, record = synthetic_alternating_filter_home()
+        alternating = charts.write_filter_capture(args.output, "synthetic_bipolar_filter_timeline", "x", capture,
+                                                   record, .8, .8, simulated=True, renderer=renderer)
         control = synthetic_accuracy_axis("synthetic_raw_control", "raw",
             travels=(175.00, 175.30, 174.90, 175.10, 175.22, 174.95, 175.08, 175.28, 174.92, 175.13))
         baseline = charts.write_accuracy(args.output, "synthetic_raw_control", {"x": control}, "complete",
@@ -35,7 +39,8 @@ def main():
         censored_timeline = charts.write_filter_capture(args.output, "synthetic_censored_timeline", "x", capture,
                                                          record, 10., 1., simulated=True, renderer=renderer)
         generated_travels = (175.00, 175.30, 174.90, 175.10, 175.22, 174.95, 175.08, 175.28, 174.92, 175.13)
-        native_control = synthetic_native_accuracy_axis("synthetic_native_control", generated_travels, censored_indices=())
+        native_control = synthetic_native_accuracy_axis("synthetic_native_control", generated_travels,
+                                                         censored_indices=(), filter_version=1)
         native_baseline = charts.write_accuracy(args.output, "synthetic_native_control", {"x": native_control},
                                                 "complete", simulated=True, renderer=renderer)
         censored_series = synthetic_native_accuracy_axis("synthetic_censored_trial", generated_travels,
@@ -43,6 +48,7 @@ def main():
         censored_comparison = charts.write_accuracy(args.output, "synthetic_censored_trial", {"x": censored_series},
             "complete", simulated=True, renderer=renderer, baseline_run_id="synthetic_native_control")
     print(json.dumps({"SYNTHETIC_NOT_PHYSICAL_RESULTS": True, "timeline": timeline["png"],
+                      "bipolar_signed_rectified": alternating["png"],
                       "raw_control": baseline["x_png"], "actual_series_ab": comparison["x_png"],
                       "native_saturation_prefix": censored_home["png"],
                       "native_saturation_cutoff": censored_timeline["png"],

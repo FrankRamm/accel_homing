@@ -245,6 +245,27 @@ def _censored_peak_record(record):
     return validate_censored_peak_record(record)
 
 
+def _filter_identity(version, config, metadata=None):
+    try:
+        from .accel_homing_filters import validate_detector_identity
+    except ImportError:
+        from accel_homing_filters import validate_detector_identity
+    return validate_detector_identity(version, config, metadata)
+
+
+def _algorithm_label(context):
+    # The isolated plotting worker has no runtime-module import path. Full
+    # identity validation happens before the immutable report is rendered.
+    if context.get("detector_type", "raw") != "filtered":
+        return "RAW"
+    version, config = context.get("detector_version"), context.get("detector_config")
+    if (type(version) is not int or version not in (1, 2) or not isinstance(config, dict)
+            or config.get("version") != version or (version == 1 and "signal_mode" in config)
+            or (version == 2 and config.get("signal_mode") != "rectified")):
+        raise ValueError("Invalid frozen filter identity for chart label")
+    return "FILTERED v%d %s" % (version, "signed" if version == 1 else "rectified")
+
+
 def _capture_data(capture, record):
     if not isinstance(capture, dict) or capture.get("dropped", 0) \
             or capture.get("fault") or capture.get("error"):
@@ -498,6 +519,83 @@ def write_capture(directory, run_id, axis, capture, record, simulated=False,
     return CapturePaths({"png": path}, receipt)
 
 
+_FILTER_VARIANTS = ("signed_v1", "rectified_v2")
+
+
+def _filter_variants(analysis):
+    """Require two honest algorithm identities on one ordered source trace."""
+    try:
+        from .accel_homing_filters import validate_detector_identity, signal_mode
+    except ImportError:
+        from accel_homing_filters import validate_detector_identity, signal_mode
+    variants = analysis.get("variants")
+    raw = analysis["raw_trace"]
+    if not isinstance(variants, dict) or set(variants) != set(_FILTER_VARIANTS):
+        raise ValueError("Filter comparison requires signed v1 and rectified v2 on the same capture")
+    references, parameters = [], []
+    for key, version, mode in (("signed_v1", 1, "signed"), ("rectified_v2", 2, "rectified")):
+        item = variants[key]
+        if not isinstance(item, dict):
+            raise ValueError("Invalid filter comparison variant")
+        config = validate_detector_identity(item.get("detector_version"), item.get("config"), item)
+        trace = item.get("trace")
+        if (item["detector_version"] != version or item.get("signal_mode") != mode or signal_mode(config) != mode
+                or not isinstance(trace, (list, tuple)) or len(trace) != len(raw)
+                or any(not isinstance(row, (list, tuple)) or len(row) != 4
+                       or not all(_finite(value) for value in row) or row[0] != original[0]
+                       for row, original in zip(trace, raw))
+                or (mode == "rectified" and any(value < 0 for row in trace for value in row[1:]))
+                or any(not isinstance(item.get(name), (list, tuple)) or len(item[name]) != len(raw)
+                       or any(not _finite(value) or value < 0 for value in item[name])
+                       for name in ("level", "weighted_level"))
+                or item.get("threshold_g") != analysis["filtered_threshold_g"]
+                or item.get("threshold_source") not in (
+                    "actual_active_detector", "same_numeric_threshold_diagnostic_not_calibrated")):
+            raise ValueError("Filter variants must use identical ordered sample identities and explicit metrics")
+        if any(item.get(name) != analysis.get(name) for name in (
+                "decision_cutoff_time_s", "decision_cutoff_original_time_s", "decision_cutoff_reason")):
+            raise ValueError("Filter variants must share the actual stop/saturation cutoff")
+        decision = item.get("decision")
+        if not isinstance(decision, dict) or type(decision.get("decision_observed")) is not bool:
+            raise ValueError("Filter comparison has no explicit observed/censored decision")
+        confirmed = decision.get("confirmation_time_s")
+        if decision["decision_observed"]:
+            original = decision.get("original_confirmation_time_s", confirmed)
+            cutoff, original_cutoff = item["decision_cutoff_time_s"], item["decision_cutoff_original_time_s"]
+            if (decision.get("censored") is not False or not all(_finite(value) for value in (
+                    confirmed, original, cutoff, original_cutoff))
+                    or not raw[0][0] <= confirmed <= raw[-1][0] or original >= original_cutoff):
+                raise ValueError("Filter confirmation is not observed before the proven comparison cutoff")
+        elif decision.get("censored") is not True or confirmed is not None:
+            raise ValueError("Unconfirmed filter comparison must remain explicitly censored")
+        references.append(item.get("reference"))
+        parameters.append({name: value for name, value in config.items() if name not in ("version", "signal_mode")})
+    if references[0] != references[1] or parameters[0] != parameters[1]:
+        raise ValueError("Filter comparison changed its frozen reference or non-signal parameters")
+    actual = analysis.get("actual_variant")
+    if ((analysis["actual_detector"] == "raw" and actual is not None)
+            or (analysis["actual_detector"] == "filtered" and actual not in variants)):
+        raise ValueError("Filter comparison lacks its actual algorithm identity")
+    if any((item["threshold_source"] == "actual_active_detector") != (key == actual)
+           for key, item in variants.items()):
+        raise ValueError("Filter comparison mislabels the actual controlling detector")
+    if actual is not None and (analysis.get("actual_detector_version") != variants[actual]["detector_version"]
+                               or analysis.get("actual_signal_mode") != variants[actual]["signal_mode"]):
+        raise ValueError("Actual filter version and signal mode do not match its variant")
+    primary = "signed_v1" if analysis["filter_config"]["version"] == 1 else "rectified_v2"
+    selected = variants[primary]
+    if (analysis["filter_config"] != selected["config"] or analysis["filtered_trace"] != selected["trace"]
+            or analysis["filtered_level"] != selected["level"] or analysis["weighted_level"] != selected["weighted_level"]):
+        raise ValueError("Filter comparison primary aliases do not match their exact algorithm")
+    return variants, primary
+
+
+def _filter_trace_columns(primary):
+    other = "rectified_v2" if primary == "signed_v1" else "signed_v1"
+    return {primary: {"xyz": [4, 5, 6], "level": 8, "weighted_level": 9},
+            other: {"xyz": [10, 11, 12], "level": 13, "weighted_level": 14}}
+
+
 def _filter_noise_summary(analysis):
     """Compare noise only on one defined pre-arm stationary reference interval."""
     interval = analysis.get("reference_interval_s")
@@ -506,33 +604,45 @@ def _filter_noise_summary(analysis):
         return {"available": False, "reason": "No validated pre-arm reference interval"}
     if not analysis.get("pre_arm_filter_replay"):
         return {"available": False, "reason": "Filtered pre-arm replay unavailable; zeros are not noise evidence"}
-    start = interval[0] + max(0., analysis.get("pre_arm_warmup_s", 0.))
+    variants, primary = _filter_variants(analysis)
+    other = next(key for key in _FILTER_VARIANTS if key != primary)
+    start = interval[0] + max([0., analysis.get("pre_arm_warmup_s", 0.)] +
+                             [item["pre_arm_warmup_s"] for item in variants.values()])
     end = min(interval[1], analysis["arm_time_s"])
-    rows = [(raw, filtered) for raw, filtered in zip(analysis["raw_trace"], analysis["filtered_trace"])
-            if start <= raw[0] < end]
-    if len(rows) < 16:
+    indices = [index for index, row in enumerate(analysis["raw_trace"]) if start <= row[0] < end]
+    if len(indices) < 16:
         return {"available": False, "reason": "Fewer than 16 uncontaminated reference samples after filter warmup"}
     def percentile(values, fraction):
         values = sorted(values)
         position = (len(values) - 1) * fraction
         lower = int(math.floor(position))
         return values[lower] + (values[min(lower + 1, len(values) - 1)] - values[lower]) * (position - lower)
-    def metrics(series):
+    def metrics(series, levels):
         means = [math.fsum(row[channel] for row in series) / len(series) for channel in (1, 2, 3)]
         centered = [tuple(row[channel + 1] - means[channel] for channel in range(3)) for row in series]
         norms = [math.sqrt(math.fsum(value * value for value in row)) for row in centered]
-        return {"rms_xyz_g": [math.sqrt(math.fsum(row[channel] ** 2 for row in centered) / len(centered))
+        return {"mean_xyz_g": means,
+                "rms_xyz_g": [math.sqrt(math.fsum(row[channel] ** 2 for row in centered) / len(centered))
                               for channel in range(3)],
                 "rms_magnitude_g": math.sqrt(math.fsum(value * value for value in norms) / len(norms)),
-                "p99_magnitude_g": percentile(norms, .99)}
-    raw, filtered = zip(*rows)
-    result = {"available": True, "interval_s": [rows[0][0][0], rows[-1][0][0]],
-              "sample_count": len(rows), "policy": "stationary_pre_arm_after_warmup_separate_means_removed",
-              "raw": metrics(raw), "filtered": metrics(filtered)}
+                "p99_magnitude_g": percentile(norms, .99),
+                "decision_level_g": {"mean": math.fsum(levels) / len(levels),
+                                     "rms": math.sqrt(math.fsum(value * value for value in levels) / len(levels)),
+                                     "p99": percentile(levels, .99)}}
+    raw = [analysis["raw_trace"][index] for index in indices]
+    variant_metrics = {key: metrics([item["trace"][index] for index in indices],
+                                    [item["weighted_level"][index] for index in indices])
+                       for key, item in variants.items()}
+    result = {"available": True, "interval_s": [raw[0][0], raw[-1][0]],
+              "sample_count": len(indices), "policy": "stationary_pre_arm_after_warmup_separate_means_removed",
+              "decision_level_policy": "weighted_level_without_mean_removal_includes_rectification_bias",
+              "raw": metrics(raw, [analysis["raw_level"][index] for index in indices]),
+              "filtered": variant_metrics[primary], "variants": variant_metrics}
     # Preserve a bounded contiguous tail, never an extrema envelope, for a PSD.
-    spectrum = rows[-4096:]
-    differences = [second[0][0] - first[0][0] for first, second in zip(spectrum, spectrum[1:])]
-    duration = spectrum[-1][0][0] - spectrum[0][0][0]
+    spectrum_indices = indices[-4096:]
+    spectrum = raw[-4096:]
+    differences = [second[0] - first[0] for first, second in zip(spectrum, spectrum[1:])]
+    duration = spectrum[-1][0] - spectrum[0][0]
     period = statistics.median(differences)
     if len(spectrum) < 256 or duration < .05:
         result["spectrum"] = {"available": False, "reason": "Need 256 contiguous samples spanning at least 50 ms"}
@@ -541,12 +651,16 @@ def _filter_noise_summary(analysis):
     else:
         result["spectrum"] = {"available": True, "sample_rate_hz": 1. / period,
                               "duration_s": duration, "sample_count": len(spectrum),
-                              "raw_xyz_g": [list(row[0][1:]) for row in spectrum],
-                              "filtered_xyz_g": [list(row[1][1:]) for row in spectrum]}
+                              "raw_xyz_g": [list(row[1:]) for row in spectrum],
+                              "filtered_xyz_g": [list(variants[primary]["trace"][index][1:]) for index in spectrum_indices],
+                              "comparison_xyz_g": [list(variants[other]["trace"][index][1:]) for index in spectrum_indices],
+                              "variant_series": {primary: "filtered_xyz_g", other: "comparison_xyz_g"}}
     return result
 
 
 def _filter_display_rows(analysis):
+    variants, primary = _filter_variants(analysis)
+    other = next(key for key in _FILTER_VARIANTS if key != primary)
     raw, filtered = analysis["raw_trace"], analysis["filtered_trace"]
     if len(raw) != len(filtered) or any(first[0] != second[0] for first, second in zip(raw, filtered)):
         raise ValueError("Filter comparison must use identical ordered sample identities")
@@ -554,22 +668,24 @@ def _filter_display_rows(analysis):
     if any(len(values) != len(raw) for values in levels):
         raise ValueError("Filter comparison levels do not match the paired trace")
     rows = [tuple(first) + tuple(second[1:]) + tuple(values[index] for values in levels)
+            + tuple(variants[other]["trace"][index][1:])
+            + (variants[other]["level"][index], variants[other]["weighted_level"][index])
             for index, (first, second) in enumerate(zip(raw, filtered))]
-    if any(len(row) != 10 or not all(_finite(value) for value in row) for row in rows):
+    if any(len(row) != 15 or not all(_finite(value) for value in row) for row in rows):
         raise ValueError("Invalid filter comparison display data")
     if len(rows) <= _MAX_CAPTURE_TRACE_POINTS:
         return rows
     # Joint extrema selection keeps raw and filtered curves on the same times.
     # Every metric/statistic/decision was already computed at full resolution.
-    stride = max(1, int(math.ceil(len(rows) / 180.)))
+    stride = max(1, int(math.ceil(len(rows) / 128.)))
     selected = set()
     for offset in range(0, len(rows), stride):
         indices = range(offset, min(offset + stride, len(rows)))
         selected.update((offset, min(offset + stride, len(rows)) - 1))
-        for channel in range(1, 10):
+        for channel in range(1, 15):
             selected.add(min(indices, key=lambda index: rows[index][channel]))
             selected.add(max(indices, key=lambda index: rows[index][channel]))
-    for decision in (analysis.get("raw_decision"), analysis.get("filtered_decision")):
+    for decision in [analysis.get("raw_decision")] + [item.get("decision") for item in variants.values()]:
         for key in ("onset_time_s", "crossing_time_s", "confirmation_time_s"):
             when = (decision or {}).get(key)
             if _finite(when):
@@ -595,11 +711,21 @@ def prepare_filter_capture(run_id, axis, capture, record, raw_threshold_g,
     analysis = compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filter_config=filter_config)
     if analysis.get("response_censoring") != captured.get("response_censoring"):
         raise ValueError("Filter replay does not match the validated response prefix")
+    if record.get("detector_type") == "filtered":
+        actual_config = _filter_identity(record.get("detector_version"), record.get("detector_config"), record)
+        actual_item = (analysis.get("variants") or {}).get(analysis.get("actual_variant"))
+        if not isinstance(actual_item, dict) or actual_config != actual_item.get("config"):
+            raise ValueError("Filter comparison actual version does not match its captured record")
     noise = _filter_noise_summary(analysis)
     rows = _filter_display_rows(analysis)
     metadata = {key: value for key, value in analysis.items()
-                if key not in ("raw_trace", "filtered_trace", "raw_level", "filtered_level", "weighted_level")}
-    metadata.update(sample_count=len(analysis["raw_trace"]), trace=rows, noise=noise)
+                if key not in ("raw_trace", "filtered_trace", "raw_level", "filtered_level", "weighted_level", "variants")}
+    variants, primary = _filter_variants(analysis)
+    metadata.update(sample_count=len(analysis["raw_trace"]), trace=rows, noise=noise,
+                    trace_columns=_filter_trace_columns(primary),
+                    variants={key: {name: value for name, value in item.items()
+                                    if name not in ("trace", "level", "weighted_level")}
+                              for key, item in variants.items()})
     payload = {"kind": "filter", "run_id": run_id, "axis": axis, "record": record,
                "analysis": metadata, "simulated": bool(simulated), "experimental": True}
     encoded = _json(payload)
@@ -738,6 +864,8 @@ def _accuracy_report(run_id, axis, item, simulated):
     trials = item["trials"]
     context = {key: trials[0].get(key) for key in _ACCURACY_CONTEXT_KEYS}
     context["detector_type"] = context["detector_type"] or "raw"
+    config = (_filter_identity(context["detector_version"], context["detector_config"], context)
+              if context["detector_type"] == "filtered" else None)
     for trial in trials[1:]:
         other = {key: trial.get(key) for key in _ACCURACY_CONTEXT_KEYS}
         other["detector_type"] = other["detector_type"] or "raw"
@@ -754,7 +882,8 @@ def _accuracy_report(run_id, axis, item, simulated):
                     "cause", "first_invalid_sample", "first_invalid_sample_index", "first_invalid_time_s",
                     "original_sample_count", "valid_prefix_sample_count", "censored_sample_count",
                     "confirmation_sample", "confirmation_sample_index", "confirmation_time_s", "observed_valid_prefix_peak_g")}})
-    report = {"version": 2 if censored_responses else 1, "kind": "completed_accuracy", "run_id": run_id, "axis": axis,
+    report = {"version": 3 if config and config["version"] == 2 else 2 if censored_responses else 1,
+              "kind": "completed_accuracy", "run_id": run_id, "axis": axis,
               "result": "complete", "measurement": "commanded_homing_travel",
               "physical_position_verified": False, "simulated": bool(simulated),
               "requested": item["requested_samples"], "count": len(trials),
@@ -778,7 +907,7 @@ def _validate_accuracy_report(report):
     _baseline_identity(report.get("run_id"), report.get("axis"))
     count, requested = report.get("count"), report.get("requested")
     context, travels = report.get("context"), report.get("travels_mm")
-    if (type(report.get("version")) is not int or report["version"] not in (1, 2)
+    if (type(report.get("version")) is not int or report["version"] not in (1, 2, 3)
             or report.get("kind") != "completed_accuracy"
             or report.get("result") != "complete" or report.get("measurement") != "commanded_homing_travel"
             or report.get("physical_position_verified") is not False or type(report.get("simulated")) is not bool
@@ -789,6 +918,12 @@ def _validate_accuracy_report(report):
             or not isinstance(travels, list) or len(travels) != count
             or any(not _finite(value) or value <= 0 for value in travels)):
         raise ValueError("Incomplete or invalid completed accuracy receipt")
+    config = (_filter_identity(context["detector_version"], context["detector_config"], context)
+              if context["detector_type"] == "filtered" else None)
+    if config is not None:
+        _filter_identity(context["detector_version"], config, report)
+    if (report["version"] == 3) != bool(config and config["version"] == 2):
+        raise ValueError("Rectified FILTERED v2 requires accuracy receipt version 3; historical identities stay unchanged")
     _validate_accuracy_censoring(report, context, count)
     computed = _accuracy_statistics([{"travel_mm": value} for value in travels])
     supplied = report.get("statistics")
@@ -811,17 +946,13 @@ def _validate_accuracy_censoring(report, context, count):
     if (type(censored_count) is not int or not 0 <= censored_count <= count
             or not isinstance(responses, list) or len(responses) != censored_count
             or (censored_count and context["detector_type"] != "filtered")
-            or (report["version"] == 2) != bool(censored_count)):
+            or (report["version"] == 2 and not censored_count)
+            or (report["version"] == 1 and censored_count)):
         raise ValueError("Invalid accuracy censored-response count")
     if censored_count:
-        try:
-            from .accel_homing_filters import DETECTOR_VERSION, detector_config
-        except ImportError:
-            from accel_homing_filters import DETECTOR_VERSION, detector_config
         config, sensor = context["detector_config"], context["sensor_context"]
         if (context["impact_metric"] != "xyz_magnitude"
-                or type(context["detector_version"]) is not int or context["detector_version"] != DETECTOR_VERSION
-                or not isinstance(config, dict) or detector_config(config) != config
+                or _filter_identity(context["detector_version"], config, context) != config
                 or not isinstance(sensor, dict) or sensor.get("backend") != "beacon_raw"):
             raise ValueError("Censored accuracy receipt requires its frozen native FILTERED context")
     expected_keys = {"trial_index", "impact_peak_g", "raw_samples_validated", "decision_prefix_validated",
@@ -1230,6 +1361,8 @@ def _check_accuracy_record(record, run_id, axis, phase, index, attempts, measure
     if measured:
         travel = _measured_travel(record)
         censored = _censored_peak_record(record)
+        if record.get("detector_type") == "filtered":
+            _filter_identity(record.get("detector_version"), record.get("detector_config"), record)
         if record.get("result") != "impact" or record.get("capture_valid") is False \
                 or not _finite(record.get("travel_mm")) or record["travel_mm"] <= 0 \
                 or not _finite(travel) or travel <= 0 \
@@ -1619,8 +1752,8 @@ def _plot_capture(figure, payload):
                             captured["sample_count"], _number(_measured_travel(record), 6),
                             _number(elapsed, 4), _number(record.get("onset_g"))),
                          peak_line] + _response_censoring_lines(censoring, captured["first_sample_time_s"]) +
-                         (["FILTERED control threshold %s g applies to causal weighted level; raw response shown here" %
-                           _number(record.get("threshold_g"), 5)] if filtered_control else []))
+                         (["%s threshold %s g applies to causal weighted level; signed raw response shown here" % (
+                           _algorithm_label(record), _number(record.get("threshold_g"), 5))] if filtered_control else []))
     axis.legend(loc="best", fontsize=8)
     _finish_layout(figure, "Stationary baseline removed. Commanded travel is not physical stop accuracy.")
 
@@ -1631,20 +1764,25 @@ def _plot_filter(figure, payload):
     analysis, record = payload["analysis"], payload["record"]
     censoring = analysis.get("response_censoring")
     actual = str(analysis["actual_detector"]).upper()
-    title = "DEVELOPMENT / EXPERIMENTAL - Filter comparison %s\nActual control: %s | Other detector: shadow replay" % (
-        payload["axis"].upper(), actual)
+    variants, columns = analysis["variants"], analysis["trace_columns"]
+    names = {"signed_v1": "v1 signed", "rectified_v2": "v2 rectified envelope"}
+    colors = {"signed_v1": "#5b42a4", "rectified_v2": "#21846c"}
+    actual_label = actual + (" " + names[analysis["actual_variant"]] if actual == "FILTERED" else "")
+    def role(key):
+        return "actual detector replay" if variants[key]["threshold_source"] == "actual_active_detector" else "diagnostic / uncalibrated"
+    title = "DEVELOPMENT / EXPERIMENTAL - Same-capture filter comparison %s\nActual control: %s | Nonactive filters: diagnostic shadow replay" % (
+        payload["axis"].upper(), actual_label)
     if censoring:
         title += "\nSATURATED / RESPONSE TRUNCATED / FULL PEAK UNAVAILABLE"
     _title(figure, payload, title)
-    grid = figure.add_gridspec(7, 2, height_ratios=(1.1, .85, .85, .85, 1.45, 1.55, 1.55 if censoring else 1.15))
+    grid = figure.add_gridspec(7, 2, height_ratios=(1.1, .85, .85, .85, 1.55, 1.55, 2.2 if censoring else 1.85))
     overview = figure.add_subplot(grid[0, :])
     xyz_axes = [figure.add_subplot(grid[number, :]) for number in (1, 2, 3)]
     level_axis = figure.add_subplot(grid[4, :])
     noise_axis, spectrum_axis = figure.add_subplot(grid[5, 0]), figure.add_subplot(grid[5, 1])
     notes = figure.add_subplot(grid[6, :])
     trace, arm = analysis["trace"], analysis["arm_time_s"]
-    raw_decision, filtered_decision = analysis["raw_decision"], analysis["filtered_decision"]
-    candidate = analysis.get("filtered_candidate") or filtered_decision
+    raw_decision = analysis["raw_decision"]
     origin = raw_decision.get("crossing_time_s", analysis.get("actual_crossing_time_s"))
     origin = origin if _finite(origin) else arm
     milliseconds = [(row[0] - origin) * 1000. for row in trace]
@@ -1663,7 +1801,7 @@ def _plot_filter(figure, payload):
     def stop_region(axis, relative_origin, factor):
         if _finite(cutoff) and trace[-1][0] > cutoff:
             axis.axvspan((cutoff - relative_origin) * factor, (trace[-1][0] - relative_origin) * factor,
-                         color="#9da3aa", alpha=.15, label="After replay cutoff: response only")
+                         color="#9da3aa", alpha=.15, label="After displayed cutoff: captured response")
         _mark_response_censoring(axis, censoring, relative_origin, factor)
         if interval:
             axis.axvspan((interval[0] - relative_origin) * factor, (interval[1] - relative_origin) * factor,
@@ -1671,7 +1809,9 @@ def _plot_filter(figure, payload):
     _axes_style(overview, "Magnitude (g)")
     overview.set_xlabel("Time from actual detector arm (s)")
     overview.plot(elapsed, [row[7] for row in trace], color="#b45e18", linewidth=.8, label="Raw XYZ magnitude")
-    overview.plot(elapsed, [row[9] for row in trace], color="#5b42a4", linewidth=.9, label="Filtered weighted decision level")
+    for key in _FILTER_VARIANTS:
+        overview.plot(elapsed, [row[columns[key]["weighted_level"]] for row in trace], color=colors[key], linewidth=.9,
+                      label="%s weighted (%s)" % (names[key], role(key)))
     overview.axvline(0, color="#45575e", linestyle=":", linewidth=.9, label="Arm")
     stop_region(overview, arm, 1.)
     _axes_summary(overview, ["Same %d valid input samples | %s context | Run %s" %
@@ -1681,28 +1821,32 @@ def _plot_filter(figure, payload):
         _axes_style(axis, "%s acceleration (g)" % letter)
         axis.plot(milliseconds, [row[channel] for row in trace], color=color, linewidth=.65,
                   alpha=.6, label="Raw %s" % letter)
-        axis.plot(milliseconds, [row[channel + 3] for row in trace], color=color, linewidth=1.25,
-                  linestyle="--", label="Causal filtered %s" % letter)
+        for key, style in (("signed_v1", "--"), ("rectified_v2", "-.")):
+            axis.plot(milliseconds, [row[columns[key]["xyz"][channel - 1]] for row in trace],
+                      color=colors[key], linewidth=1.05, linestyle=style, label="%s %s" % (names[key], letter))
         stop_region(axis, origin, 1000.)
         axis.set_xlim(*event_limits)
         axis.set_xlabel("Time from raw crossing / actual event reference (ms)")
         axis.legend(loc="upper left", ncol=4, fontsize=7)
-    _axes_summary(xyz_axes[0], ["Event detail: matched input times; offsets removed using each detector's frozen reference"])
+    _axes_summary(xyz_axes[0], ["Same signed XYZ input / frozen reference; v1 filters signed axes, v2 filters abs(centered axes)"])
     _axes_style(level_axis, "Detector level (g)")
-    for channel, label, color, style in ((7, "Raw XYZ magnitude", "#b45e18", "-"),
-                                          (8, "Filtered unweighted XYZ magnitude", "#298f94", "-"),
-                                          (9, "Filtered weighted decision level", "#5b42a4", "-")):
-        level_axis.plot(milliseconds, [row[channel] for row in trace], color=color, linewidth=.95,
-                        linestyle=style, label=label)
+    level_axis.plot(milliseconds, [row[7] for row in trace], color="#b45e18", linewidth=.85, label="Raw XYZ magnitude")
+    for key in _FILTER_VARIANTS:
+        for metric, style, label in (("level", ":", "norm"), ("weighted_level", "-", "weighted decision")):
+            level_axis.plot(milliseconds, [row[columns[key][metric]] for row in trace], color=colors[key],
+                            linewidth=1. if metric == "weighted_level" else .7,
+                            linestyle=style, label="%s %s" % (names[key], label))
     for key, label, color in (("raw_threshold_g", "Raw threshold", "#b45e18"),
-                               ("filtered_threshold_g", "Filtered threshold", "#5b42a4")):
+                               ("filtered_threshold_g", "Both filters: same numeric threshold", "#5b42a4")):
         level_axis.axhline(analysis[key], color=color, linestyle="--", linewidth=.9,
                           label="%s %s g" % (label, _number(analysis[key], 4)))
-    markers = [(raw_decision.get("crossing_time_s"), "Raw crossing", "#b45e18", ":"),
-               (candidate.get("onset_time_s"), "Filtered estimated onset", "#21846e", ":"),
-               (candidate.get("crossing_time_s"), "Filtered candidate", "#8e43ad", "--")]
-    if filtered_decision.get("decision_observed"):
-        markers.append((filtered_decision.get("confirmation_time_s"), "Filtered confirmed", "#4b287e", "-"))
+    markers = [(raw_decision.get("crossing_time_s"), "Raw crossing", "#b45e18", ":")]
+    for key in _FILTER_VARIANTS:
+        decision = variants[key]["decision"]
+        markers.extend((decision.get(field), "_nolegend_", colors[key], style)
+                       for field, style in (("onset_time_s", ":"), ("crossing_time_s", "--")))
+        if decision.get("decision_observed"):
+            markers.append((decision["confirmation_time_s"], names[key] + " confirmed", colors[key], "-"))
     for when, label, color, style in markers:
         if _finite(when):
             level_axis.axvline((when - origin) * 1000., color=color, linestyle=style,
@@ -1711,21 +1855,26 @@ def _plot_filter(figure, payload):
     level_axis.set_xlim(*event_limits)
     level_axis.set_xlabel("Time from raw crossing / actual event reference (ms)")
     level_axis.legend(loc="upper left", ncol=3, fontsize=7)
-    if raw_decision.get("decision_observed") and filtered_decision.get("decision_observed"):
-        delay_ms = (filtered_decision["confirmation_time_s"] - raw_decision["crossing_time_s"]) * 1000.
-        timing = "Paired replay confirmation minus raw crossing: %+.4g ms (algorithm time; not mechanical latency)" % delay_ms
-    else:
-        timing = "Filtered decision censored at %s; no valid extra-delay estimate" % cutoff_reason if filtered_decision.get("censored") else \
-                 "Raw decision censored; no paired extra-delay estimate"
-    _axes_summary(level_axis, [timing, "Replay cutoff: %s at %s ms from event reference" % (
+    timings = []
+    for key in _FILTER_VARIANTS:
+        decision = variants[key]["decision"]
+        if raw_decision.get("decision_observed") and decision.get("decision_observed"):
+            timings.append("%s confirmation minus raw crossing: %+.4g ms" % (
+                names[key], (decision["confirmation_time_s"] - raw_decision["crossing_time_s"]) * 1000.))
+        else:
+            timings.append("%s: %s; paired delay unavailable" % (
+                names[key], "CENSORED / no confirmation before cutoff" if not decision.get("decision_observed")
+                else "raw crossing censored"))
+    _axes_summary(level_axis, timings + ["Algorithm time only. Displayed cutoff: %s at %s ms from event reference" % (
         cutoff_reason, _number((cutoff - origin) * 1000. if _finite(cutoff) else None, 6))])
     noise = analysis["noise"]
     if noise.get("available"):
         labels, keys = ("X RMS", "Y RMS", "Z RMS", "XYZ RMS", "XYZ P99"), range(5)
-        raw_values = noise["raw"]["rms_xyz_g"] + [noise["raw"]["rms_magnitude_g"], noise["raw"]["p99_magnitude_g"]]
-        filtered_values = noise["filtered"]["rms_xyz_g"] + [noise["filtered"]["rms_magnitude_g"], noise["filtered"]["p99_magnitude_g"]]
-        noise_axis.bar([index - .18 for index in keys], raw_values, .36, color="#c27b3f", label="Raw")
-        noise_axis.bar([index + .18 for index in keys], filtered_values, .36, color="#7662ac", label="Causal filtered replay")
+        sources = [("Raw", noise["raw"], "#c27b3f")] + [
+            (names[key], noise["variants"][key], colors[key]) for key in _FILTER_VARIANTS]
+        for offset, (label, source, color) in zip((-.24, 0., .24), sources):
+            values = source["rms_xyz_g"] + [source["rms_magnitude_g"], source["p99_magnitude_g"]]
+            noise_axis.bar([index + offset for index in keys], values, .24, color=color, label=label)
         noise_axis.set_xticks(list(keys))
         noise_axis.set_xticklabels(labels, fontsize=8)
         noise_axis.set_ylabel("Acceleration (g)")
@@ -1733,8 +1882,8 @@ def _plot_filter(figure, payload):
         noise_axis.legend(fontsize=7)
         first, last = noise["interval_s"]
         _axes_summary(noise_axis, ["Pre-arm stationary reference: %+.5g to %+.5g s from arm" % (first - arm, last - arm),
-                                   "%d samples; warmup excluded; each mean removed" % noise["sample_count"],
-                                   "Noise attenuation does not establish contact accuracy"])
+                                   "%d samples; warmup excluded; each XYZ mean removed" % noise["sample_count"],
+                                   "Rectification DC is reported in the decision-level metrics below"])
     else:
         noise_axis.axis("off")
         noise_axis.text(.02, .85, "Noise comparison unavailable\n" + noise["reason"], va="top", fontsize=9,
@@ -1746,9 +1895,10 @@ def _plot_filter(figure, payload):
         count, sample_rate = spectrum["sample_count"], spectrum["sample_rate_hz"]
         window = np.hanning(count)
         frequencies = np.fft.rfftfreq(count, 1. / sample_rate)
-        for key, label, color in (("raw_xyz_g", "Raw", "#b45e18"),
-                                  ("filtered_xyz_g", "Causal filtered", "#5b42a4")):
-            values = np.asarray(spectrum[key], dtype=float)
+        sources = [("raw_xyz_g", "Raw signed XYZ", "#b45e18")] + [
+            (spectrum["variant_series"][key], names[key], colors[key]) for key in _FILTER_VARIANTS]
+        for series, label, color in sources:
+            values = np.asarray(spectrum[series], dtype=float)
             transformed = np.fft.rfft((values - values.mean(axis=0)) * window[:, None], axis=0)
             power = (np.abs(transformed) ** 2).sum(axis=1) / (sample_rate * (window ** 2).sum())
             power[1:-1 if count % 2 == 0 else None] *= 2.
@@ -1761,34 +1911,46 @@ def _plot_filter(figure, payload):
         spectrum_axis.legend(fontsize=7)
         _axes_summary(spectrum_axis, ["Contiguous reference only; Hann periodogram",
                                       "%d samples | %.3g Hz bin width | %.4g s" %
-                                      (count, sample_rate / count, spectrum["duration_s"])])
+                                      (count, sample_rate / count, spectrum["duration_s"]),
+                                      "abs() is nonlinear: spectral peaks may move or double"])
     else:
         spectrum_axis.axis("off")
         spectrum_axis.text(.02, .85, "Spectrum unavailable\n" + spectrum["reason"], va="top", fontsize=9,
                            transform=spectrum_axis.transAxes, wrap=True)
     notes.axis("off")
-    filtered_status = "observed before cutoff" if filtered_decision.get("decision_observed") else "CENSORED: observation ended at %s" % cutoff_reason
     actual_time = analysis.get("actual_confirmation_time_s")
-    evidence_name = "shadow filtered decision" if actual != "FILTERED" else "filtered control replay"
-    lines = ["DECISION EVIDENCE: actual control %s; %s %s." % (actual, evidence_name, filtered_status),
-             "Actual confirmation: %s ms from arm; stop request is a host interval, not measured mechanical stopping." %
-             _number((actual_time - arm) * 1000. if _finite(actual_time) else None, 6),
-             "ACTUAL RUN: 1 accepted home; commanded travel %s mm. Spread / standard deviation unavailable for one home." %
-             _number(_measured_travel(record), 7),
-             "A/B repeatability baseline unavailable here. Use independent ACCURACY RAW and FILTERED runs with BASELINE=<run_id>.",
-             "Filtered onset is an estimate. Response amplitude, lower RMS, and censored shadow outcomes do not establish correct contact.",
-             "Filter v%s | tau %s ms | confirmation min/max %s / %s ms | frozen XYZ weights %s" % (
-                 analysis["filter_config"].get("version"), _number(analysis["filter_config"].get("lowpass_tau_s", 0.) * 1000.),
+    lines = ["ACTUAL CONTROL: %s; confirmation %s ms from arm. Nonactive filters are diagnostic shadow replays." % (
+                actual_label, _number((actual_time - arm) * 1000. if _finite(actual_time) else None, 6))]
+    for key in _FILTER_VARIANTS:
+        decision = variants[key]["decision"]
+        observed = decision.get("decision_observed")
+        times = [_number((decision[field] - arm) * 1000. if _finite(decision.get(field)) else None, 5)
+                 for field in ("onset_time_s", "crossing_time_s", "confirmation_time_s")]
+        lines.append("%s [%s]: estimated onset / candidate / confirmation %s / %s / %s ms; %s." % (
+            names[key], role(key), *times, "observed before cutoff" if observed else "CENSORED: no confirmation before " + cutoff_reason))
+    lines.append("Same numeric filtered threshold %s g; the alternative signal metric has no independent calibration in this capture." %
+                 _number(analysis["filtered_threshold_g"], 5))
+    if noise.get("available"):
+        for label, source in [("Raw", noise["raw"])] + [(names[key], noise["variants"][key]) for key in _FILTER_VARIANTS]:
+            metrics = source["decision_level_g"]
+            lines.append("Pre-arm %s decision level mean / RMS / P99: %s / %s / %s g (no mean removal; includes DC)." % (
+                label, _number(metrics["mean"], 5), _number(metrics["rms"], 5), _number(metrics["p99"], 5)))
+    lines += ["Shared tau %s ms | confirmation min/max %s / %s ms | frozen XYZ weights %s" % (
+                 _number(analysis["filter_config"].get("lowpass_tau_s", 0.) * 1000.),
                  _number(analysis["filter_config"].get("confirmation_min_s", 0.) * 1000.),
                  _number(analysis["filter_config"].get("confirmation_max_s", 0.) * 1000.),
-                 " / ".join(_number(value) for value in analysis["reference"]["weights_xyz"]))]
+                 " / ".join(_number(value) for value in analysis["reference"]["weights_xyz"])),
+              "1 actual home; commanded travel %s mm. Repeatability needs independent ACCURACY runs with BASELINE=<run_id>." %
+              _number(_measured_travel(record), 7),
+              "Algorithm timing, lower noise, rectified amplitude and censored outcomes do not establish physical contact accuracy."]
     lines += _response_censoring_lines(censoring, arm)
     if censoring:
         lines.append("Saturation follows qualified confirmation in sample order; it need not follow the host stop request.")
-    notes.text(.01, .98, "\n".join(lines), va="top", fontsize=8.2 if censoring else 8.5,
-               linespacing=1.4 if censoring else 1.55, transform=notes.transAxes)
+    wrapped = [part for line in lines for part in textwrap.wrap(line, 150)]
+    notes.text(.01, .98, "\n".join(wrapped), va="top", fontsize=8., linespacing=1.35, transform=notes.transAxes)
     _finish_layout(figure, "Development / experimental. Causal replay uses validated input only; it cannot establish physical improvement. "
-                   "Full-sample metrics precede joint display reduction. Gray response region is excluded from shadow decisions.")
+                   "Original acquisition times govern decision eligibility; the displayed cutoff may be interpolated. "
+                   "Full-sample metrics precede joint display reduction. Gray marks response after the displayed cutoff.")
 
 
 def _plot_beta(figure, payload):
@@ -1906,7 +2068,7 @@ def _plot_accuracy(figure, payload):
                     _number(stats["stddev_mm"]), _number(stats.get("variance_mm2")))]
     if report:
         summary.append("Actual %s | threshold %s g | Run ID: %s" % (
-            report["context"]["detector_type"].upper(), _number(report["threshold_g"], 5), report["run_id"]))
+            _algorithm_label(report["context"]), _number(report["threshold_g"], 5), report["run_id"]))
     summary.append("Censored responses: %d / %d | Commanded-travel repeatability remains measurable" % (
         censored_count, len(trials)))
     if censored_count:
@@ -1923,11 +2085,11 @@ def _plot_accuracy(figure, payload):
     travel.ticklabel_format(axis="y", style="plain", useOffset=False)
     if trials:
         travel.plot(range(1, len(trials) + 1), [_measured_travel(row) for row in trials], "o-",
-                    color="#1769aa", markersize=4, label="Current %s" % (report["context"]["detector_type"].upper() if report else "run"))
+                    color="#1769aa", markersize=4, label="Current %s" % (_algorithm_label(report["context"]) if report else "run"))
         if baseline:
             travel.plot(range(1, baseline["count"] + 1), baseline["travels_mm"], "s--",
                         color="#b45e18", markersize=4, linewidth=.8,
-                        label="Baseline %s" % baseline["context"]["detector_type"].upper())
+                        label="Baseline %s" % _algorithm_label(baseline["context"]))
             travel.set_xlabel("Independent accepted-home index (unpaired runs)")
             travel.legend(fontsize=8)
         travel.set_xlim(.5, max(1.5, len(trials) + .5, baseline["count"] + .5 if baseline else 0.))
@@ -1955,9 +2117,9 @@ def _plot_accuracy(figure, payload):
                              (comparison["spread_change_mm"], comparison["stddev_change_mm"])])
         context_axis.axis("off")
         context_lines = ["BASELINE: %s | %s | threshold %s g | N=%d" % (
-            baseline["run_id"], baseline["context"]["detector_type"].upper(), _number(baseline["threshold_g"], 5), baseline["count"]),
+            baseline["run_id"], _algorithm_label(baseline["context"]), _number(baseline["threshold_g"], 5), baseline["count"]),
             "CURRENT: %s | %s | threshold %s g | N=%d" % (
-            report["run_id"], report["context"]["detector_type"].upper(), _number(report["threshold_g"], 5), report["count"]),
+            report["run_id"], _algorithm_label(report["context"]), _number(report["threshold_g"], 5), report["count"]),
             "Censored responses: baseline %s; current %d. Full response peaks are unavailable for censored homes." % (
                 str(baseline["censored_response_count"]) if "censored_response_count" in baseline else "unknown (legacy receipt)",
                 censored_count),

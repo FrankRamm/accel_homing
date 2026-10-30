@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from accel_homing_filters import (validate_filtered_capture_prefix, validate_censored_peak_record,
-                                  compare_filter_capture)
+                                  compare_filter_capture, detector_config)
 from harness import FakeEndstop, acquire_reference, batch, counts, make_homing
 from test_session import FakeRail, info
 from test_filter_engine import FilteredRig
@@ -17,7 +17,7 @@ from test_filter_engine import FilteredRig
 def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_size=8,
                             split=None, clock_shift=0., axes_map=((0, 1), (1, 1), (2, 1)),
                             time_offset=0., arm_straddle=0, clock_hz=1000., sample_period=.001,
-                            post_clip_g=3.):
+                            post_clip_g=3., filter_config=None):
     """Exercise real prepare/filter/capture callbacks, with no real hardware."""
     obj = make_homing(threshold=1., axes_map=axes_map)
     obj.reactor.now = time_offset
@@ -32,7 +32,8 @@ def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_
     rail = FakeRail(endstop, info(speed=100., retract=0., second=100.))
     obj.session_axes = obj.rails_by_axis = {axis: rail}
     obj.workflows.session = {"mode": "calibration", "state": "running", "axis": axis,
-                             "algorithm": "impact20_vector_v2", "detector_types": {axis: "filtered"}}
+                             "algorithm": "impact20_vector_v2", "detector_types": {axis: "filtered"},
+                             "detector_configs": {axis: detector_config(filter_config)}}
     obj.workflows.in_home, obj.workflows.home_axis = True, axis
     obj.start_capture()
     obj._start_stream()
@@ -211,7 +212,8 @@ class CensoredWorkflowRig(FilteredRig):
         source = existing.get("_record")
         if source is None:
             return existing
-        captured, native_record = native_filtered_capture(axis=source["axis"], time_offset=self.capture_stops * 10.)
+        captured, native_record = native_filtered_capture(axis=source["axis"], time_offset=self.capture_stops * 10.,
+                                                         filter_config=source.get("detector_config"))
         protected = {key: source[key] for key in ("start_position_mm", "expected_travel_mm") if key in source}
         source.update(native_record)
         source.update(protected)

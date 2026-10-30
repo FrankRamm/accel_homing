@@ -26,10 +26,10 @@ import mcu
 
 try:
     from .accel_homing_filters import (CausalImpactDetector, detector_config,
-                                       robust_reference, DETECTOR_VERSION)
+                                       robust_reference, signal_mode)
 except ImportError:
     from accel_homing_filters import (CausalImpactDetector, detector_config,
-                                      robust_reference, DETECTOR_VERSION)
+                                      robust_reference, signal_mode)
 
 try:
     from .accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
@@ -3208,7 +3208,8 @@ class BeaconAccelHoming:
                         "capture_admission_epoch": attempt.capture_epoch,
                         "backend": "beacon_raw" if self.backend is None else self.backend.kind,
                         "detector_type": attempt.detector_type,
-                        "detector_version": DETECTOR_VERSION if attempt.filter_engine is not None else None,
+                        "detector_version": attempt.filter_engine.config["version"] if attempt.filter_engine is not None else None,
+                        "signal_mode": signal_mode(attempt.filter_engine.config) if attempt.filter_engine is not None else None,
                         "detector_config": None if attempt.filter_engine is None else dict(attempt.filter_engine.config),
                         "sample_period_s": attempt.sample_dt,
                         "reference_interval_s": None,
@@ -3503,7 +3504,8 @@ class BeaconAccelHoming:
             "detector_type": attempt.detector_type,
             "decision_metric": "causal_weighted_xyz" if attempt.filter_engine is not None else
                                "xyz_magnitude" if attempt.vector_mode else "selected_axis",
-            "detector_version": DETECTOR_VERSION if attempt.filter_engine is not None else None,
+            "detector_version": attempt.filter_engine.config["version"] if attempt.filter_engine is not None else None,
+            "signal_mode": signal_mode(attempt.filter_engine.config) if attempt.filter_engine is not None else None,
             "detector_config": None if attempt.filter_engine is None else dict(attempt.filter_engine.config),
             "crossing_time_s": attempt.crossing_time,
             "confirmation_time_s": attempt.confirmation_time,

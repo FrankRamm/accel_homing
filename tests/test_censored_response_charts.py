@@ -22,13 +22,14 @@ def private_native_keys(value):
     return []
 
 
-def synthetic_native_accuracy_axis(run_id, travels=(175., 175.2, 174.9, 175.1), censored_indices=(1, 3)):
+def synthetic_native_accuracy_axis(run_id, travels=(175., 175.2, 174.9, 175.1), censored_indices=(1, 3), filter_version=None):
     """Real software callbacks, generated native samples and commanded travels."""
     item = {"requested_samples": len(travels), "complete": True, "discovery": None,
             "trials": [], "statistics": None, "capture_paths": [],
             "discovery_capture_paths": None, "rejected": None}
     for index, travel in enumerate((174.8,) + tuple(travels)):
-        capture, record = native_filtered_capture(clip_position=4 if index in censored_indices else None)
+        capture, record = native_filtered_capture(clip_position=4 if index in censored_indices else None,
+            filter_config=None if filter_version is None else filters.detector_config({"version": filter_version}))
         record.update(run_id=run_id, workflow_attempt=index + 1,
                       workflow_phase="measurement" if index else "discovery", accuracy_sample=index,
                       travel_mm=travel, travel_mm_exact=travel,
@@ -45,7 +46,7 @@ def synthetic_native_accuracy_axis(run_id, travels=(175., 175.2, 174.9, 175.1), 
     return item
 
 
-def synthetic_public_censored_report(count=2):
+def synthetic_public_censored_report(count=2, filter_version=1):
     """Public receipt parser fixture, not retained native capture evidence."""
     travels = [175.0 + index * .001 for index in range(count)]
     response = {"trial_index": 1, "cause": "native_clip_sentinel",
@@ -59,9 +60,9 @@ def synthetic_public_censored_report(count=2):
                 "decision_prefix_validated": True}
     context = {key: None for key in charts._ACCURACY_CONTEXT_KEYS}
     context.update(detector_type="filtered", impact_metric="xyz_magnitude",
-                   detector_version=filters.DETECTOR_VERSION, detector_config=filters.detector_config(),
+                   detector_version=filter_version, detector_config=filters.detector_config({"version": filter_version}),
                    sensor_context={"sensor": "beacon synthetic", "backend": "beacon_raw"})
-    return {"version": 2, "kind": "completed_accuracy", "run_id": "synthetic_censored_receipt",
+    return {"version": 3 if filter_version == 2 else 2, "kind": "completed_accuracy", "run_id": "synthetic_censored_receipt",
             "axis": "x", "result": "complete", "measurement": "commanded_homing_travel",
             "physical_position_verified": False, "simulated": True,
             "requested": count, "count": count, "threshold_g": 1., "context": context,
@@ -295,7 +296,7 @@ class CensoredNativeChartTests(unittest.TestCase):
                                            simulated=True, renderer=renderer)
             report = charts.read_accuracy_baseline(temporary, run_id, "x", simulated=True)
             self.assertEqual(list(Path(temporary).iterdir()), [Path(paths["x_png"])])
-        self.assertEqual(report["version"], 2)
+        self.assertEqual(report["version"], 3)
         self.assertEqual(report["censored_response_count"], 2)
         self.assertEqual([entry["trial_index"] for entry in report["censored_responses"]], [1, 3])
         self.assertTrue(all(entry["impact_peak_g"] is None for entry in report["censored_responses"]))

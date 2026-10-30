@@ -8,10 +8,20 @@ The operator performs every physical home/calibration and checks the result.
 
 ## What changes
 
-`RAW` retains the existing detector and its threshold semantics. `FILTERED`
-uses a causal first-order low-pass filter on signed mapped XYZ, a frozen robust
-stationary median/MAD reference, bounded XYZ noise weights, and a short
-confirmation window with excess-energy and multiple raw-support requirements.
+`RAW` retains the existing detector and its threshold semantics. New
+`FILTERED` calibrations use detector version 2, `signal_mode=rectified`:
+subtract the frozen signed stationary reference from each sensor axis, take
+the absolute value of each centered axis, then apply the causal first-order
+low-pass filter before the weighted XYZ decision norm. Original signed samples
+are retained. Absolute value is applied before filtering, not to a filtered
+signed signal or to the raw sensor reading before gravity/offset removal.
+
+Saved version 1 FILTERED profiles retain their original signed-axis filtering
+until a new FILTERED calibration replaces that profile. Version 1 serialized
+configurations remain unchanged and contain no `signal_mode` field. Both
+versions use a frozen robust stationary median/MAD reference, bounded XYZ
+noise weights, and a short confirmation window with excess-energy and multiple
+raw-support requirements.
 It retains transverse components; it does not project onto one axis or use
 future samples. Moving-noise characterization is observation only and never
 raises the threshold or changes weights after arming.
@@ -55,23 +65,41 @@ Repeat preparation after every successful saving calibration/restart.
    ACCEL_HOMING_CALIBRATE AXIS=X DETECTOR=FILTERED CENTERED=1
    ```
 
-   This measures fresh stationary noise, qualifies the FILTERED candidate,
+   This measures fresh stationary noise, qualifies the rectified-v2 FILTERED candidate,
    saves the selected axis and restarts Klipper by default. Explicit manual
    `threshold`/axis threshold config retains RAW semantics; remove those
    overrides and restart while idle before FILTERED calibration. The command
    refuses that conflict before motion. `SAVE_CONFIG=0` stages only; it does
-   not activate the staged model for ordinary homing.
+   not activate the staged model for ordinary homing. A successful calibration
+   publishes its stationary-noise summary; it does not automatically publish
+   the signed-versus-rectified comparison below.
 
 3. Reprepare and inspect the comparison:
 
    ```gcode
-   ACCEL_HOMING_FILTER_CHARTS AXIS=X CENTERED=1
+   ACCEL_HOMING_FILTER_CHARTS AXIS=X DETECTOR=FILTERED CENTERED=1
    ```
 
-   The saved selected mode controls the real home. Use `DETECTOR=RAW` for an
+   This performs **another real home**, requiring fresh manual preparation and
+   a physically centered toolhead after calibration/restart. The saved
+   FILTERED version controls that home; both filter versions are compared on
+   its same original capture. Use `DETECTOR=RAW` for an
    explicit control using the archived RAW profile, or `DETECTOR=FILTERED` for
-   explicit filtered control. The other detector is replayed on the same
-   input; the replay does not operate a second physical home.
+   explicit filtered control. Nonactive algorithms are diagnostic shadow
+   replays and do not operate another physical home.
+
+   If no compatible saved RAW XYZ profile is available, an explicit RAW
+   comparison threshold is supported. For an operator-chosen 4.25 g example:
+
+   ```gcode
+   ACCEL_HOMING_FILTER_CHARTS AXIS=X DETECTOR=FILTERED RAW_THRESHOLD=4.25 CENTERED=1
+   ```
+
+   This changes only the RAW shadow's numerical comparison threshold; it does
+   not change the controlling FILTERED threshold or convert an old component
+   threshold into a calibrated XYZ threshold. FILTERED calibration preserves
+   an existing RAW model profile, but a config-only default need not have an
+   archived XYZ profile.
 
 4. Reprepare and compare a new FILTERED series to the saved RAW baseline:
 
@@ -95,11 +123,22 @@ The X/Y config does not gain an independent persistent detector switch.
 ## Read the same-trace chart
 
 The **Development / Experimental** chart identifies the actual controlling
-mode, filter version/configuration, run ID and both thresholds in g. It shows
-raw and causal filtered signed XYZ and magnitudes at matched sample times;
-the weighted filtered decision level is separate from the unweighted norm.
+mode, exact filter version/configuration, run ID and thresholds in g. It shows
+the original centered signed XYZ, the prior signed-v1 filtered axes, and the
+new rectified-v2 per-axis envelopes at matched sample times. Rectified envelopes
+are reordered to machine-axis names without reintroducing `axes_map` signs;
+they are not signed acceleration or measured motion direction. Both variants
+use the same capture, frozen reference, noise weights, other filter parameters
+and numerical filtered threshold. The nonactive variant's threshold is a
+diagnostic comparison setting, not an independent calibration for that metric.
+Each weighted decision level is separate from its unweighted norm.
 Candidates, estimated onset, confirmation and the actual host stop-request
-interval are distinct. Estimated onset is not independently measured contact.
+interval are distinct for each version. Confirmation-minus-RAW-crossing values
+are algorithm-time comparisons only and remain unavailable for censored
+decisions. Estimated onset is not independently measured contact.
+Original acquisition timestamps determine decision eligibility. Retimed plot
+positions, including display-only interpolation within a packet gap, do not
+change which confirmations were observed before the real cutoff.
 
 Only samples strictly before the conservative lower bound of the actual
 stop-request interval can validate a replay decision. If native saturation
@@ -113,11 +152,16 @@ curve. Neither region proves contact or mechanical stopping.
 
 Noise RMS and robust P99 use the same validated stationary pre-arm reference
 interval, after filter warmup, with each interval mean removed. They exclude
-the candidate/contact/after-stop response. The PSD uses an unreduced contiguous
+the candidate/contact/after-stop response. Separately reported decision-level
+mean, RMS and P99 keep the mean intact, exposing the positive baseline introduced
+by rectification. A small mean-removed fluctuation is not a small decision
+level. The PSD uses an unreduced contiguous
 reference segment only: at least 256 samples spanning 50 ms and at most 10%
 sample-period irregularity. Otherwise the spectrum says unavailable. A lower
 RMS/PSD, different crossing count or rejected candidate is not a labelled false
 positive or proof of better contact accuracy.
+Absolute value is nonlinear: spectral peaks can move or double, so differences
+between these PSDs are not a linear attenuation measurement.
 
 A single comparison home has no repeatability spread/standard deviation.
 Use actual repeated ACCURACY runs for that measurement. Ordinary filtered
@@ -148,9 +192,13 @@ the machine before drawing a hardware conclusion.
 The compact validated receipt is embedded in the completed PNG. Keep its
 original filename and metadata on the host; image editors/recompression can
 strip that metadata. Old PNGs without this development receipt cannot serve
-as a baseline. Receipts with censored responses use version 2 so older code
-cannot read them as ordinary version 1 runs. Existing valid version 1 RAW
-baselines remain readable; absent censor metadata is displayed as unknown
+as a baseline. Every rectified-v2 actual run uses receipt version 3, with or
+without censored responses, so older code cannot accept it as a signed run.
+Historical signed-filter receipt versions 1 and 2 remain readable with their
+exact original detector configuration; version 2 records censored responses.
+Existing valid version 1 RAW baselines remain readable. A/B labels distinguish
+FILTERED v1 signed from FILTERED v2 rectified, and list algorithm/configuration
+differences explicitly. Absent censor metadata is displayed as unknown
 legacy evidence, not zero censored responses. Lookup accepts bounded safe IDs,
 never filesystem paths; rejects symlinks, duplicate IDs,
 malformed/incomplete/oversized receipts, another axis,
@@ -255,6 +303,13 @@ loss. These stationary observations do not establish the cause of a later
 homing fault.
 
 ## Returning to stable code
+
+Older development code from before rectified v2 rejects a v2 FILTERED profile,
+including one archived inside an otherwise RAW-selected model. Selecting or
+calibrating RAW alone does not make that model readable by such an older
+development version. Restore a verified compatible pre-v2 model/configuration
+backup when returning to that target. The stable-main procedure below is a
+different compatibility target; do not assume their model readers are identical.
 
 **A source-only switch to main is incompatible after a FILTERED model was
 saved.** A model with an active/staged FILTERED selection uses schema version

@@ -4,9 +4,9 @@ import json
 import math
 
 try:
-    from .accel_homing_filters import detector_config, DETECTOR_VERSION
+    from .accel_homing_filters import validate_detector_identity
 except ImportError:
-    from accel_homing_filters import detector_config, DETECTOR_VERSION
+    from accel_homing_filters import validate_detector_identity
 
 
 def _validate_detector_metadata(metadata):
@@ -16,13 +16,7 @@ def _validate_detector_metadata(metadata):
     if kind == "filtered":
         if metadata.get("impact_metric") != "xyz_magnitude":
             raise ValueError("filtered model must use the XYZ vector metric")
-        if (type(metadata.get("detector_version")) is not int
-                or metadata["detector_version"] != DETECTOR_VERSION or "detector_config" not in metadata):
-            raise ValueError("filtered model lacks its exact detector version/configuration")
-        if (not isinstance(metadata["detector_config"], dict)
-                or set(metadata["detector_config"]) != set(detector_config())):
-            raise ValueError("filtered model must persist every exact detector parameter")
-        detector_config(metadata["detector_config"])
+        validate_detector_identity(metadata.get("detector_version"), metadata.get("detector_config"), metadata)
     profiles = metadata.get("detector_profiles", {})
     if not isinstance(profiles, dict) or set(profiles) - {"raw", "filtered"}:
         raise ValueError("invalid saved detector profiles")

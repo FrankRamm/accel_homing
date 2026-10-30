@@ -18,7 +18,7 @@ import accel_homing_filters as filters
 from test_accuracy_charts import RecordingRenderer, png_bytes
 
 
-def synthetic_filter_home(axis="x", detector="raw", count=1450):
+def synthetic_filter_home(axis="x", detector="raw", count=1450, filter_version=None):
     """10 kHz stationary noise followed by a generated pulse, not stop evidence."""
     samples = []
     for index in range(count):
@@ -34,29 +34,34 @@ def synthetic_filter_home(axis="x", detector="raw", count=1450):
         samples.append((when, x, y, z))
     arm, crossing = 10.1, 10.12
     stop = [10.1202, 10.1206] if detector == "raw" else [10.121, 10.1214]
-    reference = filters.robust_reference([row[1:] for row in samples if row[0] < arm])
+    config = filters.detector_config(None if filter_version is None else {"version": filter_version})
+    reference = filters.robust_reference([row[1:] for row in samples if row[0] < arm], config)
     metadata = {"axis": axis, "detector_type": detector, "impact_metric": "xyz_magnitude",
                 "arm_time_s": arm, "onset_time_s": crossing, "crossing_time_s": crossing,
                 "reference_interval_s": [10., 10.0999],
                 "reference_sample_count": 1000,
                 "confirmation_time_s": crossing if detector == "raw" else crossing + .0005,
                 "stop_request_interval_s": stop, "stop_request_time_s": stop[1],
-                "detector_config": filters.detector_config(), "filter_reference": reference}
+                "detector_version": config["version"] if detector == "filtered" else 0,
+                "threshold_g": .8, "detector_config": config, "filter_reference": reference}
     capture = {"samples": samples, "baseline_g": (.2, -.1, 1.), "raw_baseline_g": (.2, -.1, 1.),
                "dropped": 0, "fault": None, "detector": metadata}
     record = {"axis": axis, "result": "impact", "capture_valid": True, "travel_mm": 175.012,
               "travel_mm_exact": 175.01234, "threshold_g": .8, "onset_g": 2.,
               "impact_peak_g": 3.5, "onset_time_s": crossing, "arm_time_s": arm,
-              "direction": 0, "impact_metric": "xyz_magnitude", "detector_type": detector}
+              "direction": 0, "impact_metric": "xyz_magnitude", "detector_type": detector,
+              "detector_version": config["version"] if detector == "filtered" else 0,
+              "detector_config": config if detector == "filtered" else None}
     return capture, record
 
 
 def synthetic_accuracy_axis(run_id, detector="raw", travels=(175.0, 175.2, 174.9, 175.1),
-                            threshold=1., speed=50.):
+                            threshold=1., speed=50., filter_version=None):
     """Independent generated commanded-travel series with complete contexts."""
     item = {"requested_samples": len(travels), "complete": True, "discovery": None,
             "trials": [], "statistics": None, "capture_paths": [], "discovery_capture_paths": None,
             "rejected": None}
+    config = filters.detector_config(None if filter_version is None else {"version": filter_version})
     for index, travel in enumerate((174.8,) + tuple(travels)):
         origin = 20. + index
         record = {"run_id": run_id, "axis": "x", "workflow_attempt": index + 1,
@@ -65,8 +70,8 @@ def synthetic_accuracy_axis(run_id, detector="raw", travels=(175.0, 175.2, 174.9
                   "threshold_g": threshold, "workflow_threshold_g": threshold, "direction": 0,
                   "onset_g": 2., "impact_peak_g": 3., "onset_time_s": origin + .002,
                   "impact_metric": "xyz_magnitude", "detector_type": detector,
-                  "detector_version": filters.DETECTOR_VERSION if detector == "filtered" else 0,
-                  "detector_config": filters.detector_config() if detector == "filtered" else None,
+                  "detector_version": config["version"] if detector == "filtered" else 0,
+                  "detector_config": config if detector == "filtered" else None,
                   "homing_speed_mm_s": speed, "configured_homing_speed_mm_s": speed, "homing_accel_mm_s2": 5000.,
                   "sensor_context": {"sensor": "adxl345 synthetic", "backend": "generic",
                                      "axes_map": "x,y,z", "full_scale_g": 16.},
@@ -149,7 +154,7 @@ class FilterComparisonTests(unittest.TestCase):
     def test_irregular_prearm_interval_has_no_spectrum(self):
         capture, _record = synthetic_filter_home()
         analysis = filters.compare_filter_capture(capture, .8, .8)
-        for rows in (analysis["raw_trace"], analysis["filtered_trace"]):
+        for rows in [analysis["raw_trace"]] + [item["trace"] for item in analysis["variants"].values()]:
             for index in range(1, 998, 2):
                 rows[index][0] += .00003
         noise = charts._filter_noise_summary(analysis)
@@ -184,7 +189,7 @@ class FilterComparisonTests(unittest.TestCase):
         self.assertEqual(analysis["sample_count"], 8000)
         replay = filters.compare_filter_capture(capture, .8, .8)
         self.assertEqual(analysis["noise"], charts._filter_noise_summary(replay))
-        self.assertTrue(all(len(row) == 10 for row in analysis["trace"]))
+        self.assertTrue(all(len(row) == 15 for row in analysis["trace"]))
 
     def test_fault_and_axis_mismatch_never_write_output(self):
         capture, record = synthetic_filter_home()

@@ -10,12 +10,13 @@ import math
 import statistics
 import struct
 
-DETECTOR_VERSION = 1
+DETECTOR_VERSION = 2
+SUPPORTED_DETECTOR_VERSIONS = (1, 2)
 MAX_REFERENCE_SAMPLES = 65536
 MAX_HISTORY_SAMPLES = 128
 MAX_MOVING_SAMPLES = 256
-DEFAULT_CONFIG = {
-    "version": DETECTOR_VERSION,
+SIGNED_CONFIG = {
+    "version": 1,
     "lowpass_tau_s": 0.0002,
     "confirmation_min_s": 0.0003,
     "confirmation_max_s": 0.0015,
@@ -27,6 +28,7 @@ DEFAULT_CONFIG = {
     "weight_floor": 0.75,
     "noise_floor_g": 0.005,
 }
+DEFAULT_CONFIG = dict(SIGNED_CONFIG, version=DETECTOR_VERSION, signal_mode="rectified")
 
 
 class FilteredSampleError(ValueError):
@@ -38,13 +40,18 @@ class FilteredSampleError(ValueError):
 
 def detector_config(config=None):
     """Validate the entire versioned configuration; unknown fields fail closed."""
-    result = dict(DEFAULT_CONFIG)
+    if config is not None and not isinstance(config, dict):
+        raise ValueError("unknown filtered-detector configuration")
+    version = DETECTOR_VERSION if config is None else config.get("version", DETECTOR_VERSION)
+    if type(version) is not int or version not in SUPPORTED_DETECTOR_VERSIONS:
+        raise ValueError("unsupported filtered-detector version")
+    result = dict(SIGNED_CONFIG if version == 1 else DEFAULT_CONFIG)
     if config is not None:
-        if not isinstance(config, dict) or set(config) - set(result):
+        if set(config) - set(result):
             raise ValueError("unknown filtered-detector configuration")
         result.update(config)
-    if type(result["version"]) is not int or result["version"] != DETECTOR_VERSION:
-        raise ValueError("unsupported filtered-detector version")
+    if version == 2 and result["signal_mode"] != "rectified":
+        raise ValueError("unsupported filtered-detector signal mode")
     bounds = {"lowpass_tau_s": (0., .001), "confirmation_min_s": (0., .0015),
               "confirmation_max_s": (.0001, .003), "excess_energy_s": (0., .002),
               "support_ratio": (.5, 1.), "release_ratio": (.1, .6),
@@ -58,6 +65,23 @@ def detector_config(config=None):
             or result["release_ratio"] >= result["support_ratio"]):
         raise ValueError("inconsistent filtered-detector confirmation bounds")
     return result
+
+
+def signal_mode(config):
+    return "signed" if config["version"] == 1 else config["signal_mode"]
+
+
+def validate_detector_identity(version, config, metadata=None):
+    """Persisted models/receipts require a complete exact versioned config."""
+    if type(version) is not int or version not in SUPPORTED_DETECTOR_VERSIONS or not isinstance(config, dict):
+        raise ValueError("filtered detector lacks its exact version/configuration")
+    canonical = detector_config(config)
+    if canonical != config or canonical["version"] != version:
+        raise ValueError("filtered detector must persist every exact parameter for its version")
+    if metadata is not None and (not isinstance(metadata, dict)
+            or ("signal_mode" in metadata and metadata["signal_mode"] != signal_mode(canonical))):
+        raise ValueError("filtered detector signal-mode label contradicts its configuration")
+    return canonical
 
 
 def _xyz(values):
@@ -94,6 +118,7 @@ class CausalImpactDetector:
     def __init__(self, threshold_g, offset_g, noise_sigma_g=(0., 0., 0.),
                  weights_xyz=(1., 1., 1.), config=None):
         self.config = detector_config(config)
+        self.signal_mode = signal_mode(self.config)
         if type(threshold_g) not in (int, float) or not math.isfinite(threshold_g) or threshold_g <= 0.:
             raise ValueError("filtered threshold must be finite and positive")
         self.threshold_g = threshold_g
@@ -126,6 +151,7 @@ class CausalImpactDetector:
                                       "noncontiguous filtered sample timestamps")
         self.previous_time = when
         delta = tuple(v - b for v, b in zip(xyz, self.offset_g))
+        filter_input = tuple(abs(value) for value in delta) if self.signal_mode == "rectified" else delta
         tau = self.config["lowpass_tau_s"]
         # The first row is an actual armed sample; initialize from the frozen
         # resting state rather than treating its acceleration as a new offset.
@@ -138,7 +164,7 @@ class CausalImpactDetector:
             period = dt
         alpha = 1. if tau == 0 or dt is None else period / (tau + period)
         self.filtered_xyz = tuple(old + alpha * (v - old)
-                                  for old, v in zip(self.filtered_xyz, delta))
+                                  for old, v in zip(self.filtered_xyz, filter_input))
         self.raw_level_g = math.sqrt(sum((v * w) ** 2 for v, w in zip(delta, self.weights_xyz)))
         self.magnitude_g = math.sqrt(sum(v*v for v in self.filtered_xyz))
         self.level_g = math.sqrt(sum((v*w)**2 for v, w in zip(self.filtered_xyz, self.weights_xyz)))
@@ -250,8 +276,7 @@ def validate_censored_peak_record(record):
         raise ValueError("censored impact does not precede the unavailable response")
     _stamp(summary.get("first_invalid_sample"))
     _stamp(summary.get("confirmation_sample"))
-    if type(record.get("detector_version")) is not int or record["detector_version"] != DETECTOR_VERSION or detector_config(record.get("detector_config")) != record.get("detector_config"):
-        raise ValueError("censored impact lacks its exact detector configuration")
+    validate_detector_identity(record.get("detector_version"), record.get("detector_config"), record)
     return True
 
 
@@ -282,9 +307,7 @@ def validate_filtered_capture_prefix(capture, record=None):
             or summary.get("kind") != "native_saturation_after_confirmation"
             or summary.get("cause") not in ("native_clip_sentinel", "axis_full_scale")):
         raise ValueError("only post-confirmation native saturation permits a censored prefix")
-    config = detector_config(detector.get("detector_config"))
-    if type(detector.get("detector_version")) is not int or detector["detector_version"] != DETECTOR_VERSION or config != detector.get("detector_config"):
-        raise ValueError("censored capture configuration changed")
+    config = validate_detector_identity(detector.get("detector_version"), detector.get("detector_config"), detector)
     samples, sources = capture.get("samples"), capture.get("_native_source_batches")
     mapping, reference = capture.get("_native_mapping"), capture.get("_native_filter_reference")
     full_scale = summary.get("full_scale_g")
@@ -499,7 +522,7 @@ def validate_filtered_capture_prefix(capture, record=None):
     return result
 
 
-def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filter_config=None):
+def _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, filter_config=None):
     """Counterfactual paired replay, censored before the actual stop request.
 
     Complete traces remain available for display. Rows after the conservative
@@ -593,6 +616,18 @@ def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filte
         if not sources:
             return original
         containing = [s for s in sources if s["filter_start_time_s"] <= original <= s["filter_end_time_s"]]
+        if not containing:
+            previous = max((s for s in sources if s["filter_end_time_s"] < original),
+                           key=lambda s: s["filter_end_time_s"], default=None)
+            following = min((s for s in sources if s["filter_start_time_s"] > original),
+                            key=lambda s: s["filter_start_time_s"], default=None)
+            if previous is not None and following is not None:
+                # A host cutoff between packets has no captured sensor row.
+                # Keep its presentation monotone between surrounding mapped
+                # identities; eligibility always uses original times above.
+                fraction = ((original - previous["filter_end_time_s"]) /
+                            (following["filter_start_time_s"] - previous["filter_end_time_s"]))
+                return previous["end_time_s"] + fraction * (following["start_time_s"] - previous["end_time_s"])
         source = (containing[0] if containing else min(sources, key=lambda s: min(
             abs(s["filter_start_time_s"] - original), abs(s["filter_end_time_s"] - original))))
         return source["start_time_s"] + (original - source["filter_start_time_s"]) * (
@@ -640,7 +675,8 @@ def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filte
                 diagnostic.previous_time = when - period
             diagnostic.feed(when, row[1:])
             display, decision = diagnostic, None
-        display_xyz = ([display.filtered_xyz[index] * sign for index, sign in native_mapping]
+        display_xyz = ([display.filtered_xyz[index] * (sign if signal_mode(config) == "signed" else 1)
+                        for index, sign in native_mapping]
                        if native_inputs and sample_index >= first_armed else list(display.filtered_xyz))
         filtered_trace.append([when] + list(display_xyz))
         filtered_level.append(display.magnitude_g)
@@ -676,6 +712,8 @@ def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filte
             "decision_time_domain": "original_online_print_time" if native_inputs else "capture_print_time",
             "display_stop_request_interval_s": None if interval is None else [display_time(v) for v in interval],
             "display_stop_request_time_s": display_time(stop),
+            "decision_cutoff_display_is_approximate": bool(native_inputs and cutoff is not None and
+                                                            cutoff_reason != "first_invalid_sample"),
             "decision_cutoff_reason": cutoff_reason, "response_censoring": censor,
             "raw_integrity": integrity,
             "censoring_policy": "strictly_before_dispatch_lower_bound",
@@ -693,3 +731,56 @@ def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filte
             "actual_confirmation_time_s": detector.get("confirmation_time_s"),
             "moving_noise": None if pre_stop_diagnostics is None else pre_stop_diagnostics["moving_noise"],
             "physical_accuracy_verified": False, "counterfactual": True}
+
+
+def compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filter_config=None):
+    """Replay signed-v1 and rectified-v2 on identical original valid samples.
+
+    The alternate uses the same numerical threshold only to compare signal
+    processing. Its threshold is not independently calibrated for that metric.
+    """
+    if not isinstance(capture, dict):
+        raise ValueError("comparison requires a complete valid capture")
+    detector = capture.get("detector") or {}
+    config = detector_config(filter_config or detector.get("detector_config"))
+    actual_config = (validate_detector_identity(detector.get("detector_version"), detector.get("detector_config"), detector)
+                     if detector.get("detector_type") == "filtered" else None)
+    if actual_config is not None and config != actual_config:
+        raise ValueError("comparison cannot replace the actual filtered configuration")
+    if actual_config is not None and (type(filtered_threshold_g) not in (int, float)
+            or not math.isfinite(filtered_threshold_g)
+            or type(detector.get("threshold_g")) not in (int, float)
+            or not math.isfinite(detector["threshold_g"])
+            or not math.isclose(filtered_threshold_g, detector["threshold_g"], rel_tol=1e-12, abs_tol=1e-12)):
+        raise ValueError("comparison cannot replace the actual filtered threshold")
+    selected_key = "signed_v1" if config["version"] == 1 else "rectified_v2"
+    actual_key = None if actual_config is None else ("signed_v1" if actual_config["version"] == 1 else "rectified_v2")
+    alternate = dict(config)
+    if config["version"] == 1:
+        alternate.update(version=2, signal_mode="rectified")
+        alternate_key = "rectified_v2"
+    else:
+        alternate.pop("signal_mode")
+        alternate["version"] = 1
+        alternate_key = "signed_v1"
+    selected = _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, config)
+    other = _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, alternate)
+    variants = {}
+    for key, analysis in ((selected_key, selected), (alternate_key, other)):
+        current = analysis["filter_config"]
+        variants[key] = {"detector_version": current["version"], "signal_mode": signal_mode(current),
+                         "config": current, "trace": analysis["filtered_trace"],
+                         "level": analysis["filtered_level"], "weighted_level": analysis["weighted_level"],
+                         "decision": analysis["filtered_decision"], "reference": analysis["reference"],
+                         "threshold_g": filtered_threshold_g,
+                         "threshold_source": "actual_active_detector" if key == actual_key else
+                                             "same_numeric_threshold_diagnostic_not_calibrated",
+                         "pre_arm_warmup_s": analysis["pre_arm_warmup_s"],
+                         "moving_noise": analysis["moving_noise"],
+                         "decision_cutoff_time_s": analysis["decision_cutoff_time_s"],
+                         "decision_cutoff_original_time_s": analysis["decision_cutoff_original_time_s"],
+                         "decision_cutoff_reason": analysis["decision_cutoff_reason"]}
+    selected.update(version=2, variants=variants, selected_variant=selected_key, actual_variant=actual_key,
+                    actual_detector_version=None if actual_config is None else actual_config["version"],
+                    actual_signal_mode=None if actual_config is None else signal_mode(actual_config))
+    return selected
