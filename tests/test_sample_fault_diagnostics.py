@@ -26,20 +26,13 @@ class HomingFaultDiagnosticsTests(unittest.TestCase):
         obj._inspect(params)
         return params
 
-    def test_native_sentinel_reports_its_exact_cause(self):
-        for value, cause in ((plugin.CLIPPED, "native_clip_sentinel"),):
-            with self.subTest(cause=cause):
-                obj, attempt, sent = self.machine()
-                self.packet(obj, [(0, 0, 128), (0, value, 128)] + [(0, 0, 128)] * 6)
-                self.assertEqual(attempt.reason, "invalid_data")
-                self.assertEqual(attempt.sample_fault["cause"], cause)
-                self.assertEqual(attempt.sample_fault["phase"], "homing_xyz")
-                self.assertEqual(attempt.sample_fault["sample_position"], 1)
-                self.assertEqual(attempt.sample_fault["sensor_axis"], "y")
-                self.assertEqual(attempt.sample_fault["raw_value"], value)
-                self.assertEqual(len(sent.messages), 1)
-                self.assertEqual(sent.messages[0][0], plugin.mcu.MCU_trsync.REASON_HOST_REQUEST)
-                json.dumps(attempt.sample_fault, allow_nan=False)
+    def test_native_marker_is_an_input_estimate_without_a_sample_fault(self):
+        obj, attempt, sent = self.machine()
+        self.packet(obj, [(0, 0, 128), (0, plugin.CLIPPED, 128)] + [(0, 0, 128)] * 6)
+        self.assertFalse(attempt.done)
+        self.assertIsNone(attempt.sample_fault)
+        self.assertEqual(attempt.marker_axis_values, 1)
+        self.assertEqual(len(sent.messages), 0)
 
     def test_vector_magnitude_at_or_above_sensor_axis_range_is_not_called_clipping(self):
         for axis_g in (10., 11.3, 12.5):
@@ -154,18 +147,18 @@ class HomingFaultDiagnosticsTests(unittest.TestCase):
 
     def test_first_fault_is_immutable_and_survives_record_console_and_status(self):
         obj, attempt, sent = self.machine()
-        self.packet(obj, [(0, plugin.CLIPPED, 128)] + [(0, 0, 128)] * 7)
+        self.packet(obj, data=tuple([0., float('nan'), 128.] + [0., 0., 128.] * 7))
         first = dict(attempt.sample_fault)
         obj._reject_homing_sample(attempt, "homing_packet", "nonmonotonic_packet_clock")
         self.assertEqual(attempt.sample_fault, first)
         self.assertEqual(len(sent.messages), 1)
         obj.disarm()
         self.assertEqual(attempt.record["sample_fault"], first)
-        with self.assertRaisesRegex(CommandError, "sensor reported a clipped axis sample"):
+        with self.assertRaisesRegex(CommandError, "sensor axis value is not finite"):
             obj.finish(attempt.endstop, attempt, plugin.mcu.MCU_trsync.REASON_HOST_REQUEST)
         command = GCmd()
         obj.cmd_STATUS(command)
-        self.assertTrue(any("native_clip_sentinel" in line for line in command.responses))
+        self.assertTrue(any("nonfinite_axis_value" in line for line in command.responses))
 
 
 class StationaryCadenceDiagnosticsTests(unittest.TestCase):
@@ -253,7 +246,7 @@ class StationaryCadenceDiagnosticsTests(unittest.TestCase):
                 obj._capture_batch(batch(start_clock, rows, delta_clock=delta))
                 self.assertEqual(obj.beta_capture["fault"], {"interval_change": "sample_gap", "gap": "sample_gap",
                                                              "duplicate": "sample_gap", "stale": "stale_data",
-                                                             "low_rate": "sample_rate", "clip": "invalid_data"}[failure])
+                                                             "low_rate": "sample_rate", "clip": None}[failure])
                 obj.stop_capture()
 
 

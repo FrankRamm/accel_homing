@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import accel_homing_charts as charts
 import accel_homing_filters as filters
 from test_accuracy_charts import RecordingRenderer, png_bytes
-from test_chronological_clipping import native_filtered_capture
+from test_chronological_clipping import historical_censored_capture as native_filtered_capture
 
 
 def private_native_keys(value):

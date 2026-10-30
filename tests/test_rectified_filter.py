@@ -183,7 +183,7 @@ class RectifiedReplayTests(unittest.TestCase):
                 clock_hz=32000000., sample_period=.000302, split=4, clock_shift=-.001,
                 axes_map=((2, -1), (0, -1), (1, 1)))
             self.assertEqual(record["detector_version"], version)
-            self.assertTrue(validate_filtered_capture_prefix(capture, record)["decision_prefix_validated"])
+            self.assertIsNone(validate_filtered_capture_prefix(capture, record))
             result = compare_filter_capture(capture, 1., 1.)
             key = "signed_v1" if version == 1 else "rectified_v2"
             self.assertEqual(result["actual_variant"], key)
@@ -202,17 +202,16 @@ class RectifiedReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "actual filtered configuration"):
             compare_filter_capture(capture, 1., 1., {"version": 1})
 
-    def test_sentinel_before_confirmation_remains_fatal_in_both_versions(self):
+    def test_marker_before_confirmation_is_bounded_and_can_confirm_in_both_versions(self):
         for version in (1, 2):
             for value, cause in ((32767, "native_clip_sentinel"),):
                 capture, record = native_filtered_capture(clip_position=0, clip_value=value,
                     filter_config={"version": version}, clock_hz=32000000., sample_period=.000302)
-                self.assertEqual(record["result"], "invalid_data")
-                self.assertEqual(record["sample_fault"]["cause"], cause)
-                self.assertEqual(record["sample_fault"]["raw_value"], value)
-                self.assertEqual(record["filter_diagnostics"]["candidate_count"], 0)
-                with self.assertRaises(ValueError):
-                    validate_filtered_capture_prefix(capture, record)
+                self.assertEqual(record["result"], "impact")
+                self.assertIsNone(record["sample_fault"])
+                self.assertEqual(record["native_clip_decode"]["marker_axis_values"], 1)
+                self.assertIsNotNone(record["confirmation_time_s"])
+                self.assertIsNone(validate_filtered_capture_prefix(capture, record))
 
 
 class RectifiedProfileTests(unittest.TestCase):

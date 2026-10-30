@@ -159,7 +159,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(result["filtered_decision"]["onset_time_s"], detector["onset_time_s"], places=10)
         self.assertAlmostEqual(result["filtered_decision"]["confirmation_time_s"], detector["confirmation_time_s"], places=10)
 
-    def test_native_raw_clipping_still_fails_before_filtered_processing(self):
+    def test_native_marker_is_decoded_without_unconditional_filtered_impact(self):
         obj = make_homing(threshold=1.)
         attempt, sent = arm_axis(obj, "x", 1000, 2000)
         attempt.vector_mode, attempt.detector_type = True, "filtered"
@@ -167,8 +167,10 @@ class RuntimeTests(unittest.TestCase):
         attempt.filter_engine = CausalImpactDetector(1., (0., 0., 1.))
         obj.reactor.now = 1.008
         obj._inspect(batch(1001, [(0, 0, 128), (32767, 0, 128)] + [(0, 0, 128)] * 6))
-        self.assertEqual(attempt.reason, "invalid_data")
-        self.assertEqual(len(sent.messages), 1)
+        self.assertFalse(attempt.done)
+        self.assertIsNone(attempt.sample_fault)
+        self.assertEqual(attempt.marker_axis_values, 1)
+        self.assertEqual(len(sent.messages), 0)
 
     def test_single_armed_row_from_straddling_packet_retains_original_period(self):
         obj, attempt = self.filtered()
@@ -190,7 +192,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(attempt.done)
         self.assertIsNone(attempt.stop_request_upper)
 
-    def test_successful_legacy_raw_clipped_capture_cannot_validate_filtered_shadow(self):
+    def test_decoded_raw_marker_capture_still_needs_reference_before_filtered_shadow(self):
         obj = make_homing(threshold=1.)
         obj.start_capture()
         attempt, _sent = arm_axis(obj, "x", 1000, 2000)
@@ -201,9 +203,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(attempt.reason, "impact")
         obj.disarm()
         capture = obj.stop_capture()
-        self.assertFalse(capture["raw_integrity"]["raw_samples_validated"])
+        self.assertTrue(capture["raw_integrity"]["raw_samples_validated"])
         self.assertEqual(capture["raw_integrity"]["clipped_axis_values"], 1)
-        with self.assertRaisesRegex(ValueError, "clipped"):
+        self.assertEqual(capture["native_clip_decode"]["marker_axis_values"], 1)
+        with self.assertRaisesRegex(ValueError, "reference"):
             compare_filter_capture(capture, 1., 1.)
 
 

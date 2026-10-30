@@ -78,21 +78,20 @@ class EndpointRuntimeTests(unittest.TestCase):
             self.assertGreater(record["filter_diagnostics"]["rejected_candidates"], 0)
             self.assertTrue(capture["raw_integrity"]["raw_samples_validated"])
 
-    def test_finite_endpoint_before_later_sentinel_remains_in_verified_prefix(self):
+    def test_finite_endpoint_before_later_marker_keeps_complete_decoded_response(self):
         for version in (1, 2):
             capture, record = endpoint_capture(-2048, version=version, sentinel=4)
             summary = filters.validate_filtered_capture_prefix(capture, record)
-            self.assertEqual(summary["cause"], "native_clip_sentinel")
-            self.assertEqual(summary["first_invalid_sample"][2], 4)
-            self.assertEqual(summary["raw_value"], 32767)
-            self.assertTrue(record["response_censored"])
-            self.assertIsNone(record["impact_peak_g"])
+            self.assertIsNone(summary)
+            self.assertEqual(capture["native_clip_decode"]["marker_axis_values"], 1)
+            self.assertFalse(record["response_censored"])
+            self.assertIsNotNone(record["impact_peak_g"])
             self.assertEqual(capture["raw_integrity"]["range_limit_axis_values"], 1)
-            self.assertGreater(summary["observed_valid_prefix_peak_g"], 15.)
+            self.assertGreater(record["impact_peak_g"], 15.)
 
-    def test_accepted_rail_does_not_hide_subsequent_preconfirmation_sentinel_or_nan(self):
+    def test_accepted_rail_does_not_hide_subsequent_preconfirmation_nan(self):
         for version in (1, 2):
-            for bad, cause in ((32767, "native_clip_sentinel"), (float("nan"), "nonfinite_axis_value")):
+            for bad, cause in ((float("nan"), "nonfinite_axis_value"),):
                 obj, attempt = self.machine(version)
                 low = tuple(attempt.bases)
                 high = (-2048, low[1], low[2])
@@ -239,16 +238,15 @@ class EndpointAcquisitionTests(unittest.TestCase):
             self.assertTrue(record["excess_amplitude_unknown"])
             obj.stop_noise_measurement()
 
-    def test_beta_acquisition_keeps_finite_endpoints_but_still_rejects_sentinel(self):
+    def test_beta_acquisition_keeps_finite_endpoints_and_decoded_marker(self):
         for value in (2047, -2048, 32767):
             obj = beta_tests.BetaRawCaptureTests().owner()
             obj._capture_batch(batch(8, [(value, 0, counts(1.)), (0, 0, counts(1.))], delta_clock=1))
             capture = obj.stop_capture()
-            self.assertEqual(capture["fault"], "invalid_data" if value == 32767 else None)
-            if value != 32767:
-                self.assertTrue(capture["raw_integrity"]["raw_samples_validated"])
-                self.assertTrue(capture["amplitude_limited"])
-                self.assertEqual(capture["samples"][0][1], value * .0078125)
+            self.assertIsNone(capture["fault"])
+            self.assertTrue(capture["raw_integrity"]["raw_samples_validated"])
+            self.assertTrue(capture["amplitude_limited"])
+            self.assertEqual(capture["samples"][0][1], (2047 if value == 32767 else value) * .0078125)
 
 
 class EndpointWorkflowRig(native.CensoredWorkflowRig):

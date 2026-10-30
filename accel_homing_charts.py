@@ -301,6 +301,7 @@ def _capture_data(capture, record):
                                     for index, axis in enumerate("xyz", 1)}}
     limited = bool(capture.get("amplitude_limited") or record.get("amplitude_limited"))
     metadata.update(amplitude_limited=limited, excess_amplitude_unknown=limited,
+                    native_clip_decode=capture.get("native_clip_decode"),
                     peak_semantics=capture.get("peak_semantics", record.get("peak_semantics", "reported_sensor_derived")))
     if censoring is not None:
         # The shared validator proved this exact finite prefix against the
@@ -726,6 +727,7 @@ def prepare_filter_capture(run_id, axis, capture, record, raw_threshold_g,
     variants, primary = _filter_variants(analysis)
     metadata.update(sample_count=len(analysis["raw_trace"]), trace=rows, noise=noise,
                     amplitude_limited=captured["amplitude_limited"],
+                    native_clip_decode=captured.get("native_clip_decode"),
                     excess_amplitude_unknown=captured["excess_amplitude_unknown"],
                     peak_semantics=captured["peak_semantics"],
                     trace_columns=_filter_trace_columns(primary),
@@ -1708,6 +1710,11 @@ def _mark_response_censoring(axis, censoring, origin, factor=1.):
 
 
 def _range_observation_lines(metadata):
+    decoding = metadata.get("native_clip_decode") or {}
+    if decoding.get("marker_axis_values", 0):
+        convention = ("the legacy RAW controller seed" if decoding.get("armed_seed_convention") else "prior sensor sign")
+        return ["Beacon markers: %d axis values shown as bounded endpoint estimates using %s; true sign/peak unknown." %
+                (decoding["marker_axis_values"], convention)]
     if not metadata.get("amplitude_limited"):
         return []
     return ["Sensor range reached; the true peak may be higher."]
@@ -1726,6 +1733,7 @@ def _response_censoring_lines(censoring, origin):
 def _plot_capture(figure, payload):
     record, trace, captured = payload["record"], payload["trace"], payload["capture"]
     censoring = captured.get("response_censoring")
+    marker_estimates = bool((captured.get("native_clip_decode") or {}).get("marker_axis_values"))
     title = payload.get("title", "Accel Homing " + payload["axis"].upper())
     if censoring:
         title += "\nSATURATED / RESPONSE TRUNCATED / FULL PEAK UNAVAILABLE"
@@ -1738,7 +1746,8 @@ def _plot_capture(figure, payload):
     magnitude = [(row[0], math.sqrt(sum(value * value for value in row[1:4]))) for row in trace]
     if vector:
         axis.plot([row[0] for row in magnitude], [row[1] for row in magnitude],
-                  linewidth=1.2, label="Captured raw XYZ magnitude" if filtered_control else "XYZ magnitude")
+                  linewidth=1.2, label="Decoded XYZ (includes marker estimates)" if marker_estimates else
+                  "Captured raw XYZ magnitude" if filtered_control else "XYZ magnitude")
     _threshold(axis, record)
     _mark_response_censoring(axis, censoring, captured["first_sample_time_s"])
     onset = record.get("onset_time_s", record.get("onset_time"))
@@ -1765,7 +1774,7 @@ def _plot_capture(figure, payload):
                             _number(elapsed, 4), _number(record.get("onset_g"))),
                          peak_line] + _range_observation_lines(captured) +
                          _response_censoring_lines(censoring, captured["first_sample_time_s"]) +
-                         (["%s threshold %s g applies to causal weighted level; signed raw response shown here" % (
+                         (["%s threshold %s g applies to causal weighted level; sensor input shown here" % (
                            _algorithm_label(record), _number(record.get("threshold_g"), 5))] if filtered_control else []))
     axis.legend(loc="best", fontsize=8)
     _finish_layout(figure, "Stationary baseline removed. Commanded travel is not physical stop accuracy.")
@@ -1775,6 +1784,7 @@ def _plot_filter(figure, payload):
     """Same-trace replay, pre-event noise and actual-run limits on one figure."""
     figure.set_size_inches(13, 17)
     analysis, record = payload["analysis"], payload["record"]
+    marker_estimates = bool((analysis.get("native_clip_decode") or {}).get("marker_axis_values"))
     censoring = analysis.get("response_censoring")
     actual = str(analysis["actual_detector"]).upper()
     variants, columns = analysis["variants"], analysis["trace_columns"]
@@ -1841,7 +1851,8 @@ def _plot_filter(figure, payload):
         axis.set_xlim(*event_limits)
         axis.set_xlabel("Time from raw crossing / actual event reference (ms)")
         axis.legend(loc="upper left", ncol=4, fontsize=7)
-    _axes_summary(xyz_axes[0], ["Same signed XYZ input / frozen reference; v1 filters signed axes, v2 filters abs(centered axes)"])
+    _axes_summary(xyz_axes[0], ["%s / frozen reference; v1 filters signed axes, v2 filters abs(centered axes)" %
+        ("Decoded XYZ (includes marker estimates)" if marker_estimates else "Same signed XYZ input")])
     _axes_style(level_axis, "Detector level (g)")
     level_axis.plot(milliseconds, [row[7] for row in trace], color="#b45e18", linewidth=.85, label="Raw XYZ magnitude")
     for key in _FILTER_VARIANTS:
@@ -1908,7 +1919,7 @@ def _plot_filter(figure, payload):
         count, sample_rate = spectrum["sample_count"], spectrum["sample_rate_hz"]
         window = np.hanning(count)
         frequencies = np.fft.rfftfreq(count, 1. / sample_rate)
-        sources = [("raw_xyz_g", "Raw signed XYZ", "#b45e18")] + [
+        sources = [("raw_xyz_g", "Decoded XYZ / marker estimates" if marker_estimates else "Raw signed XYZ", "#b45e18")] + [
             (spectrum["variant_series"][key], names[key], colors[key]) for key in _FILTER_VARIANTS]
         for series, label, color in sources:
             values = np.asarray(spectrum[series], dtype=float)
@@ -2003,12 +2014,14 @@ def _plot_beta(figure, payload):
         _axes_summary(axis, ["Central motion %d | Configured speed: %s mm/s | Planner speed: %s mm/s" % (
                                 number + 1, _number(configured, 6), _number(effective, 6)),
                              "Seed-eligible peak: %s g | Braking/return excluded from seed | %d full samples" % (
-                                _number(stats["seed_magnitude_peak_g"], 6), stats["sample_count"])])
+                                _number(stats["seed_magnitude_peak_g"], 6), stats["sample_count"])] + _range_observation_lines(captured))
         axis.legend(loc="upper right", ncol=4, fontsize=7)
     events = axes[3]
     _axes_style(events, "XYZ magnitude (g)")
     events.set_xlabel("Beta home, including rejected candidates")
     homes = payload["homes"]
+    home_marker_metadata = next((item["capture"] for item in homes
+        if (item["capture"].get("native_clip_decode") or {}).get("marker_axis_values")), {})
     if homes:
         indices = list(range(1, len(homes) + 1))
         for key, label, color in (("pre_onset_noise", "Noise strictly before crossing", "#577d34"),
@@ -2028,6 +2041,7 @@ def _plot_beta(figure, payload):
     _axes_summary(events, ["Suggested threshold: %s g | Proposal only | %d captured beta homes" % (
                             suggestion, len(homes)),
                           "Event statistics are computed per sample before any display reduction."] +
+                         _range_observation_lines(home_marker_metadata) +
                          ["Incomplete attempt %s: %s" % (
                              _number(item.get("workflow_attempt")), str(item.get("beta_reason") or item.get("result"))[:160])
                           for item in payload.get("incomplete_homes", [])[:2]])
@@ -2059,7 +2073,8 @@ def _plot_beta(figure, payload):
                 if _finite(response.get("end_time_s")):
                     axis.axvspan(boundary, response["end_time_s"] - onset,
                                  color="#d7b2ca", alpha=.12)
-            _axes_summary(axis, ["Beta home XYZ event traces | Last home emphasized | Resting offset removed"])
+            _axes_summary(axis, ["Beta home XYZ event traces | Last home emphasized | Resting offset removed"] +
+                          _range_observation_lines(home_marker_metadata))
         else:
             axis.text(.5, .5, "No valid beta home trace", ha="center", transform=axis.transAxes)
         axis.legend(loc="best", fontsize=7)
@@ -2088,11 +2103,13 @@ def _plot_accuracy(figure, payload):
     if censored_count:
         summary.append("SATURATED / RESPONSE TRUNCATED: full impact peak unavailable for censored homes; valid prefixes only")
     if any(trial.get("amplitude_limited") for trial in trials):
-        summary += _range_observation_lines({"amplitude_limited": True})
+        summary += _range_observation_lines(next((trial for trial in trials
+            if (trial.get("native_clip_decode") or {}).get("marker_axis_values")), {"amplitude_limited": True}))
     _title(figure, payload, ("DEVELOPMENT / EXPERIMENTAL - Actual run A/B " if baseline else "Accel Homing Accuracy ")
            + payload["axis"].upper())
     vector = bool(trials and trials[0].get("impact_metric") == "xyz_magnitude")
     if baseline:
+        summary.append("Baseline marker provenance is unavailable in its embedded receipt; absence does not mean no markers.")
         figure.set_size_inches(12, 15)
     axes = figure.subplots((5 if vector else 4) + (2 if baseline else 0), 1)
     travel = axes[0]
@@ -2172,7 +2189,9 @@ def _plot_accuracy(figure, payload):
     if vector:
         axis = axes[trace_start + 3]
         filtered_control = bool(trials and trials[0].get("detector_type") == "filtered")
-        _axes_style(axis, "Captured raw XYZ magnitude (g)" if filtered_control else "XYZ magnitude (g)")
+        _axes_style(axis, "Decoded XYZ / marker estimates (g)" if any(
+            (trial.get("native_clip_decode") or {}).get("marker_axis_values") for trial in trials) else
+            "Captured raw XYZ magnitude (g)" if filtered_control else "XYZ magnitude (g)")
         endpoint_labelled = False
         for index, trace in enumerate(traces):
             axis.plot([row[0] for row in trace],

@@ -1150,8 +1150,10 @@ class AccelHomingWorkflows:
         limited = context["full_scale_g"] is not None and any(
             abs(value) >= context["full_scale_g"] for row in samples for value in row[1:])
         return {"run_id": session["run_id"], "noise_iteration": iteration, **filtered_noise,
+                "native_clip_decode": capture.get("native_clip_decode"),
                 "amplitude_limited": limited, "excess_amplitude_unknown": limited,
-                "peak_semantics": "observed_code_magnitude",
+                "peak_semantics": ("bounded_native_endpoint_estimate" if
+                    (capture.get("native_clip_decode") or {}).get("marker_axis_values") else "observed_code_magnitude"),
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "baseline_g": baseline, "noise_peak_g": peaks,
@@ -1537,6 +1539,8 @@ class AccelHomingWorkflows:
                     record.get("impact_peak_g"), "observed" if record.get("detector_type") == "filtered" else "reported",
                     "; sensor range reached, true peak may be higher"
                     if record.get("amplitude_limited") else ""))
+        if (record.get("native_clip_decode") or {}).get("marker_axis_values"):
+            peak_description = "%s g (bounded Beacon marker estimates; true sign/peak unknown)" % record.get("impact_peak_g")
         self._info("%s home: result %s; onset %s g; peak %s; threshold %s g; "
                    "commanded travel %s mm" % (
             axis.upper(), record.get("result"), record.get("onset_g"),
@@ -1600,7 +1604,7 @@ class AccelHomingWorkflows:
         except ValueError as exc:
             raise self._error("filtered response prefix validation failed: %s" % exc) from exc
         baseline = capture.get("baseline_g")
-        arm, onset = record.get("arm_time_s"), record.get("onset_time_s")
+        arm, onset = record.get("arm_time_s"), record.get("trigger_onset_time_s", record.get("onset_time_s"))
         finite = lambda value: (isinstance(value, (int, float)) and not isinstance(value, bool)
                                 and math.isfinite(value))
         if expected_threshold is None:
@@ -1623,7 +1627,9 @@ class AccelHomingWorkflows:
                     and arm <= session["last_arm_time"])):
             raise self._error("homing capture does not belong to the current detector/reference")
         samples = capture["samples"]
-        retained_arm = (arm if censor is None else samples[detector["first_armed_sample_index"]][0])
+        native_proven = (isinstance(capture.get("native_clip_decode"), dict)
+                         and detector.get("detector_type") == "filtered" and detector.get("backend") == "beacon_raw")
+        retained_arm = (samples[detector["first_armed_sample_index"]][0] if censor is not None or native_proven else arm)
         if not samples[0][0] < retained_arm <= samples[-1][0]:
             raise self._error("homing capture lacks the current pre-arm reference or armed samples")
         if record.get("result") == "impact":
@@ -1675,8 +1681,8 @@ class AccelHomingWorkflows:
             if (not finite(captured_onset) or detector.get("trigger_onset_time_s") != onset
                     or samples[index][0] != captured_onset):
                 missing_impact("retained onset does not match the current detector/sample")
-            if ((censor is None and (not arm <= onset or not arm <= captured_onset <= samples[-1][0]))
-                    or (censor is not None and not retained_arm <= captured_onset <= samples[-1][0])):
+            if ((censor is None and not native_proven and (not arm <= onset or not arm <= captured_onset <= samples[-1][0]))
+                    or ((censor is not None or native_proven) and not retained_arm <= captured_onset <= samples[-1][0])):
                 missing_impact("onset lies outside the armed capture")
             # A later MCU clock adjustment may change chart timestamps.
             # Keep the original homing timestamp and align only this copied
@@ -2055,10 +2061,13 @@ class AccelHomingWorkflows:
                     "recenter_acceleration_policy": "restored_normal_limit",
                     "onset_g": [r.get("onset_g") for r in qualified],
                     "impact_peak_g": [r.get("impact_peak_g") for r in qualified],
-                    "peak_semantics": ("observed_code_magnitude" if self.detector_type(axis) == "filtered"
+                    "peak_semantics": ("bounded_native_endpoint_estimate" if any(
+                        (r.get("native_clip_decode") or {}).get("marker_axis_values") for r in qualified) else
+                        "observed_code_magnitude" if self.detector_type(axis) == "filtered"
                                        else "reported_sensor_derived"),
                     "amplitude_limited": [r.get("amplitude_limited", False) for r in qualified],
                     "excess_amplitude_unknown": [r.get("excess_amplitude_unknown", False) for r in qualified],
+                    "native_clip_decode": [r.get("native_clip_decode") for r in qualified],
                     "response_censored": [r.get("response_censored", False) for r in qualified],
                     "observed_valid_prefix_peak_g": [r.get("observed_valid_prefix_peak_g") for r in qualified],
                     "calibration_start_threshold_g": session["start_threshold_g"],

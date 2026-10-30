@@ -55,7 +55,7 @@ class NativeCaptureScopeTests(unittest.TestCase):
         scope = capture["_native_capture_scope"]
         self.assertGreater(scope["excluded_pre_reference_samples"], 8)
         self.assertEqual(scope["first_sample"], list(capture["detector"]["reference_sample_bounds"][0]))
-        self.assertTrue(validate_filtered_capture_prefix(capture, record)["decision_prefix_validated"])
+        self.assertIsNone(validate_filtered_capture_prefix(capture, record))
 
     def test_original_partial_first_packet_identity_and_period_are_preserved(self):
         capture, record = native_filtered_capture(clock_hz=32000000., sample_period=.000302, arm_straddle=2)
@@ -204,7 +204,7 @@ class NativeCaptureScopeTests(unittest.TestCase):
         self.assertFalse(worker.is_alive() or sealer.is_alive())
         self.assertFalse(errors)
         self.assertEqual(sealed[0]["_native_capture_scope"]["closed_by"], "stream_stop")
-        self.assertTrue(validate_filtered_capture_prefix(sealed[0], attempt.record)["decision_prefix_validated"])
+        self.assertIsNone(validate_filtered_capture_prefix(sealed[0], attempt.record))
 
     def test_reference_ready_before_append_survives_prepare_and_invalid_packet_cannot_arm(self):
         for malformed in (False, True):
@@ -326,7 +326,7 @@ class NativeCaptureScopeTests(unittest.TestCase):
             self.assertIsNone(obj.sensor_fault)
         with mock.patch.object(plugin.BeaconAccelHoming, "disarm", close_then_late_flush):
             capture, record = native_filtered_capture(time_offset=10.)
-        self.assertTrue(validate_filtered_capture_prefix(capture, record)["decision_prefix_validated"])
+        self.assertIsNone(validate_filtered_capture_prefix(capture, record))
 
     def test_seal_timeout_old_append_and_exception_cannot_fault_new_capture(self):
         for raises in (False, True):

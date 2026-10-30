@@ -15,6 +15,42 @@ SUPPORTED_DETECTOR_VERSIONS = (1, 2)
 MAX_REFERENCE_SAMPLES = 65536
 MAX_HISTORY_SAMPLES = 128
 MAX_MOVING_SAMPLES = 256
+NATIVE_CLIP_POLICY = "beacon_previous_sensor_sign_v1"
+
+
+def native_clip_limits(values):
+    """Require actual configured endpoints; the native marker is never a limit."""
+    if (not isinstance(values, (tuple, list)) or len(values) != 2
+            or any(type(v) is not int for v in values)
+            or not 0 < values[0] < 32767 or not -32768 <= values[1] < 0):
+        raise ValueError("native marker decoding requires configured signed clip endpoints")
+    return tuple(values)
+
+
+def decode_native_row(values, previous, clips):
+    """Beacon convention: infer a marker's endpoint from prior SENSOR code sign.
+
+    This is a bounded substitution, never an observed sign or true amplitude.
+    Zero (including a new stream's explicit zero seed) selects the positive end.
+    """
+    if (len(values) != 3 or len(previous) != 3
+            or any(type(v) not in (int, float) or not math.isfinite(v) for v in values + tuple(previous))):
+        raise ValueError("nonfinite native decoder input")
+    if 32767 not in values:
+        return tuple(values)
+    clips = native_clip_limits(clips)
+    return tuple(clips[0 if last >= 0 else 1] if value == 32767 else value
+                 for value, last in zip(values, previous))
+
+
+def decode_native_values(raw, previous, clips):
+    out = []
+    for index in range(0, len(raw), 3):
+        previous = decode_native_row(tuple(raw[index:index + 3]), previous, clips)
+        out.extend(previous)
+    return out
+
+
 SIGNED_CONFIG = {
     "version": 1,
     "lowpass_tau_s": 0.0002,
@@ -291,7 +327,12 @@ def validate_filtered_capture_prefix(capture, record=None):
     detector = capture.get("detector") or {}
     summary = capture.get("response_censoring")
     integrity = capture.get("raw_integrity") or {}
-    if summary is None:
+    decoding = capture.get("native_clip_decode")
+    decoded = (isinstance(decoding, dict) and detector.get("detector_type") == "filtered"
+               and detector.get("backend") == "beacon_raw" and summary is None)
+    if summary is None and not decoded:
+        if detector.get("detector_type") == "filtered" and integrity.get("clipped_axis_values", 0):
+            raise ValueError("native marker rows require their frozen decoder provenance")
         if (detector.get("detector_type") == "filtered" and integrity.get("raw_samples_validated") is False):
             raise ValueError("invalid FILTERED capture has no eligible censor proof")
         if record is not None and record.get("response_censored"):
@@ -299,18 +340,20 @@ def validate_filtered_capture_prefix(capture, record=None):
         return None
     finite = lambda v: type(v) in (int, float) and math.isfinite(v)
     if (capture.get("fault") or capture.get("error") or capture.get("dropped", 0)
-            or not isinstance(summary, dict) or detector.get("detector_type") != "filtered"
+            or (not decoded and not isinstance(summary, dict)) or detector.get("detector_type") != "filtered"
             or detector.get("backend") != "beacon_raw" or detector.get("result") != "impact"
             or detector.get("axis") not in ("x", "y") or type(detector.get("attempt_count")) is not int
-            or detector["attempt_count"] != 1 or integrity.get("raw_samples_validated") is not False
-            or type(summary.get("version")) is not int or summary["version"] != 1
-            or summary.get("kind") != "native_saturation_after_confirmation"
-            or summary.get("cause") not in ("native_clip_sentinel", "axis_full_scale")):
+            or detector["attempt_count"] != 1
+            or integrity.get("raw_samples_validated") is not bool(decoded)
+            or (not decoded and (type(summary.get("version")) is not int or summary["version"] != 1
+                or summary.get("kind") != "native_saturation_after_confirmation"
+                or summary.get("cause") not in ("native_clip_sentinel", "axis_full_scale")))):
         raise ValueError("only post-confirmation native saturation permits a censored prefix")
     config = validate_detector_identity(detector.get("detector_version"), detector.get("detector_config"), detector)
     samples, sources = capture.get("samples"), capture.get("_native_source_batches")
     mapping, reference = capture.get("_native_mapping"), capture.get("_native_filter_reference")
-    full_scale = summary.get("full_scale_g")
+    clips = native_clip_limits(decoding.get("clip_values")) if decoded else None
+    full_scale = clips[0] * decoding.get("count_g", 0.) if decoded else summary.get("full_scale_g")
     if (not isinstance(samples, (list, tuple)) or not 2 <= len(samples) <= 200000
             or not isinstance(sources, (list, tuple)) or not 1 <= len(sources) <= 100000
             or not isinstance(mapping, (list, tuple)) or len(mapping) != 3
@@ -334,6 +377,7 @@ def validate_filtered_capture_prefix(capture, record=None):
                 "excluded_pre_reference_samples", "excluded_previous_epoch_samples"))):
         raise ValueError("censored capture lacks its exact current reference/stream scope")
     found = None
+    last_decoded, marker_first, marker_last = None, None, None
     counts = {"clipped_axis_values": 0, "saturated_axis_values": 0, "nonfinite_axis_values": 0}
     last, last_clock, original_last = None, None, None
     for source_index, source in enumerate(sources):
@@ -347,6 +391,19 @@ def validate_filtered_capture_prefix(capture, record=None):
         else:
             raise ValueError("malformed original native response packet")
         count = len(raw) // 3
+        original_raw = raw
+        if decoded:
+            seed = _xyz(source.get("decode_previous_raw"))
+            if (decoding.get("policy") != NATIVE_CLIP_POLICY
+                    or scope.get("decoder_policy") != NATIVE_CLIP_POLICY
+                    or native_clip_limits(source.get("clip_values")) != clips
+                    or native_clip_limits(scope.get("clip_values")) != clips
+                    or 32767 in seed
+                    or (last_decoded is not None and seed != last_decoded)
+                    or (last_decoded is None and seed != _xyz(scope.get("decode_previous_raw")))):
+                raise ValueError("native decoder limits/seed/epoch provenance changed")
+            raw = decode_native_values(raw, seed, clips)
+            last_decoded = tuple(raw[-3:])
         first = source.get("first_sample_position")
         if (type(first) is not int or not 0 <= first < count
                 or type(source.get("admission_epoch")) is not int
@@ -356,6 +413,8 @@ def validate_filtered_capture_prefix(capture, record=None):
         start_clock, delta = source.get("start_clock"), source.get("delta_clock")
         start, end, received = (source.get(key) for key in ("start_time_s", "end_time_s", "received_time_s"))
         scale = source.get("count_g")
+        if decoded and scale != decoding.get("count_g"):
+            raise ValueError("native decoder scale changed")
         if (type(start_clock) is not int or not 0 <= start_clock <= 0xffffffff or type(delta) is not int
                 or not 0 < delta <= 0xffffffff or not 2 <= count <= 200000 or len(rows) + count - first > 200000
                 or not all(finite(v) for v in (start, end, received, scale)) or scale <= 0 or end <= start):
@@ -391,14 +450,17 @@ def validate_filtered_capture_prefix(capture, record=None):
                                     5. * period + .000003, scope["admission_epoch"]))
             last = when
             xyz = tuple(raw[3 * position:3 * position + 3])
+            original_xyz = tuple(original_raw[3 * position:3 * position + 3])
             if any(type(v) not in (int, float) or not math.isfinite(v) for v in xyz):
                 raise ValueError("nonfinite native response cannot be censored")
             stamp = (start_clock, delta, position, count)
             invalid = None
-            for axis, value in enumerate(xyz):
+            for axis, value in enumerate(original_xyz):
                 counts["clipped_axis_values"] += value == 32767
                 counts["saturated_axis_values"] += abs(value * scale) >= full_scale
-                if invalid is None and value == 32767:
+                if decoded and value == 32767:
+                    marker_first, marker_last = marker_first or stamp, stamp
+                if not decoded and invalid is None and value == 32767:
                     invalid = axis
             if invalid is not None and found is None:
                 found = (len(rows), stamp, when, invalid, xyz[invalid])
@@ -410,10 +472,19 @@ def validate_filtered_capture_prefix(capture, record=None):
             identities.append(stamp)
             a, b = source.get("filter_start_time_s"), source.get("filter_end_time_s")
             online_times.append(None if not finite(a) or not finite(b) else a + (b - a) * position / (count - 1))
-    if found is None or any(type(integrity.get(key)) is not int or integrity[key] != value for key, value in counts.items()):
+    if (not decoded and found is None) or any(type(integrity.get(key)) is not int or integrity[key] != value for key, value in counts.items()):
         raise ValueError("whole-capture integrity does not match original native values")
-    index, stamp, when, axis, value = found
-    if (index != len(samples) or _stamp(summary.get("first_invalid_sample")) != stamp
+    index = len(rows) if decoded else found[0]
+    if decoded:
+        if (len(samples) != index or decoding.get("marker_axis_values") != counts["clipped_axis_values"]
+                or decoding.get("first_sample") != (None if marker_first is None else list(marker_first))
+                or decoding.get("last_sample") != (None if marker_last is None else list(marker_last))
+                or decoding.get("sign_inferred") is not bool(counts["clipped_axis_values"])
+                or decoding.get("true_amplitude_unknown") is not bool(counts["clipped_axis_values"])):
+            raise ValueError("native marker substitution summary differs from original rows")
+    else:
+        index, stamp, when, axis, value = found
+    if not decoded and (index != len(samples) or _stamp(summary.get("first_invalid_sample")) != stamp
             or summary.get("first_invalid_sample_index") != index or summary.get("first_invalid_time_s") != when
             or summary.get("sensor_axis") != "xyz"[axis] or summary.get("raw_value") != value
             or summary.get("cause") != "native_clip_sentinel"
@@ -494,16 +565,16 @@ def validate_filtered_capture_prefix(capture, record=None):
         trigger_time = detector.get("trigger_" + event + "_time_s")
         if trigger_time != decision[event + "_time_s"]:
             raise ValueError("original trigger timestamp differs from online prefix replay")
-    if summary.get("confirmation_sample_index") != positions["confirmation"] or _stamp(summary.get("confirmation_sample")) != identities[positions["confirmation"]] \
-            or summary.get("confirmation_time_s") != detector["confirmation_time_s"]:
+    if not decoded and (summary.get("confirmation_sample_index") != positions["confirmation"] or _stamp(summary.get("confirmation_sample")) != identities[positions["confirmation"]] \
+            or summary.get("confirmation_time_s") != detector["confirmation_time_s"]):
         raise ValueError("censor summary changed its retained confirmation")
-    if summary.get("first_invalid_original_time_s") != online_times[index]:
+    if not decoded and summary.get("first_invalid_original_time_s") != online_times[index]:
         raise ValueError("censor summary lost its original saturation timestamp")
     peak = max(math.sqrt(sum((v - b) ** 2 for v, b in zip(row[1:], baseline))) for row in samples)
-    if summary.get("observed_valid_prefix_peak_g") != peak:
+    if not decoded and summary.get("observed_valid_prefix_peak_g") != peak:
         raise ValueError("censored prefix peak is not an observed valid value")
-    result = dict(summary, decision_prefix_validated=True,
-                  first_invalid_sample=list(stamp), confirmation_sample=list(identities[positions["confirmation"]]))
+    result = (None if decoded else dict(summary, decision_prefix_validated=True,
+                  first_invalid_sample=list(stamp), confirmation_sample=list(identities[positions["confirmation"]])))
     if record is not None:
         if (record.get("result") != "impact" or record.get("detector_type") != "filtered"
                 or record.get("detector_config") != config
@@ -513,7 +584,9 @@ def validate_filtered_capture_prefix(capture, record=None):
                 or _stamp(record.get("onset_sample")) != _stamp(detector.get("onset_sample"))
                 or record.get("trigger_onset_time_s", record.get("onset_time_s")) != detector.get("trigger_onset_time_s")
                 or not math.isclose(record.get("workflow_threshold_g", record.get("threshold_g", 0)), threshold, rel_tol=1e-12, abs_tol=1e-12)
-                or record.get("impact_peak_g") is not None
+                or (not decoded and record.get("impact_peak_g") is not None)
+                or (decoded and (not finite(record.get("impact_peak_g")) or record.get("response_censored")))
+                or (decoded and counts["clipped_axis_values"] and record.get("native_clip_decode") != decoding)
                 or record.get("trigger_confirmation_time_s") != detector.get("trigger_confirmation_time_s")):
             raise ValueError("censored prefix does not belong to current filtered record")
         existing = record.get("response_censoring")
@@ -581,6 +654,9 @@ def _compare_filter_variant(capture, raw_threshold_g, filtered_threshold_g, filt
         for source in capture["_native_source_batches"]:
             raw = (source["data"] if isinstance(source["data"], tuple) else
                    tuple(v for row in struct.iter_unpack("<hhh", source["data"]) for v in row))
+            if capture.get("native_clip_decode") is not None:
+                raw = decode_native_values(raw, _xyz(source.get("decode_previous_raw")),
+                                           native_clip_limits(source.get("clip_values")))
             count = len(raw) // 3
             for position in range(source.get("first_sample_position", 0), count):
                 if len(native_inputs) >= len(samples):

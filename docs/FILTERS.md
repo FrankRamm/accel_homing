@@ -29,7 +29,7 @@ raises the threshold or changes weights after arming.
 The versioned initial configuration uses a 0.2 ms time constant, confirmation
 between 0.3 and 1.5 ms, and a minimum XYZ weight of 0.75. These are development
 defaults, not measured optimal values. Timing, sample age, sensor health,
-overflow, explicit clipping and cleanup checks remain required. No new Python
+overflow, sample-integrity and cleanup checks remain required. No new Python
 dependency is added to the armed detector.
 
 Thresholds belong to their detector metric. A RAW component/XYZ threshold is
@@ -141,8 +141,8 @@ positions, including display-only interpolation within a packet gap, do not
 change which confirmations were observed before the real cutoff.
 
 Only samples strictly before the conservative lower bound of the actual
-stop-request interval can validate a replay decision. If native saturation
-truncates the response earlier, the first invalid sample is the replay cutoff.
+stop-request interval can validate a replay decision. For a historical censored
+capture, the earlier first invalid sample remains the replay cutoff.
 The chart names the active cutoff and its time. A detector that has not
 confirmed before that cutoff is **censored**; the chart cannot infer its
 additional delay, rejection of a false contact, or what another physical home
@@ -165,7 +165,8 @@ between these PSDs are not a linear attenuation measurement.
 
 A single comparison home has no repeatability spread/standard deviation.
 Use actual repeated ACCURACY runs for that measurement. Ordinary filtered
-capture/accuracy component curves remain raw measured response; their causal
+capture/accuracy component curves show sensor input, including explicitly
+labelled bounded endpoint estimates when native markers occur; their causal
 weighted threshold is stated separately rather than drawn over the raw norm.
 
 ## Read the actual A/B report
@@ -249,15 +250,47 @@ alone does not invalidate `raw_samples_validated`, truncate a response, or
 prevent a successful workflow/chart. Historical `axis_full_scale` receipts
 remain readable, but the current detector no longer emits that rejection.
 
-The explicit native `0x7FFF` sentinel still has no known measured sign or
-amplitude and remains subject to the existing clipping policy below.
+The known native `0x7FFF` marker now uses the configured Beacon endpoints and
+its previous decoded **sensor-axis** sign: nonnegative selects the positive
+endpoint, negative selects the negative endpoint. A new host stream starts
+with the explicit zero seed, so an initial marker selects the positive end.
+This follows Beacon's sign-selection convention; it does not claim to share
+the upstream helper's separate queued history. Endpoints come from the actual
+helper and active scale. Missing or invalid endpoints fail before `FILTERED`
+motion/acquisition; the former `32767` fallback is never a new decoder limit.
 
-Only a native Beacon `FILTERED` home with a fully qualified confirmation
+Decoded rows retain their original timestamps and identities. Subtraction of
+the frozen reference comes next, followed by the selected signed v1 or
+rectified v2 filter. The unchanged support/energy gates now count qualifying
+input rows under this decoder policy, which can include endpoint estimates.
+A marker alone is not an unconditional home, and acceptance is not proof of
+its true sign/amplitude or physical contact. No thresholds, speeds, retries,
+calibration rules or save margins are changed by this input policy.
+
+`native_clip_decode` names `beacon_previous_sensor_sign_v1`, configured limits,
+scale, marker-axis count and first/last source identities. Marker-derived
+traces and peaks are bounded endpoint estimates with inferred sign and unknown
+true peak, not original signed measurements. Reference and moving-noise data
+use the same convention. Native `RAW` control retains its legacy decoder; its
+armed chart rows use the frozen seed that that controller actually used.
+Generic numerical `32767` values are ordinary numerical data, not Beacon markers.
+
+The original bytes remain bounded private proof data. Native replay checks
+the admitted stream seed, chained packet seeds/endpoints, decoded rows,
+frozen reference and actual confirmation. Processing before confirmation is
+chronological; tail conversion/state advancement follows stop dispatch.
+Nonfinite data, timestamp/order/gap/freshness failures, overflows, frozen
+streams and changes of scale/endpoints remain errors. No row is skipped.
+
+### Historical censored native responses
+
+Older native Beacon `FILTERED` captures with a fully qualified confirmation
 strictly before the first explicit native clipped sample can retain a censored
 response. This comparison is chronological sample order, including rows in
 one packet; it does not assume the clipping happened after the host requested
-a stop. An explicit clipping sentinel at or before confirmation still stops and rejects the
-attempt. `RAW` retains its existing clipping handling.
+a stop. These historical censored captures/PNG receipts remain readable.
+New known-marker captures retain all decoded rows and are not truncated or
+aborted solely because of the marker. `RAW` retains its existing control behavior.
 
 The shared validator checks the finite contiguous prefix against the original
 native packets, frozen stationary reference, detector configuration and exact
@@ -300,7 +333,7 @@ be reconstructed.
 For the instrumented native Beacon homing rejection paths, the same command
 error and `ACCEL_HOMING_STATUS` now include the first bounded `sample_fault`
 record. Generic backend and Beta acquisition faults may still provide only
-their broader fault result. `native_clip_sentinel` means Beacon reported `0x7FFF`;
+their broader fault result. Historical `native_clip_sentinel` means Beacon reported `0x7FFF`;
 Historical `axis_full_scale` means a raw sensor axis reached its range limit;
 that magnitude-only rejection has been removed for finite values.
 An XYZ vector magnitude of 14–16 g, or even above the individual-axis range,
@@ -312,9 +345,9 @@ An in-scope prefix timing rejection also reports its packet index, previous
 and next timestamps, measured gap and limit. These numbers identify the actual
 rejected pair; an error from an older run cannot establish that pair.
 
-Stop dispatch occurs before optional diagnostic conversion or logging. Apart
-from finite range acceptance and the validated post-confirmation FILTERED clipping case above,
-the other rejection rules, watchdogs and clipping protections are unchanged. A failed
+Stop dispatch occurs before optional diagnostic conversion or logging.
+Finite range readings and known Beacon markers now enter the decoder/filter
+as described above. Other rejection rules and watchdogs are unchanged. A failed
 workflow still publishes no PNG or raw scratch capture. Copy the exact command
 error or status record for diagnosis; an earlier run without this detail cannot
 establish which rejection occurred.

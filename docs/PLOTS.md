@@ -58,14 +58,18 @@ same source/reference/weights and numerical comparison threshold; only the
 declared actual version controlled that home. Nonactive variants are diagnostic
 and do not have an independently calibrated threshold in this capture. Original
 signed XYZ remain visible, while rectified per-axis envelopes are nonnegative.
+Known native Beacon marker rows remain at their original times but use bounded
+configured-endpoint estimates selected by prior sensor sign. Their trace,
+marker count and unknown true sign/peak are labelled explicitly; `32767` is
+never plotted as an acceleration. Generic numerical values are unchanged.
 Mean-removed XYZ noise metrics are separate from decision-level mean/RMS/P99
 that retain rectification's DC. Absolute value is nonlinear, so spectral peaks
 can move/double; PSD differences do not establish physical vibration removal.
-Confirmations at/after the actual stop-request cutoff or first explicit native clipped sample
-are censored; after-cutoff valid curves are labelled response only and the
-unknown saturated tail is omitted. Original acquisition times determine
+Confirmations at/after the actual stop-request cutoff are censored;
+after-cutoff curves are labelled response only. Historical censored captures
+still omit their unavailable clipped tail. Original acquisition times determine
 eligibility; displayed cutoff markers may be interpolated. Ordinary FILTERED
-accuracy/capture plots show raw measured response, with the causal weighted
+accuracy/capture plots show sensor input (labelled estimates for marker rows), with the causal weighted
 threshold stated separately rather than overlaid on the raw magnitude.
 
 Successful `ACCEL_HOMING_CALIBRATE AXIS=X DETECTOR=FILTERED CENTERED=1` publishes
