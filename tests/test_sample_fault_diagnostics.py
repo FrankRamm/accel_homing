@@ -26,9 +26,8 @@ class HomingFaultDiagnosticsTests(unittest.TestCase):
         obj._inspect(params)
         return params
 
-    def test_native_sentinel_and_individual_fullscale_report_different_exact_causes(self):
-        for value, cause in ((plugin.CLIPPED, "native_clip_sentinel"),
-                             (counts(16.), "axis_full_scale")):
+    def test_native_sentinel_reports_its_exact_cause(self):
+        for value, cause in ((plugin.CLIPPED, "native_clip_sentinel"),):
             with self.subTest(cause=cause):
                 obj, attempt, sent = self.machine()
                 self.packet(obj, [(0, 0, 128), (0, value, 128)] + [(0, 0, 128)] * 6)
@@ -57,10 +56,10 @@ class HomingFaultDiagnosticsTests(unittest.TestCase):
         obj, attempt, _sent = self.machine()
         raw = tuple([counts(16.), 0., 128., 0., float("nan"), 128.] + [0., 0., 128.] * 6)
         self.packet(obj, data=raw)
-        self.assertEqual(attempt.sample_fault["cause"], "axis_full_scale")
-        self.assertEqual(attempt.sample_fault["sample_position"], 0)
-        self.assertEqual(attempt.sample_fault["sensor_axis"], "x")
-        self.assertEqual(attempt.sample_fault["raw_value"], counts(16.))
+        self.assertEqual(attempt.sample_fault["cause"], "nonfinite_axis_value")
+        self.assertEqual(attempt.sample_fault["sample_position"], 1)
+        self.assertEqual(attempt.sample_fault["sensor_axis"], "y")
+        self.assertTrue(math.isnan(raw[4]))
 
     def test_zero_or_nonfinite_packet_interval_still_stops_with_precise_fault(self):
         for delta in (0, float("nan")):

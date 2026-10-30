@@ -299,6 +299,9 @@ def _capture_data(capture, record):
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "absolute_peak_g": {axis: max(abs(row[index]) for row in delta)
                                     for index, axis in enumerate("xyz", 1)}}
+    limited = bool(capture.get("amplitude_limited") or record.get("amplitude_limited"))
+    metadata.update(amplitude_limited=limited, excess_amplitude_unknown=limited,
+                    peak_semantics=capture.get("peak_semantics", record.get("peak_semantics", "reported_sensor_derived")))
     if censoring is not None:
         # The shared validator proved this exact finite prefix against the
         # retained original native packets. Never export those private packets.
@@ -722,6 +725,9 @@ def prepare_filter_capture(run_id, axis, capture, record, raw_threshold_g,
                 if key not in ("raw_trace", "filtered_trace", "raw_level", "filtered_level", "weighted_level", "variants")}
     variants, primary = _filter_variants(analysis)
     metadata.update(sample_count=len(analysis["raw_trace"]), trace=rows, noise=noise,
+                    amplitude_limited=captured["amplitude_limited"],
+                    excess_amplitude_unknown=captured["excess_amplitude_unknown"],
+                    peak_semantics=captured["peak_semantics"],
                     trace_columns=_filter_trace_columns(primary),
                     variants={key: {name: value for name, value in item.items()
                                     if name not in ("trace", "level", "weighted_level")}
@@ -1701,6 +1707,12 @@ def _mark_response_censoring(axis, censoring, origin, factor=1.):
                  label="First native saturation / response truncated")
 
 
+def _range_observation_lines(metadata):
+    if not metadata.get("amplitude_limited"):
+        return []
+    return ["Sensor range reached; the true peak may be higher."]
+
+
 def _response_censoring_lines(censoring, origin):
     if not censoring:
         return []
@@ -1746,12 +1758,13 @@ def _plot_capture(figure, payload):
     axis.plot([peak[0]], [peak_value], "o", color="#192d45", markersize=4)
     peak_line = ("Observed valid-prefix peak: %s g  |  Displayed-prefix %s maximum: %s g" % (
                     _number(record.get("observed_valid_prefix_peak_g")), peak_name, _number(abs(peak_value)))
-                 if censoring else "Detector peak: %s g  |  Captured %s peak: %s g" % (
+                 if censoring else "Recorded peak: %s g  |  Captured %s peak: %s g" % (
                     _number(record.get("impact_peak_g")), peak_name, _number(abs(peak_value))))
     _axes_summary(axis, ["Samples: %d  |  Travel: %s mm  |  Onset: %s s / %s g" % (
                             captured["sample_count"], _number(_measured_travel(record), 6),
                             _number(elapsed, 4), _number(record.get("onset_g"))),
-                         peak_line] + _response_censoring_lines(censoring, captured["first_sample_time_s"]) +
+                         peak_line] + _range_observation_lines(captured) +
+                         _response_censoring_lines(censoring, captured["first_sample_time_s"]) +
                          (["%s threshold %s g applies to causal weighted level; signed raw response shown here" % (
                            _algorithm_label(record), _number(record.get("threshold_g"), 5))] if filtered_control else []))
     axis.legend(loc="best", fontsize=8)
@@ -1944,6 +1957,7 @@ def _plot_filter(figure, payload):
               _number(_measured_travel(record), 7),
               "Algorithm timing, lower noise, rectified amplitude and censored outcomes do not establish physical contact accuracy."]
     lines += _response_censoring_lines(censoring, arm)
+    lines += _range_observation_lines(analysis)
     if censoring:
         lines.append("Saturation follows qualified confirmation in sample order; it need not follow the host stop request.")
     wrapped = [part for line in lines for part in textwrap.wrap(line, 150)]
@@ -2073,6 +2087,8 @@ def _plot_accuracy(figure, payload):
         censored_count, len(trials)))
     if censored_count:
         summary.append("SATURATED / RESPONSE TRUNCATED: full impact peak unavailable for censored homes; valid prefixes only")
+    if any(trial.get("amplitude_limited") for trial in trials):
+        summary += _range_observation_lines({"amplitude_limited": True})
     _title(figure, payload, ("DEVELOPMENT / EXPERIMENTAL - Actual run A/B " if baseline else "Accel Homing Accuracy ")
            + payload["axis"].upper())
     vector = bool(trials and trials[0].get("impact_metric") == "xyz_magnitude")
@@ -2205,7 +2221,7 @@ def _plot_noise(figure, payload):
         if "noise_magnitude_peak_g" in record:
             summary.append("XYZ-magnitude peak: %s g (calibration metric)" %
                            _number(record["noise_magnitude_peak_g"], 4))
-        _axes_summary(axis, summary)
+        _axes_summary(axis, summary + _range_observation_lines(record))
         axis.legend(loc="best", ncol=3, fontsize=8)
     for axis in axes[:-1]:
         axis.set_xlabel("")

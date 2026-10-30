@@ -150,6 +150,8 @@ class StationaryNoiseRecoveryTests(unittest.TestCase):
     def test_opt_in_never_retries_stale_future_duplicate_clipped_driver_or_frozen_data(self):
         for decoded in (False, True):
             for mode in ("stale", "future", "duplicate", "clip", "error", "frozen", "map"):
+                if decoded and mode == "clip":
+                    continue  # generic finite range readings are accepted; native 0x7FFF is not
                 with self.subTest(decoded=decoded, mode=mode):
                     obj = sensor(decoded)
                     noise_flow(obj, mode)

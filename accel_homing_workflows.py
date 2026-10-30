@@ -1147,7 +1147,11 @@ class AccelHomingWorkflows:
             filtered_noise = {"filtered_noise_peak_g": filtered_peak, "filter_reference": reference,
                               "detector_config": config, "detector_version": config["version"],
                               "signal_mode": signal_mode(config)}
+        limited = context["full_scale_g"] is not None and any(
+            abs(value) >= context["full_scale_g"] for row in samples for value in row[1:])
         return {"run_id": session["run_id"], "noise_iteration": iteration, **filtered_noise,
+                "amplitude_limited": limited, "excess_amplitude_unknown": limited,
+                "peak_semantics": "observed_code_magnitude",
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "baseline_g": baseline, "noise_peak_g": peaks,
@@ -1529,7 +1533,10 @@ class AccelHomingWorkflows:
         if session["mode"] != "accuracy":
             session["records"].append(record)
         peak_description = ("unavailable (response censored; observed valid prefix %s g)" % record.get("observed_valid_prefix_peak_g")
-                            if record.get("response_censored") else "%s g" % record.get("impact_peak_g"))
+                if record.get("response_censored") else "%s g (%s sensor peak%s)" % (
+                    record.get("impact_peak_g"), "observed" if record.get("detector_type") == "filtered" else "reported",
+                    "; sensor range reached, true peak may be higher"
+                    if record.get("amplitude_limited") else ""))
         self._info("%s home: result %s; onset %s g; peak %s; threshold %s g; "
                    "commanded travel %s mm" % (
             axis.upper(), record.get("result"), record.get("onset_g"),
@@ -2048,6 +2055,10 @@ class AccelHomingWorkflows:
                     "recenter_acceleration_policy": "restored_normal_limit",
                     "onset_g": [r.get("onset_g") for r in qualified],
                     "impact_peak_g": [r.get("impact_peak_g") for r in qualified],
+                    "peak_semantics": ("observed_code_magnitude" if self.detector_type(axis) == "filtered"
+                                       else "reported_sensor_derived"),
+                    "amplitude_limited": [r.get("amplitude_limited", False) for r in qualified],
+                    "excess_amplitude_unknown": [r.get("excess_amplitude_unknown", False) for r in qualified],
                     "response_censored": [r.get("response_censored", False) for r in qualified],
                     "observed_valid_prefix_peak_g": [r.get("observed_valid_prefix_peak_g") for r in qualified],
                     "calibration_start_threshold_g": session["start_threshold_g"],

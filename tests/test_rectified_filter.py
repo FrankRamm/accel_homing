@@ -202,9 +202,9 @@ class RectifiedReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "actual filtered configuration"):
             compare_filter_capture(capture, 1., 1., {"version": 1})
 
-    def test_rail_or_sentinel_before_confirmation_remains_fatal_in_both_versions(self):
+    def test_sentinel_before_confirmation_remains_fatal_in_both_versions(self):
         for version in (1, 2):
-            for value, cause in ((-2048, "axis_full_scale"), (32767, "native_clip_sentinel")):
+            for value, cause in ((32767, "native_clip_sentinel"),):
                 capture, record = native_filtered_capture(clip_position=0, clip_value=value,
                     filter_config={"version": version}, clock_hz=32000000., sample_period=.000302)
                 self.assertEqual(record["result"], "invalid_data")

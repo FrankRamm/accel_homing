@@ -184,17 +184,18 @@ class CensoredAccuracyReceiptTests(unittest.TestCase):
 
 
 class CensoredNativeChartTests(unittest.TestCase):
-    def test_both_full_scale_signs_remain_censored_without_invented_tail_sign(self):
-        for raw_value in (-2047, 2047):
+    def test_finite_range_signs_keep_full_recorded_response_without_censoring(self):
+        for raw_value in (-2048, -2047, 2047):
             capture, record = native_filtered_capture(clip_value=raw_value)
             prepared = charts.prepare_capture("synthetic_full_scale", "x", capture, record, simulated=True)
             _receipt, frozen, metadata = charts._prepared_capture(prepared)
             with self.subTest(raw_value=raw_value):
-                self.assertEqual(metadata["response_censoring"]["cause"], "axis_full_scale")
-                self.assertEqual(metadata["response_censoring"]["raw_value"], raw_value)
-                self.assertEqual(frozen["observed_valid_prefix_peak_g"], 3.)
-                self.assertIsNone(frozen["impact_peak_g"])
-                self.assertLess(metadata["last_sample_time_s"], metadata["response_censoring"]["first_invalid_time_s"])
+                self.assertNotIn("response_censoring", metadata)
+                self.assertFalse(frozen["response_censored"])
+                self.assertGreater(frozen["impact_peak_g"], 15.)
+                self.assertTrue(metadata["amplitude_limited"])
+                self.assertTrue(metadata["excess_amplitude_unknown"])
+                self.assertEqual(max(abs(row[1]) for row in _receipt.trace), abs(raw_value) * .0078125)
 
     def test_only_validated_native_prefix_reaches_capture_renderer(self):
         capture, record = native_filtered_capture()

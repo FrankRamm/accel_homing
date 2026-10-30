@@ -264,6 +264,8 @@ class NoiseAcquisitionTests(unittest.TestCase):
     def test_missing_stale_future_duplicate_gap_clip_error_frozen_and_map_fail_without_motion(self):
         for decoded in (False, True):
             for mode in ("missing", "stale", "future", "duplicate", "gap", "clip", "error", "frozen", "map"):
+                if decoded and mode == "clip":
+                    continue  # this fixture is finite 16g for generic sensors, not a native sentinel
                 with self.subTest(decoded=decoded, mode=mode):
                     obj = self.machine(decoded)
                     noise_flow(obj, mode)

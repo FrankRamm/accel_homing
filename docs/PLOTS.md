@@ -61,7 +61,7 @@ signed XYZ remain visible, while rectified per-axis envelopes are nonnegative.
 Mean-removed XYZ noise metrics are separate from decision-level mean/RMS/P99
 that retain rectification's DC. Absolute value is nonlinear, so spectral peaks
 can move/double; PSD differences do not establish physical vibration removal.
-Confirmations at/after the actual stop-request cutoff or first saturated sample
+Confirmations at/after the actual stop-request cutoff or first explicit native clipped sample
 are censored; after-cutoff valid curves are labelled response only and the
 unknown saturated tail is omitted. Original acquisition times determine
 eligibility; displayed cutoff markers may be interpolated. Ordinary FILTERED

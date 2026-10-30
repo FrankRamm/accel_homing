@@ -398,7 +398,7 @@ def validate_filtered_capture_prefix(capture, record=None):
             for axis, value in enumerate(xyz):
                 counts["clipped_axis_values"] += value == 32767
                 counts["saturated_axis_values"] += abs(value * scale) >= full_scale
-                if invalid is None and (value == 32767 or abs(value * scale) >= full_scale):
+                if invalid is None and value == 32767:
                     invalid = axis
             if invalid is not None and found is None:
                 found = (len(rows), stamp, when, invalid, xyz[invalid])
@@ -416,7 +416,7 @@ def validate_filtered_capture_prefix(capture, record=None):
     if (index != len(samples) or _stamp(summary.get("first_invalid_sample")) != stamp
             or summary.get("first_invalid_sample_index") != index or summary.get("first_invalid_time_s") != when
             or summary.get("sensor_axis") != "xyz"[axis] or summary.get("raw_value") != value
-            or summary.get("cause") != ("native_clip_sentinel" if value == 32767 else "axis_full_scale")
+            or summary.get("cause") != "native_clip_sentinel"
             or summary.get("original_sample_count") != len(rows)
             or summary.get("valid_prefix_sample_count") != index
             or summary.get("censored_sample_count") != len(rows) - index

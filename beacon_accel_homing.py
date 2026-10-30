@@ -236,7 +236,10 @@ def decode_clips(raw, previous, clips):
 def describe(r):
     """One line per homing pass, for the status command and klippy.log."""
     peak = ("unavailable (response censored; observed valid prefix %s g)" % r.get("observed_valid_prefix_peak_g")
-            if r.get("response_censored") else "%s g" % r["impact_peak_g"])
+            if r.get("response_censored") else "%s g (%s sensor peak%s)" % (
+                r["impact_peak_g"], "observed" if r.get("detector_type") == "filtered" else "reported",
+                "; sensor range reached, true peak may be higher"
+                if r.get("amplitude_limited") else ""))
     return ("%s pass %d: %s, onset %s g, peak %s, noise +%.1f/-%.1f g, travel %s mm%s"
             % (r["axis"].upper(), r["pass"], r["result"], r["onset_g"], peak,
                r["noise_pos_g"], r["noise_neg_g"], r.get("travel_mm"),
@@ -346,6 +349,7 @@ class Attempt:
         self.sample_fault = None
         self.first_armed_sample = None
         self.response_censoring = None
+        self.amplitude_limited = False  # finite original codes; informational, never a trigger/health gate
         self.capture_epoch = None
         self.capture_token = self.capture_reference = None
         self.filter_packet_times = {}
@@ -1286,10 +1290,7 @@ class BeaconAccelHoming:
                         return "sample_gap"
                 values = tuple(axis[number] for axis in raw)
                 if (not all(math.isfinite(value) for value in values)
-                        or (self.backend is None and CLIPPED in values)
-                        or (self.full_scale_g is not None
-                            and any(abs(value) * self.session_scale["scale"] / 1000.0
-                                    >= self.full_scale_g for value in values))):
+                        or (self.backend is None and CLIPPED in values)):
                     return "invalid_data"
                 identity = (params["start_clock"], params["delta_clock"], number, count)
                 reference_error = reference.add(when, values, identity)
@@ -1455,6 +1456,7 @@ class BeaconAccelHoming:
                           index, map_sign, direction, limit_raw, count_g)
         attempt.vector_mode = vector_mode
         attempt.detector_type = detector_type
+        self._note_range_observation(attempt, (value for row in reference._samples for value in row[2]))
         if capture_binding is not None:
             attempt.capture_token, attempt.capture_epoch, attempt.capture_reference = capture_binding
         if filter_reference is not None:
@@ -1860,12 +1862,10 @@ class BeaconAccelHoming:
                 for index, value in enumerate(raw):
                     finite = math.isfinite(value)
                     sentinel = self.backend is None and value == CLIPPED
-                    saturated = (finite and self.full_scale_g is not None
-                                 and abs(value * attempt.count_g) >= self.full_scale_g)
-                    rejected = (not finite if cause == "nonfinite_axis_value" else sentinel or saturated)
+                    rejected = (not finite if cause == "nonfinite_axis_value" else sentinel)
                     if rejected:
                         fault.update(cause="nonfinite_axis_value" if not finite else
-                                     "native_clip_sentinel" if sentinel else "axis_full_scale",
+                                     "native_clip_sentinel",
                                      sample_position=index // 3 + source_skip,
                                      sensor_axis="xyz"[index % 3], raw_value=value,
                                      axis_value_g=None if not finite or sentinel else value * attempt.count_g,
@@ -2161,6 +2161,8 @@ class BeaconAccelHoming:
         raw = (data if isinstance(data, tuple) else memoryview(data).cast("h") if NATIVE_LE
                else [v for sample in SAMPLE.iter_unpack(data) for v in sample])
         chronological_native = attempt.detector_type == "filtered" and self.backend is None
+        if not chronological_native:
+            self._note_range_observation(attempt, raw)
         if strict_native and not chronological_native and not all(math.isfinite(value) for value in raw):
             self._reject_homing_sample(attempt, "homing_xyz", "nonfinite_axis_value", source_params,
                                        raw=raw, source_skip=source_skip)
@@ -2267,11 +2269,11 @@ class BeaconAccelHoming:
                     self._reject_homing_sample(attempt, "homing_xyz", "nonfinite_axis_value", source_params,
                                                raw=xyz, source_skip=position + source_skip)
                     return
-                if (CLIPPED in xyz or (self.full_scale_g is not None and any(
-                        abs(value * attempt.count_g) >= self.full_scale_g for value in xyz))):
-                    self._reject_homing_sample(attempt, "homing_xyz", "clipped_or_full_scale", source_params,
+                if CLIPPED in xyz:
+                    self._reject_homing_sample(attempt, "homing_xyz", "native_clip_sentinel", source_params,
                                                raw=xyz, source_skip=position + source_skip)
                     return
+                self._note_range_observation(attempt, xyz)
             if xyz != previous or attempt.vector_unchanged_since is None:
                 attempt.varied = attempt.varied or xyz != previous
                 attempt.vector_unchanged_since = self.clock_to_time(
@@ -2353,11 +2355,30 @@ class BeaconAccelHoming:
         self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
         self._track_impact(attempt, params, None, count, values)
 
+    def _note_range_observation(self, attempt, raw):
+        """Finite original range observations do not invalidate data or imply contact.
+
+        In particular the explicit native sentinel has no measured sign/amplitude.
+        Call before legacy decoding so it cannot manufacture a range observation.
+        """
+        if getattr(attempt, "amplitude_limited", False) or self.full_scale_g is None:
+            return
+        if any(math.isfinite(value) and (self.backend is not None or value != CLIPPED)
+               and abs(value * attempt.count_g) >= self.full_scale_g for value in raw):
+            attempt.amplitude_limited = True
+            if attempt.record is not None:
+                with self.lock:
+                    attempt.record.update(amplitude_limited=True, excess_amplitude_unknown=True)
+
     def _track_impact(self, attempt, params, data, count, values=None,
                        source_params=None, source_skip=0):
         """Largest reading shortly after the onset, for status."""
         if attempt.impact_until is None or not clock_after(attempt.impact_until, params["start_clock"]):
             return
+        original = params.get("data")
+        if original is not None:
+            self._note_range_observation(attempt, original if isinstance(original, tuple) else
+                                         (v for row in SAMPLE.iter_unpack(sample_slice(original, count)) for v in row))
         if attempt.vector_mode:
             raw = (data if isinstance(data, (tuple, list, memoryview)) else
                    [v for row in SAMPLE.iter_unpack(sample_slice(data, count)) for v in row])
@@ -2370,15 +2391,13 @@ class BeaconAccelHoming:
                     if not all(math.isfinite(value) for value in xyz):
                         self._sensor_fault("invalid_data")
                         return
-                    invalid = next((index for index, value in enumerate(xyz)
-                                    if value == CLIPPED or (self.full_scale_g is not None
-                                        and abs(value * attempt.count_g) >= self.full_scale_g)), None)
+                    invalid = next((index for index, value in enumerate(xyz) if value == CLIPPED), None)
                     if invalid is not None:
                         source = params if source_params is None else source_params
                         censor = {
                             "first_invalid_sample": (source["start_clock"], source["delta_clock"],
                                                      position + source_skip, sample_count(source["data"])),
-                            "cause": "native_clip_sentinel" if xyz[invalid] == CLIPPED else "axis_full_scale"}
+                            "cause": "native_clip_sentinel"}
                         with self.lock:
                             if attempt.response_censoring is None:
                                 attempt.impact_peak = max(attempt.impact_peak, measured_peak)
@@ -2737,14 +2756,14 @@ class BeaconAccelHoming:
                         self._sensor_fault("sample_gap")
                         return
                 values = tuple(axis[number] for axis in raw)
+                if quality is not None:
+                    quality["saturation_axis_values"] += sum(
+                        math.isfinite(value) and (self.backend is not None or value != CLIPPED)
+                        and abs(value * count_g) >= full_scale for value in values) if full_scale is not None else 0
                 if (not all(math.isfinite(value) for value in values)
-                        or (self.backend is None and CLIPPED in values)
-                        or (full_scale is not None
-                            and any(abs(value * count_g) >= full_scale for value in values))):
+                        or (self.backend is None and CLIPPED in values)):
                     if quality is not None:
                         quality["clipped_axis_values"] += sum(value == CLIPPED for value in values) if self.backend is None else 0
-                        quality["saturation_axis_values"] += sum(
-                            abs(value * count_g) >= full_scale for value in values) if full_scale is not None else 0
                     self._sensor_fault("invalid_data")
                     return
                 if len(window["samples"]) >= self.capture_limit:
@@ -2980,10 +2999,10 @@ class BeaconAccelHoming:
                         full_scale, count_g = context["full_scale_g"], context["count_g"]
                         quality["clipped_axis_values"] += sum(value == CLIPPED for channel in raw for value in channel) if self.backend is None else 0
                         quality["saturation_axis_values"] += sum(
-                            abs(value * count_g) >= full_scale for channel in raw for value in channel) if full_scale is not None else 0
+                            math.isfinite(value) and (self.backend is not None or value != CLIPPED)
+                            and abs(value * count_g) >= full_scale for channel in raw for value in channel) if full_scale is not None else 0
                         if any(not math.isfinite(value)
                                or (self.backend is None and value == CLIPPED)
-                               or (full_scale is not None and abs(value * count_g) >= full_scale)
                                for channel in raw for value in channel):
                             reason = "invalid_data"
                         else:
@@ -3275,7 +3294,7 @@ class BeaconAccelHoming:
                          "excluded_previous_epoch_samples": token["excluded_epoch_samples"]}
         native_source, first_invalid, original_offset = [], None, 0
         integrity = {"raw_samples_validated": True, "clipped_axis_values": 0,
-                     "saturated_axis_values": 0, "nonfinite_axis_values": 0}
+                     "saturated_axis_values": 0, "range_limit_axis_values": 0, "nonfinite_axis_values": 0}
         onset_matches, onset_index = 0, None
         ref_matches, ref_indices = [0, 0], [None, None]
         event_matches, event_indices = {"crossing": 0, "confirmation": 0, "first_armed": 0}, {}
@@ -3306,6 +3325,9 @@ class BeaconAccelHoming:
                 integrity["clipped_axis_values"] += sum(value == CLIPPED for value in scoped_raw)
             if self.full_scale_g is not None:
                 integrity["saturated_axis_values"] += sum(abs(value * count_g) >= self.full_scale_g for value in scoped_raw)
+                integrity["range_limit_axis_values"] += sum(
+                    math.isfinite(value) and (self.backend is not None or value != CLIPPED)
+                    and abs(value * count_g) >= self.full_scale_g for value in scoped_raw)
             if self.backend is None and not native_filtered and CLIPPED in raw:
                 raw = decode_clips(raw, previous, self.clip_values)
             previous = raw[-3:]
@@ -3328,8 +3350,7 @@ class BeaconAccelHoming:
                 xyz = raw[number * 3:number * 3 + 3]
                 if native_filtered and first_invalid is None:
                     bad = next((index for index, value in enumerate(xyz)
-                                if not math.isfinite(value) or value == CLIPPED or
-                                (self.full_scale_g is not None and abs(value * count_g) >= self.full_scale_g)), None)
+                                if not math.isfinite(value) or value == CLIPPED), None)
                     if bad is not None:
                         value = xyz[bad]
                         first_invalid = {"version": 1, "kind": "native_saturation_after_confirmation",
@@ -3338,8 +3359,7 @@ class BeaconAccelHoming:
                                          "first_invalid_time_s": start + number * dt,
                                          "first_invalid_original_time_s": (None if online is None else
                                              online[0] + (online[1] - online[0]) * number / (count - 1)),
-                                         "cause": "nonfinite_axis_value" if not math.isfinite(value) else
-                                                  "native_clip_sentinel" if value == CLIPPED else "axis_full_scale",
+                                         "cause": "nonfinite_axis_value" if not math.isfinite(value) else "native_clip_sentinel",
                                          "sensor_axis": "xyz"[bad], "raw_value": value,
                                          "full_scale_g": self.full_scale_g}
                 if first_invalid is None:
@@ -3369,12 +3389,26 @@ class BeaconAccelHoming:
             resting = samples[:min(50, len(samples))]
             baseline = tuple(sum(row[i] for row in resting) / len(resting) for i in (1, 2, 3))
         integrity["raw_samples_validated"] = not any(integrity[key] for key in (
-            "clipped_axis_values", "saturated_axis_values", "nonfinite_axis_values"))
+            "clipped_axis_values", "nonfinite_axis_values"))
+        amplitude_limited = bool(integrity["range_limit_axis_values"] or
+                                 (attempt is not None and getattr(attempt, "amplitude_limited", False)))
+        peak_semantics = ("observed_code_magnitude" if attempt is not None and attempt.detector_type == "filtered"
+                          else "reported_sensor_derived")
+        if detector is not None:
+            detector.update(amplitude_limited=amplitude_limited, excess_amplitude_unknown=amplitude_limited,
+                            peak_semantics=peak_semantics)
+        if attempt is not None and amplitude_limited:
+            with self.lock:
+                attempt.amplitude_limited = True
+                if attempt.record is not None:
+                    attempt.record.update(amplitude_limited=True, excess_amplitude_unknown=True)
         raw_baseline = (None if attempt is None or attempt.raw_bases is None else
                         tuple(attempt.raw_bases[index] * sign * attempt.count_g for index, sign in mapping))
         captured = {"samples": samples, "dropped": dropped, "baseline_g": baseline,
                 "raw_baseline_g": raw_baseline, "fault": fault,
                 "raw_integrity": integrity,
+                "amplitude_limited": amplitude_limited, "excess_amplitude_unknown": amplitude_limited,
+                "peak_semantics": peak_semantics,
                 "detector": detector,
                 # Used only for in-process provenance; workflows remove this
                 # reference before exporting metadata or publishing status.
@@ -3521,6 +3555,9 @@ class BeaconAccelHoming:
             "impact_sign": (1 if attempt.onset_raw > 0 else -1 if attempt.onset_raw < 0 else None)
                            if onset else None,
             "impact_peak_g": (round(attempt.impact_peak * to_g, 2) if onset and attempt.response_censoring is None else None),
+            "peak_semantics": "observed_code_magnitude" if attempt.detector_type == "filtered" else "reported_sensor_derived",
+            "amplitude_limited": attempt.amplitude_limited,
+            "excess_amplitude_unknown": attempt.amplitude_limited,
             "response_censored": attempt.response_censoring is not None,
             "observed_valid_prefix_peak_g": (attempt.impact_peak * to_g if attempt.response_censoring is not None else None),
             "trigger_crossing_time_s": attempt.crossing_time,
@@ -3550,6 +3587,8 @@ class BeaconAccelHoming:
             censored = attempt.response_censoring is not None
             result.update(impact_peak_g=(None if censored or not onset else round(attempt.impact_peak * to_g, 2)),
                           response_censored=censored,
+                          amplitude_limited=attempt.amplitude_limited,
+                          excess_amplitude_unknown=attempt.amplitude_limited,
                           observed_valid_prefix_peak_g=attempt.impact_peak * to_g if censored else None)
             attempt.record = result
             self.last[attempt.axis] = result

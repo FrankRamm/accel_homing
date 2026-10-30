@@ -17,7 +17,7 @@ from test_filter_engine import FilteredRig
 def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_size=8,
                             split=None, clock_shift=0., axes_map=((0, 1), (1, 1), (2, 1)),
                             time_offset=0., arm_straddle=0, clock_hz=1000., sample_period=.001,
-                            post_clip_g=3., filter_config=None):
+                            post_clip_g=3., filter_config=None, row_values=None):
     """Exercise real prepare/filter/capture callbacks, with no real hardware."""
     obj = make_homing(threshold=1., axes_map=axes_map)
     obj.reactor.now = time_offset
@@ -51,7 +51,9 @@ def native_filtered_capture(axis="x", clip_position=4, clip_value=32767, packet_
     when = obj.preparation.last + sample_period
     attempt = obj.prepare(endstop, when + arm_straddle * sample_period)
     obj.arm(attempt)
-    rows = [(counts(3.), 0, counts(1.))] * packet_size
+    rows = list(row_values) if row_values is not None else [(counts(3.), 0, counts(1.))] * packet_size
+    if len(rows) != packet_size:
+        raise ValueError("fixture rows must match packet size")
     if clip_position is not None:
         rows[clip_position] = (clip_value, 0, counts(1.))
         for i in range(clip_position + 1, packet_size):
@@ -109,8 +111,8 @@ class ChronologicalClippingTests(unittest.TestCase):
         self.assertEqual(a["response_censoring"]["valid_prefix_sample_count"], b["response_censoring"]["valid_prefix_sample_count"])
         self.assertEqual(a["observed_valid_prefix_peak_g"], b["observed_valid_prefix_peak_g"])
 
-    def test_fullscale_and_actual_rate_synthetic_prefix_use_same_strict_order(self):
-        for value in (counts(16.), 32767):
+    def test_sentinel_and_actual_rate_synthetic_prefix_use_same_strict_order(self):
+        for value in (32767,):
             for straddle in (0, 2):
                 capture, record = native_filtered_capture(clip_value=value, arm_straddle=straddle,
                                                           clock_hz=32000000., sample_period=.000302)

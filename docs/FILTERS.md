@@ -29,7 +29,7 @@ raises the threshold or changes weights after arming.
 The versioned initial configuration uses a 0.2 ms time constant, confirmation
 between 0.3 and 1.5 ms, and a minimum XYZ weight of 0.75. These are development
 defaults, not measured optimal values. Timing, sample age, sensor health,
-overflow, saturation and cleanup checks remain required. No new Python
+overflow, explicit clipping and cleanup checks remain required. No new Python
 dependency is added to the armed detector.
 
 Thresholds belong to their detector metric. A RAW component/XYZ threshold is
@@ -227,13 +227,36 @@ and a censored-response count alongside independently computed travel statistics
 
 ## Sample-fault diagnostics
 
-### Native saturation after FILTERED confirmation
+### Finite range observations and explicit native clipping
+
+Finite signed axis values at or above the configured per-axis range now enter
+the existing reference, noise, homing and replay pipelines. They do not imply
+an impact: `FILTERED` still requires its existing temporal/energy confirmation,
+and all timestamp, frozen-stream, quiet-reference and other health checks still
+apply. Threshold headroom and scale-metadata validation are unchanged.
+`RAW`, signed `FILTERED` v1 and rectified v2 retain their signal calculations;
+v2 still subtracts the frozen signed reference before taking absolute values.
+
+`amplitude_limited` and `excess_amplitude_unknown` are informational: at least
+one finite original axis value was at/above the configured range. The numeric
+`impact_peak_g` for accepted finite `FILTERED` values is an **observed code-derived magnitude**, not proof of the
+true physical maximum or any excess beyond that range. These finite values are
+not clamped or reconstructed. `RAW` retains `reported_sensor_derived` peak semantics
+and its existing legacy sentinel handling. The existing `saturated_axis_values` counter describes range
+observations, not proven physical clipping; `range_limit_axis_values` excludes
+the explicit native sentinel and nonfinite values. A finite range observation
+alone does not invalidate `raw_samples_validated`, truncate a response, or
+prevent a successful workflow/chart. Historical `axis_full_scale` receipts
+remain readable, but the current detector no longer emits that rejection.
+
+The explicit native `0x7FFF` sentinel still has no known measured sign or
+amplitude and remains subject to the existing clipping policy below.
 
 Only a native Beacon `FILTERED` home with a fully qualified confirmation
-strictly before the first clipped/full-scale sample can retain a censored
+strictly before the first explicit native clipped sample can retain a censored
 response. This comparison is chronological sample order, including rows in
 one packet; it does not assume the clipping happened after the host requested
-a stop. Saturation at or before confirmation still stops and rejects the
+a stop. An explicit clipping sentinel at or before confirmation still stops and rejects the
 attempt. `RAW` retains its existing clipping handling.
 
 The shared validator checks the finite contiguous prefix against the original
@@ -278,7 +301,8 @@ For the instrumented native Beacon homing rejection paths, the same command
 error and `ACCEL_HOMING_STATUS` now include the first bounded `sample_fault`
 record. Generic backend and Beta acquisition faults may still provide only
 their broader fault result. `native_clip_sentinel` means Beacon reported `0x7FFF`;
-`axis_full_scale` means an individual raw sensor axis reached its range limit.
+Historical `axis_full_scale` means a raw sensor axis reached its range limit;
+that magnitude-only rejection has been removed for finite values.
 An XYZ vector magnitude of 14–16 g, or even above the individual-axis range,
 does not itself prove clipping. `nonmonotonic_packet_clock`,
 `filter_nonmonotonic_time` and `filter_sample_gap` identify different timestamp
@@ -289,8 +313,8 @@ and next timestamps, measured gap and limit. These numbers identify the actual
 rejected pair; an error from an older run cannot establish that pair.
 
 Stop dispatch occurs before optional diagnostic conversion or logging. Apart
-from the validated post-confirmation FILTERED saturation case above, the
-rejection rules, watchdogs and clipping protections are unchanged. A failed
+from finite range acceptance and the validated post-confirmation FILTERED clipping case above,
+the other rejection rules, watchdogs and clipping protections are unchanged. A failed
 workflow still publishes no PNG or raw scratch capture. Copy the exact command
 error or status record for diagnosis; an earlier run without this detail cannot
 establish which rejection occurred.

@@ -67,7 +67,7 @@ class GenericPreparationTest(unittest.TestCase):
 
     def test_fault_or_noisy_generic_preparation_aborts_before_any_dispatch(self):
         for mode in ("noise", "no_data", "stale", "future", "duplicate", "gap",
-                     "saturated", "nonfinite", "errors", "overflows"):
+                     "nonfinite", "errors", "overflows"):
             with self.subTest(mode=mode):
                 obj, endstop = self.session()
                 sequence = [0]
@@ -88,8 +88,6 @@ class GenericPreparationTest(unittest.TestCase):
                     elif mode == "gap" and last:
                         start += 0.020
                         obj.reactor.now += 0.020
-                    elif mode == "saturated":
-                        x = 16.0
                     elif mode == "nonfinite":
                         x = float("nan")
                     elif mode in ("errors", "overflows"):
@@ -869,7 +867,7 @@ class CalibrationReferenceTest(unittest.TestCase):
                         self.assertAlmostEqual(obj.onset_time(attempt), rows[0][0], delta=1e-6)
 
     def test_calibration_data_faults_and_capacity_still_abort_before_dispatch(self):
-        for mode in ("stale", "future", "duplicate", "gap", "saturated", "nonfinite",
+        for mode in ("stale", "future", "duplicate", "gap", "nonfinite",
                      "errors", "overflows", "capacity"):
             with self.subTest(mode=mode):
                 obj, endstop = GenericPreparationTest().session()
@@ -889,8 +887,6 @@ class CalibrationReferenceTest(unittest.TestCase):
                     elif mode == "gap" and last:
                         start += 0.020
                         obj.reactor.now += 0.020
-                    elif mode == "saturated":
-                        x = 16.0
                     elif mode == "nonfinite":
                         x = float("nan")
                     elif mode in ("errors", "overflows"):
