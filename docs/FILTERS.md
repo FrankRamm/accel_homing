@@ -102,10 +102,14 @@ Candidates, estimated onset, confirmation and the actual host stop-request
 interval are distinct. Estimated onset is not independently measured contact.
 
 Only samples strictly before the conservative lower bound of the actual
-stop-request interval can validate a replay decision. A filtered candidate
-that confirms later is **censored**; the chart cannot infer its additional
-delay or what another physical home would have done. Gray after-cutoff curves
-show captured response only. They do not prove contact or mechanical stopping.
+stop-request interval can validate a replay decision. If native saturation
+truncates the response earlier, the first invalid sample is the replay cutoff.
+The chart names the active cutoff and its time. A detector that has not
+confirmed before that cutoff is **censored**; the chart cannot infer its
+additional delay, rejection of a false contact, or what another physical home
+would have done. Gray after-cutoff curves show valid captured response only.
+An amber region marks an omitted saturated tail and contains no reconstructed
+curve. Neither region proves contact or mechanical stopping.
 
 Noise RMS and robust P99 use the same validated stationary pre-arm reference
 interval, after filter warmup, with each interval mean removed. They exclude
@@ -128,9 +132,13 @@ trials or combines a replay with real homes. Both series are independent;
 their accepted-home indices are not paired physical measurements.
 
 The report compares count, actual commanded travel, range and population
-standard deviation. It lists detector/metric/config/threshold differences as
-the treatment. Sensor, geometry, speeds and homing acceleration must be
-present and match for reported-context comparability. Missing/different
+standard deviation. It separately counts censored responses: a qualified
+commanded-travel trial can remain valid while its full response peak is
+unavailable. Only each trial's validated finite prefix appears in the response
+overlays; a truncated endpoint is marked. It lists detector, metric,
+configuration and threshold differences as the treatment. Sensor, geometry,
+speeds and homing acceleration must be present and match for reported-context
+comparability. Missing/different
 conditions are shown prominently and prohibit attributing the change to
 filtering. Even matching recorded conditions establish only the variation
 observed in those runs, not absolute position, correct contact, lack of missed
@@ -140,8 +148,12 @@ the machine before drawing a hardware conclusion.
 The compact validated receipt is embedded in the completed PNG. Keep its
 original filename and metadata on the host; image editors/recompression can
 strip that metadata. Old PNGs without this development receipt cannot serve
-as a baseline. Lookup accepts bounded safe IDs, never filesystem paths; rejects
-symlinks, duplicate IDs, malformed/incomplete/oversized receipts, another axis,
+as a baseline. Receipts with censored responses use version 2 so older code
+cannot read them as ordinary version 1 runs. Existing valid version 1 RAW
+baselines remain readable; absent censor metadata is displayed as unknown
+legacy evidence, not zero censored responses. Lookup accepts bounded safe IDs,
+never filesystem paths; rejects symlinks, duplicate IDs,
+malformed/incomplete/oversized receipts, another axis,
 and synthetic/actual mixing. Baseline selection is validated before movement
 and again before publication. A directory with more than 4096 entries requires
 operator housekeeping; no old outputs are deleted automatically.
@@ -161,9 +173,46 @@ python3 -B tests/render_filter_examples.py --output /tmp/accel-homing-synthetic-
 
 Every generated figure is prominently **SYNTHETIC / SIMULATED / NOT PRINTER
 MEASUREMENT**. The generated pulse, noise and independent travel series are
-visual/software fixtures, not printer measurements or results.
+visual/software fixtures, not printer measurements or results. Native callback
+examples also exercise post-confirmation saturation, its missing response tail,
+and a censored-response count alongside independently computed travel statistics.
 
 ## Sample-fault diagnostics
+
+### Native saturation after FILTERED confirmation
+
+Only a native Beacon `FILTERED` home with a fully qualified confirmation
+strictly before the first clipped/full-scale sample can retain a censored
+response. This comparison is chronological sample order, including rows in
+one packet; it does not assume the clipping happened after the host requested
+a stop. Saturation at or before confirmation still stops and rejects the
+attempt. `RAW` retains its existing clipping handling.
+
+The shared validator checks the finite contiguous prefix against the original
+native packets, frozen stationary reference, detector configuration and exact
+confirmation identities for this attempt. It replays the actual detector to
+verify that confirmation. Whole-capture `raw_samples_validated` remains
+`false`. Any malformed/nonfinite data, timing failure, invalid reference or
+other integrity fault still rejects the capture, including a fault later in
+the unusable tail. Rows after the first saturation are never skipped and
+joined to earlier rows.
+
+The exported samples contain only that validated prefix. Public
+`response_censoring` metadata identifies the first invalid original packet
+row and time, original/prefix/censored sample counts, confirmation, and the
+separately named `observed_valid_prefix_peak_g`. The full `impact_peak_g` is
+`null`: a prefix maximum is not a complete impact peak, bound on the missing
+response, or evidence that contact was correct. Charts state **SATURATED /
+RESPONSE TRUNCATED / FULL PEAK UNAVAILABLE** and omit the unknown tail.
+Original native packets remain bounded private validation evidence in memory;
+they are not serialized to a PNG or raw scratch file.
+
+A failed or incomplete workflow still publishes no chart. This exception does
+not establish that an earlier failed calibration would have passed: without
+its original valid prefix and confirmation evidence, that conclusion cannot
+be reconstructed.
+
+### Rejection details
 
 `invalid_data` is a general stop result, not proof of a repeated timestamp.
 For the instrumented native Beacon homing rejection paths, the same command
@@ -177,7 +226,8 @@ does not itself prove clipping. `nonmonotonic_packet_clock`,
 rejections. The record includes the phase, packet clocks/count, and relevant
 sample position, axis, value or time difference; it does not retain raw history.
 
-Stop dispatch occurs before optional diagnostic conversion or logging. The
+Stop dispatch occurs before optional diagnostic conversion or logging. Apart
+from the validated post-confirmation FILTERED saturation case above, the
 rejection rules, watchdogs and clipping protections are unchanged. A failed
 workflow still publishes no PNG or raw scratch capture. Copy the exact command
 error or status record for diagnosis; an earlier run without this detail cannot

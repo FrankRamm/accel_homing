@@ -24,6 +24,7 @@ _MAX_PNG_BYTES = 32 * 1024 * 1024
 _MAX_PNG_PIXELS = 12 * 1024 * 1024
 _MAX_INPUT_BYTES = 32 * 1024 * 1024
 _MAX_SAMPLES = 500000
+_MAX_CENSORED_NATIVE_SAMPLES = 200000
 _POPULATION = "population (divide by N)"
 _NOISE_WINDOWS = 3
 _NOISE_WINDOW_SECONDS = 1.0
@@ -228,10 +229,29 @@ def _envelope(samples, buckets=512):
     return tuple(result)
 
 
+def _validated_response_censoring(capture, record):
+    try:
+        from .accel_homing_filters import validate_filtered_capture_prefix
+    except ImportError:
+        from accel_homing_filters import validate_filtered_capture_prefix
+    return validate_filtered_capture_prefix(capture, record)
+
+
+def _censored_peak_record(record):
+    try:
+        from .accel_homing_filters import validate_censored_peak_record
+    except ImportError:
+        from accel_homing_filters import validate_censored_peak_record
+    return validate_censored_peak_record(record)
+
+
 def _capture_data(capture, record):
     if not isinstance(capture, dict) or capture.get("dropped", 0) \
             or capture.get("fault") or capture.get("error"):
         raise ValueError("Sensor capture fault or buffer overflow; refusing an incomplete PNG")
+    censoring = _validated_response_censoring(capture, record)
+    if censoring is not None and not _censored_peak_record(record):
+        raise ValueError("Censored capture requires its qualified nullable-peak FILTERED record")
     samples = capture.get("samples", ())
     if not isinstance(samples, (tuple, list)) or not 2 <= len(samples) <= _MAX_SAMPLES:
         raise ValueError("No bounded accelerometer capture for this home")
@@ -258,6 +278,11 @@ def _capture_data(capture, record):
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "absolute_peak_g": {axis: max(abs(row[index]) for row in delta)
                                     for index, axis in enumerate("xyz", 1)}}
+    if censoring is not None:
+        # The shared validator proved this exact finite prefix against the
+        # retained original native packets. Never export those private packets.
+        metadata.update(response_censoring=censoring,
+                        raw_integrity=capture["raw_integrity"])
     _json(record)
     return _envelope(delta), metadata
 
@@ -409,6 +434,17 @@ def _prepared_capture(prepared):
                 peaks[axis], max(abs(row[index]) for row in trace), rel_tol=1e-12, abs_tol=1e-12)
                    for index, axis in enumerate("xyz", 1))):
         raise ValueError("Deferred capture measurements do not match its trace")
+    censored = _censored_peak_record(record)
+    censoring = metadata.get("response_censoring")
+    if censored:
+        integrity = metadata.get("raw_integrity")
+        if (censoring != record.get("response_censoring")
+                or not isinstance(integrity, dict) or integrity.get("raw_samples_validated") is not False
+                or censoring["valid_prefix_sample_count"] != count
+                or last >= censoring["first_invalid_time_s"]):
+            raise ValueError("Deferred censored capture does not match its validated prefix receipt")
+    elif censoring is not None:
+        raise ValueError("Deferred censor metadata has no qualified FILTERED record")
     return receipt, record, metadata
 
 
@@ -551,12 +587,14 @@ def prepare_filter_capture(run_id, axis, capture, record, raw_threshold_g,
     if (record.get("axis", axis) != axis
             or (capture.get("detector") or {}).get("axis", axis) != axis):
         raise ValueError("Filter comparison capture axis does not match its record")
-    _capture_data(capture, record)
+    _trace, captured = _capture_data(capture, record)
     try:
         from .accel_homing_filters import compare_filter_capture
     except ImportError:
         from accel_homing_filters import compare_filter_capture
     analysis = compare_filter_capture(capture, raw_threshold_g, filtered_threshold_g, filter_config=filter_config)
+    if analysis.get("response_censoring") != captured.get("response_censoring"):
+        raise ValueError("Filter replay does not match the validated response prefix")
     noise = _filter_noise_summary(analysis)
     rows = _filter_display_rows(analysis)
     metadata = {key: value for key, value in analysis.items()
@@ -705,13 +743,26 @@ def _accuracy_report(run_id, axis, item, simulated):
         other["detector_type"] = other["detector_type"] or "raw"
         if other != context:
             raise ValueError("Accuracy detector/sensor/geometry/speed context changed during the run")
-    report = {"version": 1, "kind": "completed_accuracy", "run_id": run_id, "axis": axis,
+    censored_responses = []
+    for index, trial in enumerate(trials, 1):
+        if _censored_peak_record(trial):
+            summary = trial["response_censoring"]
+            censored_responses.append({
+                "trial_index": index, "impact_peak_g": None,
+                "raw_samples_validated": False, "decision_prefix_validated": True,
+                **{key: summary[key] for key in (
+                    "cause", "first_invalid_sample", "first_invalid_sample_index", "first_invalid_time_s",
+                    "original_sample_count", "valid_prefix_sample_count", "censored_sample_count",
+                    "confirmation_sample", "confirmation_sample_index", "confirmation_time_s", "observed_valid_prefix_peak_g")}})
+    report = {"version": 2 if censored_responses else 1, "kind": "completed_accuracy", "run_id": run_id, "axis": axis,
               "result": "complete", "measurement": "commanded_homing_travel",
               "physical_position_verified": False, "simulated": bool(simulated),
               "requested": item["requested_samples"], "count": len(trials),
               "threshold_g": trials[0]["threshold_g"], "context": context,
               "travels_mm": [_measured_travel(trial) for trial in trials],
-              "statistics": item["statistics"]}
+              "statistics": item["statistics"],
+              "censored_response_count": len(censored_responses),
+              "censored_responses": censored_responses}
     return _validate_accuracy_report(report)
 
 
@@ -727,7 +778,8 @@ def _validate_accuracy_report(report):
     _baseline_identity(report.get("run_id"), report.get("axis"))
     count, requested = report.get("count"), report.get("requested")
     context, travels = report.get("context"), report.get("travels_mm")
-    if (report.get("version") != 1 or report.get("kind") != "completed_accuracy"
+    if (type(report.get("version")) is not int or report["version"] not in (1, 2)
+            or report.get("kind") != "completed_accuracy"
             or report.get("result") != "complete" or report.get("measurement") != "commanded_homing_travel"
             or report.get("physical_position_verified") is not False or type(report.get("simulated")) is not bool
             or type(count) is not int or not 2 <= count <= 50 or requested != count
@@ -737,6 +789,7 @@ def _validate_accuracy_report(report):
             or not isinstance(travels, list) or len(travels) != count
             or any(not _finite(value) or value <= 0 for value in travels)):
         raise ValueError("Incomplete or invalid completed accuracy receipt")
+    _validate_accuracy_censoring(report, context, count)
     computed = _accuracy_statistics([{"travel_mm": value} for value in travels])
     supplied = report.get("statistics")
     if (not isinstance(supplied, dict) or set(supplied) != set(computed)
@@ -747,6 +800,67 @@ def _validate_accuracy_report(report):
     if len(_json(report).encode("ascii")) > _MAX_ACCURACY_REPORT_BYTES:
         raise ValueError("Completed accuracy receipt exceeds its bounded metadata limit")
     return report
+
+
+def _validate_accuracy_censoring(report, context, count):
+    """Validate public response limits without treating legacy absence as zero."""
+    keys = ("censored_response_count", "censored_responses")
+    if all(key not in report for key in keys) and report["version"] == 1:
+        return  # Existing completed v1 baselines did not record this evidence.
+    censored_count, responses = (report.get(key) for key in keys)
+    if (type(censored_count) is not int or not 0 <= censored_count <= count
+            or not isinstance(responses, list) or len(responses) != censored_count
+            or (censored_count and context["detector_type"] != "filtered")
+            or (report["version"] == 2) != bool(censored_count)):
+        raise ValueError("Invalid accuracy censored-response count")
+    if censored_count:
+        try:
+            from .accel_homing_filters import DETECTOR_VERSION, detector_config
+        except ImportError:
+            from accel_homing_filters import DETECTOR_VERSION, detector_config
+        config, sensor = context["detector_config"], context["sensor_context"]
+        if (context["impact_metric"] != "xyz_magnitude"
+                or type(context["detector_version"]) is not int or context["detector_version"] != DETECTOR_VERSION
+                or not isinstance(config, dict) or detector_config(config) != config
+                or not isinstance(sensor, dict) or sensor.get("backend") != "beacon_raw"):
+            raise ValueError("Censored accuracy receipt requires its frozen native FILTERED context")
+    expected_keys = {"trial_index", "impact_peak_g", "raw_samples_validated", "decision_prefix_validated",
+                     "cause", "first_invalid_sample", "first_invalid_sample_index", "first_invalid_time_s",
+                     "original_sample_count", "valid_prefix_sample_count", "censored_sample_count",
+                     "confirmation_sample", "confirmation_sample_index", "confirmation_time_s", "observed_valid_prefix_peak_g"}
+    indices = []
+    for response in responses:
+        if not isinstance(response, dict) or set(response) != expected_keys:
+            raise ValueError("Invalid accuracy censored-response receipt")
+        trial = response["trial_index"]
+        original, prefix, censored = (response[key] for key in (
+            "original_sample_count", "valid_prefix_sample_count", "censored_sample_count"))
+        invalid, confirmation = response["first_invalid_sample_index"], response["confirmation_sample_index"]
+        stamps = [response[key] for key in ("first_invalid_sample", "confirmation_sample")]
+        valid_stamps = all(isinstance(stamp, list) and len(stamp) == 4
+                           and all(type(value) is int and value >= 0 for value in stamp)
+                           and stamp[0] <= 0xffffffff and 0 < stamp[1] <= 0xffffffff
+                           and 2 <= stamp[3] <= _MAX_CENSORED_NATIVE_SAMPLES and stamp[2] < stamp[3]
+                           for stamp in stamps)
+        if (type(trial) is not int or not 1 <= trial <= count
+                or any(type(value) is not int for value in (original, prefix, censored, invalid, confirmation))
+                or not 2 <= prefix < original <= _MAX_CENSORED_NATIVE_SAMPLES or original != prefix + censored
+                or invalid != prefix or not 0 <= confirmation < invalid
+                or not valid_stamps
+                or (stamps[0][0:2] + stamps[0][3:] == stamps[1][0:2] + stamps[1][3:]
+                    and stamps[1][2] >= stamps[0][2])
+                or response["cause"] not in ("native_clip_sentinel", "axis_full_scale")
+                or response["impact_peak_g"] is not None or response["raw_samples_validated"] is not False
+                or response["decision_prefix_validated"] is not True
+                or not _finite(response["first_invalid_time_s"])
+                or not _finite(response["confirmation_time_s"])
+                or response["confirmation_time_s"] >= response["first_invalid_time_s"]
+                or not _finite(response["observed_valid_prefix_peak_g"])
+                or response["observed_valid_prefix_peak_g"] < 0):
+            raise ValueError("Invalid accuracy censored-response measurements")
+        indices.append(trial)
+    if indices != sorted(set(indices)):
+        raise ValueError("Accuracy censored-response trials are duplicated or out of order")
 
 
 def _png_with_accuracy_report(data, report):
@@ -1115,11 +1229,12 @@ def _check_accuracy_record(record, run_id, axis, phase, index, attempts, measure
     attempts.add(attempt)
     if measured:
         travel = _measured_travel(record)
+        censored = _censored_peak_record(record)
         if record.get("result") != "impact" or record.get("capture_valid") is False \
                 or not _finite(record.get("travel_mm")) or record["travel_mm"] <= 0 \
                 or not _finite(travel) or travel <= 0 \
                 or not _finite(record.get("onset_g")) \
-                or not _finite(record.get("impact_peak_g")) or record["impact_peak_g"] < 0 \
+                or (not censored and (not _finite(record.get("impact_peak_g")) or record["impact_peak_g"] < 0)) \
                 or not _finite(record.get("threshold_g")) or record["threshold_g"] <= 0 \
                 or record.get("direction") not in (-1, 0, 1):
             raise ValueError("Accuracy trial has invalid travel or acceleration measurements")
@@ -1440,9 +1555,35 @@ def _threshold(axis, record, label=True):
                      label=name if label and index == 0 else None)
 
 
+def _mark_response_censoring(axis, censoring, origin, factor=1.):
+    """Mark missing response without extending a measured/filter curve."""
+    if not censoring:
+        return
+    cutoff = (censoring["first_invalid_time_s"] - origin) * factor
+    end = (censoring["original_last_sample_time_s"] - origin) * factor
+    if end > cutoff:
+        axis.axvspan(cutoff, end, color="#d59128", alpha=.13,
+                     label="Saturated response tail omitted")
+    axis.axvline(cutoff, color="#ad5d00", linestyle="--", linewidth=1.,
+                 label="First native saturation / response truncated")
+
+
+def _response_censoring_lines(censoring, origin):
+    if not censoring:
+        return []
+    return ["SATURATED / RESPONSE TRUNCATED: full impact peak unavailable; observed valid-prefix peak %s g." %
+            _number(censoring["observed_valid_prefix_peak_g"], 5),
+            "Valid prefix %d / %d samples; %d censored from %.6g s. Only valid samples before saturation are shown." % (
+                censoring["valid_prefix_sample_count"], censoring["original_sample_count"],
+                censoring["censored_sample_count"], censoring["first_invalid_time_s"] - origin)]
+
+
 def _plot_capture(figure, payload):
     record, trace, captured = payload["record"], payload["trace"], payload["capture"]
+    censoring = captured.get("response_censoring")
     title = payload.get("title", "Accel Homing " + payload["axis"].upper())
+    if censoring:
+        title += "\nSATURATED / RESPONSE TRUNCATED / FULL PEAK UNAVAILABLE"
     _title(figure, payload, title)
     axis = figure.subplots()
     _axes_style(axis)
@@ -1454,6 +1595,7 @@ def _plot_capture(figure, payload):
         axis.plot([row[0] for row in magnitude], [row[1] for row in magnitude],
                   linewidth=1.2, label="Captured raw XYZ magnitude" if filtered_control else "XYZ magnitude")
     _threshold(axis, record)
+    _mark_response_censoring(axis, censoring, captured["first_sample_time_s"])
     onset = record.get("onset_time_s", record.get("onset_time"))
     elapsed = None
     if _finite(onset):
@@ -1469,11 +1611,14 @@ def _plot_capture(figure, payload):
     peak_value = peak[1] if vector else peak[channel]
     peak_name = "XYZ magnitude" if vector else "|%s|" % payload["axis"].upper()
     axis.plot([peak[0]], [peak_value], "o", color="#192d45", markersize=4)
+    peak_line = ("Observed valid-prefix peak: %s g  |  Displayed-prefix %s maximum: %s g" % (
+                    _number(record.get("observed_valid_prefix_peak_g")), peak_name, _number(abs(peak_value)))
+                 if censoring else "Detector peak: %s g  |  Captured %s peak: %s g" % (
+                    _number(record.get("impact_peak_g")), peak_name, _number(abs(peak_value))))
     _axes_summary(axis, ["Samples: %d  |  Travel: %s mm  |  Onset: %s s / %s g" % (
                             captured["sample_count"], _number(_measured_travel(record), 6),
                             _number(elapsed, 4), _number(record.get("onset_g"))),
-                         "Detector peak: %s g  |  Captured %s peak: %s g" % (
-                            _number(record.get("impact_peak_g")), peak_name, _number(abs(peak_value)))] +
+                         peak_line] + _response_censoring_lines(censoring, captured["first_sample_time_s"]) +
                          (["FILTERED control threshold %s g applies to causal weighted level; raw response shown here" %
                            _number(record.get("threshold_g"), 5)] if filtered_control else []))
     axis.legend(loc="best", fontsize=8)
@@ -1484,10 +1629,14 @@ def _plot_filter(figure, payload):
     """Same-trace replay, pre-event noise and actual-run limits on one figure."""
     figure.set_size_inches(13, 17)
     analysis, record = payload["analysis"], payload["record"]
+    censoring = analysis.get("response_censoring")
     actual = str(analysis["actual_detector"]).upper()
-    _title(figure, payload, "DEVELOPMENT / EXPERIMENTAL - Filter comparison %s\nActual control: %s | Other detector: shadow replay" %
-           (payload["axis"].upper(), actual))
-    grid = figure.add_gridspec(7, 2, height_ratios=(1.1, .85, .85, .85, 1.45, 1.55, 1.15))
+    title = "DEVELOPMENT / EXPERIMENTAL - Filter comparison %s\nActual control: %s | Other detector: shadow replay" % (
+        payload["axis"].upper(), actual)
+    if censoring:
+        title += "\nSATURATED / RESPONSE TRUNCATED / FULL PEAK UNAVAILABLE"
+    _title(figure, payload, title)
+    grid = figure.add_gridspec(7, 2, height_ratios=(1.1, .85, .85, .85, 1.45, 1.55, 1.55 if censoring else 1.15))
     overview = figure.add_subplot(grid[0, :])
     xyz_axes = [figure.add_subplot(grid[number, :]) for number in (1, 2, 3)]
     level_axis = figure.add_subplot(grid[4, :])
@@ -1502,14 +1651,20 @@ def _plot_filter(figure, payload):
     elapsed = [row[0] - arm for row in trace]
     interval = analysis.get("stop_request_interval_s")
     cutoff = analysis.get("decision_cutoff_time_s")
+    cutoff_reason = {"first_invalid_sample": "first native saturation",
+                     "stop_dispatch_lower_bound": "actual stop-request lower bound",
+                     "unknown_stop_time": "unknown actual stop-request time"}.get(
+                         analysis.get("decision_cutoff_reason"), "actual stop-request lower bound")
     event_end = max([origin + .006] + [value + .001 for value in (
         analysis.get("actual_confirmation_time_s"), analysis.get("stop_request_time_s")) if _finite(value)])
+    response_end = censoring["original_last_sample_time_s"] if censoring else trace[-1][0]
     event_limits = (max((trace[0][0] - origin) * 1000., -3.),
-                    min((trace[-1][0] - origin) * 1000., (event_end - origin) * 1000.))
+                    min((response_end - origin) * 1000., (event_end - origin) * 1000.))
     def stop_region(axis, relative_origin, factor):
-        if _finite(cutoff):
+        if _finite(cutoff) and trace[-1][0] > cutoff:
             axis.axvspan((cutoff - relative_origin) * factor, (trace[-1][0] - relative_origin) * factor,
                          color="#9da3aa", alpha=.15, label="After replay cutoff: response only")
+        _mark_response_censoring(axis, censoring, relative_origin, factor)
         if interval:
             axis.axvspan((interval[0] - relative_origin) * factor, (interval[1] - relative_origin) * factor,
                          color="#42484f", alpha=.22, label="Actual host stop-request interval")
@@ -1519,8 +1674,8 @@ def _plot_filter(figure, payload):
     overview.plot(elapsed, [row[9] for row in trace], color="#5b42a4", linewidth=.9, label="Filtered weighted decision level")
     overview.axvline(0, color="#45575e", linestyle=":", linewidth=.9, label="Arm")
     stop_region(overview, arm, 1.)
-    _axes_summary(overview, ["Same %d valid input samples | Full-trace context | Run %s" %
-                             (analysis["sample_count"], payload["run_id"])])
+    _axes_summary(overview, ["Same %d valid input samples | %s context | Run %s" %
+                             (analysis["sample_count"], "Validated-prefix" if censoring else "Full-trace", payload["run_id"])])
     overview.legend(loc="upper left", ncol=3, fontsize=7)
     for channel, (axis, letter, color) in enumerate(zip(xyz_axes, "XYZ", ("#c34a45", "#278356", "#3678b7")), 1):
         _axes_style(axis, "%s acceleration (g)" % letter)
@@ -1560,9 +1715,10 @@ def _plot_filter(figure, payload):
         delay_ms = (filtered_decision["confirmation_time_s"] - raw_decision["crossing_time_s"]) * 1000.
         timing = "Paired replay confirmation minus raw crossing: %+.4g ms (algorithm time; not mechanical latency)" % delay_ms
     else:
-        timing = "Filtered decision censored at actual stop request; no valid extra-delay estimate" if filtered_decision.get("censored") else \
+        timing = "Filtered decision censored at %s; no valid extra-delay estimate" % cutoff_reason if filtered_decision.get("censored") else \
                  "Raw decision censored; no paired extra-delay estimate"
-    _axes_summary(level_axis, [timing])
+    _axes_summary(level_axis, [timing, "Replay cutoff: %s at %s ms from event reference" % (
+        cutoff_reason, _number((cutoff - origin) * 1000. if _finite(cutoff) else None, 6))])
     noise = analysis["noise"]
     if noise.get("available"):
         labels, keys = ("X RMS", "Y RMS", "Z RMS", "XYZ RMS", "XYZ P99"), range(5)
@@ -1611,7 +1767,7 @@ def _plot_filter(figure, payload):
         spectrum_axis.text(.02, .85, "Spectrum unavailable\n" + spectrum["reason"], va="top", fontsize=9,
                            transform=spectrum_axis.transAxes, wrap=True)
     notes.axis("off")
-    filtered_status = "observed before cutoff" if filtered_decision.get("decision_observed") else "CENSORED: not confirmed before stop request"
+    filtered_status = "observed before cutoff" if filtered_decision.get("decision_observed") else "CENSORED: observation ended at %s" % cutoff_reason
     actual_time = analysis.get("actual_confirmation_time_s")
     evidence_name = "shadow filtered decision" if actual != "FILTERED" else "filtered control replay"
     lines = ["DECISION EVIDENCE: actual control %s; %s %s." % (actual, evidence_name, filtered_status),
@@ -1620,14 +1776,18 @@ def _plot_filter(figure, payload):
              "ACTUAL RUN: 1 accepted home; commanded travel %s mm. Spread / standard deviation unavailable for one home." %
              _number(_measured_travel(record), 7),
              "A/B repeatability baseline unavailable here. Use independent ACCURACY RAW and FILTERED runs with BASELINE=<run_id>.",
-             "Filtered onset is an estimate. After-stop response, lower RMS, and shadow rejection are not evidence of correct contact.",
+             "Filtered onset is an estimate. Response amplitude, lower RMS, and censored shadow outcomes do not establish correct contact.",
              "Filter v%s | tau %s ms | confirmation min/max %s / %s ms | frozen XYZ weights %s" % (
                  analysis["filter_config"].get("version"), _number(analysis["filter_config"].get("lowpass_tau_s", 0.) * 1000.),
                  _number(analysis["filter_config"].get("confirmation_min_s", 0.) * 1000.),
                  _number(analysis["filter_config"].get("confirmation_max_s", 0.) * 1000.),
                  " / ".join(_number(value) for value in analysis["reference"]["weights_xyz"]))]
-    notes.text(.01, .98, "\n".join(lines), va="top", fontsize=8.5, linespacing=1.55, transform=notes.transAxes)
-    _finish_layout(figure, "Development / experimental. Causal replay compares one valid trace; it cannot establish physical improvement. "
+    lines += _response_censoring_lines(censoring, arm)
+    if censoring:
+        lines.append("Saturation follows qualified confirmation in sample order; it need not follow the host stop request.")
+    notes.text(.01, .98, "\n".join(lines), va="top", fontsize=8.2 if censoring else 8.5,
+               linespacing=1.4 if censoring else 1.55, transform=notes.transAxes)
+    _finish_layout(figure, "Development / experimental. Causal replay uses validated input only; it cannot establish physical improvement. "
                    "Full-sample metrics precede joint display reduction. Gray response region is excluded from shadow decisions.")
 
 
@@ -1737,6 +1897,7 @@ def _plot_accuracy(figure, payload):
     stats = payload.get("statistics") or {}
     trials, traces = payload["trials"], payload["traces"]
     report, baseline, comparison = payload.get("report"), payload.get("baseline"), payload.get("comparison")
+    censored_count = sum(bool(trial.get("response_censoring")) for trial in trials)
     summary = ["Accepted homes: %d / %d" % (len(trials), payload["requested"])]
     if stats:
         summary[0] += "  |  Mean: %s mm  |  Range: %s mm" % (_number(stats["mean_mm"], 6), _number(stats["spread_mm"]))
@@ -1746,6 +1907,10 @@ def _plot_accuracy(figure, payload):
     if report:
         summary.append("Actual %s | threshold %s g | Run ID: %s" % (
             report["context"]["detector_type"].upper(), _number(report["threshold_g"], 5), report["run_id"]))
+    summary.append("Censored responses: %d / %d | Commanded-travel repeatability remains measurable" % (
+        censored_count, len(trials)))
+    if censored_count:
+        summary.append("SATURATED / RESPONSE TRUNCATED: full impact peak unavailable for censored homes; valid prefixes only")
     _title(figure, payload, ("DEVELOPMENT / EXPERIMENTAL - Actual run A/B " if baseline else "Accel Homing Accuracy ")
            + payload["axis"].upper())
     vector = bool(trials and trials[0].get("impact_metric") == "xyz_magnitude")
@@ -1793,6 +1958,9 @@ def _plot_accuracy(figure, payload):
             baseline["run_id"], baseline["context"]["detector_type"].upper(), _number(baseline["threshold_g"], 5), baseline["count"]),
             "CURRENT: %s | %s | threshold %s g | N=%d" % (
             report["run_id"], report["context"]["detector_type"].upper(), _number(report["threshold_g"], 5), report["count"]),
+            "Censored responses: baseline %s; current %d. Full response peaks are unavailable for censored homes." % (
+                str(baseline["censored_response_count"]) if "censored_response_count" in baseline else "unknown (legacy receipt)",
+                censored_count),
             "Treatment/settings differences: %s" % (", ".join(comparison["treatment_differences"]) or "none recorded")]
         if comparison["comparable_context"]:
             context_lines.append("Reported sensor, geometry, speeds and acceleration match. Change describes commanded-travel repeatability.")
@@ -1804,13 +1972,21 @@ def _plot_accuracy(figure, payload):
         context_axis.text(.01, .98, "\n".join(context_lines), va="top", fontsize=8.5,
                           transform=context_axis.transAxes, linespacing=1.5)
     trace_start = 3 if baseline else 1
+    def truncated_endpoint(axis, trace, index, value, labelled):
+        if index < len(trials) and trials[index].get("response_censoring"):
+            axis.plot([trace[-1][0]], [value], "x", color="#ad5d00", markersize=5,
+                      label="Truncated capture: last valid XYZ sample" if not labelled else None)
+            return True
+        return labelled
     for channel, (axis, color, letter) in enumerate(zip(axes[trace_start:],
                     ("red", "green", "blue"), "XYZ"), 1):
         _axes_style(axis, "%s acceleration (g)" % letter)
+        endpoint_labelled = False
         for index, trace in enumerate(traces):
             axis.plot([row[0] for row in trace], [row[channel] for row in trace], color=color,
                       alpha=.35 if len(traces) > 1 else 1., linewidth=.7,
                       label="%s (%d homes)" % (letter, len(traces)) if index == 0 else None)
+            endpoint_labelled = truncated_endpoint(axis, trace, index, trace[-1][channel], endpoint_labelled)
         if not vector and channel == {"x": 1, "y": 2}[payload["axis"]] and trials:
             _threshold(axis, trials[0])
         if traces:
@@ -1819,12 +1995,15 @@ def _plot_accuracy(figure, payload):
         axis = axes[trace_start + 3]
         filtered_control = bool(trials and trials[0].get("detector_type") == "filtered")
         _axes_style(axis, "Captured raw XYZ magnitude (g)" if filtered_control else "XYZ magnitude (g)")
+        endpoint_labelled = False
         for index, trace in enumerate(traces):
             axis.plot([row[0] for row in trace],
                       [math.sqrt(sum(value * value for value in row[1:4])) for row in trace],
                       linewidth=.7, alpha=.35 if len(traces) > 1 else 1.,
                       label=("Raw response (not filtered decision level)" if filtered_control else "XYZ magnitude")
                       if index == 0 else None)
+            endpoint_labelled = truncated_endpoint(axis, trace, index,
+                math.sqrt(sum(value * value for value in trace[-1][1:4])), endpoint_labelled)
         _threshold(axis, trials[0])
         if filtered_control:
             _axes_summary(axis, ["Filtered control threshold %s g applies to causal weighted level; see FILTER_CHARTS for decision traces" %

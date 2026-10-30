@@ -53,14 +53,14 @@ class HomingFaultDiagnosticsTests(unittest.TestCase):
                 self.assertLess(abs(row[0] * attempt.count_g), obj.full_scale_g)
                 self.assertGreater(attempt.impact_peak * attempt.count_g, 14.)
 
-    def test_nonfinite_guard_reports_its_actual_cause_even_with_earlier_finite_saturation(self):
+    def test_native_filtered_reports_the_first_unusable_row_chronologically(self):
         obj, attempt, _sent = self.machine()
         raw = tuple([counts(16.), 0., 128., 0., float("nan"), 128.] + [0., 0., 128.] * 6)
         self.packet(obj, data=raw)
-        self.assertEqual(attempt.sample_fault["cause"], "nonfinite_axis_value")
-        self.assertEqual(attempt.sample_fault["sample_position"], 1)
-        self.assertEqual(attempt.sample_fault["sensor_axis"], "y")
-        self.assertIsNone(attempt.sample_fault["raw_value"])
+        self.assertEqual(attempt.sample_fault["cause"], "axis_full_scale")
+        self.assertEqual(attempt.sample_fault["sample_position"], 0)
+        self.assertEqual(attempt.sample_fault["sensor_axis"], "x")
+        self.assertEqual(attempt.sample_fault["raw_value"], counts(16.))
 
     def test_zero_or_nonfinite_packet_interval_still_stops_with_precise_fault(self):
         for delta in (0, float("nan")):

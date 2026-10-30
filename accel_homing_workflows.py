@@ -24,10 +24,12 @@ import uuid
 
 try:
     from .accel_homing_filters import (detector_config, CausalImpactDetector,
-                                       robust_reference, DETECTOR_VERSION)
+                                       robust_reference, DETECTOR_VERSION,
+                                       validate_filtered_capture_prefix, validate_censored_peak_record)
 except ImportError:
     from accel_homing_filters import (detector_config, CausalImpactDetector,
-                                      robust_reference, DETECTOR_VERSION)
+                                      robust_reference, DETECTOR_VERSION,
+                                      validate_filtered_capture_prefix, validate_censored_peak_record)
 
 try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
@@ -1501,6 +1503,10 @@ class AccelHomingWorkflows:
             self._validate_accuracy_capture(session, axis, source_record, detector_record,
                                             record, capture, record["workflow_threshold_g"])
             record["early_capture_valid"] = True
+        elif record.get("detector_type") == "filtered":
+            self._validate_accuracy_capture(session, axis, source_record, detector_record,
+                                            record, capture, record["workflow_threshold_g"])
+            record["capture_valid"] = True
         if session.get("beta"):
             if not early_calibration:
                 self._validate_accuracy_capture(session, axis, source_record, detector_record,
@@ -1509,10 +1515,12 @@ class AccelHomingWorkflows:
             session["beta_homes"].append(compact_beta_home(capture, record))
         if session["mode"] != "accuracy":
             session["records"].append(record)
-        self._info("%s home: result %s; onset %s g; peak %s g; threshold %s g; "
+        peak_description = ("unavailable (response censored; observed valid prefix %s g)" % record.get("observed_valid_prefix_peak_g")
+                            if record.get("response_censored") else "%s g" % record.get("impact_peak_g"))
+        self._info("%s home: result %s; onset %s g; peak %s; threshold %s g; "
                    "commanded travel %s mm" % (
             axis.upper(), record.get("result"), record.get("onset_g"),
-            record.get("impact_peak_g"), record.get("threshold_g"), record.get("travel_mm")))
+            peak_description, record.get("threshold_g"), record.get("travel_mm")))
         session["terminal_home"] = (axis, record, source_record)
         return record, capture
 
@@ -1567,6 +1575,10 @@ class AccelHomingWorkflows:
     def _validate_accuracy_capture(self, session, axis, source_record, detector_record,
                                    record, capture, expected_threshold=None):
         detector = capture.get("detector")
+        try:
+            censor = validate_filtered_capture_prefix(capture, record)
+        except ValueError as exc:
+            raise self._error("filtered response prefix validation failed: %s" % exc) from exc
         baseline = capture.get("baseline_g")
         arm, onset = record.get("arm_time_s"), record.get("onset_time_s")
         finite = lambda value: (isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -1591,7 +1603,8 @@ class AccelHomingWorkflows:
                     and arm <= session["last_arm_time"])):
             raise self._error("homing capture does not belong to the current detector/reference")
         samples = capture["samples"]
-        if not samples[0][0] < arm <= samples[-1][0]:
+        retained_arm = (arm if censor is None else samples[detector["first_armed_sample_index"]][0])
+        if not samples[0][0] < retained_arm <= samples[-1][0]:
             raise self._error("homing capture lacks the current pre-arm reference or armed samples")
         if record.get("result") == "impact":
             captured_onset = detector.get("onset_time_s")
@@ -1625,7 +1638,8 @@ class AccelHomingWorkflows:
                                       detail(diagnostics["onset_sample_matches"]),
                                       detail(diagnostics["onset_sample_index"]), len(samples)))
             if (not finite(onset) or not finite(detector.get("onset_g"))
-                    or not finite(detector.get("impact_peak_g")) or detector["impact_peak_g"] < 0):
+                    or (censor is None and (not finite(detector.get("impact_peak_g")) or detector["impact_peak_g"] < 0))
+                    or (censor is not None and detector.get("impact_peak_g") is not None)):
                 missing_impact("invalid measured impact values")
             source_stamp = stamp(source_record.get("onset_sample"))
             capture_stamp = stamp(detector.get("onset_sample"))
@@ -1641,7 +1655,8 @@ class AccelHomingWorkflows:
             if (not finite(captured_onset) or detector.get("trigger_onset_time_s") != onset
                     or samples[index][0] != captured_onset):
                 missing_impact("retained onset does not match the current detector/sample")
-            if not arm <= onset or not arm <= captured_onset <= samples[-1][0]:
+            if ((censor is None and (not arm <= onset or not arm <= captured_onset <= samples[-1][0]))
+                    or (censor is not None and not retained_arm <= captured_onset <= samples[-1][0])):
                 missing_impact("onset lies outside the armed capture")
             # A later MCU clock adjustment may change chart timestamps.
             # Keep the original homing timestamp and align only this copied
@@ -1668,6 +1683,15 @@ class AccelHomingWorkflows:
                           confirmation_time_s=detector.get("confirmation_time_s"),
                           stop_request_time_s=detector.get("stop_request_time_s"),
                           stop_request_interval_s=detector.get("stop_request_interval_s"))
+            if censor is not None:
+                record.update(response_censoring=censor, response_censored=True, decision_prefix_validated=True,
+                              observed_valid_prefix_peak_g=censor["observed_valid_prefix_peak_g"],
+                              trigger_crossing_time_s=detector.get("trigger_crossing_time_s"),
+                              trigger_confirmation_time_s=detector.get("trigger_confirmation_time_s"))
+                validate_censored_peak_record(record)
+                publisher = getattr(self.owner, "publish_censored_response", None)
+                if publisher is not None:
+                    publisher(source_record, censor)
         session["last_arm_time"] = arm
 
     def _quality(self, axis, record):
@@ -2010,6 +2034,8 @@ class AccelHomingWorkflows:
                     "recenter_acceleration_policy": "restored_normal_limit",
                     "onset_g": [r.get("onset_g") for r in qualified],
                     "impact_peak_g": [r.get("impact_peak_g") for r in qualified],
+                    "response_censored": [r.get("response_censored", False) for r in qualified],
+                    "observed_valid_prefix_peak_g": [r.get("observed_valid_prefix_peak_g") for r in qualified],
                     "calibration_start_threshold_g": session["start_threshold_g"],
                     "calibration_step_g": session["threshold_step_g"],
                     "tested_threshold_g": tested_threshold,
