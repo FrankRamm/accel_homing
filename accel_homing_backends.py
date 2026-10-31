@@ -106,6 +106,17 @@ class _LegacyClient:
             self.closed = not self.callback(message["params"])
 
 
+def _checked_rows(rows):
+    # The subscription callback latches malformed rows as invalid_data.
+    for row in rows:
+        if len(row) != 4:
+            raise ValueError("invalid sample shape")
+        sample = tuple(float(value) for value in row)
+        if not all(math.isfinite(value) for value in sample):
+            raise ValueError("nonfinite sample")
+        yield sample
+
+
 class ConfiguredAccelBackend:
     """Machine-mapped mm/s² batches, normalized to 0.001 g detector units."""
     kind = "klipper_batch"
@@ -283,29 +294,35 @@ class ConfiguredAccelBackend:
         # home_rails_begin can attach to an already streaming helper before
         # move_begin establishes its stricter post-settle cutoff. Drain old
         # valid backlog here rather than poisoning the upcoming preparation.
-        # Active noise windows have their own cutoff; trimming by age there
-        # would hide genuinely late samples belonging to the measured window.
-        warmup_cutoff = None
-        if reference is None and self.owner.attempt is None and not noise_session:
-            warmup_cutoff = self.owner.main_mcu.estimated_print_time(
-                self.owner.reactor.monotonic()) - self.max_age
-            if self.last_sample_time is not None and self.last_sample_time < warmup_cutoff:
+        # Measured windows and response tails stay strict. Ordinary calibration
+        # opens a capture before G28, but it is not bound to a home until arm().
+        warmup = (reference is None and self.owner.attempt is None and not noise_session
+                  and self.owner.tail is None and self.owner.pending_move is None
+                  and self.owner.beta_capture is None and self.owner.beta_motion_capture is None
+                  and self.owner.capture_attempt is None)
+        decoded = _checked_rows(rows)
+        if warmup:
+            # Parse before choosing the warmup boundary: rows which age out
+            # during conversion must not survive one clock and fail another.
+            # Armed/measured paths retain their final clock after continuity.
+            decoded = list(decoded)
+            now = self.owner.reactor.monotonic()
+            print_time = self.owner.main_mcu.estimated_print_time(now)
+            if self.last_sample_time is not None and print_time - self.last_sample_time > self.max_age:
                 # This history is outside the same interval being drained.
                 # Comparing a retained row with it would report our own trim
                 # as missing samples. Reset once, before checking retained rows.
                 self.prepare_reference()
-        for row in rows:
-            if len(row) != 4:
-                return self._fail("invalid_data")
-            sample = tuple(float(value) for value in row)
-            if not all(math.isfinite(value) for value in sample):
-                return self._fail("invalid_data")
+            self.pending = [row for row in self.pending if print_time - row[0] <= self.max_age]
+        for sample in decoded:
             if drain_noise or (noise_cutoff is not None and sample[0] <= noise_cutoff):
                 continue
             if reference is not None and sample[0] <= reference.cutoff:
                 reference.pre_cutoff += 1
                 continue
-            if warmup_cutoff is not None and sample[0] < warmup_cutoff:
+            if warmup and print_time - sample[0] > self.max_age:
+                if values:
+                    return self._fail("sample_gap")
                 continue
             if self.last_sample_time is not None:
                 dt = sample[0] - self.last_sample_time
@@ -322,8 +339,9 @@ class ConfiguredAccelBackend:
         self.pending = []
         if not values:
             return
-        now = self.owner.reactor.monotonic()
-        print_time = self.owner.main_mcu.estimated_print_time(now)
+        if not warmup:
+            now = self.owner.reactor.monotonic()
+            print_time = self.owner.main_mcu.estimated_print_time(now)
         self.last_age = print_time - values[-1][0]
         if reference is not None:
             reference.oldest_batch_age = print_time - values[0][0]
