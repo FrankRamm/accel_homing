@@ -449,7 +449,7 @@ def validate_homing_speeds(graph, args, family, existing):
                 or (startup is not None and (not math.isfinite(startup)
                     or not policy.STARTUP_REQUEST_TRAVEL_MIN <= startup <= policy.STARTUP_REQUEST_TRAVEL_MAX))
                 or not 0.001 <= interval <= 0.020 or interval >= age):
-            raise InstallError("Generic settings require max_sample_age 0.005..0.070s, "
+            raise InstallError("Generic settings require startup/nominal planning max_sample_age 0.005..0.070s, "
                                "optional max_report_travel %.12g..%.12gmm, optional max_startup_travel %.12g..%.12gmm, "
                                "stream_interval 0.001..0.020s and stream_interval < max_sample_age; "
                                "all values must be finite. No files changed."
@@ -525,7 +525,7 @@ def validate_homing_speeds(graph, args, family, existing):
                                        % (axis.upper(), setting, pass_effective, rail_acceleration))
                 if ((cap is not None and pass_effective > cap)
                         or (startup is not None and budget > startup)):
-                    report_policy = ("report-speed limit %.12g mm/s for %.12g s max_sample_age / %.12g mm max_report_travel"
+                    report_policy = ("nominal report-speed limit %.12g mm/s for %.12g s configured max_sample_age / %.12g mm max_report_travel"
                                      % (cap, age, travel) if cap is not None else "report-distance cap disabled")
                     startup_policy = ("startup stop request needs %.12g mm of commanded travel (%.12g mm max_startup_travel limit)"
                                       % (budget, startup) if startup is not None else "startup-distance cap disabled")

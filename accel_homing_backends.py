@@ -180,6 +180,7 @@ class ConfiguredAccelBackend:
         self.saved_interval = self.applied_interval = None
         self.client = None
         self.last_sample_time = None
+        self.start_time = None
         self.last_age = self.observed_rate = None
         self.error_counts = None
         self.pending = []
@@ -210,6 +211,7 @@ class ConfiguredAccelBackend:
         self.pending = []
         self.fault = None
         self.last_xyz = self.unchanged_since = None
+        self.start_time = self.owner.main_mcu.estimated_print_time(self.owner.reactor.monotonic())
         self.saved_interval = getattr(self.helper, self.interval_attr)
         if not math.isfinite(self.saved_interval) or self.saved_interval <= 0:
             raise self.owner.printer.command_error("accel_homing: driver reporting interval"
@@ -291,36 +293,20 @@ class ConfiguredAccelBackend:
             if self.last_sample_time is not None and self.last_sample_time <= noise_cutoff:
                 self.last_sample_time = None
                 self.last_xyz = self.unchanged_since = None
-        # home_rails_begin can attach to an already streaming helper before
-        # move_begin establishes its stricter post-settle cutoff. Drain old
-        # valid backlog here rather than poisoning the upcoming preparation.
-        # Measured windows and response tails stay strict. Ordinary calibration
-        # opens a capture before G28, but it is not bound to a home until arm().
+        # Unbound pre-home warmup may attach to an already streaming helper.
+        # Drain only samples from before this subscription, never by their age.
+        # A bound capture/armed move keeps its own full-precision boundaries.
         warmup = (reference is None and self.owner.attempt is None and not noise_session
                   and self.owner.tail is None and self.owner.pending_move is None
                   and self.owner.beta_capture is None and self.owner.beta_motion_capture is None
                   and self.owner.capture_attempt is None)
-        decoded = _checked_rows(rows)
-        if warmup:
-            # Parse before choosing the warmup boundary: rows which age out
-            # during conversion must not survive one clock and fail another.
-            # Armed/measured paths retain their final clock after continuity.
-            decoded = list(decoded)
-            now = self.owner.reactor.monotonic()
-            print_time = self.owner.main_mcu.estimated_print_time(now)
-            if self.last_sample_time is not None and print_time - self.last_sample_time > self.max_age:
-                # This history is outside the same interval being drained.
-                # Comparing a retained row with it would report our own trim
-                # as missing samples. Reset once, before checking retained rows.
-                self.prepare_reference()
-            self.pending = [row for row in self.pending if print_time - row[0] <= self.max_age]
-        for sample in decoded:
+        for sample in _checked_rows(rows):
             if drain_noise or (noise_cutoff is not None and sample[0] <= noise_cutoff):
                 continue
             if reference is not None and sample[0] <= reference.cutoff:
                 reference.pre_cutoff += 1
                 continue
-            if warmup and print_time - sample[0] > self.max_age:
+            if warmup and self.start_time is not None and sample[0] <= self.start_time:
                 if values:
                     return self._fail("sample_gap")
                 continue
@@ -339,28 +325,27 @@ class ConfiguredAccelBackend:
         self.pending = []
         if not values:
             return
-        if not warmup:
-            now = self.owner.reactor.monotonic()
-            print_time = self.owner.main_mcu.estimated_print_time(now)
+        now = self.owner.reactor.monotonic()
+        print_time = self.owner.main_mcu.estimated_print_time(now)
+        if not all(math.isfinite(value) for value in (now, print_time)):
+            return self._fail("invalid_data")
         self.last_age = print_time - values[-1][0]
         if reference is not None:
             reference.oldest_batch_age = print_time - values[0][0]
             reference.newest_batch_age = self.last_age
         attempt = self.owner.attempt
-        relevant = [row for row in values if attempt is None or row[0] >= attempt.arm_time]
-        if self.last_age < -0.005 or (relevant and print_time - relevant[0][0] > self.max_age):
+        if self.last_age < -0.005:
             # Stop any armed move before diagnostic formatting or logging.
             self._fail("stale_data")
             record_timing = getattr(self.owner, "_record_sample_timing_fault", None)
             if record_timing is not None:
+                relevant = [row for row in values if attempt is None or row[0] >= attempt.arm_time]
                 oldest, newest = (relevant or values)[0][0], values[-1][0]
-                future = self.last_age < -0.005
                 cutoff = (noise_cutoff if noise_cutoff is not None else
                           reference.cutoff if reference is not None else
                           attempt.arm_time if attempt is not None else None)
                 record_timing("backend_batch", print_time, oldest, newest, cutoff=cutoff,
-                              reason="future" if future else "too_old",
-                              sample_time=newest if future else oldest)
+                              reason="future", sample_time=newest)
             return
         if (attempt is not None and not attempt.done
                 and values[-1][0] - max(self.unchanged_since, attempt.arm_time) > 0.025
@@ -395,6 +380,7 @@ class ConfiguredAccelBackend:
             "start_clock": self.print_time_to_clock(values[0][0]) & 0xFFFFFFFF,
             "delta_clock": self.print_time_to_clock(values[-1][0] - values[0][0]),
             "data": data, "#receive_time": now,
+            "_sample_start_time_s": values[0][0], "_sample_end_time_s": values[-1][0],
         })
 
     def validate_rail(self, info, error):
@@ -460,7 +446,7 @@ class ConfiguredAccelBackend:
             report_setting = "disabled" if self.report_travel is None else "%.12g mm" % self.report_travel
             startup_setting = "disabled" if self.startup_travel is None else "%.12g mm" % self.startup_travel
             detail = ("effective homing speed %.6g mm/s and acceleration %.6g mm/s^2;"
-                      " report needs %.12g mm at max_sample_age %.6g s"
+                      " nominal report travel %.12g mm at configured max_sample_age %.6g s"
                       " (max_report_travel %s); startup needs %.12g mm"
                       " (max_startup_travel %s, stream_interval %.6g s)."
                       " The current-setting homing_speed ceiling is at most %.6g mm/s."
@@ -470,7 +456,7 @@ class ConfiguredAccelBackend:
                          travel, startup_setting, self.interval, maximum))
             if report_failed:
                 raise error("accel_homing: %s homing speed exceeds %.1f mm/s for the"
-                            " sample-age/report-travel policy; %s"
+                            " nominal report-travel policy; %s"
                             % (self.name, self.max_speed, detail))
             raise error("accel_homing: startup motion proof needs %.2f mm of commanded travel"
                         " before the host stop request, above the %.1f mm policy; %s"
@@ -479,7 +465,10 @@ class ConfiguredAccelBackend:
     def get_status(self):
         status = {"type": self.kind, "sensor": self.name,
                 "requested_interval_s": self.interval,
-                "max_sample_age_s": self.max_age,
+                "max_sample_age_s": None, "sample_age_limit_enforced": False,
+                "configured_max_sample_age_s": self.max_age,
+                "receipt_timeout_s": self.owner.stream_timeout,
+                "stream_start_time_s": self.start_time,
                 "last_sample_age_s": self.last_age,
                 "observed_rate_hz": self.observed_rate,
                 "max_homing_speed": self.max_speed, "fault": self.fault,

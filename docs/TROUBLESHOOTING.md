@@ -37,11 +37,20 @@ installer-created registration, not a pre-existing manual entry it does not own.
 
 ## Data and homing faults
 
-Missing, stale, invalid, nonmonotonic, frozen or non-finite data requires fixing
+Missing valid deliveries, future/invalid/nonmonotonic timestamps, frozen or
+non-finite data requires fixing
 the sensor/transport/configuration issue. Inspect `BEACON_ACCEL_HOMING_STATUS`
 for retained preparation/timing details. A reported `ok` at the end of one
 reference does not prove sustained stream health; inspect rejection counts,
 sample/batch ages and failure context.
+
+For generic sensors, an old current-window timestamp alone is accepted,
+including 80 ms or more of delivery delay. `max_sample_age` is a nominal
+planning input and no longer caps that age. Check monotonic receipt intervals
+against the independent `stream_timeout`, future timestamps, measurement
+cutoffs and continuity instead. A pre-arm impact still cannot hit, and
+pre-arm-only callbacks do not renew armed liveness. Native Beacon retains its
+separate age checks. Actual silence can still abort a delayed stream.
 
 Recognized finite sensor rails and native Beacon clipping markers are accepted
 as bounded RAW observations, with range provenance and unknown excess
@@ -52,7 +61,7 @@ apply; inspect capture and resting-reference notes separately.
 
 A legacy `no_motion` means the required conservative proof was unavailable
 within its deadline. It does not establish that the motor physically stayed
-still or that raising a threshold/freshness limit is the correct fix. New
+still or that raising a threshold or receipt timeout is the correct fix. New
 simple vector models use a different detector and omit that integrated proof.
 Do not compare thresholds between those metrics as if they were identical.
 

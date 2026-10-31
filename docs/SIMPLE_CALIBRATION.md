@@ -62,9 +62,13 @@ mapping or impact-sign choice is needed. Ordinary motion can also cross the
 threshold: it is not an independent classifier of mechanical contact.
 
 There is no acceleration-derived velocity integration, noise-envelope motion
-proof or startup-motion deadline in this detector. Missing, stale, invalid,
-gapped/frozen streams and the full-move travel/time limit still stop with an
+proof or startup-motion deadline in this detector. Missing valid deliveries,
+future/invalid timestamps, gapped/frozen streams and the full-move travel/time limit still stop with an
 error. Host-delivered sensor data does not provide a hard real-time stop bound.
+Generic current-window data is not rejected merely for arriving 80 ms or more
+after measurement. Its reference and moving detector use receipt liveness,
+while cutoffs exclude earlier windows/pre-arm impacts. Native Beacon's age
+policy is unchanged. See [timing details](DETAILS.md#timing-and-optional-travel-policies).
 
 ## Threshold and attempt bounds
 

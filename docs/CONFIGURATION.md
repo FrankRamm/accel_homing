@@ -115,7 +115,7 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `baseline_time` | `0.1` | Fresh reference duration in seconds; 0.05–1, with at least 50 contiguous samples. |
 | `baseline_batches` | `25` | Retained baseline batch capacity; integer 10–200. |
 | `baseline_noise_floor` | `0.7` | Generic legacy quiet-reference floor in g; 0–0.7. Does not apply to the simple vector detector or change native Beacon's separate policy. |
-| `stream_timeout` | `0.05` | Stream watchdog in seconds; 0.01–0.5; generic backend also limits it to `max_sample_age`. |
+| `stream_timeout` | `0.05` | Independent stream receipt watchdog in seconds (0.01–0.5). Generic data renews it through validated relevant rows. Native Beacon retains its timing policy. |
 | `travel_margin` | `1.1` | Full-move travel/time margin multiplier; 1–2. |
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
@@ -158,16 +158,34 @@ raw adapter. Known standard driver ranges are listed in
 | Option | Default | Meaning and accepted range |
 | --- | --- | --- |
 | `stream_interval` | `0.005` | Requested reporting interval in seconds; 0.001–0.020 and strictly less than `max_sample_age`. Restored afterward. |
-| `max_sample_age` | `0.070` | Sample freshness bound in seconds; 0.005–0.070. Explicit lower values remain active. |
+| `max_sample_age` | `0.070` | Nominal reporting and selected-axis startup-deadline assumption in seconds (0.005–0.070). Existing lower values remain planning inputs. |
 | `min_sample_rate` | `1000` | Minimum delivered/configured rate in Hz; 800–10000. |
 | `sensor_range` | Known driver range | Actual full-scale g range; positive, at most 1000; required for an unknown compatible object. |
 | `max_report_travel` | Disabled when absent | Optional nominal reporting-distance policy, 0.1–2.0 mm. |
 | `max_startup_travel` | Disabled when absent | Optional nominal startup-request-distance policy, 0.1–5.0 mm. |
 
+Generic samples from the current stream/reference/measurement window remain
+eligible when they arrive 80 ms or more after their sensor timestamp. A fixed
+stream-start cutoff excludes prior-generation warmup; measurement cutoffs
+still exclude earlier reference/window data, and pre-arm impacts cannot hit.
+The 5 ms future guard, continuity, rate, error/overflow, frozen-data checks and
+full-move deadlines remain. Receipt silence is independent: only validated
+relevant rows renew `stream_timeout`. Existing initial acquisition allowances
+apply before a window receives its first eligible samples.
+
+Generic status reports `sample_age_limit_enforced: false` and null actual
+`max_sample_age_s` / reference `max_sample_age_ms` limits. The retained nominal
+value is labelled `configured_max_sample_age_s` (or `_ms` in reference status).
+Receipt timing has its own `last_receipt_time_s` / `receipt_timeout_ms` fields.
+The selected-axis startup deadline still includes the nominal age assumption
+when optional travel budgets are absent. `stream_timeout` remains independent
+of that assumption.
+Native Beacon's timestamp-age protection is unchanged.
+
 Leave optional limits absent to disable them; do not write `None`. No default
 50 mm/s cap or startup-distance cap is added. Explicit limits can reject a
 configured plan, including after a macro lowers live acceleration. They do
-not automatically edit speed, acceleration or freshness. They describe nominal
+not automatically edit speed, acceleration or receipt timeouts. They describe nominal
 command travel before a host request, not physical stopping distance. See
 [the formulas and limitations](DETAILS.md#timing-and-optional-travel-policies).
 

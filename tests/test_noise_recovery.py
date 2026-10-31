@@ -149,7 +149,9 @@ class StationaryNoiseRecoveryTests(unittest.TestCase):
 
     def test_opt_in_never_retries_stale_future_duplicate_clipped_driver_or_frozen_data(self):
         for decoded in (False, True):
-            modes = ("stale", "future", "duplicate", "error", "frozen", "map")
+            modes = ("future", "duplicate", "error", "frozen", "map")
+            if not decoded:
+                modes += ("stale",)
             for mode in modes + (() if decoded else ("clip",)):
                 with self.subTest(decoded=decoded, mode=mode):
                     obj = sensor(decoded)
@@ -282,8 +284,9 @@ class StationaryNoiseRecoveryTests(unittest.TestCase):
                     elif fatal == "data_error":
                         obj.helper.emit({"data": samples(start), "errors": 1})
                     else:
-                        obj.reactor.now += .1
-                        obj.helper.emit({"data": samples(start)})
+                        # A future timestamp remains fatal; old current-window
+                        # timestamps no longer provide an age-fault fixture.
+                        obj.helper.emit({"data": samples(start, size=32)})
                     self.assertEqual(obj.sensor_fault, fatal)
                     # Clear only the fake driver's cumulative count so the
                     # next packet actually exercises its timestamp gap path.

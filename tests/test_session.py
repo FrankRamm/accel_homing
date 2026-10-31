@@ -363,7 +363,7 @@ class StatusTest(unittest.TestCase):
         obj.cmd_STATUS(types.SimpleNamespace(respond_info=messages.append))
         policy = next(message for message in messages if "baseline policy" in message)
         self.assertIn("ordinary homing requires quiet XYZ", policy)
-        self.assertIn("fresh 100.00 ms / 50 sample reference", policy)
+        self.assertIn("post-settle 100.00 ms / 50 sample reference", policy)
         self.assertIn("without a quiet-range limit", policy)
         self.assertIn("no acceleration-derived motion proof for XYZ magnitude", policy)
 

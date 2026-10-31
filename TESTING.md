@@ -28,6 +28,8 @@ python3 -B -m unittest discover -s tests -p 'test_beta_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_noise_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -v
 python3 -B -m unittest discover -s tests -p 'test_absolute_charts.py' -v
+python3 -B -m unittest discover -s tests -p 'test_sample_age*.py' -v
+python3 -B -m unittest discover -s tests -p 'test_warmup_timing.py' -v
 ```
 
 The tests cover installation/ownership/rollback, adapter contracts and faults,
@@ -60,6 +62,14 @@ full suite run establish different things; identify which were actually done.
   threshold plus exactly 0.25 g. Only successful calibration saves/restarts.
 - Stationary noise retries discard complete rejected windows, respect per-window
   and whole-session limits, and keep homing/Beta policies unchanged.
+- Generic valid current-window data is accepted despite old sensor timestamps,
+  including the reported 71.432/8.943 ms batch and 80 ms or longer delays.
+  Tests distinguish advancing delayed receipts from real silence, exercise
+  watchdog polls and a late post-arm hit, exclude pre-arm-only data from
+  hit/liveness evidence, and retain future/continuity/error/overflow/frozen/rate
+  guards. Reference arming, stationary windows and Beta use their receipt
+  liveness; native Beacon's age protection remains. `max_sample_age` stays a
+  nominal planning input, independently of the valid-receipt timeout.
 - Failed measurements do not invoke final PNG publication. Every multi-axis
   image is rendered before publication; rollback removes only newly owned files.
 - Capture, ACCURACY, stationary/post-calibration noise and Beta PNGs display

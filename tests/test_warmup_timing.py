@@ -1,9 +1,9 @@
-"""Offline freshness boundaries for unmeasured configured-sensor warmup."""
+"""Offline current-window and receipt timing for configured-sensor warmup."""
 import unittest
 from unittest import mock
 
 from harness import plugin, stationary_stream
-from test_backends import G, HOST, arm, generic, samples
+from test_backends import G, HOST, arm, baseline, generic, samples
 
 
 OLDEST = 35.020921
@@ -16,6 +16,12 @@ def reported_rows():
     # A dense, uniform ~3200 Hz packet, with the exact reported endpoints.
     return [(OLDEST + (NEWEST - OLDEST) * n / 200, 0., 0., G)
             for n in range(201)]
+
+
+def measured_window():
+    return {"cutoff": 35., "complete": False, "index": 1, "samples": [],
+            "duration": 1., "last": None, "interval": None, "changed": False,
+            "last_receipt_time": None}
 
 
 class DelayedRows(list):
@@ -39,14 +45,13 @@ class WarmupTimingTest(unittest.TestCase):
         obj.backend.helper.emit({"data": DelayedRows(
             obj, reported_rows() if rows is None else rows, after), **fields})
 
-    def test_reported_packet_ordinary_capture_keeps_only_final_fresh_suffix(self):
+    def test_reported_71_432_8_943_ms_packet_keeps_every_current_capture_row(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj = self.owner(legacy)
                 obj.start_capture()  # Ordinary CALIBRATE opens this before G28.
                 self.delayed(obj)
-                expected = [row for row in reported_rows()
-                            if AFTER_PARSE - row[0] <= obj.backend.max_age]
+                expected = reported_rows()
                 self.assertIsNone(obj.sensor_fault)
                 self.assertIsNone(obj.sample_timing_fault)
                 self.assertEqual(obj.backend.max_age, .070)
@@ -55,7 +60,8 @@ class WarmupTimingTest(unittest.TestCase):
                 self.assertEqual(len(captured["samples"]), len(expected))
                 for actual, original in zip(captured["samples"], expected):
                     self.assertAlmostEqual(actual[0], original[0], delta=.000001)
-                self.assertGreaterEqual(captured["samples"][0][0], AFTER_PARSE - .070)
+                self.assertAlmostEqual(captured["samples"][0][0], OLDEST, delta=.000001)
+                self.assertGreater(AFTER_PARSE - captured["samples"][0][0], .070)
                 # move_begin starts a clean, strictly post-settle reference.
                 obj.session_axes = {"x": None}
                 stationary_stream(obj)
@@ -64,17 +70,17 @@ class WarmupTimingTest(unittest.TestCase):
                 self.assertIsNotNone(obj.preparation.baseline())
                 self.assertGreater(obj.preparation.first, obj.preparation.cutoff)
 
-    def test_processing_delay_drains_wholly_stale_backlog_without_refresh(self):
+    def test_processing_delay_preserves_wholly_old_valid_warmup_and_receipt(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj = self.owner(legacy)
                 self.delayed(obj, samples(35.017200, size=16))
                 self.assertIsNone(obj.sensor_fault)
-                self.assertIsNone(obj.last_batch)
-                self.assertIsNone(obj.backend.last_sample_time)
+                self.assertEqual(obj.last_batch, AFTER_PARSE)
+                self.assertAlmostEqual(obj.backend.last_sample_time, samples(35.017200, size=16)[-1][0])
                 self.assertEqual(obj.backend.pending, [])
 
-    def test_pending_singleton_ages_during_parse_then_fresh_rows_start_new_sequence(self):
+    def test_pending_singleton_survives_parse_delay_in_same_contiguous_sequence(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj = self.owner(legacy)
@@ -83,25 +89,25 @@ class WarmupTimingTest(unittest.TestCase):
                 self.assertEqual(obj.backend.pending, first)
                 rows = samples(OLDEST + 1 / 3200., size=200)
                 self.delayed(obj, rows)
-                expected = [row for row in rows if AFTER_PARSE - row[0] <= .070]
+                expected = first + rows
                 self.assertIsNone(obj.sensor_fault)
                 self.assertEqual(obj.backend.pending, [])
                 self.assertEqual(len(obj.recent[-1]), 3 * len(expected))
-                self.assertEqual(obj.backend.unchanged_since, expected[0][0])
+                self.assertEqual(obj.backend.unchanged_since, first[0][0])
 
-    def test_warmup_boundary_uses_same_age_comparison_for_trim_and_admission(self):
-        for age in (.070, .070000001):
+    def test_warmup_does_not_trim_at_exact_70_or_80_ms(self):
+        for age in (.070, .070000001, .080):
             with self.subTest(age=age):
                 obj = self.owner()
-                now = .070  # An exact maximum-age comparison, with no cancellation.
+                now = 1.0  # Every row belongs to this stream generation.
                 rows = samples(now - age, size=8)
                 obj.reactor.now = now
                 self.delayed(obj, rows, after=now)
-                expected = [row for row in rows if now - row[0] <= .070]
+                expected = rows
                 self.assertIsNone(obj.sensor_fault)
                 self.assertEqual(len(obj.recent[-1]), 3 * len(expected))
 
-    def test_measured_scopes_reject_oldest_at_post_parse_time(self):
+    def test_measured_scopes_accept_reported_delay_without_timestamp_age_fault(self):
         for legacy in (False, True):
             for scope in ("armed", "reference", "noise", "beta_moving", "beta_home", "beta_tail", "tail",
                           "pending_move", "bound_capture"):
@@ -109,14 +115,14 @@ class WarmupTimingTest(unittest.TestCase):
                     obj = self.owner(legacy)
                     attempt = None
                     if scope == "armed":
-                        attempt, trigger = arm(obj, when=OLDEST)
+                        baseline(obj, OLDEST - .060)
+                        attempt, trigger = arm(obj, when=OLDEST, deadline=OLDEST + 10.)
                     elif scope == "reference":
                         obj.preparation = plugin.QuietReference("x", 35., .1, 100.)
                     elif scope == "noise":
                         obj._end_session()
                         obj.start_noise_measurement()
-                        obj.noise_window = {"cutoff": 35., "complete": False,
-                                            "index": 1, "samples": []}
+                        obj.noise_window = measured_window()
                     elif scope == "beta_moving":
                         obj._end_session()
                         obj.reactor.now = 35.
@@ -131,39 +137,47 @@ class WarmupTimingTest(unittest.TestCase):
                         if scope == "bound_capture":
                             obj.start_capture()
                             obj.capture_attempt = object()
+                        elif scope == "tail":
+                            baseline(obj, OLDEST - .060)
+                            tail, _trigger = arm(obj, when=OLDEST, deadline=OLDEST + 10.)
+                            tail.bases = obj._baseline()
+                            tail.baseline = tail.bases[tail.index]
+                            tail.last_samples = list(tail.bases)
+                            tail.impact_until = obj.backend.print_time_to_clock(OLDEST + .2)
+                            tail.record = {"impact_peak_g": 0.}
+                            obj.attempt, obj.tail = None, tail
                         else:
                             setattr(obj, scope, object())
                     self.delayed(obj)
-                    self.assertEqual(obj.sensor_fault, "stale_data")
-                    diagnostic = obj.sample_timing_fault
-                    self.assertEqual(diagnostic["reason"], "too_old")
-                    self.assertEqual(diagnostic["oldest_sample_time_s"], OLDEST)
-                    self.assertEqual(diagnostic["oldest_batch_age_ms"], 71.432)
-                    self.assertEqual(diagnostic["newest_batch_age_ms"], 8.943)
-                    self.assertIsNone(obj.last_batch)
+                    self.assertIsNone(obj.sensor_fault)
+                    self.assertIsNone(obj.sample_timing_fault)
+                    self.assertEqual(obj.last_batch, AFTER_PARSE)
+                    self.assertAlmostEqual(obj.backend.last_age * 1000., 8.94346153846)
                     if attempt is not None:
                         self.assertIs(obj.attempt, attempt)
-                        self.assertEqual(diagnostic["context"], "homing")
-                        self.assertEqual(trigger.messages, [[HOST]])
+                        self.assertIsNone(attempt.reason)
+                        self.assertEqual(trigger.messages, [])
 
     def test_measured_pending_singleton_is_not_trimmed(self):
         for scope in ("armed", "reference", "noise"):
             with self.subTest(scope=scope):
                 obj = self.owner()
                 if scope == "armed":
-                    attempt, trigger = arm(obj, when=OLDEST)
+                    baseline(obj, OLDEST - .060)
+                    attempt, trigger = arm(obj, when=OLDEST, deadline=OLDEST + 10.)
                 elif scope == "reference":
                     obj.preparation = plugin.QuietReference("x", 35., .1, 100.)
                 else:
                     obj._end_session()
                     obj.start_noise_measurement()
-                    obj.noise_window = {"cutoff": 35., "complete": False,
-                                        "index": 1, "samples": []}
+                    obj.noise_window = measured_window()
                 obj.backend.helper.emit({"data": samples(OLDEST, size=1)})
                 self.assertEqual(len(obj.backend.pending), 1)
                 self.delayed(obj, samples(OLDEST + 1 / 3200., size=16))
-                self.assertEqual(obj.sensor_fault, "stale_data")
-                self.assertEqual(obj.sample_timing_fault["oldest_sample_time_s"], OLDEST)
+                self.assertIsNone(obj.sensor_fault)
+                self.assertIsNone(obj.sample_timing_fault)
+                self.assertEqual(obj.backend.pending, [])
+                self.assertEqual(obj.last_batch, AFTER_PARSE)
 
     def test_warmup_does_not_hide_a_stale_interior_replay(self):
         for legacy in (False, True):

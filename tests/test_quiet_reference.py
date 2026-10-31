@@ -290,18 +290,18 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
                 self.assertEqual(attempt.reason, "impact")
                 self.assertAlmostEqual(obj.onset_time(attempt), when, delta=1e-6)
 
-    def test_acquired_rolling_window_still_expires_or_is_invalidated_before_arm(self):
-        for mode in ("stale", "new_noise"):
+    def test_acquired_rolling_window_rejects_silence_or_new_noise_before_arm(self):
+        for mode in ("silence", "new_noise"):
             with self.subTest(mode=mode):
                 obj, endstop = self.machine()
                 self.prepare(obj, endstop)
-                if mode == "stale":
-                    obj.reactor.now += obj.backend.max_age + 0.010
+                if mode == "silence":
+                    obj.reactor.now += obj.stream_timeout + 0.010
                 else:
                     feed(obj, samples(obj.backend.last_sample_time + 1 / 3200.0, x=-0.8))
                 with self.assertRaisesRegex(CommandError, "fresh quiet"):
                     endstop.home_start(obj.reactor.now + 0.010, 0, 0, 0)
-                expected = ("expired_before_arm" if mode == "stale"
+                expected = ("no_data_before_arm" if mode == "silence"
                             else "quiet_window_invalidated_before_arm")
                 self.assertEqual(obj.baseline_status["result"], expected)
                 self.assertEqual(endstop._dispatch.started, [])

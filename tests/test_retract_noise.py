@@ -265,7 +265,9 @@ class NoiseAcquisitionTests(unittest.TestCase):
         for decoded in (False, True):
             # A native all-marker window is still frozen; a finite generic
             # range observation is valid and is covered by the endpoint tests.
-            modes = ("missing", "stale", "future", "duplicate", "gap", "error", "frozen", "map")
+            modes = ("missing", "future", "duplicate", "gap", "error", "frozen", "map")
+            if not decoded:
+                modes += ("stale",)
             for mode in modes + (() if decoded else ("clip",)):
                 with self.subTest(decoded=decoded, mode=mode):
                     obj = self.machine(decoded)
@@ -318,7 +320,7 @@ class NoiseAcquisitionTests(unittest.TestCase):
 
     def test_second_window_timing_fault_retains_signed_ages_without_replacing_homing_baseline(self):
         for decoded in (False, True):
-            for mode in ("stale", "future"):
+            for mode in (("future",) if decoded else ("stale", "future")):
                 with self.subTest(decoded=decoded, mode=mode):
                     obj = self.machine(decoded)
                     count_g = obj.scale["scale"] / 1000.0
@@ -376,15 +378,18 @@ class NoiseAcquisitionTests(unittest.TestCase):
             obj.reactor.on_pause = None
         obj.reactor.on_pause = flow_once
         obj.start_noise_measurement()
-        with self.assertRaisesRegex(CommandError, "stopped receiving fresh samples"):
-            obj.collect_noise_window(lambda: None)
+        faults = []
+        with self.assertRaisesRegex(CommandError, "stopped receiving validated samples"):
+            obj.collect_noise_window(lambda: None, on_acquisition_fault=faults.append)
         obj.stop_noise_measurement()
-        fault = obj.sample_timing_fault
+        self.assertIsNone(obj.sample_timing_fault)
+        self.assertEqual(len(faults), 1)
+        fault = faults[0]
         self.assertEqual(fault["phase"], "noise_wait")
         self.assertEqual(fault["window"], 1)
-        self.assertEqual(fault["max_sample_age_ms"], 10.0)
-        self.assertGreater(fault["sample_age_ms"], 10.0)
-        self.assertLess(fault["sample_age_ms"], obj.backend.max_age * 1000.0)
+        self.assertEqual(fault["receipt_timeout_s"], .010)
+        self.assertGreater(fault["receipt_now_s"] - fault["last_receipt_time_s"], .010)
+        self.assertLess(fault["receipt_now_s"] - fault["last_receipt_time_s"], obj.backend.max_age)
 
 
 class NoiseRig(Rig):

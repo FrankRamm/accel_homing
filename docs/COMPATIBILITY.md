@@ -109,7 +109,8 @@ with legacy/unknown sign-gated qualification need fresh calibration or an
 explicit manual threshold unless their recorded policy already establishes
 sign-independent qualification. Existing profiles are not silently rewritten.
 
-Generic delivery checks include freshness, timestamps, rate, error counters,
+Generic delivery checks include relevant-row receipt liveness, the independent
+5 ms future guard, timestamp continuity, rate, error counters,
 malformed/frozen/non-finite data and active range context. Valid finite rail
 values remain bounded observations with unknown excess amplitude. Native
 Beacon clipping sentinels become bounded endpoint estimates using prior sensor
@@ -118,6 +119,11 @@ axis-value counts and finite-rail counts remain separate, including in
 reference, capture, noise-window and Beta motion diagnostics. Native Beacon follows its
 separate raw-stream timing policy. These checks do not make the paths identical
 or prove that every delayed native packet or every transport failure is caught.
+Generic past timestamp age alone does not reject current-window rows, trim
+warmup or expire a recently received reference. `max_sample_age` remains a
+nominal travel/startup-planning assumption. Real receipt silence and the other
+validity checks remain. This policy has not been physically qualified on every
+sensor/printer combination.
 
 No hard end-to-end latency or physical stopping bound is provided. Python host
 scheduling, USB/CAN transport, MCU dispatch, motor response, belt slip and

@@ -81,9 +81,11 @@ A transient sample gap, fresh-data wait timeout or acquisition timeout discards
 the entire affected window and starts a fresh one-second acquisition. A window permits at most two such retries,
 with at most three shared across all three windows. Console diagnostics identify
 retries and exhaustion. Partial windows are never joined or used for statistics.
-Sensor errors, old/future timestamps, invalid data, changed context and
-cancellation abort without this recovery. Homing and Beta moving-noise checks
-retain their existing strict policy.
+Sensor errors, future/invalid timestamps, changed context and cancellation
+abort without this recovery. Generic current-window rows are accepted despite
+old sensor timestamps. Only validated relevant receipts renew the independent
+stream watchdog. Native Beacon retains its age policy. Homing/Beta do not opt
+into stationary-window retries.
 
 Mapped X/Y hints are diagnostic. The numerical candidate is the measured peak
 plus the larger of 20% or 0.1 g, rounded upward onto the configured start/step

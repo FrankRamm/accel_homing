@@ -553,7 +553,7 @@ class ConfigurableStartupBudgetTests(unittest.TestCase):
             obj.fake_printer.send_event("klippy:connect")
         message = str(caught.exception)
         for part in ("exceeds 50.0", "effective homing speed 75 mm/s", "acceleration 5000 mm/s^2",
-                     "report needs 1.5 mm", "max_sample_age 0.02 s", "max_report_travel 1 mm",
+                     "nominal report travel 1.5 mm", "configured max_sample_age 0.02 s", "max_report_travel 1 mm",
                      "startup needs 4.1625 mm", "max_startup_travel 3 mm", "stream_interval 0.005 s",
                      "speed and acceleration were not changed", "not a guarantee of physical stopping travel"):
             self.assertIn(part, message)
@@ -632,7 +632,7 @@ class ConfigurableStartupBudgetTests(unittest.TestCase):
             if accepted:
                 obj.backend.validate_motion_plan(75.0, 5000.0, CommandError)
             else:
-                with self.assertRaisesRegex(CommandError, "sample-age/report-travel"):
+                with self.assertRaisesRegex(CommandError, "nominal report-travel"):
                     obj.backend.validate_motion_plan(75.0, 5000.0, CommandError)
 
     def test_speed_ceiling_uses_each_configured_budget_at_extreme_accelerations(self):
@@ -677,7 +677,7 @@ class ConfigurableStartupBudgetTests(unittest.TestCase):
         obj.cmd_STATUS(types.SimpleNamespace(respond_info=messages.append))
         self.assertTrue(any("max_report_travel 1.500 mm, max_startup_travel 4.500 mm" in line
                             and "not physical stopping distances" in line for line in messages))
-        self.assertTrue(any("report-age speed ceiling 75.0 mm/s" in line for line in messages))
+        self.assertTrue(any("nominal report-travel speed ceiling 75.0 mm/s" in line for line in messages))
 
 
 class OptionalTravelPolicyTests(unittest.TestCase):
@@ -729,7 +729,7 @@ class OptionalTravelPolicyTests(unittest.TestCase):
                     generic(options={name: invalid})
         report_only = generic(options={"max_report_travel": 1.0})
         self.assertIsNone(report_only.backend.startup_travel)
-        with self.assertRaisesRegex(CommandError, "sample-age/report-travel"):
+        with self.assertRaisesRegex(CommandError, "nominal report-travel"):
             report_only.backend.validate_motion_plan(75.0, 5000.0, CommandError)
         self.assertEqual(report_only.backend.motion_startup_speed_limit(5000.0), 1.0 / 0.070)
         startup_only = generic(options={"max_startup_travel": 3.0})
@@ -763,7 +763,7 @@ class OptionalTravelPolicyTests(unittest.TestCase):
         json.dumps(status, allow_nan=False)
         messages = []
         obj.cmd_STATUS(types.SimpleNamespace(respond_info=messages.append))
-        self.assertTrue(any("report-age speed ceiling disabled" in text for text in messages))
+        self.assertTrue(any("nominal report-travel speed ceiling disabled" in text for text in messages))
         self.assertTrue(any("max_report_travel disabled, max_startup_travel disabled" in text for text in messages))
         attempt.effective_speed = attempt.effective_accel = None  # Legacy detector replay has no plan.
         speed, accel, timeout = obj._motion_startup_plan(attempt)
@@ -787,7 +787,7 @@ class OptionalTravelPolicyTests(unittest.TestCase):
             json.dumps(status, allow_nan=False)
             self.assertIsNone(status["backend"]["startup_motion_request_travel_mm"])
 
-    def test_absent_policies_do_not_disable_missing_stale_or_frozen_faults(self):
+    def test_absent_policies_do_not_disable_missing_future_or_frozen_faults(self):
         for fault in ("no_data", "stale_data", "frozen"):
             with self.subTest(fault=fault):
                 obj, attempt, trigger = prepared_generic(speed=75.0)
@@ -796,7 +796,7 @@ class OptionalTravelPolicyTests(unittest.TestCase):
                     obj._watchdog(obj.reactor.now)
                 elif fault == "stale_data":
                     feed(obj, [(attempt.arm_time + number / 3200.0, 0.0, 0.0, G)
-                               for number in range(16)], age=0.070)
+                               for number in range(16)], age=-.006)
                 else:
                     while not attempt.done and obj.reactor.now < attempt.arm_time + 0.060:
                         first = obj.backend.last_sample_time + 1 / 3200.0

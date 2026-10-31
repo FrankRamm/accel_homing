@@ -948,7 +948,7 @@ class AccelHomingWorkflows:
         seed = self.noise_seeds.pop(axis, None)
         if seed is not None:
             self._info("%s calibration starts at %.6g g from stationary noise run %s. "
-                       "This is an initial candidate; fresh-sample checks and ten-home "
+                       "This is an initial candidate; current-window sample checks and ten-home "
                        "qualification remain required" % (
                            axis.upper(), seed, self.noise_recommendation["run_id"]))
         return seed
@@ -2599,7 +2599,10 @@ class AccelHomingWorkflows:
             "sensor": optional("sensor context", self.owner.noise_sensor_context),
             "timing_policy": {"stream_timeout_s": getattr(self.owner, "stream_timeout", None),
                               "reference_max_age_s": optional("reference age", lambda: self.owner._reference_max_age()),
-                              "homing_batch_max_age_s": getattr(backend, "max_age", getattr(self.owner, "stream_timeout", None)),
+                              "homing_batch_max_age_s": (None if backend is not None else getattr(self.owner, "stream_timeout", None)),
+                              "sample_age_limit_enforced": backend is None,
+                              "configured_max_sample_age_s": getattr(backend, "max_age", None),
+                              "receipt_timeout_s": getattr(self.owner, "stream_timeout", None),
                               "max_future_s": 0.005, "report_interval_s": getattr(backend, "interval", None),
                               "capture_sample_limit": getattr(self.owner, "capture_limit", None)},
             "motion_plan": plan, "driver_current_context": session.get("beta_driver_current_context"),

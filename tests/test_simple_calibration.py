@@ -103,13 +103,18 @@ class VectorDetectorTests(unittest.TestCase):
                 self.assertFalse(attempt.done, attempt.reason)
         self.assertGreater(obj.reactor.now - attempt.arm_time, 20. / attempt.effective_speed)
 
-    def test_stale_data_still_stops_the_simple_move(self):
+    def test_delayed_data_keeps_simple_move_live_then_real_silence_stops_it(self):
         obj, attempt = prepared()
         rows = [(attempt.arm_time + n / 3200., .001 * (n % 2) * G, 0., G)
                 for n in range(-15, 17)]
-        feed(obj, rows, age=obj.backend.max_age + .001)
+        feed(obj, rows, age=.080)
+        obj._watchdog(obj.reactor.now)
+        self.assertFalse(attempt.done)
+        self.assertIsNone(obj.sensor_fault)
+        obj.reactor.now += obj.stream_timeout + .001
+        obj._watchdog(obj.reactor.now)
         self.assertTrue(attempt.done)
-        self.assertEqual(attempt.reason, "stale_data")
+        self.assertEqual(attempt.reason, "no_data")
 
     def test_missing_data_and_full_travel_watchdogs_remain_active(self):
         for reason in ("no_data", "travel"):

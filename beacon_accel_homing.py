@@ -106,6 +106,7 @@ class QuietReference:
         self.threshold_g = threshold_g
         self.require_quiet = require_quiet
         self.first = self.last = None
+        self.last_receipt_time = None
         self.count = 0
         self.totals = [0.0, 0.0, 0.0]
         self.low = self.high = None
@@ -318,10 +319,12 @@ def describe_reference(status):
     require_quiet = status.get("quiet_range_enforced", True)
     limit = ("limit %.3f g" % status["quiet_limit_g"] if require_quiet else
              "quiet range not required for calibration")
+    age_policy = ("past-age limit disabled" if status["max_sample_age_ms"] is None else
+                  "max %.2f ms" % status["max_sample_age_ms"])
     result = ("baseline %s: %s (%s); best %s %d/%d samples, %.2f/%.2f ms,"
             " p-p XYZ %s g (%s); observed p-p XYZ %s g;"
             " accepted %d, pre-cutoff %d, resets %d; sample age %s ms"
-            " (max %.2f ms), batch oldest/newest %s/%s ms"
+            " (%s), batch oldest/newest %s/%s ms"
             % (status["axis"].upper(), status["result"].replace("_", " "), status["phase"].replace("_", " "),
                "quiet" if require_quiet else "reference",
                status["best_quiet_samples"], status["required_samples"],
@@ -329,7 +332,7 @@ def describe_reference(status):
                xyz(status["best_quiet_peak_to_peak_g"]), limit,
                xyz(status["observed_peak_to_peak_g"]), status["accepted_samples"],
                status["pre_cutoff_samples"], status["quiet_resets"],
-               age(status["sample_age_ms"]), status["max_sample_age_ms"],
+               age(status["sample_age_ms"]), age_policy,
                age(status["oldest_batch_age_ms"]), age(status["newest_batch_age_ms"])))
     if status["motion_proof_noise_bound_g"] is not None:
         result += "; motion-proof noise bound XYZ %s g" % xyz(status["motion_proof_noise_bound_g"])
@@ -562,8 +565,6 @@ class BeaconAccelHoming:
             for axis in AXES:
                 if config.get(axis + "_threshold", None) is None:
                     self.threshold_g[axis] = default_threshold
-        if self.backend is not None and self.stream_timeout > self.backend.max_age:
-            self.stream_timeout = self.backend.max_age
 
         self.lock = threading.Lock()
         self.sensor_fault_lock = threading.Lock()
@@ -1206,7 +1207,8 @@ class BeaconAccelHoming:
                     ready = reference.baseline() is not None
                     last = reference.last
                 sensor_now = self.main_mcu.estimated_print_time(now)
-                if ready and last is not None and -0.005 <= sensor_now - last <= self._reference_max_age():
+                if (ready and last is not None and self._sample_time_valid(sensor_now, last)
+                        and self._reference_receiving(reference, now)):
                     self._remember_reference(reference, sensor_now, "acquisition", "ready")
                     return
                 if now - started > self.baseline_time + STREAM_START_TIMEOUT:
@@ -1255,7 +1257,11 @@ class BeaconAccelHoming:
                 "quiet_resets": 0 if reference is None else reference.resets,
                 "sample_age_ms": (None if reference is None or reference.last is None
                                   else round((sensor_now - reference.last) * 1000.0, 3)),
-                "max_sample_age_ms": self._reference_max_age() * 1000.0,
+                "max_sample_age_ms": (None if self.backend is not None else self.stream_timeout * 1000.0),
+                "sample_age_limit_enforced": self.backend is None,
+                "configured_max_sample_age_ms": (None if self.backend is None else self.backend.max_age * 1000.0),
+                "last_receipt_time_s": None if reference is None else reference.last_receipt_time,
+                "receipt_timeout_ms": self.stream_timeout * 1000.0,
                 "oldest_batch_age_ms": (None if reference is None or reference.oldest_batch_age is None
                                         else round(reference.oldest_batch_age * 1000.0, 3)),
                 "newest_batch_age_ms": (None if reference is None or reference.newest_batch_age is None
@@ -1296,12 +1302,27 @@ class BeaconAccelHoming:
                      for low, high, base in zip(reference.low, reference.high, bases))
 
     def _reference_max_age(self):
-        return self.stream_timeout if self.backend is None else self.backend.max_age
+        return self.stream_timeout if self.backend is None else None
+
+    def _sample_time_valid(self, sensor_now, when):
+        age = sensor_now - when
+        return (math.isfinite(age) and age >= -0.005
+                and (self.backend is not None or age <= self.stream_timeout))
+
+    def _reference_receiving(self, reference, eventtime):
+        return (self.backend is None or (reference.last_receipt_time is not None
+                and eventtime - reference.last_receipt_time <= self.stream_timeout))
+
+    def _batch_timing(self, params, count):
+        if self.backend is not None and "_sample_start_time_s" in params:
+            start, end = params["_sample_start_time_s"], params["_sample_end_time_s"]
+            return start, (end - start) / max(count - 1.0, 1.0)
+        return (self.clock_to_time(params["start_clock"]),
+                params["delta_clock"] / max(count - 1.0, 1.0) / self.beacon_freq)
 
     def _collect_reference(self, params, data, count, now):
         """Validate sensor time and every axis while no homing move is armed."""
-        interval = params["delta_clock"] / (count - 1.0) / self.beacon_freq
-        start = self.clock_to_time(params["start_clock"])
+        start, interval = self._batch_timing(params, count)
         if not math.isfinite(interval) or interval <= 0.0 or not math.isfinite(start):
             return "invalid_data"
         sensor_now = self.main_mcu.estimated_print_time(now)
@@ -1327,7 +1348,7 @@ class BeaconAccelHoming:
                         reference.oldest_batch_age = sensor_now - when
                         reference.newest_batch_age = sensor_now - (start + (count - 1) * interval)
                         first_eligible = False
-                if not -0.005 <= sensor_now - when <= self._reference_max_age():
+                if not self._sample_time_valid(sensor_now, when):
                     return "stale_data"
                 if reference.last is not None:
                     if when <= reference.last:
@@ -1342,6 +1363,7 @@ class BeaconAccelHoming:
                     (original, (params["start_clock"], params["delta_clock"], number, count)))
                 if reference_error is not None:
                     return reference_error
+                reference.last_receipt_time = now
         return None
 
     def _handle_move_end(self, hmove):
@@ -1445,7 +1467,8 @@ class BeaconAccelHoming:
         direction = self.impact_sign[axis]
         if self.sensor_fault is not None:
             raise self.printer.command_error("accel_homing: %s" % FAILURES[self.sensor_fault])
-        now = self.main_mcu.estimated_print_time(self.reactor.monotonic())
+        eventtime = self.reactor.monotonic()
+        now = self.main_mcu.estimated_print_time(eventtime)
         with self.lock:
             reference = self.preparation
             bases = reference.baseline() if reference is not None and reference.axis == axis else None
@@ -1454,8 +1477,11 @@ class BeaconAccelHoming:
                       and not (self.workflows.calibration_reference(axis)
                                or self._uses_vector_detector(axis)) else
                       "quiet_window_invalidated_before_arm" if bases is None else
-                      "expired_before_arm" if reference.last is None
-                      or not -0.005 <= now - reference.last <= self._reference_max_age() else "ready")
+                      "expired_before_arm" if self.backend is None and (reference.last is None
+                      or not self._sample_time_valid(now, reference.last)) else
+                      "future_before_arm" if reference.last is None
+                      or not self._sample_time_valid(now, reference.last) else
+                      "no_data_before_arm" if not self._reference_receiving(reference, eventtime) else "ready")
             if result != "ready":
                 bases = None
             proof_noise = self._reference_motion_noise(reference, bases, axis)
@@ -1837,10 +1863,6 @@ class BeaconAccelHoming:
         if eventtime - attempt.last_data > self.stream_timeout:
             self._fire(attempt, "no_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return self.reactor.NEVER
-        if self.backend is not None and self.backend.last_sample_time is not None:
-            if print_time - self.backend.last_sample_time > self.backend.max_age:
-                self._fire(attempt, "stale_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
-                return self.reactor.NEVER
         if print_time > attempt.deadline + self.stream_timeout:
             self._fire(attempt, "travel", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return self.reactor.NEVER
@@ -1966,7 +1988,7 @@ class BeaconAccelHoming:
         if max_age is None:
             max_age = self._reference_max_age()
         if reason is None:
-            reason = "too_old" if sensor_now - oldest > max_age else "future"
+            reason = "too_old" if max_age is not None and sensor_now - oldest > max_age else "future"
         if sample_time is None:
             sample_time = oldest if reason == "too_old" else newest
         window = self.noise_window
@@ -1983,7 +2005,8 @@ class BeaconAccelHoming:
             "sample_age_ms": round((sensor_now - sample_time) * 1000.0, 3),
             "oldest_batch_age_ms": round((sensor_now - oldest) * 1000.0, 3),
             "newest_batch_age_ms": round((sensor_now - newest) * 1000.0, 3),
-            "max_sample_age_ms": max_age * 1000.0,
+            "max_sample_age_ms": None if max_age is None else max_age * 1000.0,
+            "sample_age_limit_enforced": self.backend is None,
             "max_future_ms": 5.0,
         }
         logging.info("accel_homing: sample timing fault %s",
@@ -1998,7 +2021,8 @@ class BeaconAccelHoming:
         if count < 2:
             return
         now = params.get("#receive_time") or self.reactor.monotonic()
-        self.last_batch = now
+        if self.backend is None:
+            self.last_batch = now
         attempt = self.attempt
         if attempt is None:
             if self.tail is not None:
@@ -2008,9 +2032,14 @@ class BeaconAccelHoming:
                     reason = self._collect_reference(params, data, count, now)
                     if reason is not None:
                         self._sensor_fault(reason)
+                        if self.backend is not None:
+                            return
+                if self.backend is not None:
+                    self.last_batch = now
                 self.recent.append(data)
             return
-        attempt.last_data = now
+        if self.backend is None:
+            attempt.last_data = now
         if attempt.done:
             self._track_impact(attempt, params, data, count)
             return
@@ -2021,10 +2050,16 @@ class BeaconAccelHoming:
             return
         start_clock = params["start_clock"]
         interval = params["delta_clock"] / (count - 1.0)
-        source_params, source_skip = params, 0
+        source_params, source_skip, source_count = params, 0, count
         expanded_native = self.backend is None and attempt.proof_noise is not None
         strict_native = self.backend is None and (expanded_native or attempt.vector_mode)
-        if strict_native and (not math.isfinite(interval) or interval <= 0.0):
+        # The configured adapter validates full-precision source rows first.
+        # Direct detector replays still validate before refreshing liveness.
+        direct_generic = self.backend is not None and "_sample_start_time_s" not in params
+        strict = strict_native or direct_generic
+        width = 3 if isinstance(data, tuple) else 6
+        if ((strict and (not math.isfinite(interval) or interval <= 0.0))
+                or (direct_generic and len(data) % width)):
             self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return
         if not clock_after(start_clock, attempt.arm_clock):
@@ -2041,14 +2076,21 @@ class BeaconAccelHoming:
             start_clock = (start_clock + int(round(skip * interval))) & 0xFFFFFFFF
             params = dict(params, data=data, start_clock=start_clock,
                           delta_clock=int(round((count - 1) * interval)))
-        if strict_native:
-            start_time = self.clock_to_time(start_clock)
-            end_time = self.clock_to_time(start_clock + params["delta_clock"])
+            if self.backend is not None and "_sample_start_time_s" in params:
+                source_time, source_interval = self._batch_timing(source_params, source_count)
+                params["_sample_start_time_s"] = source_time + skip * source_interval
+        if strict:
+            if self.backend is None:
+                start_time = self.clock_to_time(start_clock)
+                end_time = self.clock_to_time(start_clock + params["delta_clock"])
+            else:
+                start_time, sample_interval = self._batch_timing(params, count)
+                end_time = start_time + (count - 1) * sample_interval
             sensor_now = self.main_mcu.estimated_print_time(now)
             if not all(math.isfinite(value) for value in (start_time, end_time, sensor_now)):
                 self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
                 return
-            if (sensor_now - start_time > self.stream_timeout
+            if ((self.backend is None and sensor_now - start_time > self.stream_timeout)
                     or end_time - sensor_now > 0.005):
                 self._fire(attempt, "stale_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
                 return
@@ -2084,7 +2126,7 @@ class BeaconAccelHoming:
         params = dict(params, data=data)
         raw = (data if isinstance(data, tuple) else memoryview(data).cast("h") if NATIVE_LE
                else [v for sample in SAMPLE.iter_unpack(data) for v in sample])
-        if strict_native and not all(math.isfinite(value) for value in raw):
+        if strict and not all(math.isfinite(value) for value in raw):
             self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return
         if self.backend is None and CLIPPED in raw:
@@ -2095,6 +2137,8 @@ class BeaconAccelHoming:
             raw = decoded[source_skip * 3:source_skip * 3 + count * 3]
             if source_skip:
                 params["_native_decode_previous"] = tuple(decoded[source_skip * 3 - 3:source_skip * 3])
+        if self.backend is not None:
+            attempt.last_data = self.last_batch = now
         if attempt.vector_mode:
             if attempt.gap:
                 self._fire(attempt, "sample_gap", mcu.MCU_trsync.REASON_HOST_REQUEST)
@@ -2413,7 +2457,8 @@ class BeaconAccelHoming:
                 window = {"index": session["windows_started"],
                           "cutoff": self.main_mcu.estimated_print_time(started),
                           "duration": duration, "samples": [], "last": None,
-                          "interval": None, "complete": False, "changed": False}
+                          "interval": None, "complete": False, "changed": False,
+                          "last_receipt_time": None}
                 self.sensor_fault = None
                 self.noise_window = window
                 if self.backend is not None:
@@ -2486,14 +2531,23 @@ class BeaconAccelHoming:
                             "cutoff_time_s": window["cutoff"],
                             **window["signal_quality"].summary(),
                             "_noise_context": session["context"]}
-                sensor_now = self.main_mcu.estimated_print_time(now)
-                if last is not None and sensor_now - last > self.stream_timeout:
-                    self._record_sample_timing_fault(
-                        "noise_wait", sensor_now, last, last,
-                        cutoff=window["cutoff"], reason="too_old", sample_time=last,
-                        max_age=self.stream_timeout)
-                    raise _NoiseAcquisitionFailure("no_fresh_data",
-                        "accel_homing: noise measurement stopped receiving fresh samples")
+                if self.backend is None:
+                    sensor_now = self.main_mcu.estimated_print_time(now)
+                    if last is not None and sensor_now - last > self.stream_timeout:
+                        self._record_sample_timing_fault(
+                            "noise_wait", sensor_now, last, last,
+                            cutoff=window["cutoff"], reason="too_old", sample_time=last,
+                            max_age=self.stream_timeout)
+                        raise _NoiseAcquisitionFailure("no_fresh_data",
+                            "accel_homing: noise measurement stopped receiving fresh samples")
+                else:
+                    receipt = window.get("last_receipt_time")
+                    if receipt is not None and now - receipt > self.stream_timeout:
+                        window["fault_details"] = {"phase": "noise_wait",
+                            "last_receipt_time_s": receipt, "receipt_now_s": now,
+                            "receipt_timeout_s": self.stream_timeout}
+                        raise _NoiseAcquisitionFailure("no_fresh_data",
+                            "accel_homing: noise measurement stopped receiving validated samples")
                 if now - started > window["duration"] + STREAM_START_TIMEOUT:
                     raise _NoiseAcquisitionFailure("acquisition_timeout",
                         "accel_homing: noise measurement acquisition timeout")
@@ -2527,8 +2581,7 @@ class BeaconAccelHoming:
         if count < 2 or len(data) % width:
             self._sensor_fault("invalid_data")
             return
-        interval = params["delta_clock"] / (count - 1.0) / self.beacon_freq
-        start = self.clock_to_time(params["start_clock"])
+        start, interval = self._batch_timing(params, count)
         minimum_rate = 800.0 if self.backend is None else self.backend.min_rate * 0.98
         if (not math.isfinite(start) or not math.isfinite(interval) or interval <= 0.0
                 or 1.0 / interval < minimum_rate):
@@ -2556,11 +2609,11 @@ class BeaconAccelHoming:
                 when = start + number * interval
                 if when <= window["cutoff"]:
                     continue
-                if not -0.005 <= sensor_now - when <= max_age:
+                if not self._sample_time_valid(sensor_now, when):
                     self._record_sample_timing_fault(
                         "noise_batch", sensor_now, start, start + (count - 1) * interval,
                         cutoff=window["cutoff"],
-                        reason="too_old" if sensor_now - when > max_age else "future",
+                        reason="too_old" if max_age is not None and sensor_now - when > max_age else "future",
                         sample_time=when)
                     self._sensor_fault("stale_data")
                     return
@@ -2612,6 +2665,7 @@ class BeaconAccelHoming:
                 if quality is not None:
                     quality["sample_count"] += 1
                 window["last"], window["interval"] = when, interval
+                window["last_receipt_time"] = now
                 self.last_batch = now
                 if (window["duration"] is not None
                         and when - window["samples"][0][0] + 0.000000001 >= window["duration"]):
@@ -2682,7 +2736,8 @@ class BeaconAccelHoming:
             cutoff = self.main_mcu.estimated_print_time(self.reactor.monotonic())
             window = {"index": session["windows_started"] + 1, "cutoff": cutoff,
                       "duration": None, "samples": [], "last": None, "interval": None,
-                      "complete": False, "changed": False, "beta_quality": self._new_beta_quality(context)}
+                      "complete": False, "changed": False, "last_receipt_time": None,
+                      "beta_quality": self._new_beta_quality(context)}
             token = {"session": session, "window": window, "sensor_context": context,
                      "generation": self.operation_generation, "baseline_samples": rows,
                      "reference_signal_quality": reference_signal,
@@ -2717,8 +2772,14 @@ class BeaconAccelHoming:
             raise self.printer.command_error("accel_homing: beta moving capture: %s" % FAILURES[self.sensor_fault])
         now = self.reactor.monotonic()
         last = window["last"]
-        if ((last is None and now - token["started"] > STREAM_START_TIMEOUT)
-                or (last is not None and self.main_mcu.estimated_print_time(now) - last > self.stream_timeout)):
+        if self.backend is None:
+            missing = ((last is None and now - token["started"] > STREAM_START_TIMEOUT)
+                       or (last is not None and self.main_mcu.estimated_print_time(now) - last > self.stream_timeout))
+        else:
+            receipt = window.get("last_receipt_time")
+            missing = ((receipt is None and now - token["started"] > STREAM_START_TIMEOUT)
+                       or (receipt is not None and now - receipt > self.stream_timeout))
+        if missing:
             raise self.printer.command_error("accel_homing: beta moving capture stopped receiving fresh samples")
 
     def stop_beta_motion_capture(self, token, check_running):
@@ -2818,15 +2879,14 @@ class BeaconAccelHoming:
                 if count < 2 or len(data) % width:
                     reason = "invalid_data"
                 else:
-                    interval = params["delta_clock"] / (count - 1.0) / self.beacon_freq
-                    start = self.clock_to_time(params["start_clock"])
+                    start, interval = self._batch_timing(params, count)
                     now = self.main_mcu.estimated_print_time(self.reactor.monotonic())
                     self._update_beta_quality_times(quality, start, interval, count, now)
                     rate = 800.0 if self.backend is None else self.backend.min_rate * 0.98
                     if (not all(math.isfinite(value) for value in (start, interval, now))
                             or interval <= 0 or 1.0 / interval < rate):
                         reason = "sample_rate"
-                    elif (now - start > self._reference_max_age()
+                    elif (not self._sample_time_valid(now, start)
                           or start + (count - 1) * interval - now > 0.005):
                         reason = "stale_data"
                     elif (state["last_sample_time_s"] is not None
@@ -2936,6 +2996,8 @@ class BeaconAccelHoming:
                         self.capture_decode_previous = tuple(decode_native_values(raw, seed, clips)[-3:])
                     except ValueError:
                         pass  # Validation retains the original fault; never invent decoder history.
+                elif "_sample_start_time_s" in params:
+                    context = (params["_sample_start_time_s"], params["_sample_end_time_s"])
                 self.capture_decode_contexts.append(context)
                 self.capture_samples += count
         if (overflow and state is not None and self.beta_capture is state
@@ -3016,7 +3078,8 @@ class BeaconAccelHoming:
         samples, previous = [], [0, 0, 0]
         quality = self._signal_quality("capture", batches[0][3] if batches else
                                        (self.session_scale or self.scale)["scale"] / 1000.0,
-                                       contexts[0][1] if contexts and contexts[0] is not None else None)
+                                       contexts[0][1] if self.backend is None and contexts
+                                       and contexts[0] is not None else None)
         onset_matches, onset_index = 0, None
         for batch_index, (start_clock, delta_clock, data, count_g) in enumerate(batches):
             count = sample_count(data)
@@ -3037,7 +3100,10 @@ class BeaconAccelHoming:
                     raise self.printer.command_error("accel_homing: native capture decoder context changed")
                 raw = decode_native_values(raw, *context)
             previous = raw[-3:]
-            start, end = self.clock_to_time(start_clock), self.clock_to_time(start_clock + delta_clock)
+            if self.backend is not None and batch_index < len(contexts) and contexts[batch_index] is not None:
+                start, end = contexts[batch_index]
+            else:
+                start, end = self.clock_to_time(start_clock), self.clock_to_time(start_clock + delta_clock)
             dt = (end - start) / (count - 1)
             for number in range(count):
                 xyz = raw[number * 3:number * 3 + 3]
@@ -3283,17 +3349,19 @@ class BeaconAccelHoming:
         gcmd.respond_info("accel_homing: sensor %s, backend %s, X %.12g g, Y %.12g g"
                           % (self.sensor_name, kind, self.threshold_g["x"], self.threshold_g["y"]))
         gcmd.respond_info("accel_homing: baseline policy: legacy ordinary homing requires quiet XYZ;"
-                          " simple calibration and saved XYZ-magnitude models require a fresh"
+                          " simple calibration and saved XYZ-magnitude models require a post-settle"
                           " %.2f ms / %d sample reference without a quiet-range limit;"
                           " no acceleration-derived motion proof for XYZ magnitude"
                           % (self.baseline_time * 1000.0, BASELINE_MIN_SAMPLES))
         if self.backend is not None:
-            gcmd.respond_info("accel_homing: requested report interval %.4f s, sample-age limit"
-                              " %.4f s, observed rate %s Hz, report-age speed ceiling %s;"
+            gcmd.respond_info("accel_homing: requested report interval %.4f s, past sample-age limit disabled;"
+                              " configured max_sample_age %.4f s controls startup timing and nominal travel planning;"
+                              " observed rate %s Hz, nominal report-travel speed ceiling %s;"
+                              " no-delivery timeout %.4f s; late impact data may request a stop;"
                               " total stop latency is not guaranteed"
                               % (self.backend.interval, self.backend.max_age, self.backend.observed_rate,
                                  "disabled" if self.backend.max_speed is None
-                                 else "%.1f mm/s" % self.backend.max_speed))
+                                 else "%.1f mm/s" % self.backend.max_speed, self.stream_timeout))
         if self.backend is not None:
             gcmd.respond_info("accel_homing: max_report_travel %s, max_startup_travel %s;"
                               " optional commanded-travel limits, not physical stopping distances"

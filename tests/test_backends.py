@@ -66,7 +66,7 @@ class GenericPreparationTest(unittest.TestCase):
         self.assertEqual(endstop._dispatch.started, [])
 
     def test_fault_or_noisy_generic_preparation_aborts_before_any_dispatch(self):
-        for mode in ("noise", "no_data", "stale", "future", "duplicate", "gap",
+        for mode in ("noise", "no_data", "future", "duplicate", "gap",
                      "nonfinite", "errors", "overflows"):
             with self.subTest(mode=mode):
                 obj, endstop = self.session()
@@ -179,17 +179,20 @@ class GenericPreparationTest(unittest.TestCase):
                 self.assertEqual(diagnostic["pre_cutoff_samples"] > 0, mode == "pre_cutoff")
                 self.assertEqual(endstop._dispatch.started, [])
 
-    def test_ready_reference_expiry_before_arm_is_reported_separately(self):
+    def test_silent_ready_reference_is_rejected_before_arm_by_receipt_timeout(self):
         obj, endstop = self.session()
         self.begin(obj, endstop)
         obj.reactor.now += obj.backend.max_age + 0.010
-        with self.assertRaisesRegex(CommandError, "expired before arm"):
+        receipt = obj.preparation.last_receipt_time
+        self.assertGreater(obj.reactor.now - receipt, obj.stream_timeout)
+        with self.assertRaises(CommandError):
             endstop.home_start(obj.reactor.now + 0.010, 0, 0, 0)
         diagnostic = obj.get_status(obj.reactor.now)["baseline"]
-        self.assertEqual(diagnostic["result"], "expired_before_arm")
+        self.assertEqual(diagnostic["result"], "no_data_before_arm")
         self.assertEqual(diagnostic["phase"], "before_arm")
         self.assertGreaterEqual(diagnostic["best_quiet_span_ms"], 100.0)
-        self.assertGreater(diagnostic["sample_age_ms"], diagnostic["max_sample_age_ms"])
+        self.assertIsNone(diagnostic["max_sample_age_ms"])
+        self.assertGreater(diagnostic["sample_age_ms"], diagnostic["configured_max_sample_age_ms"])
         self.assertFalse(obj.homing_active)
         self.assertIsNone(obj.preparation)
         self.assertEqual(endstop._dispatch.started, [])
@@ -203,7 +206,8 @@ class GenericPreparationTest(unittest.TestCase):
         self.begin(obj, endstop)
         self.assertIsNone(obj.sensor_fault)
         self.assertAlmostEqual(obj.baseline_status["sample_age_ms"], 22.82, delta=0.002)
-        self.assertEqual(obj.baseline_status["max_sample_age_ms"], 70.0)
+        self.assertIsNone(obj.baseline_status["max_sample_age_ms"])
+        self.assertEqual(obj.baseline_status["configured_max_sample_age_ms"], 70.0)
         self.assertEqual(obj.baseline_status["result"], "ready")
         self.assertEqual(endstop._dispatch.started, [])
 
@@ -221,16 +225,17 @@ class GenericPreparationTest(unittest.TestCase):
         self.assertAlmostEqual(obj.onset_time(obj.attempt), when, places=6)
         self.assertEqual(endstop.get_mcu().log, [("mcu", [7, HIT])])
 
-    def test_pending_sample_age_is_rechecked_before_contact(self):
+    def test_pending_post_arm_contact_survives_80_ms_timestamp_age(self):
         obj, endstop = self.session()
         self.begin(obj, endstop)
         when = obj.backend.last_sample_time + 1 / 3200.0
         endstop.home_start(when, 0, 0, 0)
         feed(obj, samples(when, size=1, x=-3))
         self.assertIsNone(obj.attempt.reason)
-        feed(obj, samples(when + 1 / 3200.0, size=2), age=obj.backend.max_age - 0.0003)
-        self.assertEqual(obj.attempt.reason, "stale_data")
-        self.assertEqual(endstop.get_mcu().log, [("mcu", [7, HOST])])
+        feed(obj, samples(when + 1 / 3200.0, size=2), age=.080)
+        self.assertEqual(obj.attempt.reason, "impact")
+        self.assertAlmostEqual(obj.onset_time(obj.attempt), when, places=6)
+        self.assertEqual(endstop.get_mcu().log, [("mcu", [7, HIT])])
 
     def test_other_clients_survive_success_and_gate_failure(self):
         for failure in (False, True):
@@ -389,10 +394,20 @@ class BaselineFloorTest(unittest.TestCase):
         self.assertAlmostEqual(obj.baseline_status["impact_threshold_g"], 0.5)
         self.assertIn("trial impact threshold 0.5", plugin.describe_reference(obj.baseline_status))
 
-    def test_half_g_floor_keeps_pre_cutoff_and_timestamp_rejections(self):
+    def test_half_g_floor_keeps_cutoff_future_guards_and_admits_delayed_reference(self):
         for profile in ("pre_cutoff", "stale", "future"):
             with self.subTest(profile=profile):
                 obj, endstop = self.machine(profile=profile)
+                if profile == "stale":
+                    obj._prepare_reference()
+                    self.assertIsNone(obj.sensor_fault)
+                    self.assertEqual(obj.baseline_status["result"], "ready")
+                    self.assertGreaterEqual(obj.baseline_status["accepted_samples"], plugin.BASELINE_MIN_SAMPLES)
+                    self.assertIsNone(obj.baseline_status["max_sample_age_ms"])
+                    self.assertGreater(obj.baseline_status["oldest_batch_age_ms"],
+                                       obj.baseline_status["configured_max_sample_age_ms"])
+                    self.assertEqual(endstop.trigger_log.messages, [])
+                    continue
                 with self.assertRaises(CommandError):
                     obj._prepare_reference()
                 self.assertFalse(obj.homing_active)
@@ -808,7 +823,7 @@ class CalibrationReferenceTest(unittest.TestCase):
                 with self.assertRaisesRegex(CommandError, "fresh accelerometer reference"):
                     obj.prepare(endstop, obj.reactor.now + 0.010)
                 self.assertEqual(obj.baseline_status["result"],
-                                 "expired_before_arm" if mode == "expiry"
+                                 "no_data_before_arm" if mode == "expiry"
                                  else "calibration_reference_outside_trial")
                 self.assertFalse(obj.homing_active)
                 self.assertIsNone(obj.preparation)
@@ -869,7 +884,7 @@ class CalibrationReferenceTest(unittest.TestCase):
                         self.assertAlmostEqual(obj.onset_time(attempt), rows[0][0], delta=1e-6)
 
     def test_calibration_data_faults_and_capacity_still_abort_before_dispatch(self):
-        for mode in ("stale", "future", "duplicate", "gap", "nonfinite",
+        for mode in ("future", "duplicate", "gap", "nonfinite",
                      "errors", "overflows", "capacity"):
             with self.subTest(mode=mode):
                 obj, endstop = GenericPreparationTest().session()
@@ -1110,27 +1125,25 @@ class GenericTriggerTest(unittest.TestCase):
 
 
 class WarmupContinuityTest(unittest.TestCase):
-    """Discarded warmup history must not create or conceal a retained-data gap."""
+    """Valid delayed warmup retains continuity; only scope cutoffs discard rows."""
 
     def seeded(self, legacy=False, singleton=False):
-        # Preserve the original 20 ms warmup-cutoff scenarios explicitly.
+        # Keep an explicit 20 ms nominal value to expose accidental age caps.
         obj = generic(legacy=legacy, options={"max_sample_age": 0.020})
         rows = samples(9.990, size=1 if singleton else 16, x=2.0)
         feed(obj, rows)
         return obj, rows[-1][0]
 
-    def test_continuous_delayed_batch_starts_new_retained_sequence(self):
+    def test_continuous_delayed_batch_keeps_every_row_in_same_sequence(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj, previous = self.seeded(legacy)
-                # Every source interval is 0.3125 ms. Warmup intentionally
-                # discards the prefix older than 10.010 s; comparing its fresh
-                # suffix with 9.9946875 s formerly fabricated a sample_gap.
+                # Every source interval remains 0.3125 ms despite host delay.
                 rows = samples(previous + 1 / 3200.0, size=106)
                 obj.reactor.now = 10.030
                 cutoff = obj.reactor.now - obj.backend.max_age
                 obj.backend.helper.emit({"data": rows})
-                retained = [row for row in rows if row[0] >= cutoff]
+                retained = rows
                 self.assertIsNone(obj.sensor_fault)
                 self.assertAlmostEqual(obj.backend.observed_rate, 3200.0)
                 self.assertEqual(len(obj.recent[-1]), 3 * len(retained))
@@ -1142,7 +1155,7 @@ class WarmupContinuityTest(unittest.TestCase):
                 self.assertIsNone(obj.sensor_fault)
                 self.assertIsNotNone(obj.preparation.baseline())
 
-    def test_stale_pending_singleton_is_discarded_before_fresh_batch(self):
+    def test_old_pending_singleton_cannot_hide_a_real_gap_to_later_batch(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj, previous = self.seeded(legacy, singleton=True)
@@ -1150,27 +1163,25 @@ class WarmupContinuityTest(unittest.TestCase):
                 obj.reactor.now = 10.030
                 rows = samples(10.0105)
                 obj.backend.helper.emit({"data": rows})
-                self.assertIsNone(obj.sensor_fault)
-                self.assertEqual(obj.backend.pending, [])
-                self.assertEqual(len(obj.recent[-1]), 3 * len(rows))
-                self.assertEqual(obj.backend.last_xyz, rows[-1][1:])
-                self.assertEqual(obj.backend.unchanged_since, rows[0][0])
+                self.assertEqual(obj.sensor_fault, "sample_gap")
+                self.assertIsNone(obj.last_batch)
 
-    def test_all_old_batch_clears_obsolete_tracking_without_refreshing_data(self):
+    def test_all_old_valid_batches_keep_continuity_and_refresh_receipt(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj, previous = self.seeded(legacy)
                 receipt = obj.last_batch
                 obj.reactor.now = 10.030
-                obj.backend.helper.emit({"data": samples(previous + 1 / 3200.0)})
+                rows = samples(previous + 1 / 3200.0)
+                obj.backend.helper.emit({"data": rows})
                 self.assertIsNone(obj.sensor_fault)
-                self.assertIsNone(obj.backend.last_sample_time)
-                self.assertIsNone(obj.backend.last_xyz)
-                self.assertIsNone(obj.backend.unchanged_since)
+                self.assertEqual(obj.backend.last_sample_time, rows[-1][0])
+                self.assertEqual(obj.backend.last_xyz, rows[-1][1:])
+                self.assertEqual(obj.backend.unchanged_since, rows[0][0])
                 self.assertEqual(obj.backend.pending, [])
-                self.assertEqual(obj.last_batch, receipt)
+                self.assertEqual(obj.last_batch, 10.030)
                 obj.reactor.now = 10.035
-                obj.backend.helper.emit({"data": samples(10.016)})
+                obj.backend.helper.emit({"data": samples(rows[-1][0] + 1 / 3200.0)})
                 self.assertIsNone(obj.sensor_fault)
                 self.assertEqual(obj.last_batch, 10.035)
 
@@ -1189,7 +1200,7 @@ class WarmupContinuityTest(unittest.TestCase):
                         obj.reactor.now = 10.005
                         rows = samples(9.98, size=2) + samples(previous + 0.002)
                     obj.backend.helper.emit({"data": rows})
-                    self.assertEqual(obj.sensor_fault, "sample_gap")
+                    self.assertEqual(obj.sensor_fault, "sample_gap" if stale_history else "invalid_data")
 
     def test_warmup_drain_preserves_latched_faults_and_rejects_invalid_data(self):
         for legacy in (False, True):
@@ -1267,15 +1278,16 @@ class NoiseWindowBoundaryTest(unittest.TestCase):
                 self.assertIsNone(obj.sensor_fault)
                 self.assertEqual(len(window["samples"]), 16)
 
-    def test_current_window_oldest_row_cannot_be_hidden_by_fresh_tail(self):
+    def test_current_window_preserves_oldest_row_and_recent_tail(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj, window = self.session(legacy=legacy, cutoff=9.9)
                 # Homing warmup trimming would discard the old prefix and
                 # accept this batch, hiding lost data inside a measured window.
                 obj.backend.helper.emit({"data": samples(9.970, size=94)})
-                self.assertEqual(obj.sensor_fault, "stale_data")
-                self.assertEqual(window["samples"], [])
+                self.assertIsNone(obj.sensor_fault)
+                self.assertEqual(len(window["samples"]), 94)
+                self.assertAlmostEqual(window["samples"][0][0], 9.970, places=6)
 
     def test_current_window_future_duplicate_and_gap_still_fail(self):
         for legacy in (False, True):
@@ -1295,7 +1307,7 @@ class NoiseWindowBoundaryTest(unittest.TestCase):
                                 "gap": "sample_gap"}[mode]
                     self.assertEqual(obj.sensor_fault, expected)
 
-    def test_current_window_pending_sample_keeps_its_age_limit(self):
+    def test_current_window_pending_sample_survives_nominal_age_value(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 obj, window = self.session(legacy=legacy)
@@ -1303,8 +1315,9 @@ class NoiseWindowBoundaryTest(unittest.TestCase):
                 self.assertEqual(len(obj.backend.pending), 1)
                 obj.reactor.now = 10.011
                 obj.backend.helper.emit({"data": samples(9.9908125, size=1)})
-                self.assertEqual(obj.sensor_fault, "stale_data")
-                self.assertEqual(window["samples"], [])
+                self.assertIsNone(obj.sensor_fault)
+                self.assertEqual(len(window["samples"]), 2)
+                self.assertAlmostEqual(window["samples"][0][0], 9.9905, places=6)
 
     def test_between_windows_drain_pending_and_continuity_before_next_window(self):
         for legacy in (False, True):
@@ -1354,8 +1367,8 @@ class NoiseWindowBoundaryTest(unittest.TestCase):
 
 
 class StreamIntegrityTest(unittest.TestCase):
-    def test_default_armed_sample_age_accepts_22_point_82_ms_and_rejects_over_70_ms(self):
-        for oldest_age, expected in ((0.02282, HIT), (0.05001, HIT), (0.06999, HIT), (0.07001, HOST)):
+    def test_armed_sample_age_accepts_22_82_70_01_and_80_ms(self):
+        for oldest_age in (.02282, .05001, .06999, .07001, .080):
             with self.subTest(oldest_age=oldest_age):
                 obj = generic()
                 baseline(obj)
@@ -1363,8 +1376,8 @@ class StreamIntegrityTest(unittest.TestCase):
                 rows = samples(10.060, x=-15)
                 feed(obj, rows, age=oldest_age - (rows[-1][0] - rows[0][0]))
                 self.assertEqual(obj.backend.max_age, 0.070)
-                self.assertEqual(attempt.reason, "impact" if expected == HIT else "stale_data")
-                self.assertEqual(trigger.messages, [[expected]])
+                self.assertEqual(attempt.reason, "impact")
+                self.assertEqual(trigger.messages, [[HIT]])
 
     def check_fault(self, rows, reason, age=0.001, **fields):
         obj = generic()
@@ -1376,11 +1389,23 @@ class StreamIntegrityTest(unittest.TestCase):
         with self.assertRaises(CommandError):
             obj.finish(attempt.endstop, attempt, HOST)
 
-    def test_stale_impact_never_sets_origin(self):
-        self.check_fault(samples(10.060, x=-15), "stale_data", age=0.070)
+    def test_wholly_old_post_arm_impact_still_requests_hit(self):
+        obj = generic()
+        baseline(obj)
+        attempt, trigger = arm(obj)
+        feed(obj, samples(10.060, x=-15), age=.080)
+        self.assertEqual(attempt.reason, "impact")
+        self.assertEqual(trigger.messages, [[HIT]])
+        self.assertAlmostEqual(obj.onset_time(attempt), 10.060, places=6)
 
-    def test_oldest_threshold_sample_is_checked_not_only_latest(self):
-        self.check_fault(samples(10.060, size=224, x=-15), "stale_data")
+    def test_oldest_threshold_sample_is_not_discarded_by_recent_tail(self):
+        obj = generic()
+        baseline(obj)
+        attempt, trigger = arm(obj)
+        feed(obj, samples(10.060, size=224, x=-15))
+        self.assertEqual(attempt.reason, "impact")
+        self.assertEqual(trigger.messages, [[HIT]])
+        self.assertAlmostEqual(obj.onset_time(attempt), 10.060, places=6)
 
     def test_future_timestamp_never_sets_origin(self):
         self.check_fault(samples(10.060, x=-15), "stale_data", age=-0.050)
@@ -1415,15 +1440,15 @@ class StreamIntegrityTest(unittest.TestCase):
         obj = generic("mpu9250 toolhead")
         self.assertEqual(obj.threshold_g, {"x": 4.0, "y": 4.0})
 
-    def test_watchdog_checks_sensor_time_without_new_callback(self):
+    def test_watchdog_uses_recent_valid_receipt_not_old_sensor_timestamp(self):
         obj = generic()
         baseline(obj)
         attempt, trigger = arm(obj)
-        feed(obj, samples(10.060))
-        attempt.last_data = 10.14  # Receipt is fresh but measurement is old.
-        obj._watchdog(10.14)
-        self.assertEqual(attempt.reason, "stale_data")
-        self.assertEqual(trigger.messages, [[HOST]])
+        attempt.vector_mode = True
+        feed(obj, samples(10.060), age=.080)
+        obj._watchdog(obj.reactor.now + .010)
+        self.assertIsNone(attempt.reason)
+        self.assertEqual(trigger.messages, [])
 
     def test_empty_batches_do_not_refresh_last_data(self):
         obj = generic()
@@ -1432,21 +1457,21 @@ class StreamIntegrityTest(unittest.TestCase):
         last_data = attempt.last_data
         obj.backend.helper.emit({"data": []})
         self.assertEqual(attempt.last_data, last_data)
-        obj._watchdog(10.1)
+        obj._watchdog(attempt.last_data + obj.stream_timeout + .000001)
         self.assertEqual(trigger.messages, [[HOST]])
 
 
 class SubscriptionAndPolicyTest(unittest.TestCase):
     def test_default_sample_age_and_explicit_shorter_limits(self):
         for options, expected_age, expected_timeout in (
-                ({}, 0.070, 0.050), ({"max_sample_age": 0.020}, 0.020, 0.020),
+                ({}, 0.070, 0.050), ({"max_sample_age": 0.020}, 0.020, 0.050),
                 ({"max_sample_age": 0.050}, 0.050, 0.050),
                 ({"stream_timeout": 0.010}, 0.070, 0.010)):
             with self.subTest(options=options):
                 obj = generic(options=options)
                 self.assertEqual(obj.backend.max_age, expected_age)
                 self.assertEqual(obj.stream_timeout, expected_timeout)
-                self.assertEqual(obj._reference_max_age(), expected_age)
+                self.assertIsNone(obj._reference_max_age())
         self.assertEqual(make_homing().stream_timeout, 0.050)
 
     def test_shared_clients_survive_and_interval_is_restored(self):

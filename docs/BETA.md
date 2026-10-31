@@ -59,6 +59,12 @@ an abort when reporting remains available. They include:
 - Cleanup/restoration state, partial-output errors and the final proposal/result.
 - `physical_position_verified: false`.
 
+Generic Beta stationary references, moving windows and home captures accept
+valid current-window rows despite past timestamp age. Their liveness uses
+validated receipts with the independent stream timeout. Future timestamps,
+cutoffs, continuity and other data faults remain checked. Native Beacon's
+timing policy is unchanged.
+
 One combined Beta PNG records a successful proposal's motion/noise/trial
 information after required cleanup succeeds. Failed, incomplete or cancelled
 experiments save no PNG. Bounded console diagnostics still explain the abort,

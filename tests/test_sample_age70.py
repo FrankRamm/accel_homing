@@ -1,4 +1,4 @@
-"""Generic 70 ms freshness bound; synthetic transport/reference data only."""
+"""Generic nominal sample-age planning value; synthetic data only."""
 import math
 import unittest
 
@@ -6,12 +6,12 @@ from harness import CommandError, ConfigError, make_homing, plugin
 import test_backends as backends
 
 
-class SampleAge70Tests(unittest.TestCase):
+class NominalSampleAgeTests(unittest.TestCase):
     def receive(self, oldest_age, options=None, legacy=False, newest_age=None):
         obj = backends.generic(options=options, legacy=legacy)
         # A dense, uniform packet retains the reported 44.794 ms span. Two
         # endpoints alone would correctly fail the independent rate/gap rules.
-        now, size = .070, 145
+        now, size = 1.0, 145
         first = now - oldest_age
         last = first + .044794 if newest_age is None else now - newest_age
         rows = [(first + number * (last - first) / (size - 1), 0., 0., backends.G)
@@ -30,37 +30,37 @@ class SampleAge70Tests(unittest.TestCase):
                 self.assertEqual(reference.count, 145)
                 self.assertAlmostEqual(reference.oldest_batch_age * 1000., 51.876, places=6)
                 self.assertAlmostEqual(reference.newest_batch_age * 1000., 7.082, places=6)
-                self.assertEqual(obj._reference_max_age(), .070)
+                self.assertIsNone(obj._reference_max_age())
 
-    def test_reported_packet_still_fails_explicit_50_ms_without_weakening_that_value(self):
+    def test_explicit_50_ms_remains_nominal_without_rejecting_reported_packet(self):
         obj, reference = self.receive(.051876, {"max_sample_age": .050})
-        self.assertEqual(obj.sensor_fault, "stale_data")
-        self.assertEqual(reference.count, 0)
+        self.assertIsNone(obj.sensor_fault)
+        self.assertEqual(reference.count, 145)
         self.assertEqual(obj.backend.max_age, .050)
         self.assertAlmostEqual(reference.oldest_batch_age * 1000., 51.876, places=6)
         self.assertAlmostEqual(reference.newest_batch_age * 1000., 7.082, places=6)
 
-    def test_exact_70_ms_is_accepted_and_older_is_rejected(self):
+    def test_exact_70_ms_and_older_current_reference_data_are_accepted(self):
         for legacy in (False, True):
-            for age, accepted in ((.070, True), (.070001, False)):
+            for age in (.070, .070001, .080, .200):
                 with self.subTest(legacy=legacy, age=age):
                     obj, reference = self.receive(age, legacy=legacy)
-                    self.assertEqual(obj.sensor_fault, None if accepted else "stale_data")
-                    self.assertEqual(reference.count, 145 if accepted else 0)
+                    self.assertIsNone(obj.sensor_fault)
+                    self.assertEqual(reference.count, 145)
 
-    def test_explicit_20_and_50_ms_remain_active_in_reference_and_runtime(self):
+    def test_explicit_20_and_50_ms_do_not_become_reference_age_caps(self):
         for bound in (.020, .050):
-            for age, accepted in ((bound, True), (bound + .000001, False)):
+            for age in (bound, bound + .000001, .080):
                 # Use a short live packet entirely inside the selected bound.
                 obj = backends.generic(options={"max_sample_age": bound})
                 obj.preparation = plugin.QuietReference("x", -1., .1, 1000., require_quiet=False)
-                obj.reactor.now = bound
-                first = bound - age
+                obj.reactor.now = 1.0
+                first = obj.reactor.now - age
                 rows = backends.samples(first)
                 obj.backend.helper.emit({"data": rows})
                 self.assertEqual(obj.backend.max_age, bound)
-                self.assertEqual(obj._reference_max_age(), bound)
-                self.assertEqual(obj.sensor_fault, None if accepted else "stale_data")
+                self.assertIsNone(obj._reference_max_age())
+                self.assertIsNone(obj.sensor_fault)
 
     def test_configuration_accepts_70_and_rejects_above_70(self):
         self.assertEqual(backends.generic(options={"max_sample_age": .070}).backend.max_age, .070)
@@ -68,7 +68,7 @@ class SampleAge70Tests(unittest.TestCase):
             with self.subTest(age=age), self.assertRaises(ConfigError):
                 backends.generic(options={"max_sample_age": age})
 
-    def test_watchdog_and_native_beacon_age_remain_50_ms(self):
+    def test_independent_receipt_watchdog_and_native_beacon_age_remain_50_ms(self):
         obj = backends.generic()
         self.assertEqual(obj.backend.max_age, .070)
         self.assertEqual(obj.stream_timeout, .050)

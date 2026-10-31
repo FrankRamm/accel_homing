@@ -82,17 +82,35 @@ a low threshold or every acceleration is usable.
 
 These observed bounds do not guarantee future noise. Preparation does not
 measure physical motor current, prevent a hold-to-run transient, or prove that
-a carriage moved. Data validity, freshness and raw impacts remain separate.
+a carriage moved. Data validity, delivery continuity and raw impacts remain separate.
 
 ## Timing and optional travel policies
 
-Generic defaults request a 5 ms report interval and permit sample age up to
-70 ms. `stream_interval` must remain strictly less than `max_sample_age`.
-The adapter temporarily shortens driver batching and restores the prior
-interval afterward. A configured lower stream timeout/freshness setting is
-preserved. The stream watchdog still defaults to 50 ms. Native Beacon uses its
-distinct raw path. Explicit reporting/startup distance policies continue to
-use the configured sample age; a higher age can tighten their speed limits.
+Generic defaults request a 5 ms report interval. `max_sample_age` remains a
+70 ms nominal planning assumption. Its existing numeric bounds and
+`stream_interval < max_sample_age` configuration rule remain for compatibility.
+It is not a past-timestamp acceptance limit or warmup trimming boundary.
+Valid current-window samples can arrive 80 ms or more after measurement,
+including during preparation, homing, stationary acquisition and Beta.
+The adapter temporarily shortens driver batching and restores it afterward.
+
+Generic liveness uses monotonic receipt of validated relevant rows and the
+independent `stream_timeout`, default 50 ms. Pre-arm-only callbacks cannot
+keep an armed move alive. Reference arming and stationary/Beta windows also
+check receipt silence independently of sensor timestamp age.
+Stationary acquisition must complete within the window duration plus 0.5 s.
+This existing deadline also allows an initial delivery delay. The Beta
+response tail retains its separate bounded wait. Stream/reference/window cutoffs, the
+5 ms future guard and continuity/rate/error/overflow/frozen-data safeguards
+remain. Native Beacon retains its separate timestamp-age policy.
+
+Explicit reporting/startup distance policies still use the configured nominal
+age. A higher value can tighten their speed limits. The selected-axis startup
+deadline also includes this assumption when optional travel budgets are absent.
+Regular delayed receipts can satisfy `stream_timeout` while the carriage
+continues travelling or pushing until the host receives and acts on an older
+contact sample. Nominal travel settings cannot cap that transport delay or
+the resulting physical distance.
 
 There is no default 50 mm/s cap, reporting-distance cap or startup-distance
 cap. Configured finite positive homing speed is retained, subject to normal
@@ -111,7 +129,7 @@ or change timing/acceleration. Installer flags of the same names opt in
 explicitly and are rejected for native Beacon.
 
 For legacy startup proof, let `v` be effective speed in mm/s, `a` effective
-acceleration in mm/s², `age` the backend freshness bound and `interval` the
+acceleration in mm/s², `age` the configured nominal age assumption and `interval` the
 watchdog/report interval supplied by that path. The shared helper calculates:
 
 ```text
@@ -130,7 +148,7 @@ stopping distance. Runtime checks use current live limits, including changes
 made by other macros. Simple vector detection omits the integrated startup
 proof, while applicable generic plan/admission checks remain in place.
 
-Missing/stale data, invalid/nonmonotonic timestamps, rate/error/range faults and
+Receipt silence, future/invalid/nonmonotonic timestamps, rate/error/range faults and
 the full-move deadline are not relaxed to admit a requested speed. Finite input
 and finite derived raw trigger limits/deadlines are required.
 
