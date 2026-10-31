@@ -353,7 +353,7 @@ class GenericNoMotionPolicyTests(unittest.TestCase):
             self.assertIsNone(attempt.reason)
             self.assertEqual(trigger.messages, [])
             self.assertTrue(attempt.motion_seen)
-            self.assertAlmostEqual(obj.backend.motion_startup_timeout(1.0, 1000.0), 0.116)
+            self.assertAlmostEqual(obj.backend.motion_startup_timeout(1.0, 1000.0), 0.136)
 
     def test_effective_velocity_and_lower_policy_cap_qualify_motion(self):
         for speed, velocity, options, expected in (
@@ -389,8 +389,8 @@ class GenericNoMotionPolicyTests(unittest.TestCase):
     def test_default_deadline_and_nominal_command_request_budget_are_explicit(self):
         obj, _attempt, _trigger = prepared_generic()
         status = obj.backend.get_status()
-        self.assertAlmostEqual(status["startup_motion_timeout_s"], 0.085)
-        self.assertAlmostEqual(status["startup_motion_request_travel_mm"], 4.15)
+        self.assertAlmostEqual(status["startup_motion_timeout_s"], 0.105)
+        self.assertAlmostEqual(status["startup_motion_request_travel_mm"], 5.15)
         self.assertIsNone(status["startup_motion_request_limit_mm"])
         self.assertFalse(status["latency_guaranteed"])
 
@@ -445,7 +445,7 @@ class MotionPolicyPreflightTests(unittest.TestCase):
     def test_configured_homing_accel_cap_and_zero_are_respected(self):
         for cap, live, expected in ((1500.0, 20000.0, 1500), (0.0, 1500.0, 1500)):
             with self.subTest(cap=cap):
-                obj, toolhead, rails = self.machine(speeds=(30.0,), options={"homing_accel": cap, "max_startup_travel": 3.0})
+                obj, toolhead, rails = self.machine(speeds=(25.0,), options={"homing_accel": cap, "max_startup_travel": 3.0})
                 toolhead.accel = live
                 rails[0].info = info(speed=50.0, retract=0)
                 with self.assertRaisesRegex(CommandError, "acceleration %s mm/s" % expected):
@@ -615,7 +615,7 @@ class ConfigurableStartupBudgetTests(unittest.TestCase):
             obj = generic(options={"max_startup_travel": value}, connect=False)
             self.assertEqual(obj.backend.startup_travel, value)
             self.assertEqual(obj.backend.get_status()["startup_motion_request_limit_mm"], value)
-            self.assertAlmostEqual(obj.backend.motion_startup_timeout(75.0, 5000.0), 0.090)
+            self.assertAlmostEqual(obj.backend.motion_startup_timeout(75.0, 5000.0), 0.110)
 
     def test_exact_startup_and_report_boundaries_match_strict_installer_policy(self):
         required = 4.1625
@@ -691,7 +691,7 @@ class OptionalTravelPolicyTests(unittest.TestCase):
         self.assertIsNone(obj.backend.startup_travel)
         self.assertIsNone(obj.backend.max_speed)
         self.assertIsNone(obj.backend.motion_startup_speed_limit(5000.0))
-        self.assertEqual(obj.backend.max_age, 0.050)
+        self.assertEqual(obj.backend.max_age, 0.070)
         self.assertEqual(obj.backend.interval, 0.005)
         MotionPolicyPreflightTests().assert_no_effects(obj, toolhead)
 
@@ -731,17 +731,17 @@ class OptionalTravelPolicyTests(unittest.TestCase):
         self.assertIsNone(report_only.backend.startup_travel)
         with self.assertRaisesRegex(CommandError, "sample-age/report-travel"):
             report_only.backend.validate_motion_plan(75.0, 5000.0, CommandError)
-        self.assertEqual(report_only.backend.motion_startup_speed_limit(5000.0), 20.0)
+        self.assertEqual(report_only.backend.motion_startup_speed_limit(5000.0), 1.0 / 0.070)
         startup_only = generic(options={"max_startup_travel": 3.0})
         self.assertIsNone(startup_only.backend.max_speed)
         with self.assertRaisesRegex(CommandError, "3.0 mm policy"):
             startup_only.backend.validate_motion_plan(75.0, 5000.0, CommandError)
         maximum = startup_only.backend.motion_startup_speed_limit(5000.0)
-        self.assertGreater(maximum, 36.0)
-        self.assertLess(maximum, 37.0)
+        self.assertGreater(maximum, 29.0)
+        self.assertLess(maximum, 30.0)
         startup_only.backend.validate_motion_plan(maximum, 5000.0, CommandError)
-        generic(options={"max_startup_travel": 4.5}).backend.validate_motion_plan(50.0, 5000.0, CommandError)
-        generic(options={"max_report_travel": 1.5}).backend.validate_motion_plan(30.0, 1500.0, CommandError)
+        generic(options={"max_startup_travel": 4.5}).backend.validate_motion_plan(40.0, 5000.0, CommandError)
+        generic(options={"max_report_travel": 1.5}).backend.validate_motion_plan(20.0, 1500.0, CommandError)
 
     def test_startup_only_ceiling_is_bounded_without_reporting_cap(self):
         for accel in (5e-324, 100.0, 5000.0, 1e308):
@@ -759,7 +759,7 @@ class OptionalTravelPolicyTests(unittest.TestCase):
         self.assertIsNone(backend["max_report_travel_mm"])
         self.assertIsNone(backend["startup_motion_request_limit_mm"])
         self.assertEqual(backend["startup_motion_evaluated_speed_mm_s"], 100.0)
-        self.assertAlmostEqual(backend["startup_motion_timeout_s"], 0.095)
+        self.assertAlmostEqual(backend["startup_motion_timeout_s"], 0.115)
         json.dumps(status, allow_nan=False)
         messages = []
         obj.cmd_STATUS(types.SimpleNamespace(respond_info=messages.append))
@@ -796,7 +796,7 @@ class OptionalTravelPolicyTests(unittest.TestCase):
                     obj._watchdog(obj.reactor.now)
                 elif fault == "stale_data":
                     feed(obj, [(attempt.arm_time + number / 3200.0, 0.0, 0.0, G)
-                               for number in range(16)], age=0.050)
+                               for number in range(16)], age=0.070)
                 else:
                     while not attempt.done and obj.reactor.now < attempt.arm_time + 0.060:
                         first = obj.backend.last_sample_time + 1 / 3200.0

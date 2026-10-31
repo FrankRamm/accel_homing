@@ -116,8 +116,8 @@ class ConfiguredAccelBackend:
         self.name = owner.sensor_name
         self.interval = config.getfloat("stream_interval", 0.005,
                                         minval=0.001, maxval=0.020)
-        self.max_age = config.getfloat("max_sample_age", 0.050,
-                                       minval=0.005, maxval=0.050)
+        self.max_age = config.getfloat("max_sample_age", 0.070,
+                                       minval=0.005, maxval=0.070)
         self.min_rate = config.getfloat("min_sample_rate", 1000.0,
                                         minval=800.0, maxval=10000.0)
         self.report_travel = config.getfloat("max_report_travel", None,

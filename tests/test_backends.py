@@ -201,7 +201,7 @@ class GenericPreparationTest(unittest.TestCase):
         self.begin(obj, endstop)
         self.assertIsNone(obj.sensor_fault)
         self.assertAlmostEqual(obj.baseline_status["sample_age_ms"], 22.82, delta=0.002)
-        self.assertEqual(obj.baseline_status["max_sample_age_ms"], 50.0)
+        self.assertEqual(obj.baseline_status["max_sample_age_ms"], 70.0)
         self.assertEqual(obj.baseline_status["result"], "ready")
         self.assertEqual(endstop._dispatch.started, [])
 
@@ -1349,15 +1349,15 @@ class NoiseWindowBoundaryTest(unittest.TestCase):
 
 
 class StreamIntegrityTest(unittest.TestCase):
-    def test_default_armed_sample_age_accepts_22_point_82_ms_and_rejects_over_50_ms(self):
-        for oldest_age, expected in ((0.02282, HIT), (0.04999, HIT), (0.05001, HOST)):
+    def test_default_armed_sample_age_accepts_22_point_82_ms_and_rejects_over_70_ms(self):
+        for oldest_age, expected in ((0.02282, HIT), (0.05001, HIT), (0.06999, HIT), (0.07001, HOST)):
             with self.subTest(oldest_age=oldest_age):
                 obj = generic()
                 baseline(obj)
                 attempt, trigger = arm(obj)
                 rows = samples(10.060, x=-15)
                 feed(obj, rows, age=oldest_age - (rows[-1][0] - rows[0][0]))
-                self.assertEqual(obj.backend.max_age, 0.050)
+                self.assertEqual(obj.backend.max_age, 0.070)
                 self.assertEqual(attempt.reason, "impact" if expected == HIT else "stale_data")
                 self.assertEqual(trigger.messages, [[expected]])
 
@@ -1372,10 +1372,10 @@ class StreamIntegrityTest(unittest.TestCase):
             obj.finish(attempt.endstop, attempt, HOST)
 
     def test_stale_impact_never_sets_origin(self):
-        self.check_fault(samples(10.060, x=-15), "stale_data", age=0.050)
+        self.check_fault(samples(10.060, x=-15), "stale_data", age=0.070)
 
     def test_oldest_threshold_sample_is_checked_not_only_latest(self):
-        self.check_fault(samples(10.060, size=160, x=-15), "stale_data")
+        self.check_fault(samples(10.060, size=224, x=-15), "stale_data")
 
     def test_future_timestamp_never_sets_origin(self):
         self.check_fault(samples(10.060, x=-15), "stale_data", age=-0.050)
@@ -1415,8 +1415,8 @@ class StreamIntegrityTest(unittest.TestCase):
         baseline(obj)
         attempt, trigger = arm(obj)
         feed(obj, samples(10.060))
-        attempt.last_data = 10.12  # Receipt is fresh but measurement is old.
-        obj._watchdog(10.12)
+        attempt.last_data = 10.14  # Receipt is fresh but measurement is old.
+        obj._watchdog(10.14)
         self.assertEqual(attempt.reason, "stale_data")
         self.assertEqual(trigger.messages, [[HOST]])
 
@@ -1434,8 +1434,9 @@ class StreamIntegrityTest(unittest.TestCase):
 class SubscriptionAndPolicyTest(unittest.TestCase):
     def test_default_sample_age_and_explicit_shorter_limits(self):
         for options, expected_age, expected_timeout in (
-                ({}, 0.050, 0.050), ({"max_sample_age": 0.020}, 0.020, 0.020),
-                ({"stream_timeout": 0.010}, 0.050, 0.010)):
+                ({}, 0.070, 0.050), ({"max_sample_age": 0.020}, 0.020, 0.020),
+                ({"max_sample_age": 0.050}, 0.050, 0.050),
+                ({"stream_timeout": 0.010}, 0.070, 0.010)):
             with self.subTest(options=options):
                 obj = generic(options=options)
                 self.assertEqual(obj.backend.max_age, expected_age)
@@ -1489,14 +1490,14 @@ class SubscriptionAndPolicyTest(unittest.TestCase):
     def test_excessive_rail_speed_rejected_before_any_motion(self):
         obj = generic(options={"max_report_travel": 1.0})
         rail = FakeRail(with_endstops(obj)["x"], info(speed=100, retract=0))
-        with self.assertRaisesRegex(CommandError, "exceeds 20.0"):
+        with self.assertRaisesRegex(CommandError, "exceeds 14.3"):
             obj._handle_rails_begin(None, [rail])
         self.assertEqual(obj.toolhead.moves, [])
         self.assertEqual(obj.toolhead.accel_log, [])
 
     def test_speed_policy_tracks_report_travel_and_sample_age(self):
         obj = generic(options={"max_report_travel": 0.5})
-        self.assertEqual(obj.backend.max_speed, 10)
+        self.assertEqual(obj.backend.max_speed, 0.5 / 0.070)
         with self.assertRaises(ConfigError):
             obj.backend.validate_rail(info(speed=30, retract=0), ConfigError)
 

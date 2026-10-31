@@ -101,10 +101,12 @@ a carriage moved. Data validity, freshness and raw impacts remain separate.
 ## Timing and optional travel policies
 
 Generic defaults request a 5 ms report interval and permit sample age up to
-50 ms. `stream_interval` must remain strictly less than `max_sample_age`.
+70 ms. `stream_interval` must remain strictly less than `max_sample_age`.
 The adapter temporarily shortens driver batching and restores the prior
 interval afterward. A configured lower stream timeout/freshness setting is
-preserved. Native Beacon uses its distinct raw path.
+preserved. The stream watchdog still defaults to 50 ms. Native Beacon uses its
+distinct raw path. Explicit reporting/startup distance policies continue to
+use the configured sample age; a higher age can tighten their speed limits.
 
 There is no default 50 mm/s cap, reporting-distance cap or startup-distance
 cap. Configured finite positive homing speed is retained, subject to normal
