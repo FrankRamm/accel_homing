@@ -428,7 +428,7 @@ def validate_homing_speeds(graph, args, family, existing):
             velocity = float(printer.get("max_velocity", "nan"))
             acceleration = float(printer.get("max_accel", "nan"))
             homing_accel = float(existing.get("homing_accel", "5000")) if existing else 5000.0
-            age = float(existing.get("max_sample_age", "0.050")) if existing else 0.050
+            age = float(existing.get("max_sample_age", "0.070")) if existing else 0.070
             travel = (overrides["max_report_travel"] if "max_report_travel" in overrides else
                       existing.get("max_report_travel") if existing else None)
             startup = (overrides["max_startup_travel"] if "max_startup_travel" in overrides else
@@ -443,13 +443,13 @@ def validate_homing_speeds(graph, args, family, existing):
         if homing_accel:
             acceleration = min(acceleration, homing_accel)
         if (not all(math.isfinite(v) for v in (age, interval))
-                or not 0.005 <= age <= 0.050
+                or not 0.005 <= age <= 0.070
                 or (travel is not None and (not math.isfinite(travel)
                     or not policy.REPORT_TRAVEL_MIN <= travel <= policy.REPORT_TRAVEL_MAX))
                 or (startup is not None and (not math.isfinite(startup)
                     or not policy.STARTUP_REQUEST_TRAVEL_MIN <= startup <= policy.STARTUP_REQUEST_TRAVEL_MAX))
                 or not 0.001 <= interval <= 0.020 or interval >= age):
-            raise InstallError("Generic settings require max_sample_age 0.005..0.050s, "
+            raise InstallError("Generic settings require max_sample_age 0.005..0.070s, "
                                "optional max_report_travel %.12g..%.12gmm, optional max_startup_travel %.12g..%.12gmm, "
                                "stream_interval 0.001..0.020s and stream_interval < max_sample_age; "
                                "all values must be finite. No files changed."

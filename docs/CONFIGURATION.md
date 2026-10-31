@@ -158,7 +158,7 @@ raw adapter. Known standard driver ranges are listed in
 | Option | Default | Meaning and accepted range |
 | --- | --- | --- |
 | `stream_interval` | `0.005` | Requested reporting interval in seconds; 0.001–0.020 and strictly less than `max_sample_age`. Restored afterward. |
-| `max_sample_age` | `0.050` | Sample freshness bound in seconds; 0.005–0.050. |
+| `max_sample_age` | `0.070` | Sample freshness bound in seconds; 0.005–0.070. Explicit lower values remain active. |
 | `min_sample_rate` | `1000` | Minimum delivered/configured rate in Hz; 800–10000. |
 | `sensor_range` | Known driver range | Actual full-scale g range; positive, at most 1000; required for an unknown compatible object. |
 | `max_report_travel` | Disabled when absent | Optional nominal reporting-distance policy, 0.1–2.0 mm. |
