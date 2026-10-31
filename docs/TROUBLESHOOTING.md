@@ -37,11 +37,18 @@ installer-created registration, not a pre-existing manual entry it does not own.
 
 ## Data and homing faults
 
-Missing, stale, invalid, nonmonotonic, frozen or saturated data requires fixing
+Missing, stale, invalid, nonmonotonic, frozen or non-finite data requires fixing
 the sensor/transport/configuration issue. Inspect `BEACON_ACCEL_HOMING_STATUS`
 for retained preparation/timing details. A reported `ok` at the end of one
 reference does not prove sustained stream health; inspect rejection counts,
 sample/batch ages and failure context.
+
+Recognized finite sensor rails and native Beacon clipping markers are accepted
+as bounded RAW observations, with range provenance and unknown excess
+amplitude. Beacon markers are endpoint estimates with unknown true sign/peak.
+They do not by themselves establish invalid transport or a measured impact
+peak. Threshold headroom and other acquisition/data-fault safeguards still
+apply; inspect capture and resting-reference notes separately.
 
 A legacy `no_motion` means the required conservative proof was unavailable
 within its deadline. It does not establish that the motor physically stayed

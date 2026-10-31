@@ -843,9 +843,9 @@ class DetectorCaptureProvenanceTests(unittest.TestCase):
         capture = obj.stop_capture()
         detector = capture["detector"]
         self.assertEqual(capture["samples"][0][1], -0.0078125)
-        self.assertEqual(detector["onset_g"], -0.0078125)
+        self.assertEqual(detector["onset_g"], 0.0078125)
         self.assertEqual(detector["impact_peak_g"], 0.0078125)
-        self.assertEqual(detector["direction"], -1)
+        self.assertEqual(detector["direction"], 0)
         self.assertEqual(detector["threshold_g"], 0.001)
         self.assertEqual(detector["homing_speed_mm_s"], 37.0)
         self.assertIsNone(obj.capture_attempt)

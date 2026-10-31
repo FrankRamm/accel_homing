@@ -98,14 +98,24 @@ and raw three-axis magnitude. They do not use a quietness gate or an
 acceleration-derived startup-motion proof. Ordinary motion or an obstruction
 can cross the same threshold as an intended endstop.
 
-Manual config thresholds and older models retain the legacy selected-axis
-detector and its preparation/motion rules. Generic legacy homing rejects
+Manual config thresholds and older selected-axis models use absolute deviation
+on the selected machine axis, retaining legacy preparation/motion rules. Generic legacy homing rejects
 unproved startup with `no_motion`; it does not accept a stationary generic
 sensor as a successful already-pressed stop. Native Beacon retains a separate
 legacy pressed-start path. See [detector details](DETAILS.md#detector-paths).
 
+Compatible saved XYZ-magnitude profiles remain accepted. Selected-axis profiles
+with legacy/unknown sign-gated qualification need fresh calibration or an
+explicit manual threshold unless their recorded policy already establishes
+sign-independent qualification. Existing profiles are not silently rewritten.
+
 Generic delivery checks include freshness, timestamps, rate, error counters,
-malformed/frozen/clipped data and active range. Native Beacon follows its
+malformed/frozen/non-finite data and active range context. Valid finite rail
+values remain bounded observations with unknown excess amplitude. Native
+Beacon clipping sentinels become bounded endpoint estimates using prior sensor
+sign; the original marker does not establish true sign or amplitude. Marker
+axis-value counts and finite-rail counts remain separate, including in
+reference, capture, noise-window and Beta motion diagnostics. Native Beacon follows its
 separate raw-stream timing policy. These checks do not make the paths identical
 or prove that every delayed native packet or every transport failure is caught.
 
@@ -119,7 +129,10 @@ max-minus-min travel **at most 2.00 mm**, after a separate discovery. It is not
 a physical accuracy specification. A wrong obstruction, skipped steps or a
 repeatedly wrong center estimate can still produce plausible results.
 
-Plots use bounded retained data, not every raw sample. Displayed traces/peaks
+Plots show absolute baseline-relative components in g, with nonnegative
+acceleration axes and markers. Signed source/reference values and relative
+event times remain intact, and travel statistics retain their mm scale.
+Bounded envelopes keep signed extrema and absolute troughs, not every raw sample. Displayed traces/peaks
 can differ from the full stream; they are diagnostic views, not independent
 evidence that all physical transients were captured. Existing hardware,
 native-stream and plotting limitations remain relevant after repository

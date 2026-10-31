@@ -198,11 +198,11 @@ class PortablePNGTests(unittest.TestCase):
         self.assertEqual(value["created_local"], local.isoformat())
         self.assertEqual(value["created_utc"], "2026-10-28T02:59:42.987654+00:00")
 
-    def test_compact_threshold_legend_preserves_small_signed_limits_and_exact_positions(self):
+    def test_compact_threshold_legend_preserves_small_absolute_limit_and_exact_position(self):
         axis = mock.Mock()
         charts._threshold(axis, {"threshold_g": .001, "direction": 0})
-        self.assertEqual([call.args[0] for call in axis.axhline.call_args_list], [-.001, .001])
-        self.assertEqual([call.kwargs["label"] for call in axis.axhline.call_args_list], ["Trigger ±0.001 g", None])
+        self.assertEqual([call.args[0] for call in axis.axhline.call_args_list], [.001])
+        self.assertEqual([call.kwargs["label"] for call in axis.axhline.call_args_list], ["Absolute-axis trigger 0.001 g"])
 
     def test_faults_nonfinite_baselines_and_unserializable_records_leave_no_chart(self):
         original = {"samples": [(1., 0., 0., 1.), (1.1, .2, .1, 1.)], "baseline_g": (0., 0., 1.)}

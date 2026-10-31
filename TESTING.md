@@ -27,6 +27,7 @@ python3 -B -m unittest discover -s tests -p 'test_calibration_margin.py' -v
 python3 -B -m unittest discover -s tests -p 'test_beta_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_noise_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -v
+python3 -B -m unittest discover -s tests -p 'test_absolute_charts.py' -v
 ```
 
 The tests cover installation/ownership/rollback, adapter contracts and faults,
@@ -61,6 +62,15 @@ full suite run establish different things; identify which were actually done.
   and whole-session limits, and keep homing/Beta policies unchanged.
 - Failed measurements do not invoke final PNG publication. Every multi-axis
   image is rendered before publication; rollback removes only newly owned files.
+- Capture, ACCURACY, stationary/post-calibration noise and Beta PNGs display
+  absolute components after signed-reference subtraction. Acceleration limits,
+  threshold lines and peak markers are nonnegative and include the full plotted
+  range after autoscaling. Raw/reference signs, negative relative event times
+  and the precise travel scale/statistics remain intact. Dense bipolar
+  envelopes preserve signed extrema and absolute troughs within bounded
+  primary/receipt sizes. Range notes count all displayed homes/windows, keep
+  native marker and finite-rail totals separate, and disclose uncertain
+  references without double counting; legacy provenance can be unavailable.
 - Beta produces a labelled PNG only for a successful restored proposal; failures
   retain bounded console diagnostics without staging/saving thresholds/models
   or restarting.

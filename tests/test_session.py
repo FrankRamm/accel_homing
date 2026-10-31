@@ -529,7 +529,7 @@ class EnablePreparationTest(unittest.TestCase):
                            [(counts(-15), 0, counts(1))] * 7
                            + [(counts(-0.6), 0, counts(1))]))
         self.assertEqual(obj.attempt.reason, "impact")
-        self.assertAlmostEqual(obj.attempt.onset_raw * obj.attempt.count_g, -0.6,
+        self.assertAlmostEqual(obj.attempt.onset_raw * obj.attempt.count_g, 0.6,
                                delta=obj.attempt.count_g / 2)
         self.assertAlmostEqual(obj.onset_time(obj.attempt), when)
 
@@ -624,8 +624,8 @@ class EnablePreparationTest(unittest.TestCase):
                     self.assertAlmostEqual(obj.onset_time(attempt), when, places=6)
                     self.assertEqual(endstop.get_mcu().log, [("mcu", [7, HIT])])
 
-    def test_native_calibration_still_rejects_clipped_changed_scale_and_bad_timestamps(self):
-        for mode in ("clip", "scale", "stale", "future"):
+    def test_native_calibration_still_rejects_changed_scale_and_bad_timestamps(self):
+        for mode in ("scale", "stale", "future"):
             with self.subTest(mode=mode):
                 obj, endstop, _log, _lines = self.session()
                 obj.workflows.session = {"mode": "calibration", "state": "running", "axis": "x"}
@@ -703,7 +703,7 @@ class EnablePreparationTest(unittest.TestCase):
                 self.assertLessEqual(obj.reactor.now, 10.25 + obj.baseline_time + 0.506)
 
     def test_invalid_reference_streams_abort_before_dispatch(self):
-        for mode in ("stale", "future", "duplicate", "out_of_order", "gap", "clip", "scale"):
+        for mode in ("stale", "future", "duplicate", "out_of_order", "gap", "scale"):
             with self.subTest(mode=mode):
                 obj, endstop, _log, _lines = self.session()
                 plain = obj.reactor.on_pause

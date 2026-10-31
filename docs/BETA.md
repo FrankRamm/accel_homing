@@ -65,6 +65,14 @@ experiments save no PNG. Bounded console diagnostics still explain the abort,
 including available trials and cleanup results. A rendering/reporting failure
 is itself reported when possible.
 
+The PNG shows absolute components after signed resting-offset subtraction;
+negative times before each exact crossing remain visible. Full-sample event
+statistics retain their existing definitions. Range notes cover every motion
+and captured home, including finite rails without a native sentinel. Native
+markers are bounded endpoint estimates with unknown true sign/peak; finite
+rails have unknown excess amplitude. Reference observations are disclosed
+separately and can overlap capture counts. See [plots](PLOTS.md).
+
 ## Limits and cancellation
 
 There is no encoder or independent contact/return verification. The central

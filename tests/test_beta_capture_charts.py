@@ -110,11 +110,13 @@ class BetaRawCaptureTests(unittest.TestCase):
         obj.start_capture(beta=True)
         return obj
 
-    def test_native_clipped_marker_is_faulted_before_decode_can_hide_it(self):
+    def test_native_clipped_marker_is_retained_as_a_bounded_endpoint_estimate(self):
         obj = self.owner()
         obj._capture_batch(batch(8, [(plugin.CLIPPED, 0, counts(1.)), (0, 0, counts(1.))], delta_clock=1))
         captured = obj.stop_capture()
-        self.assertEqual(captured["fault"], "invalid_data")
+        self.assertIsNone(captured["fault"])
+        self.assertEqual(captured["native_clip_decode"]["marker_axis_values"], 1)
+        self.assertTrue(captured["excess_amplitude_unknown"])
         self.assertGreater(captured["beta_capture"]["quality"]["clipped_axis_values"], 0)
         self.assertNotEqual(captured["samples"][0][1], plugin.CLIPPED * obj.scale["scale"] / 1000.)
         self.assertIsNone(obj.beta_capture)

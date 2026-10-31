@@ -4,6 +4,14 @@ ACCURACY measures variation in **commanded homing travel** at the currently
 active thresholds and configured homing speed. It does not measure carriage
 position with an encoder or establish absolute physical accuracy.
 
+Its acceleration plots show absolute components after subtracting the signed
+resting reference. Threshold/peak markers stay nonnegative; precise commanded
+travel and its population statistics retain their mm scale. Range notes count
+every measured home and exclude the qualifier. Native marker estimates and
+finite sensor rails are reported separately with unknown excess amplitude;
+resting-reference uncertainty is disclosed without adding those counts to
+the capture totals. See [plot semantics](PLOTS.md).
+
 ## Run
 
 Follow the [manual preparation](COMMANDS.md#prepare-every-moving-workflow):

@@ -32,6 +32,8 @@ except ImportError:  # Standalone offline replay harness
 
 SAMPLE = struct.Struct("<hhh")
 CLIPPED = 0x7FFF
+NATIVE_CLIP_POLICY = "beacon_previous_sensor_sign_v1"
+POLARITY_POLICY = "absolute_after_reference_subtraction_v1"
 NATIVE_LE = sys.byteorder == "little"
 BEACON_ACCEL_DATA = "beacon_accel_data start_clock=%u delta_clock=%u data=%*s"
 TRIGGER_CMD = "trsync_trigger oid=%c reason=%c"
@@ -108,6 +110,7 @@ class QuietReference:
         self.totals = [0.0, 0.0, 0.0]
         self.low = self.high = None
         self._samples = collections.deque()
+        self._observations = collections.deque()
         self._minimum = [collections.deque() for _ in range(3)]
         self._maximum = [collections.deque() for _ in range(3)]
         self.overflow = False
@@ -118,7 +121,7 @@ class QuietReference:
         self.best_peak_to_peak = (0.0, 0.0, 0.0)
         self.oldest_batch_age = self.newest_batch_age = None
 
-    def add(self, when, values):
+    def add(self, when, values, observation=None):
         values = tuple(values)
         self.accepted += 1
         self.last = when
@@ -129,6 +132,7 @@ class QuietReference:
         if self.overflow:
             return "baseline_overflow"
         self._samples.append((self.accepted, when, values))
+        self._observations.append(observation)
         self.totals = [a + b for a, b in zip(self.totals, values)]
         for value, minimum, maximum in zip(values, self._minimum, self._maximum):
             while minimum and minimum[-1][1] >= value:
@@ -158,6 +162,7 @@ class QuietReference:
             # acquisition after its bounded capacity has been exceeded.
             self.overflow = True
             self._samples.clear()
+            self._observations.clear()
             for queue in self._minimum + self._maximum:
                 queue.clear()
             self.first, self.count = None, 0
@@ -174,6 +179,7 @@ class QuietReference:
 
     def _drop_first(self):
         number, _when, values = self._samples.popleft()
+        self._observations.popleft()
         self.totals = [a - b for a, b in zip(self.totals, values)]
         for queue in self._minimum + self._maximum:
             if queue[0][0] == number:
@@ -221,10 +227,84 @@ def decode_clips(raw, previous, clips):
     return out
 
 
+def native_clip_limits(values):
+    """Require actual signed endpoints; 0x7FFF itself is never an endpoint."""
+    if (not isinstance(values, (tuple, list)) or len(values) != 2
+            or any(type(value) is not int for value in values)
+            or not 0 < values[0] < CLIPPED or not -32768 <= values[1] < 0):
+        raise ValueError("native marker decoding requires configured signed clip endpoints")
+    return tuple(values)
+
+
+def decode_native_values(raw, previous, clips):
+    """Bounded Beacon substitutions preserve the prior SENSOR-axis sign.
+
+    A zero seed selects the positive endpoint. Neither inferred sign nor
+    substituted amplitude is an observed measurement of a clipped sample.
+    """
+    if len(raw) % 3 or len(previous) != 3:
+        raise ValueError("invalid native decoder row width")
+    if not all(math.isfinite(value) for value in tuple(raw) + tuple(previous)):
+        raise ValueError("nonfinite native decoder input")
+    if CLIPPED not in raw:
+        return list(raw)
+    return decode_clips(raw, previous, native_clip_limits(clips))
+
+
+class _SignalQuality:
+    """Original code observations, separate from baseline-subtracted decisions."""
+    def __init__(self, native, mapping, count_g, full_scale, clips, scope):
+        self.native, self.mapping = native, tuple(mapping)
+        self.count_g, self.full_scale, self.clips = count_g, full_scale, clips
+        self.scope = scope
+        self.markers, self.limits = [0, 0, 0], [0, 0, 0]
+        self.first = self.last = None
+        self.nonfinite = 0
+
+    def observe(self, values, identity=None):
+        marked = False
+        for axis, (index, _sign) in enumerate(self.mapping):
+            value = values[index]
+            if not math.isfinite(value):
+                self.nonfinite += 1
+            elif self.native and value == CLIPPED:
+                self.markers[axis] += 1
+                marked = True
+            elif ((self.native and self.clips is not None and value in self.clips)
+                  or self.full_scale is not None and abs(value * self.count_g) >= self.full_scale):
+                self.limits[axis] += 1
+        if marked:
+            self.first = self.first or identity
+            self.last = identity
+
+    def summary(self):
+        count, limited = sum(self.markers), bool(sum(self.markers) or sum(self.limits))
+        decoding = None
+        if count:
+            decoding = {"policy": NATIVE_CLIP_POLICY, "marker_axis_values": count,
+                        "marker_axis_values_xyz": dict(zip("xyz", self.markers)),
+                        "clip_values": list(self.clips), "count_g": self.count_g,
+                        "sign_inferred": True, "true_amplitude_unknown": True,
+                        "zero_seed_selects": "positive", "scope": self.scope,
+                        "first_sample": None if self.first is None else list(self.first),
+                        "last_sample": None if self.last is None else list(self.last)}
+        return {"amplitude_limited": limited, "excess_amplitude_unknown": limited,
+                "peak_semantics": "bounded_native_endpoint_estimate" if count else "reported_sensor_derived",
+                "signal_scope": self.scope, "native_clip_decode": decoding,
+                "clipped_axis_values": count,
+                "clipped_axis_counts": dict(zip("xyz", self.markers)),
+                "range_limit_axis_values": sum(self.limits),
+                "range_limit_axis_counts": dict(zip("xyz", self.limits))}
+
+
 def describe(r):
     """One line per homing pass, for the status command and klippy.log."""
-    return ("%s pass %d: %s, onset %s g, peak %s g, noise +%.1f/-%.1f g, travel %s mm%s"
+    uncertainty = (" (bounded endpoint estimate; true sign/peak unknown)"
+                   if (r.get("native_clip_decode") or {}).get("marker_axis_values") else
+                   " (range reached; true peak may be higher)" if r.get("amplitude_limited") else "")
+    return ("%s pass %d: %s, onset %s g, peak %s g%s, noise +%.1f/-%.1f g, travel %s mm%s"
             % (r["axis"].upper(), r["pass"], r["result"], r["onset_g"], r["impact_peak_g"],
+               uncertainty,
                r["noise_pos_g"], r["noise_neg_g"], r.get("travel_mm"),
                ", origin kept" if r.get("kept_origin") else ""))
 
@@ -323,6 +403,9 @@ class Attempt:
         self.bases = None           # resting reading of all three sensor axes
         self.sums = [0.0, 0.0, 0.0]  # integrated readings since the pass started
         self.vector_mode = False   # XYZ magnitude; no acceleration-derived motion proof
+        self.signal_quality = None
+        self.signal_packet = None
+        self.reference_signal_quality = None
         self.vector_unchanged_since = None
         self.proof_noise = None    # measured uncertainty for calibration/expanded references
         self.proof_state = None    # atomic (sums, sample count, dt, end clock) for that proof
@@ -495,6 +578,9 @@ class BeaconAccelHoming:
         self.sample_timing_fault = None
         self.scale = self.session_scale = None
         self.clip_values = (CLIPPED, -CLIPPED - 1)
+        self.native_decode_previous = (0, 0, 0)
+        self.native_stream_clip_values = None
+        self.native_stream_generation = 0
         self.stream_alone = False
         self.full_scale_g = None
         self.recent = collections.deque(maxlen=self.baseline_batches)
@@ -513,6 +599,8 @@ class BeaconAccelHoming:
         self.last = {}
         self.history = collections.deque(maxlen=20)
         self.capture_batches = None
+        self.capture_decode_contexts = None
+        self.capture_decode_previous = (0, 0, 0)
         self.capture_samples = self.capture_dropped = 0
         self.capture_limit = 200000
         self.capture_baseline = None
@@ -755,6 +843,36 @@ class BeaconAccelHoming:
         index, sign = self.helper.config.axes_map[AXES[axis]]
         return index, sign
 
+    def _native_decode_context(self, params):
+        return (tuple(params.get("_native_decode_previous", self.native_decode_previous)),
+                params.get("_native_clip_values", getattr(self.helper, "_clip_values", None)))
+
+    def _signal_quality(self, scope, count_g=None, clips=None):
+        mapping = ([(0, 1), (1, 1), (2, 1)] if self.backend is not None
+                   else self.helper.config.axes_map)
+        if self.backend is None:
+            clips = getattr(self.helper, "_clip_values", None) if clips is None else clips
+            clips = native_clip_limits(clips) if clips is not None else None
+        return _SignalQuality(self.backend is None, mapping,
+                              self.session_scale["scale"] / 1000.0 if count_g is None else count_g,
+                              self.full_scale_g, clips, scope)
+
+    def _observe_response(self, attempt, params, original, count):
+        identity = (params["start_clock"], params["delta_clock"], count)
+        if attempt.signal_packet == identity:
+            return
+        if attempt.signal_quality is None:
+            clips = self._native_decode_context(params)[1] if self.backend is None else None
+            attempt.signal_quality = self._signal_quality("armed_response", attempt.count_g, clips)
+        for number in range(count):
+            attempt.signal_quality.observe(original[number * 3:number * 3 + 3],
+                (params["start_clock"], params["delta_clock"], number, count))
+        attempt.signal_packet = identity
+        if attempt.record is not None:
+            attempt.record.update(attempt.signal_quality.summary())
+            if attempt.reference_signal_quality and attempt.reference_signal_quality["amplitude_limited"]:
+                attempt.record.update(amplitude_limited=True, excess_amplitude_unknown=True)
+
     # Stream and acceleration, owned only for the duration of a homing session
     def _start_stream(self):
         self.sensor_fault = None
@@ -768,6 +886,13 @@ class BeaconAccelHoming:
             self.stream_on = True
             return
         helper = self.helper
+        clips = getattr(helper, "_clip_values", None)
+        clips = native_clip_limits(clips) if clips is not None else None
+        if not self.stream_on:
+            with self.lock:
+                self.native_stream_generation += 1
+                self.native_decode_previous = (0, 0, 0)
+                self.native_stream_clip_values = clips
         # Streaming alone at our own scale: a Beacon client starting later
         # (the web API dump) would switch the sensor range mid-move.
         self.stream_alone = not helper._stream_en
@@ -1181,6 +1306,9 @@ class BeaconAccelHoming:
             return "invalid_data"
         sensor_now = self.main_mcu.estimated_print_time(now)
         raw = [axis_values(sample_slice(data, count), index) for index in range(3)]
+        decoded = (decode_native_values(tuple(value for row in zip(*raw) for value in row),
+                                       *self._native_decode_context(params))
+                   if self.backend is None else None)
         with self.lock:
             reference = self.preparation
             if reference is None:
@@ -1206,14 +1334,12 @@ class BeaconAccelHoming:
                         return "invalid_data"
                     if when - reference.last > 5.0 * interval + 0.000003:
                         return "sample_gap"
-                values = tuple(axis[number] for axis in raw)
-                if (not all(math.isfinite(value) for value in values)
-                        or (self.backend is None and CLIPPED in values)
-                        or (self.full_scale_g is not None
-                            and any(abs(value) * self.session_scale["scale"] / 1000.0
-                                    >= self.full_scale_g for value in values))):
+                original = tuple(axis[number] for axis in raw)
+                values = original if decoded is None else tuple(decoded[number * 3:number * 3 + 3])
+                if not all(math.isfinite(value) for value in values):
                     return "invalid_data"
-                reference_error = reference.add(when, values)
+                reference_error = reference.add(when, values,
+                    (original, (params["start_clock"], params["delta_clock"], number, count)))
                 if reference_error is not None:
                     return reference_error
         return None
@@ -1352,6 +1478,11 @@ class BeaconAccelHoming:
                           deadline, beacon_mcu.print_time_to_clock(deadline) & 0xFFFFFFFF,
                           index, map_sign, direction, limit_raw, count_g)
         attempt.vector_mode = vector_mode
+        reference_quality = self._signal_quality("stationary_reference", count_g)
+        for observation in reference._observations:
+            if observation is not None:
+                reference_quality.observe(*observation)
+        attempt.reference_signal_quality = reference_quality.summary()
         attempt.steppers = endstop.get_steppers()
         attempt.bases = bases
         attempt.proof_noise = proof_noise
@@ -1765,6 +1896,23 @@ class BeaconAccelHoming:
             self.saved_handler(params)
 
     def _inspect(self, params):
+        native_owned = self.backend is None and (self.stream_on or self.homing_active
+            or self.noise_session is not None or self.capture_batches is not None
+            or self.attempt is not None or self.tail is not None)
+        generation = None
+        if native_owned:
+            with self.lock:
+                generation = self.native_stream_generation
+                clips = getattr(self.helper, "_clip_values", None)
+                clips = native_clip_limits(clips) if clips is not None else None
+                frozen = self.native_stream_clip_values
+                if frozen is None:
+                    self.native_stream_clip_values = frozen = clips
+                params = dict(params, _native_decode_previous=tuple(self.native_decode_previous),
+                              _native_clip_values=frozen)
+            if clips != frozen:
+                self._sensor_fault("scale")
+                return
         try:
             self._inspect_batch(params)
         finally:
@@ -1772,6 +1920,20 @@ class BeaconAccelHoming:
             # processing.  Conversion for charts is deferred to stop_capture.
             if self.capture_batches is not None:
                 self._capture_batch(params)
+            if native_owned:
+                data = params["data"]
+                raw = (data if isinstance(data, tuple) else
+                       tuple(v for row in SAMPLE.iter_unpack(data) for v in row))
+                if raw:
+                    try:
+                        decoded = (decode_native_values(raw, *self._native_decode_context(params))
+                                   if CLIPPED in raw else raw)
+                    except ValueError:
+                        self._sensor_fault("invalid_data")
+                    else:
+                        with self.lock:
+                            if self.native_stream_generation == generation:
+                                self.native_decode_previous = tuple(decoded[-3:])
 
     def _sensor_fault(self, reason):
         with self.sensor_fault_lock:
@@ -1919,13 +2081,20 @@ class BeaconAccelHoming:
             self._fire(attempt, "travel", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return
         data = sample_slice(data, count)
+        params = dict(params, data=data)
         raw = (data if isinstance(data, tuple) else memoryview(data).cast("h") if NATIVE_LE
                else [v for sample in SAMPLE.iter_unpack(data) for v in sample])
         if strict_native and not all(math.isfinite(value) for value in raw):
             self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return
         if self.backend is None and CLIPPED in raw:
-            raw = decode_clips(raw, attempt.last_samples, self.clip_values)
+            original = source_params["data"]
+            original = (original if isinstance(original, tuple) else
+                        tuple(v for row in SAMPLE.iter_unpack(original) for v in row))
+            decoded = decode_native_values(original, *self._native_decode_context(source_params))
+            raw = decoded[source_skip * 3:source_skip * 3 + count * 3]
+            if source_skip:
+                params["_native_decode_previous"] = tuple(decoded[source_skip * 3 - 3:source_skip * 3])
         if attempt.vector_mode:
             if attempt.gap:
                 self._fire(attempt, "sample_gap", mcu.MCU_trsync.REASON_HOST_REQUEST)
@@ -1939,8 +2108,8 @@ class BeaconAccelHoming:
         base = attempt.baseline
         above, below = top - base, base - bottom
         pos, neg = (above, below) if attempt.map_sign > 0 else (below, above)
-        direction = attempt.direction or attempt.auto_direction
-        level = pos if direction > 0 else neg if direction < 0 else max(pos, neg)
+        direction = 0
+        level = max(pos, neg)
         if level <= attempt.limit_raw:
             # Quiet batch: keep the cheap statistics only. Noise peaks count one
             # batch late, so the rising edge right before an impact is not noise.
@@ -1980,9 +2149,8 @@ class BeaconAccelHoming:
                 attempt.proof_sample_time = self.clock_to_time(end_clock)
             attempt.last_samples = [raw[-3], raw[-2], raw[-1]]
             if not direction:
-                # The stop decelerates the toolhead, so once it travels the
-                # impact can only point against the travel. A start-of-move
-                # jolt in the travel direction is then ignored.
+                # Retain signed travel diagnostics; impact acceptance uses
+                # absolute reference-subtracted values in either direction.
                 speed = (sums[attempt.index] * attempt.map_sign * attempt.count_g
                          * MM_PER_S2_PER_G * attempt.sample_dt)
                 if attempt.proof_noise is not None:
@@ -1994,6 +2162,10 @@ class BeaconAccelHoming:
                         attempt.auto_direction = 1
                 elif abs(speed) >= AUTO_DIRECTION_SPEED:
                     attempt.auto_direction = -1 if speed > 0 else 1
+            original = params["data"]
+            original = (original if isinstance(original, tuple) else
+                        tuple(v for row in SAMPLE.iter_unpack(original) for v in row))
+            self._observe_response(attempt, params, original, count)
             return
         self._onset(attempt, params, values, count, source_params, source_skip)
 
@@ -2031,14 +2203,16 @@ class BeaconAccelHoming:
         attempt.last_end_clock = params["start_clock"] + params["delta_clock"]
         attempt.proof_sample_time = self.clock_to_time(attempt.last_end_clock)
         attempt.last_samples = list(previous)
+        original = params["data"]
+        original = (original if isinstance(original, tuple) else
+                    tuple(v for row in SAMPLE.iter_unpack(original) for v in row))
+        self._observe_response(attempt, params, original, count)
 
     def _onset(self, attempt, params, values, count, source_params=None, source_skip=0):
         base, map_sign = attempt.baseline, attempt.map_sign
-        direction = attempt.direction or attempt.auto_direction
-        # Clips are already decoded, so they pass the same direction check.
         for position, raw in enumerate(values):
             value = (raw - base) * map_sign
-            if (value * direction if direction else abs(value)) > attempt.limit_raw:
+            if abs(value) > attempt.limit_raw:
                 break
         else:
             return
@@ -2050,7 +2224,7 @@ class BeaconAccelHoming:
         source = params if source_params is None else source_params
         attempt.onset_sample = (source["start_clock"], source["delta_clock"],
                                 position + source_skip, sample_count(source["data"]))
-        attempt.onset_raw = value
+        attempt.onset_raw = abs(value)
         attempt.impact_until = (start_clock + self.impact_window) & 0xFFFFFFFF
         self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
         self._track_impact(attempt, params, None, count, values)
@@ -2059,11 +2233,20 @@ class BeaconAccelHoming:
         """Largest reading shortly after the onset, for status."""
         if attempt.impact_until is None or not clock_after(attempt.impact_until, params["start_clock"]):
             return
+        original = params.get("data")
+        if original is not None:
+            original = (original if isinstance(original, tuple) else
+                        tuple(v for row in SAMPLE.iter_unpack(sample_slice(original, count)) for v in row))
+            self._observe_response(attempt, params, original, count)
+            if self.backend is None and CLIPPED in original:
+                decoded = decode_native_values(original, *self._native_decode_context(params))
+                if attempt.vector_mode:
+                    data = decoded
+                elif values is None:
+                    values = decoded[attempt.index::3]
         if attempt.vector_mode:
             raw = (data if isinstance(data, (tuple, list, memoryview)) else
                    [v for row in SAMPLE.iter_unpack(sample_slice(data, count)) for v in row])
-            if self.backend is None and CLIPPED in raw:
-                raw = decode_clips(raw, attempt.last_samples, self.clip_values)
             peak = max(math.sqrt(sum((raw[n + axis] - attempt.bases[axis]) ** 2
                                      for axis in range(3))) for n in range(0, count * 3, 3))
             if peak > attempt.impact_peak:
@@ -2074,9 +2257,7 @@ class BeaconAccelHoming:
         if values is None:
             values = axis_values(sample_slice(data, count), attempt.index)
         top, bottom = max(values), min(values)
-        peak = (self.full_scale_g / attempt.count_g
-                if self.backend is None and top == CLIPPED and self.full_scale_g
-                else max(top - attempt.baseline, attempt.baseline - bottom))
+        peak = max(top - attempt.baseline, attempt.baseline - bottom)
         if peak > attempt.impact_peak:
             attempt.impact_peak = peak
             if attempt.record is not None:
@@ -2303,6 +2484,7 @@ class BeaconAccelHoming:
                         raise self.printer.command_error("accel_homing: insufficient noise samples")
                     return {"samples": samples, "dropped": 0, "fault": None,
                             "cutoff_time_s": window["cutoff"],
+                            **window["signal_quality"].summary(),
                             "_noise_context": session["context"]}
                 sensor_now = self.main_mcu.estimated_print_time(now)
                 if last is not None and sensor_now - last > self.stream_timeout:
@@ -2361,9 +2543,15 @@ class BeaconAccelHoming:
         count_g = self.noise_session["context"]["count_g"]
         full_scale = self.noise_session["context"]["full_scale_g"]
         raw = [axis_values(sample_slice(data, count), index) for index in range(3)]
+        decoded = (decode_native_values(tuple(value for row in zip(*raw) for value in row),
+                                       *self._native_decode_context(params))
+                   if self.backend is None else None)
         with self.lock:
             if self.noise_window is not window:
                 return
+            if "signal_quality" not in window:
+                window["signal_quality"] = self._signal_quality(
+                    "beta_motion" if window["duration"] is None else "noise_window", count_g)
             for number in range(count):
                 when = start + number * interval
                 if when <= window["cutoff"]:
@@ -2398,11 +2586,9 @@ class BeaconAccelHoming:
                             "batch_sample_count": count}
                         self._sensor_fault("sample_gap")
                         return
-                values = tuple(axis[number] for axis in raw)
-                if (not all(math.isfinite(value) for value in values)
-                        or (self.backend is None and CLIPPED in values)
-                        or (full_scale is not None
-                            and any(abs(value * count_g) >= full_scale for value in values))):
+                original = tuple(axis[number] for axis in raw)
+                values = original if decoded is None else tuple(decoded[number * 3:number * 3 + 3])
+                if not all(math.isfinite(value) for value in values):
                     if quality is not None:
                         quality["clipped_axis_values"] += sum(value == CLIPPED for value in values) if self.backend is None else 0
                         quality["saturation_axis_values"] += sum(
@@ -2412,6 +2598,13 @@ class BeaconAccelHoming:
                 if len(window["samples"]) >= self.capture_limit:
                     self._sensor_fault("proof_overflow")
                     return
+                window["signal_quality"].observe(original,
+                    (params["start_clock"], params["delta_clock"], number, count))
+                if quality is not None:
+                    quality["clipped_axis_values"] += sum(value == CLIPPED for value in original) if self.backend is None else 0
+                    quality["saturation_axis_values"] += sum(
+                        (self.backend is not None or value != CLIPPED)
+                        and abs(value * count_g) >= full_scale for value in original) if full_scale is not None else 0
                 xyz = tuple(values[index] * sign * count_g for index, sign in mapping)
                 if window["samples"] and xyz != window["samples"][0][1:]:
                     window["changed"] = True
@@ -2478,6 +2671,13 @@ class BeaconAccelHoming:
             baseline = self.collect_noise_window(check_running, 1.0)
             check_running()
             rows = tuple(baseline["samples"])
+            reference_signal = json.loads(json.dumps({key: baseline[key] for key in (
+                "amplitude_limited", "excess_amplitude_unknown", "peak_semantics", "signal_scope",
+                "native_clip_decode", "range_limit_axis_values", "range_limit_axis_counts",
+                "clipped_axis_values", "clipped_axis_counts") if key in baseline}))
+            reference_signal["signal_scope"] = "stationary_reference"
+            if reference_signal.get("native_clip_decode"):
+                reference_signal["native_clip_decode"]["scope"] = "stationary_reference"
             offset = tuple(math.fsum(row[index] for row in rows) / len(rows) for index in (1, 2, 3))
             cutoff = self.main_mcu.estimated_print_time(self.reactor.monotonic())
             window = {"index": session["windows_started"] + 1, "cutoff": cutoff,
@@ -2485,6 +2685,7 @@ class BeaconAccelHoming:
                       "complete": False, "changed": False, "beta_quality": self._new_beta_quality(context)}
             token = {"session": session, "window": window, "sensor_context": context,
                      "generation": self.operation_generation, "baseline_samples": rows,
+                     "reference_signal_quality": reference_signal,
                      "baseline_g": offset, "capture_cutoff_time_s": cutoff,
                      "sample_rate_hz": (len(rows) - 1) / (rows[-1][0] - rows[0][0]),
                      "started": self.reactor.monotonic()}
@@ -2538,10 +2739,15 @@ class BeaconAccelHoming:
                     self.reactor.pause(now + 0.005)
             with self.lock:
                 rows = tuple(window["samples"])
+                signal = window["signal_quality"].summary()
+            if token["reference_signal_quality"].get("amplitude_limited"):
+                signal.update(amplitude_limited=True, excess_amplitude_unknown=True)
             if len(rows) < BASELINE_MIN_SAMPLES or not window["changed"]:
                 raise self.printer.command_error("accel_homing: beta moving capture is insufficient or frozen")
             baseline = token["baseline_samples"]
             return {"samples": rows, "baseline_g": token["baseline_g"], "dropped": 0,
+                    **signal,
+                    "reference_signal_quality": token["reference_signal_quality"],
                     "fault": None, "sensor_context": token["sensor_context"],
                     "_noise_context": token["sensor_context"],
                     "baseline_first_sample_time_s": baseline[0][0],
@@ -2575,6 +2781,8 @@ class BeaconAccelHoming:
             if self.capture_batches is not None:
                 raise self.printer.command_error("accel_homing: capture already active")
             self.capture_batches = []
+            self.capture_decode_contexts = []
+            self.capture_decode_previous = tuple(self.native_decode_previous)
             self.capture_samples = self.capture_dropped = 0
             self.capture_baseline = None
             self.capture_attempt = None
@@ -2632,11 +2840,9 @@ class BeaconAccelHoming:
                         full_scale, count_g = context["full_scale_g"], context["count_g"]
                         quality["clipped_axis_values"] += sum(value == CLIPPED for channel in raw for value in channel) if self.backend is None else 0
                         quality["saturation_axis_values"] += sum(
-                            abs(value * count_g) >= full_scale for channel in raw for value in channel) if full_scale is not None else 0
-                        if any(not math.isfinite(value)
-                               or (self.backend is None and value == CLIPPED)
-                               or (full_scale is not None and abs(value * count_g) >= full_scale)
-                               for channel in raw for value in channel):
+                            math.isfinite(value) and (self.backend is not None or value != CLIPPED)
+                            and abs(value * count_g) >= full_scale for channel in raw for value in channel) if full_scale is not None else 0
+                        if any(not math.isfinite(value) for channel in raw for value in channel):
                             reason = "invalid_data"
                         else:
                             if state["first_sample_time_s"] is None:
@@ -2718,6 +2924,19 @@ class BeaconAccelHoming:
             else:
                 self.capture_batches.append((params["start_clock"], params["delta_clock"],
                                              data, self.session_scale["scale"] / 1000.0))
+                context = None
+                if self.backend is None:
+                    seed = tuple(params.get("_native_decode_previous", self.capture_decode_previous))
+                    clips = params.get("_native_clip_values", getattr(self.helper, "_clip_values", None))
+                    clips = native_clip_limits(clips) if clips is not None else None
+                    context = (seed, clips)
+                    raw = (data if isinstance(data, tuple) else
+                           tuple(v for row in SAMPLE.iter_unpack(data) for v in row))
+                    try:
+                        self.capture_decode_previous = tuple(decode_native_values(raw, seed, clips)[-3:])
+                    except ValueError:
+                        pass  # Validation retains the original fault; never invent decoder history.
+                self.capture_decode_contexts.append(context)
                 self.capture_samples += count
         if (overflow and state is not None and self.beta_capture is state
                 and self.operation_generation == state["generation"] and not state["cancelled"]):
@@ -2757,6 +2976,7 @@ class BeaconAccelHoming:
         """
         with self.lock:
             batches, self.capture_batches = self.capture_batches or [], None
+            contexts, self.capture_decode_contexts = self.capture_decode_contexts or [], None
             dropped, baseline = self.capture_dropped, self.capture_baseline
             attempt, self.capture_attempt = self.capture_attempt, None
             attempt_count, self.capture_attempts = self.capture_attempts, 0
@@ -2786,14 +3006,19 @@ class BeaconAccelHoming:
                                     if attempt.onset_batch is not None else None),
                         "impact_peak_g": (attempt.impact_peak * attempt.count_g
                                           if attempt.onset_batch is not None else None),
-                        "direction": 0 if attempt.vector_mode else attempt.direction or attempt.auto_direction,
+                        "direction": 0,
+                        "polarity_policy": POLARITY_POLICY,
+                        "reference_signal_quality": attempt.reference_signal_quality,
                         "impact_metric": "xyz_magnitude" if attempt.vector_mode else "selected_axis",
                         "homing_speed_mm_s": attempt.effective_speed,
                         "homing_accel_mm_s2": attempt.effective_accel,
                         "attempt_count": attempt_count}
         samples, previous = [], [0, 0, 0]
+        quality = self._signal_quality("capture", batches[0][3] if batches else
+                                       (self.session_scale or self.scale)["scale"] / 1000.0,
+                                       contexts[0][1] if contexts and contexts[0] is not None else None)
         onset_matches, onset_index = 0, None
-        for start_clock, delta_clock, data, count_g in batches:
+        for batch_index, (start_clock, delta_clock, data, count_g) in enumerate(batches):
             count = sample_count(data)
             if valid_onset_sample and (start_clock, delta_clock, count) == (
                     onset_sample[0], onset_sample[1], onset_sample[3]):
@@ -2801,8 +3026,16 @@ class BeaconAccelHoming:
                 onset_index = len(samples) + onset_sample[2]
             raw = (list(data) if isinstance(data, tuple)
                    else [v for row in SAMPLE.iter_unpack(sample_slice(data, count)) for v in row])
-            if self.backend is None and CLIPPED in raw:
-                raw = decode_clips(raw, previous, self.clip_values)
+            quality.count_g = count_g
+            for number in range(count):
+                quality.observe(raw[number * 3:number * 3 + 3],
+                                (start_clock, delta_clock, number, count))
+            if self.backend is None:
+                context = contexts[batch_index] if batch_index < len(contexts) else (previous, self.clip_values)
+                limits = None if context is None or context[1] is None else native_clip_limits(context[1])
+                if context is None or limits != quality.clips:
+                    raise self.printer.command_error("accel_homing: native capture decoder context changed")
+                raw = decode_native_values(raw, *context)
             previous = raw[-3:]
             start, end = self.clock_to_time(start_clock), self.clock_to_time(start_clock + delta_clock)
             dt = (end - start) / (count - 1)
@@ -2820,7 +3053,14 @@ class BeaconAccelHoming:
         if baseline is None and samples:
             resting = samples[:min(50, len(samples))]
             baseline = tuple(sum(row[i] for row in resting) / len(resting) for i in (1, 2, 3))
+        signal = quality.summary()
+        reference_signal = None if attempt is None else attempt.reference_signal_quality
+        if reference_signal and reference_signal["amplitude_limited"]:
+            signal.update(amplitude_limited=True, excess_amplitude_unknown=True)
+        if detector is not None:
+            detector.update(signal)
         return {"samples": samples, "dropped": dropped, "baseline_g": baseline, "fault": fault,
+                **signal, "reference_signal_quality": reference_signal,
                 "detector": detector,
                 # Used only for in-process provenance; workflows remove this
                 # reference before exporting metadata or publishing status.
@@ -2926,10 +3166,11 @@ class BeaconAccelHoming:
             "threshold_g": round(attempt.limit_raw * to_g, 2),
             "impact_metric": "xyz_magnitude" if attempt.vector_mode else "selected_axis",
             "physical_position_verified": False,
-            "direction": 0 if attempt.vector_mode else attempt.direction or attempt.auto_direction,
+            "direction": 0,
+            "polarity_policy": POLARITY_POLICY,
+            "reference_signal_quality": attempt.reference_signal_quality,
             "onset_g": round(attempt.onset_raw * to_g, 2) if onset else None,
-            "impact_sign": (1 if attempt.onset_raw > 0 else -1 if attempt.onset_raw < 0 else None)
-                           if onset else None,
+            "impact_sign": 0 if onset else None,
             "impact_peak_g": round(attempt.impact_peak * to_g, 2) if onset else None,
             "noise_pos_g": round(attempt.noise_pos * to_g, 2),
             "noise_neg_g": round(attempt.noise_neg * to_g, 2),
@@ -2945,6 +3186,10 @@ class BeaconAccelHoming:
             "backend": "beacon_raw" if self.backend is None else self.backend.kind,
             "trigger_after_arm_s": round(recorded_onset - attempt.arm_time, 4) if onset else None,
         }
+        if attempt.signal_quality is not None:
+            result.update(attempt.signal_quality.summary())
+        if attempt.reference_signal_quality and attempt.reference_signal_quality["amplitude_limited"]:
+            result.update(amplitude_limited=True, excess_amplitude_unknown=True)
         if attempt.motion_deadline is not None or self.backend is not None:
             result["motion_proof"] = self._motion_proof_status(attempt)
         attempt.record = result
@@ -3094,6 +3339,7 @@ class BeaconAccelHoming:
             full_scale = self._full_scale_g(scale) if self.helper is not None else None
             validate_threshold(threshold, "THRESHOLD", gcmd.error, full_scale)
             self.threshold_g[axis] = threshold
+            self.workflows.note_manual_threshold(axis, threshold)
         if sign is not None:
             self.impact_sign[axis] = sign
         gcmd.respond_info("beacon_accel_homing %s: threshold %.12g g, impact_sign %d (until restart)"

@@ -34,8 +34,13 @@ for your machine and independent Z support. See the complete
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal for X or Y. Optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0`; rejects `SAVE_CONFIG=1`. |
 | `ACCEL_HOMING_CANCEL` | Cancel owned workflow/pending preparation and restore temporary settings when handled. Not an emergency stop. |
-| `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Temporary threshold for X or Y; optional `IMPACT_SIGN=-1|0|1`; until restart. |
+| `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Temporary threshold for X or Y; optional compatibility `IMPACT_SIGN` accepts `-1`, `0`, `1`; until restart. |
 | `SET_BEACON_ACCEL_HOMING AXIS=X THRESHOLD=1` | Retained alias of `SET_ACCEL_HOMING`. |
+
+`IMPACT_SIGN` does not select RAW detector polarity. A SET containing only
+`IMPACT_SIGN` does not create an explicit manual threshold or requalify an old
+selected-axis model; supply `THRESHOLD` or complete fresh calibration if the
+model's qualification is refused.
 
 No separate centering-confirmation command or popup prompt is required.
 Only one workflow may own the sensor/motion session at a time. A new command

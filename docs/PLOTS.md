@@ -32,15 +32,38 @@ are retained; the plugin does not rotate or delete old final chart outputs.
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final accuracy overview per requested axis after every axis succeeds. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Yes | Combined **Beta** moving-noise/trial diagnostic and suggestion report. |
 
-The plots show baseline-relative acceleration, the configured detector
-threshold and detected onset when available. New vector-model captures label
-XYZ magnitude; legacy captures retain their detector context. The measured
-onset/peak can differ from the threshold used to request stopping.
+Acceleration curves show `abs(ax-bx)`, `abs(ay-by)` and `abs(az-bz)` in g.
+The fresh signed resting reference is subtracted **before** taking absolute
+values. Acceleration axes, threshold lines and peak markers are nonnegative.
+New vector-model captures also label XYZ magnitude; selected-axis captures
+retain their detector context. The measured onset/peak can differ from the
+threshold used to request stopping. Signed source samples, reference offsets,
+travel statistics and times are retained internally. Relative event times can
+be negative; ACCURACY retains its precise travel scale in mm.
 
-Traces retain bounded summaries and signed extrema instead of every sample.
+Traces retain bounded summaries, signed extrema and absolute-value troughs
+instead of every sample. New capture envelopes have at most 4096 points;
+legacy published-capture receipts retain at most 512. Display reduction does
+not change the signed samples used for detection or statistics.
 A diagnostic chart cannot establish that all vector peaks or physical
 transients were preserved, nor measure end-to-end stopping latency. Synthetic
 fixtures are marked **SIMULATED / NOT PRINTER MEASUREMENT**.
+
+Native Beacon clipping markers are decoded as bounded sensor-endpoint
+estimates using prior sensor sign. Their true sign and amplitude are unknown;
+an estimated plotted peak is not a recovered impact peak. Finite sensor-rail
+values are reported separately, with unknown excess amplitude. Recognized
+markers or rails do not by themselves invalidate otherwise valid RAW data.
+Threshold headroom, acquisition and other data-fault checks still apply.
+
+Range notes aggregate every measured ACCURACY home (excluding the qualifier),
+all three noise windows, and every Beta motion/home in their respective
+groups. Counts are axis values, not a count of samples. Capture/window/motion
+provenance and resting-reference provenance are disclosed separately; their
+counts can overlap and are never added together. A limited reference can
+make the baseline uncertain even when the plotted capture has no markers.
+Older receipts without range metadata remain usable and are labelled as
+having unavailable provenance. Mixed native decode conventions are reported.
 
 ## Stationary noise
 

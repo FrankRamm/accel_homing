@@ -205,8 +205,14 @@ def _identity(run_id, axis):
         raise ValueError("Capture axis must be x or y")
 
 
-def _envelope(samples, buckets=512):
-    """Keep every bucket's first/last and all signed XYZ extrema."""
+def _envelope(samples, buckets=512, max_points=None):
+    """Retain signed extrema and absolute troughs within the display budget."""
+    budget = min(_MAX_CAPTURE_TRACE_POINTS, buckets * 8,
+                 _MAX_CAPTURE_TRACE_POINTS if max_points is None else max_points)
+    if len(samples) <= budget:
+        return tuple(tuple(row) for row in samples)
+    # Two endpoints and three selections per XYZ component fit in 11 rows.
+    buckets = max(1, budget // 11)
     stride = max(1, int(math.ceil(len(samples) / float(buckets))))
     result = []
     for offset in range(0, len(samples), stride):
@@ -214,9 +220,128 @@ def _envelope(samples, buckets=512):
         chosen = {0, len(bucket) - 1}
         for channel in (1, 2, 3):
             chosen.update((min(range(len(bucket)), key=lambda i: bucket[i][channel]),
-                           max(range(len(bucket)), key=lambda i: bucket[i][channel])))
+                           max(range(len(bucket)), key=lambda i: bucket[i][channel]),
+                           min(range(len(bucket)), key=lambda i: abs(bucket[i][channel]))))
         result.extend(tuple(bucket[index]) for index in sorted(chosen))
     return tuple(result)
+
+
+_RANGE_FIELDS = ("amplitude_limited", "excess_amplitude_unknown", "peak_semantics",
+                 "native_clip_decode", "range_limit_axis_values", "clipped_axis_values",
+                 "range_limit_axis_counts", "clipped_axis_counts", "range_limit_axis_values_xyz",
+                 "signal_scope")
+
+
+def _range_metadata(capture, record, scope="capture"):
+    """Keep exact capture provenance separate from a wider detector/reference."""
+    source = capture if any(key in capture for key in _RANGE_FIELDS) else record
+    result = {key: source[key] for key in _RANGE_FIELDS if key in source}
+    for key in ("range_limit_axis_values", "clipped_axis_values"):
+        if key in result and (type(result[key]) is not int or result[key] < 0):
+            raise ValueError("Invalid sensor range observation count")
+    decoding = result.get("native_clip_decode")
+    if decoding is not None and (not isinstance(decoding, dict)
+            or type(decoding.get("marker_axis_values")) is not int
+            or decoding["marker_axis_values"] < 0):
+        raise ValueError("Invalid native marker provenance")
+    if result:
+        result["range_provenance_scope"] = source.get("signal_scope", scope) if source is capture else "detector_record"
+    reference = capture.get("reference_signal_quality", record.get("reference_signal_quality"))
+    if reference is not None:
+        if not isinstance(reference, dict):
+            raise ValueError("Invalid stationary reference provenance")
+        result["reference_signal_quality"] = reference
+    return json.loads(_json(result))
+
+
+def _range_summary(entries, scope, unit):
+    """Aggregate each displayed capture once; references are never added."""
+    result = {"scope": scope, "unit": unit, "total_items": len(entries),
+              "unknown_items": 0, "limited_items": 0, "native_marker_items": 0,
+              "marker_axis_values": 0, "finite_rail_items": 0, "range_limit_axis_values": 0,
+              "unclassified_limited_items": 0, "detector_record_items": 0,
+              "reference_limited_items": 0, "reference_marker_axis_values": 0,
+              "reference_range_limit_axis_values": 0,
+              "native_decode_policies": [], "native_decode_scopes": [], "native_decode_conventions": []}
+    policies, scopes, conventions = set(), set(), set()
+    for record, captured in entries:
+        reference = captured.get("reference_signal_quality", record.get("reference_signal_quality")) or {}
+        reference_markers = (reference.get("native_clip_decode") or {}).get("marker_axis_values", 0)
+        reference_rails = reference.get("range_limit_axis_values", 0)
+        if any(type(value) is not int or value < 0 for value in (reference_markers, reference_rails)):
+            raise ValueError("Invalid reference range observation counts")
+        result["reference_limited_items"] += int(bool(reference.get("amplitude_limited")
+            or reference.get("excess_amplitude_unknown") or reference_markers or reference_rails))
+        result["reference_marker_axis_values"] += reference_markers
+        result["reference_range_limit_axis_values"] += reference_rails
+        metadata = captured if any(key in captured for key in _RANGE_FIELDS) else record
+        if not any(key in metadata for key in _RANGE_FIELDS):
+            result["unknown_items"] += 1
+            continue
+        if captured.get("range_provenance_scope") == "detector_record" or metadata is record:
+            result["detector_record_items"] += 1
+        decoding = metadata.get("native_clip_decode") or {}
+        markers = decoding.get("marker_axis_values", 0)
+        rails = metadata.get("range_limit_axis_values", 0)
+        if type(markers) is not int or markers < 0 or type(rails) is not int or rails < 0:
+            raise ValueError("Invalid chart range observation counts")
+        limited = bool(metadata.get("amplitude_limited") or metadata.get("excess_amplitude_unknown")
+                       or markers or rails)
+        result["limited_items"] += int(limited)
+        result["native_marker_items"] += int(bool(markers))
+        result["marker_axis_values"] += markers
+        result["finite_rail_items"] += int(bool(rails))
+        result["range_limit_axis_values"] += rails
+        result["unclassified_limited_items"] += int(limited and not markers and not rails)
+        if markers:
+            policy = str(decoding.get("policy", "unspecified"))
+            policies.add(policy)
+            scopes.add(str(decoding.get("scope", captured.get("range_provenance_scope", "detector_record"))))
+            conventions.add("legacy_raw_controller_seed" if decoding.get("armed_seed_convention") else
+                            "prior_sensor_sign" if policy == "beacon_previous_sensor_sign_v1" else
+                            "recorded:" + policy)
+    result["native_decode_policies"] = sorted(policies)
+    result["native_decode_scopes"] = sorted(scopes)
+    result["native_decode_conventions"] = sorted(conventions)
+    return result
+
+
+def _range_observation_lines(summary):
+    unit, count = summary["unit"], summary["total_items"]
+    lines = []
+    if summary["marker_axis_values"]:
+        conventions = summary["native_decode_conventions"]
+        convention = ("prior sensor sign" if conventions == ["prior_sensor_sign"] else
+                      "legacy RAW controller seed" if conventions == ["legacy_raw_controller_seed"] else
+                      "mixed/legacy decode conventions" if len(conventions) > 1 else "recorded decode convention")
+        lines.append("Native markers: %d axis values in %d/%d %s; bounded endpoint estimates (%s); true sign/peak unknown." % (
+            summary["marker_axis_values"], summary["native_marker_items"], count, unit, convention))
+    if summary["range_limit_axis_values"]:
+        lines.append("Finite sensor rails: %d axis values in %d/%d %s; excess amplitude unknown." % (
+            summary["range_limit_axis_values"], summary["finite_rail_items"], count, unit))
+    if summary["unclassified_limited_items"]:
+        lines.append("Sensor amplitude limit reported for %d/%d %s; true peak may be higher." % (
+            summary["unclassified_limited_items"], count, unit))
+    if summary["detector_record_items"]:
+        lines.append("Range provenance uses detector records for %d/%d %s; capture-only counts unavailable." % (
+            summary["detector_record_items"], count, unit))
+    if summary["unknown_items"]:
+        lines.append("Range/marker provenance unavailable for %d/%d retained %s." % (
+            summary["unknown_items"], count, unit))
+    if summary["reference_limited_items"]:
+        lines.append("Separate resting references: limits in %d/%d %s (%d native marker / %d finite-rail axis values); "
+                     "baseline/true peak uncertain; counts may overlap capture." % (
+            summary["reference_limited_items"], count, unit, summary["reference_marker_axis_values"],
+            summary["reference_range_limit_axis_values"]))
+    return lines
+
+
+def _marked_envelope(trace, extra):
+    """Retain exact Beta event rows without exceeding the capture point limit."""
+    extra = tuple({tuple(row) for row in extra})
+    if len(trace) + len(extra) > _MAX_CAPTURE_TRACE_POINTS:
+        trace = _envelope(trace, max_points=_MAX_CAPTURE_TRACE_POINTS - len(extra))
+    return sorted({tuple(row) for row in tuple(trace) + extra})
 
 
 def _capture_data(capture, record):
@@ -249,6 +374,7 @@ def _capture_data(capture, record):
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "absolute_peak_g": {axis: max(abs(row[index]) for row in delta)
                                     for index, axis in enumerate("xyz", 1)}}
+    metadata.update(_range_metadata(capture, record))
     _json(record)
     return _envelope(delta), metadata
 
@@ -522,10 +648,14 @@ def write_accuracy(directory, run_id, axis_results, result, reason=None, simulat
         raise ValueError("Accuracy published paths must start as an empty mapping")
     rendered, keys = [], []
     for axis, item in axes.items():
-        traces = [reference.receipt.trace for reference in item["capture_paths"] if reference is not None]
+        references = [reference for reference in item["capture_paths"] if reference is not None]
+        traces = [reference.receipt.trace for reference in references]
+        captures = [json.loads(reference.receipt.metadata_json) for reference in references]
         payload = {"kind": "accuracy", "axis": axis, "result": result, "reason": reason,
                    "requested": item["requested_samples"], "trials": item["trials"],
-                   "statistics": item["statistics"], "traces": traces,
+                   "statistics": item["statistics"], "traces": traces, "captures": captures,
+                   "range_summary": _range_summary(list(zip(item["trials"], captures)),
+                                                   "measured_homes_qualifier_excluded", "homes"),
                    "discovery": item.get("discovery"), "simulated": bool(simulated), **clock}
         data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
         _check_png(data, decode_pixels=False)
@@ -542,6 +672,7 @@ def write_noise_capture(directory, run_id, iteration, capture, record, simulated
     samples, baseline, delta = _validate_noise_capture(run_id, iteration, capture, record)
     elapsed = [(row[0] - samples[0][0], *row[1:]) for row in delta]
     metadata = {"sample_count": len(samples), "baseline_g": list(baseline)}
+    metadata.update(_range_metadata(capture, record, "noise_window"))
     receipt = _Receipt("noise", run_id, None, iteration, _json(record), _json(metadata),
                        _envelope(elapsed), None, None, bool(simulated))
     _check_running(check_running)
@@ -595,6 +726,10 @@ def prepare_noise(run_id, iterations, recommendation, result, reason=None, simul
     payload = {"kind": "noise", "result": result, "reason": reason,
                "records": [item["record"] for item in iterations],
                "traces": [receipt.trace for receipt in receipts],
+               "captures": [json.loads(receipt.metadata_json) for receipt in receipts],
+               "range_summary": _range_summary([
+                   (item["record"], json.loads(receipt.metadata_json))
+                   for item, receipt in zip(iterations, receipts)], "stationary_noise_windows", "windows"),
                "recommendation": recommendation, "simulated": bool(simulated), **clock}
     data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
     _check_png(data, decode_pixels=False)
@@ -687,15 +822,15 @@ def compact_beta_home(capture, record):
     # every exact event/peak row in addition to the ordinary display envelope.
     extra = [(row[0] - samples[0][0],) + tuple(row[index + 1] - baseline[index] for index in range(3))
              for row in samples if row[0] in marked_times]
-    trace = sorted({tuple(row) for row in tuple(trace) + tuple(extra)})
+    trace = _marked_envelope(trace, extra)
     onset = telemetry["first_crossing"]["time_s"]
     onset_span = telemetry["onset_window"]["end_time_s"] - onset
     response_end = telemetry["post_stop_response"].get("end_time_s")
     event_end = max(onset + onset_span, response_end if _finite(response_end) else onset + onset_span)
     event = [(row[0] - samples[0][0],) + tuple(row[index + 1] - baseline[index] for index in range(3))
              for row in samples if onset - onset_span <= row[0] <= event_end]
-    event_trace = sorted({tuple(row) for row in tuple(_envelope(event, 256)) + tuple(extra)
-                          if onset - onset_span <= row[0] + samples[0][0] <= event_end})
+    event_trace = _marked_envelope(_envelope(event, 256), [row for row in extra
+        if onset - onset_span <= row[0] + samples[0][0] <= event_end])
     return {"record": json.loads(_json(record)),
             "capture": {**metadata, "trace": trace,
                         "event_trace": event_trace,
@@ -729,12 +864,14 @@ def write_beta_motion(directory, run_id, axis, iterations, homes=(), result="com
             raise ValueError("Beta moving captures overlap or changed sensor context")
         previous_end, motion_context = capture["samples"][-1][0], context
         trace, metadata = _capture_data(capture, record)
+        if metadata.get("range_provenance_scope") == "capture":
+            metadata["range_provenance_scope"] = "beta_motion"
         marked = {statistics["seed_peak_time_s"], statistics["all_phase_peak_time_s"]}
         marked.update(phase["peak_time_s"] for phase in statistics["phases"])
         rows, baseline = capture["samples"], capture["baseline_g"]
         extra = [(row[0] - rows[0][0],) + tuple(row[index + 1] - baseline[index] for index in range(3))
                  for row in rows if row[0] in marked]
-        trace = sorted({tuple(row) for row in tuple(trace) + tuple(extra)})
+        trace = _marked_envelope(trace, extra)
         motions.append({"record": record, "statistics": statistics,
                         "trace": trace, "capture": metadata})
     for item in homes:
@@ -766,6 +903,10 @@ def write_beta_motion(directory, run_id, axis, iterations, homes=(), result="com
     title = "Accel Homing Beta %s - Suggested Threshold" % axis.upper()
     payload = {"kind": "beta", "axis": axis, "motions": motions, "homes": home_traces,
                "incomplete_homes": incomplete_homes,
+               "motion_range_summary": _range_summary([
+                   (item["record"], item["capture"]) for item in motions], "beta_motion_captures", "motions"),
+               "home_range_summary": _range_summary([
+                   (item["record"], item["capture"]) for item in home_traces], "beta_home_captures", "homes"),
                "proposed_threshold_g": proposed_threshold_g, "result": result, "reason": reason,
                "title": title, "simulated": bool(simulated), **clock}
     data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
@@ -1097,7 +1238,7 @@ def _finish_layout(figure, footer, reason=None):
     figure.tight_layout(pad=1.1, h_pad=1.4, rect=(0, bottom, 1, 1))
 
 
-def _axes_style(axis, ylabel="Acceleration (g)", zero=True):
+def _axes_style(axis, ylabel="Absolute acceleration (g)", zero=True):
     axis.minorticks_on()
     axis.grid(which="major", color="grey", linewidth=.6, alpha=.4)
     axis.grid(which="minor", color="lightgrey", linewidth=.4, alpha=.4)
@@ -1109,26 +1250,29 @@ def _axes_style(axis, ylabel="Acceleration (g)", zero=True):
     axis.margins(x=.02, y=.12)
 
 
+def _absolute_limits(axis):
+    # Clamp only after relim/autoscale: setting bottom=0 before plotting disables
+    # Matplotlib's Y autoscaling and can clip the signal at its initial range.
+    axis.relim()
+    axis.autoscale_view(scalex=False, scaley=True)
+    axis.set_ylim(bottom=0)
+
+
 def _traces(axis, trace, alpha=1.0, labels=True):
     for index, (letter, color) in enumerate(zip("XYZ", ("red", "green", "blue")), 1):
-        axis.plot([row[0] for row in trace], [row[index] for row in trace], color=color,
-                  linewidth=.75, alpha=alpha, label=letter if labels else None)
+        axis.plot([row[0] for row in trace], [abs(row[index]) for row in trace], color=color,
+                  linewidth=.75, alpha=alpha, label="|%s|" % letter if labels else None)
 
 
 def _threshold(axis, record, label=True):
     threshold = record.get("threshold_g")
     if not _finite(threshold) or threshold <= 0:
         return
-    direction = record.get("direction", 0)
     vector = record.get("impact_metric") == "xyz_magnitude"
-    limits = ([threshold] if vector else
-              [direction * threshold] if direction in (-1, 1) else [-threshold, threshold])
     name = ("XYZ magnitude trigger %s g" % _number(threshold, 4) if vector else
-            "Trigger %+.4g g" % limits[0] if len(limits) == 1 else
-            "Trigger ±%s g" % _number(threshold, 4))
-    for index, value in enumerate(limits):
-        axis.axhline(value, color="#744b98", linestyle="--", linewidth=1.1,
-                     label=name if label and index == 0 else None)
+            "Absolute-axis trigger %s g" % _number(threshold, 4))
+    axis.axhline(threshold, color="#744b98", linestyle="--", linewidth=1.1,
+                 label=name if label else None)
 
 
 def _plot_capture(figure, payload):
@@ -1155,20 +1299,26 @@ def _plot_capture(figure, payload):
     channel = {"x": 1, "y": 2}[payload["axis"]]
     peak = (max(magnitude, key=lambda row: row[1]) if vector else
             max(trace, key=lambda row: abs(row[channel])))
-    peak_value = peak[1] if vector else peak[channel]
+    peak_value = peak[1] if vector else abs(peak[channel])
     peak_name = "XYZ magnitude" if vector else "|%s|" % payload["axis"].upper()
     axis.plot([peak[0]], [peak_value], "o", color="#192d45", markersize=4)
+    range_summary = _range_summary([(record, captured)], "home_capture", "captures")
+    onset_g = record.get("onset_g")
+    peak_g = record.get("impact_peak_g")
+    peak_label = "Endpoint-estimate detector peak" if range_summary["marker_axis_values"] else "Reported detector peak"
     _axes_summary(axis, ["Samples: %d  |  Travel: %s mm  |  Onset: %s s / %s g" % (
                             captured["sample_count"], _number(_measured_travel(record), 6),
-                            _number(elapsed, 4), _number(record.get("onset_g"))),
-                         "Detector peak: %s g  |  Captured %s peak: %s g" % (
-                            _number(record.get("impact_peak_g")), peak_name, _number(abs(peak_value)))])
+                            _number(elapsed, 4), _number(abs(onset_g) if _finite(onset_g) else onset_g)),
+                         "%s: %s g  |  Displayed %s peak: %s g" % (
+                            peak_label, _number(abs(peak_g) if _finite(peak_g) else peak_g), peak_name,
+                            _number(peak_value))] + _range_observation_lines(range_summary))
+    _absolute_limits(axis)
     axis.legend(loc="best", fontsize=8)
-    _finish_layout(figure, "Stationary baseline removed. Commanded travel is not physical stop accuracy.")
+    _finish_layout(figure, "Absolute components after stationary-baseline subtraction. Commanded travel is not physical stop accuracy.")
 
 
 def _plot_beta(figure, payload):
-    """Beta-only combined diagnostic; ordinary chart styles remain untouched."""
+    """Beta-only combined diagnostic with absolute centered components."""
     figure.set_size_inches(12, 17)
     suggestion = _number(payload.get("proposed_threshold_g"), 6)
     _title(figure, payload, "%s: %s g" % (payload["title"], suggestion))
@@ -1180,6 +1330,7 @@ def _plot_beta(figure, payload):
         if number >= len(payload["motions"]):
             axis.text(.5, .5, "No valid beta motion capture", ha="center", transform=axis.transAxes)
             _axes_summary(axis, ["Central motion %d" % (number + 1)])
+            _absolute_limits(axis)
             continue
         item = payload["motions"][number]
         record, stats, trace, captured = item["record"], item["statistics"], item["trace"], item["capture"]
@@ -1203,12 +1354,18 @@ def _plot_beta(figure, payload):
         _axes_summary(axis, ["Central motion %d | Configured speed: %s mm/s | Planner speed: %s mm/s" % (
                                 number + 1, _number(configured, 6), _number(effective, 6)),
                              "Seed-eligible peak: %s g | Braking/return excluded from seed | %d full samples" % (
-                                _number(stats["seed_magnitude_peak_g"], 6), stats["sample_count"])])
+                                _number(stats["seed_magnitude_peak_g"], 6), stats["sample_count"])] +
+                            _range_observation_lines(_range_summary([(record, captured)], "beta_motion", "motions")))
         axis.legend(loc="upper right", ncol=4, fontsize=7)
+        _absolute_limits(axis)
     events = axes[3]
     _axes_style(events, "XYZ magnitude (g)")
     events.set_xlabel("Beta home, including rejected candidates")
     homes = payload["homes"]
+    home_range = payload.get("home_range_summary") or _range_summary([
+        (item["record"], item["capture"]) for item in homes], "beta_home_captures", "homes")
+    motion_range = payload.get("motion_range_summary") or _range_summary([
+        (item["record"], item["capture"]) for item in payload["motions"]], "beta_motion_captures", "motions")
     if homes:
         indices = list(range(1, len(homes) + 1))
         for key, label, color in (("pre_onset_noise", "Noise strictly before crossing", "#577d34"),
@@ -1228,11 +1385,13 @@ def _plot_beta(figure, payload):
     _axes_summary(events, ["Suggested threshold: %s g | Proposal only | %d captured beta homes" % (
                             suggestion, len(homes)),
                           "Event statistics are computed per sample before any display reduction."] +
+                         _range_observation_lines(home_range) +
                          ["Incomplete attempt %s: %s" % (
                              _number(item.get("workflow_attempt")), str(item.get("beta_reason") or item.get("result"))[:160])
                           for item in payload.get("incomplete_homes", [])[:2]])
+    _absolute_limits(events)
     for channel, (axis, letter, color) in enumerate(zip(axes[4:], "XYZ", ("red", "green", "blue")), 1):
-        _axes_style(axis, "%s acceleration (g)" % letter)
+        _axes_style(axis, "|%s| acceleration (g)" % letter)
         axis.set_xlabel("Time from each beta home's exact first crossing (s)")
         for number, item in enumerate(homes):
             record, captured = item["record"], item["capture"]
@@ -1240,7 +1399,7 @@ def _plot_beta(figure, payload):
             trace = captured.get("event_trace") or captured["trace"]
             last = number == len(homes) - 1
             axis.plot([row[0] + captured["first_sample_time_s"] - onset for row in trace],
-                      [row[channel] for row in trace], color=color,
+                      [abs(row[channel]) for row in trace], color=color,
                       linewidth=1.0 if last else .6, alpha=.95 if last else .23,
                       label="Last beta home" if last else None)
         axis.axvline(0, color="#2462a6", linestyle=":", linewidth=.8, label="Exact first crossing")
@@ -1259,14 +1418,16 @@ def _plot_beta(figure, payload):
                 if _finite(response.get("end_time_s")):
                     axis.axvspan(boundary, response["end_time_s"] - onset,
                                  color="#d7b2ca", alpha=.12)
-            _axes_summary(axis, ["Beta home XYZ event traces | Last home emphasized | Resting offset removed"])
+            _axes_summary(axis, ["Absolute Beta home components | Last home emphasized | Resting offset removed"])
         else:
             axis.text(.5, .5, "No valid beta home trace", ha="center", transform=axis.transAxes)
         axis.legend(loc="best", fontsize=7)
+        _absolute_limits(axis)
     _finish_layout(figure,
         "Beta suggestion only; no model staged or saved. Runtime-restoration outcome is in the command diagnostics. "
-        "Exact event metrics use full samples; plotted curves are extrema envelopes. "
-        "Queue completion is host observed, not a measurement of mechanical stopping.", payload.get("reason"))
+        "Exact event metrics use full samples; absolute curves follow resting-offset subtraction. "
+        "Queue completion is host observed, not a measurement of mechanical stopping. " +
+        " ".join(_range_observation_lines(motion_range)), payload.get("reason"))
 
 
 def _plot_accuracy(figure, payload):
@@ -1278,6 +1439,10 @@ def _plot_accuracy(figure, payload):
         summary += ["Min: %s mm  |  Max: %s mm  |  Std dev: %s mm  |  Variance: %s mm²" % (
                     _number(stats["min_mm"], 6), _number(stats["max_mm"], 6),
                     _number(stats["stddev_mm"]), _number(stats.get("variance_mm2")))]
+    range_summary = payload.get("range_summary") or _range_summary([
+        (record, captured) for record, captured in zip(trials, payload.get("captures", [{} for _ in trials]))],
+        "measured_homes_qualifier_excluded", "homes")
+    summary += _range_observation_lines(range_summary)
     _title(figure, payload, "Accel Homing Accuracy " + payload["axis"].upper())
     vector = bool(trials and trials[0].get("impact_metric") == "xyz_magnitude")
     axes = figure.subplots(5 if vector else 4, 1)
@@ -1294,15 +1459,16 @@ def _plot_accuracy(figure, payload):
     _axes_summary(travel, summary)
     for channel, (axis, color, letter) in enumerate(zip(axes[1:],
                     ("red", "green", "blue"), "XYZ"), 1):
-        _axes_style(axis, "%s acceleration (g)" % letter)
+        _axes_style(axis, "|%s| acceleration (g)" % letter)
         for index, trace in enumerate(traces):
-            axis.plot([row[0] for row in trace], [row[channel] for row in trace], color=color,
+            axis.plot([row[0] for row in trace], [abs(row[channel]) for row in trace], color=color,
                       alpha=.35 if len(traces) > 1 else 1., linewidth=.7,
-                      label="%s (%d homes)" % (letter, len(traces)) if index == 0 else None)
+                      label="|%s| (%d homes)" % (letter, len(traces)) if index == 0 else None)
         if not vector and channel == {"x": 1, "y": 2}[payload["axis"]] and trials:
             _threshold(axis, trials[0])
         if traces:
             axis.legend(fontsize=8, loc="best")
+        _absolute_limits(axis)
     if vector:
         axis = axes[4]
         _axes_style(axis, "XYZ magnitude (g)")
@@ -1313,6 +1479,7 @@ def _plot_accuracy(figure, payload):
                       label="XYZ magnitude" if index == 0 else None)
         _threshold(axis, trials[0])
         axis.legend(fontsize=8, loc="best")
+        _absolute_limits(axis)
     _finish_layout(figure, "Commanded travel only; not physical stop accuracy. Qualifier excluded. Population statistics.", payload.get("reason"))
 
 
@@ -1332,7 +1499,7 @@ def _plot_noise(figure, payload):
     peak = max(.001, max((abs(value) for trace in traces for row in trace for value in row[1:]), default=0.)) * 1.1
     for index, axis in enumerate(axes):
         _axes_style(axis)
-        axis.set_ylim(-peak, peak)
+        axis.set_ylim(0, peak)
         if index >= len(traces):
             axis.set_title("Window %d - no valid data" % (index + 1), fontsize=10)
             continue
@@ -1345,11 +1512,17 @@ def _plot_noise(figure, payload):
         if "noise_magnitude_peak_g" in record:
             summary.append("XYZ-magnitude peak: %s g (calibration metric)" %
                            _number(record["noise_magnitude_peak_g"], 4))
+        captures = payload.get("captures", [{} for _ in records])
+        summary += _range_observation_lines(_range_summary([(record, captures[index])], "noise_window", "windows"))
         _axes_summary(axis, summary)
         axis.legend(loc="best", ncol=3, fontsize=8)
     for axis in axes[:-1]:
         axis.set_xlabel("")
-    _finish_layout(figure, "Window means removed. " + note, payload.get("reason"))
+    range_summary = payload.get("range_summary") or _range_summary([
+        (record, captured) for record, captured in zip(records, payload.get("captures", [{} for _ in records]))],
+        "stationary_noise_windows", "windows")
+    _finish_layout(figure, "Absolute components after window-mean subtraction. " + note + " " +
+                   " ".join(_range_observation_lines(range_summary)), payload.get("reason"))
 
 
 if __name__ == "__main__":

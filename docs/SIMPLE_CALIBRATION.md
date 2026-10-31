@@ -78,8 +78,11 @@ When the sensor range is known, the candidate and final saved threshold must
 remain at or below
 `0.8 * sensor_full_scale_g`. This existing 80% rule is a conservative software
 headroom policy, not the physical saturation point. The active stream range is
-checked again before arming; sensor saturation, invalid data and other fault
-checks remain separate. An unknown range prevents automatic noise-based
+checked again before arming. Recognized finite rails and native Beacon clipping
+markers remain accepted bounded observations with separate range provenance;
+excess amplitude is unknown, as are native markers' true sign and peak.
+Invalid/non-finite samples and acquisition/timing faults still abort. An
+unknown range prevents automatic noise-based
 selection; an explicit, otherwise valid `START_THRESHOLD` can still be used.
 Neither value is clamped downward to fit a limit. If the qualified candidate
 plus the final 0.5 g margin exceeds that ceiling, calibration aborts without

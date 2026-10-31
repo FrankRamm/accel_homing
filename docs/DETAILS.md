@@ -16,7 +16,7 @@ or a hard real-time endstop.
 | --- | --- |
 | New simple calibration | Fresh XYZ resting offset; magnitude at each sample; no quiet-range gate or integrated motion proof. |
 | New saved model with `impact_metric: xyz_magnitude` | Same vector detector during ordinary homing, TEST, CHARTS and ACCURACY after reload, unless explicit config thresholds take precedence. |
-| Explicit config thresholds / older models | Legacy machine-axis detector with fresh quiet reference and its motion/pressed policies. |
+| Explicit config thresholds / older selected-axis models | Absolute machine-axis deviation about a fresh quiet reference, with legacy motion/pressed policies. |
 | Beta calibration | Isolated moving-noise experiment and proposal; does not replace or save the ordinary model. |
 
 The vector detector evaluates
@@ -25,6 +25,21 @@ The first sample reaching the threshold requests stopping; a later peak does
 not delay that request. Channel permutations/sign reversals do not change the
 magnitude. Motion, vibration, binding and intended stop contact can all produce
 the same threshold crossing. The full-move deadline and data-fault checks remain.
+
+The selected-axis RAW detector similarly compares `abs(a-b)` with its
+threshold; homing direction does not select an acceleration polarity.
+Reference subtraction always precedes the absolute value. Source protocol
+values, reference offsets and the signed evidence used for motion proof and
+recovery retain their signs. PNG component curves apply the same absolute
+display convention; travel and relative times keep their existing meaning.
+
+Known finite sensor rails remain valid bounded observations. Native Beacon's
+clipping sentinel has no measured sign or amplitude; it is decoded to a
+bounded endpoint estimate using prior sensor sign. Diagnostics distinguish
+these markers from finite rail values, disclose unknown excess amplitude and
+retain separate capture and resting-reference scopes. Other invalid or
+non-finite data still faults. These observations do not relax threshold
+headroom or establish a physical impact peak.
 
 Changing a threshold through temporary SET does not save a new detector/model.
 Persistent manual overrides take precedence over saved model values on reload.
@@ -58,8 +73,10 @@ max(0.20 * active_threshold_g, min(0.5, active_threshold_g))
 
 For references admitted above the older 20% gate, legacy motion proof discounts
 the observed per-axis noise bounds. Generic proof uses the maximum absolute
-deviation from the accepted mean; uncertain signed motion keeps raw impacts
-bidirectional. Expanded native references retain bounded motion/pressed checks.
+deviation from the accepted mean. Signed integration supplies motion-proof
+evidence and does not select impact polarity: RAW impacts always use absolute
+deviation from the reference. Expanded native references retain bounded
+motion/pressed checks.
 Ambiguous startup fails with `no_motion`; wider admission does not prove that
 a low threshold or every acceleration is usable.
 
@@ -153,6 +170,11 @@ workflows. Per-home ACCURACY traces remain in memory; failures retain console
 statistics without a chart. A successful Beta proposal emits a labelled PNG;
 its same-command console diagnostics also cover failures. See [plots](PLOTS.md) and
 [Beta](BETA.md).
+
+Displayed acceleration components are nonnegative after signed-reference
+subtraction. Bounded envelopes preserve signed extrema and absolute troughs;
+they are not a full-resolution export. Range notes aggregate all displayed
+homes/windows and report limited references separately without double counting.
 
 The source/API references and unresolved physical limits are collected in
 [compatibility](COMPATIBILITY.md). Test evidence belongs to its exact revision

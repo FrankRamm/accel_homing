@@ -168,14 +168,14 @@ class KeepOriginTest(unittest.TestCase):
 
 
 class TravelDirectionTest(unittest.TestCase):
-    """With no configured sign, travel fixes which way an impact must point."""
+    """Signed travel estimates never restrict absolute impact acceptance."""
 
-    def test_jolt_in_the_travel_direction_is_ignored_once_moving(self):
+    def test_impact_in_the_travel_direction_is_accepted_once_moving(self):
         obj, attempt, trigger = armed()
         end = feed(obj, attempt, 200, 1.0, 2)  # about 150 mm/s in +X
         self.assertEqual(attempt.auto_direction, -1)
         obj._inspect(batch(end, [(counts(9.0), 0, counts(1.0))] + [REST] * 7))
-        self.assertEqual(trigger.messages, [])
+        self.assertEqual(trigger.messages, [[HIT]])
         obj._inspect(batch(end + 8, [(counts(-9.0), 0, counts(1.0))] + [REST] * 7))
         self.assertEqual(trigger.messages, [[HIT]])
 
@@ -185,10 +185,10 @@ class TravelDirectionTest(unittest.TestCase):
         self.assertEqual(trigger.messages, [[HIT]])
         self.assertEqual(attempt.auto_direction, 0)
 
-    def test_configured_sign_wins(self):
+    def test_configured_sign_does_not_suppress_signed_travel_diagnostics(self):
         obj, attempt, trigger = armed(impact_sign=1)
         end = feed(obj, attempt, 200, 1.0, 2)
-        self.assertEqual(attempt.auto_direction, 0)
+        self.assertEqual(attempt.auto_direction, -1)
         obj._inspect(batch(end, [(counts(9.0), 0, counts(1.0))] + [REST] * 7))
         self.assertEqual(trigger.messages, [[HIT]])
 

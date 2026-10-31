@@ -89,6 +89,9 @@ exact accuracy command printed in the console; it does not rerun automatically.
 Charts are saved only after the requested workflow and its required cleanup/save
 succeed. Failed, rejected or cancelled runs keep console diagnostics without
 saving a partial PNG, including temporary per-home images.
+Acceleration curves show absolute deviation after subtracting the signed
+resting reference. Native marker estimates and finite sensor rails carry
+separate range notes; commanded-travel statistics keep their mm scale.
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.

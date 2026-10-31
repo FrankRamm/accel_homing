@@ -263,7 +263,10 @@ class NoiseAcquisitionTests(unittest.TestCase):
 
     def test_missing_stale_future_duplicate_gap_clip_error_frozen_and_map_fail_without_motion(self):
         for decoded in (False, True):
-            for mode in ("missing", "stale", "future", "duplicate", "gap", "clip", "error", "frozen", "map"):
+            # A native all-marker window is still frozen; a finite generic
+            # range observation is valid and is covered by the endpoint tests.
+            modes = ("missing", "stale", "future", "duplicate", "gap", "error", "frozen", "map")
+            for mode in modes + (() if decoded else ("clip",)):
                 with self.subTest(decoded=decoded, mode=mode):
                     obj = self.machine(decoded)
                     noise_flow(obj, mode)

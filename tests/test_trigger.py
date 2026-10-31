@@ -35,14 +35,14 @@ class DirectionalTriggerTest(unittest.TestCase):
         self.assertEqual(attempt.onset_batch[2], 3)
         self.assertEqual(attempt.reason, "impact")
 
-    def test_opposite_direction_never_triggers(self):
+    def test_opposite_configured_direction_also_triggers(self):
         obj = make_homing()
         feed_baseline(obj)
         attempt, trigger = arm_axis(obj, "x", 200, 9000)
         obj._inspect(batch(200, [x_sample(14.0)] * 8))
         obj._inspect(batch(208, still()))
-        self.assertEqual(trigger.messages, [])
-        self.assertAlmostEqual(attempt.noise_pos * attempt.count_g, 14.0, delta=0.05)
+        self.assertEqual(trigger.messages, [[HIT]])
+        self.assertAlmostEqual(attempt.onset_raw * attempt.count_g, 14.0, delta=0.05)
 
     def test_other_axes_are_ignored(self):
         obj = make_homing()
@@ -64,11 +64,10 @@ class DirectionalTriggerTest(unittest.TestCase):
         attempt, trigger = arm_axis(obj, "x", 200, 9000)
         obj._inspect(batch(200, [x_sample(-3.0), (0x7FFF, 0, counts(1.0))] + still(6)))
         self.assertEqual(trigger.messages, [[HIT]])
-        self.assertLess(attempt.onset_raw, 0)
+        self.assertGreater(attempt.onset_raw, 0)
         self.assertEqual(attempt.onset_batch[2], 1)
 
-    def test_clip_against_the_configured_direction_never_triggers(self):
-        # A positive clip is still a clip the wrong way for impact_sign -1.
+    def test_clip_against_configured_direction_uses_absolute_centered_value(self):
         obj = make_homing()
         feed_baseline(obj)
         attempt, trigger = arm_axis(obj, "x", 200, 9000)
@@ -76,17 +75,17 @@ class DirectionalTriggerTest(unittest.TestCase):
         # The next batch starts with a clip too. It follows the decoded clip
         # before it, not the raw 0x7FFF marker, so it stays positive.
         obj._inspect(batch(208, [(0x7FFF, 0, counts(1.0))] + still(7)))
-        self.assertEqual(trigger.messages, [])
+        self.assertEqual(trigger.messages, [[HIT]])
         hit = still()
         hit[2] = x_sample(-12.0)
         obj._inspect(batch(216, hit))
         self.assertEqual(trigger.messages, [[HIT]])
-        self.assertEqual(attempt.onset_batch[2], 2)
+        self.assertEqual(attempt.onset_batch[2], 1)
 
-    def test_ignored_clips_count_as_full_scale_in_the_measured_speed(self):
+    def test_other_axis_clips_keep_signed_values_in_the_motion_integral(self):
         obj = make_homing()
         feed_baseline(obj)
-        attempt, _trigger = arm_axis(obj, "x", 200, 9000)
+        attempt, _trigger = arm_axis(obj, "y", 200, 9000)
         obj._inspect(batch(200, [x_sample(3.0)] + [(0x7FFF, 0, counts(1.0))] * 7))
         clip = obj.clip_values[0]
         self.assertAlmostEqual(attempt.sums[0], counts(3.0) + 7 * clip - 8 * attempt.bases[0])
@@ -125,7 +124,7 @@ class EitherDirectionTest(unittest.TestCase):
             attempt, trigger = arm_axis(obj, "x", 200, 9000)
             obj._inspect(batch(200, [x_sample(g)] + still(7)))
             self.assertEqual(trigger.messages, [[HIT]])
-            self.assertEqual(attempt.onset_raw > 0, g > 0)
+            self.assertGreater(attempt.onset_raw, 0)
 
     def test_noise_below_threshold_in_both_directions_does_not_trigger(self):
         obj = make_homing(impact_sign=0)
@@ -141,9 +140,7 @@ class EitherDirectionTest(unittest.TestCase):
         obj = make_homing(options={"x_impact_sign": 0, "y_impact_sign": 0})
         self.assertEqual(obj.impact_sign, {"x": 0, "y": 0})
 
-    def test_checked_noise_skips_travel_direction_once_moving(self):
-        # Once the toolhead travels, a jolt in the travel direction is not
-        # compared with the threshold, so it is not counted as noise.
+    def test_checked_noise_keeps_both_directions_once_moving(self):
         obj = make_homing(impact_sign=0)
         feed_baseline(obj)
         attempt, trigger = arm_axis(obj, "x", 200, 9000)
@@ -153,7 +150,7 @@ class EitherDirectionTest(unittest.TestCase):
         obj._inspect(batch(216, still()))
         self.assertEqual(trigger.messages, [])
         self.assertAlmostEqual(attempt.noise_pos * attempt.count_g, 7.0, delta=0.05)
-        self.assertAlmostEqual(attempt.noise_checked * attempt.count_g, 3.0, delta=0.05)
+        self.assertAlmostEqual(attempt.noise_checked * attempt.count_g, 7.0, delta=0.05)
 
 
 class PerAxisThresholdTest(unittest.TestCase):
@@ -265,7 +262,7 @@ class ReportingTest(unittest.TestCase):
         obj._inspect(batch(212, [x_sample(14.0)] + still(7)))
         obj._inspect(batch(400, [x_sample(15.5)] + still(7)))  # outside the impact window
         self.assertAlmostEqual(record.record["impact_peak_g"], 14.0, delta=0.05)
-        self.assertEqual(record.record["impact_sign"], -1)
+        self.assertEqual(record.record["impact_sign"], 0)
 
     def test_velocity_from_travel_has_the_travel_sign(self):
         obj = make_homing()

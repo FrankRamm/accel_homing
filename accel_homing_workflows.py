@@ -55,6 +55,11 @@ _SAFE_Z_G28 = _SafeZHoming.cmd_G28 if _SafeZHoming is not None else None
 _OVERRIDE_G28 = _HomingOverride.cmd_G28 if _HomingOverride is not None else None
 
 AXES = {"x": 0, "y": 1}
+POLARITY_POLICY = "absolute_after_reference_subtraction_v1"
+SIGNAL_QUALITY_FIELDS = ("amplitude_limited", "excess_amplitude_unknown", "peak_semantics",
+                        "signal_scope", "native_clip_decode", "range_limit_axis_values",
+                        "range_limit_axis_counts", "clipped_axis_values", "clipped_axis_counts",
+                        "reference_signal_quality")
 CALIBRATION_MIN_TRAVEL_MM = 20.0
 CALIBRATION_REPEATABILITY_MM = 2.0
 CALIBRATION_THRESHOLD_MARGIN_G = 0.5
@@ -188,6 +193,7 @@ class AccelHomingWorkflows:
                             if config.get(a + "_threshold", None) is not None}
         if config.get("threshold", None) is not None:
             self.manual_axes.update(AXES)
+        self.temporary_manual_thresholds = {}
         self.model = None
         if config.has_section(self.model_section):
             self.model = self.printer.load_object(config, self.model_section)
@@ -698,6 +704,32 @@ class AccelHomingWorkflows:
         if self.session is not None and (not self.in_home or set(axes) != {self.home_axis}):
             raise self._error("a supervised workflow is active; resume calibration with its "
                               "command or use CANCEL")
+        calibrating = bool(self.session and self.session.get("mode") == "calibration")
+        for axis in axes:
+            if (calibrating or axis in self.manual_axes or self._temporary_manual_threshold(axis)
+                    or self.model is None or axis not in self.model.thresholds):
+                continue
+            metadata = self.model.metadata[axis]
+            if (metadata.get("impact_metric") != "xyz_magnitude"
+                    and metadata.get("polarity_policy") != POLARITY_POLICY
+                    and not (getattr(self.owner, "backend", None) is None
+                             and metadata.get("native_polarity_policy") == POLARITY_POLICY)):
+                raise self._error("Saved selected-axis homing model has legacy/unknown sign-gated "
+                                  "qualification; recalibrate with ACCEL_HOMING_CALIBRATE AXIS=%s "
+                                  "CENTERED=1 or set an explicit manual threshold" % axis.upper())
+
+    def _temporary_manual_threshold(self, axis):
+        return (axis in self.temporary_manual_thresholds
+                and self.temporary_manual_thresholds[axis] == self.owner.threshold_g[axis])
+
+    def note_manual_threshold(self, axis, threshold):
+        self.temporary_manual_thresholds[axis] = threshold
+
+    @staticmethod
+    def _signal_metadata(capture):
+        # Freeze small summaries without retaining mutable acquisition objects.
+        return json.loads(json.dumps({key: capture[key] for key in SIGNAL_QUALITY_FIELDS
+                                      if key in capture}, allow_nan=False))
 
     def check_home_result(self, record):
         # Single-touch geometry is enforced before any workflow motion. Record
@@ -788,7 +820,7 @@ class AccelHomingWorkflows:
                 and self.session.get("algorithm") == SIMPLE_CALIBRATION):
             return True
         model = self.model
-        return bool(model is not None and axis not in self.manual_axes
+        return bool(model is not None and axis not in self.manual_axes and not self._temporary_manual_threshold(axis)
                     and axis in model.thresholds
                     and model.metadata[axis].get("impact_metric") == "xyz_magnitude")
 
@@ -1019,6 +1051,7 @@ class AccelHomingWorkflows:
                                                 for index, axis in enumerate("xyz", 1)))
                              for row in samples)
         return {"run_id": session["run_id"], "noise_iteration": iteration,
+                **self._signal_metadata(capture),
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "baseline_g": baseline, "noise_peak_g": peaks,
@@ -1338,6 +1371,7 @@ class AccelHomingWorkflows:
         source_record = record
         detector_record = capture.pop("_record", None)
         record = dict(record)
+        record.update(self._signal_metadata(capture))
         record["run_id"] = session["run_id"]
         record["workflow_attempt"] = session["attempts"]
         record["workflow_threshold_g"] = (threshold if threshold is not None
@@ -1860,6 +1894,8 @@ class AccelHomingWorkflows:
             # sensor headroom, not just the lower threshold used by the trials.
             threshold = self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
+                    "polarity_policy": POLARITY_POLICY,
+                    "signal_quality": [self._signal_metadata(record) for record in qualified],
                     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "expected_center_travel_mm": self._geometry(axis)[1],
                     "travel_tolerance_fraction": self.travel_tolerance,
@@ -2235,6 +2271,7 @@ class AccelHomingWorkflows:
                             or samples[-1][0] < end - interval):
                         raise self._error("Beta capture does not cover the complete forward motion interval")
                     record = {key: value for key, value in plan.items() if key not in ("extractor", "current_helper")}
+                    record.update(self._signal_metadata(capture))
                     record.update(run_id=session["run_id"], beta=True, iteration=iteration,
                                   segments=segments, phase_time_source="actual_commanded_trapq",
                                   motor_settle_complete_time_s=session["beta_motor_settle_complete_time_s"])

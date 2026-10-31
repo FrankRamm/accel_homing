@@ -62,8 +62,10 @@ y_threshold: 0.5
 Manual values must be finite and positive. They have no fixed 0.5/3 g minimum
 or 15 g maximum. When the sensor range is known, a threshold must be at most
 80% of that full-scale range; the active stream is checked again before arming.
-The raw trigger representation must also remain finite and positive. Sensor
-saturation/data faults are separate checks. Do not paste an 8 g threshold for
+The raw trigger representation must also remain finite and positive. Recognized
+sensor rails/Beacon clipping estimates are accepted as bounded observations
+with unknown excess amplitude; they do not relax threshold headroom or other
+data-fault checks. Do not paste an 8 g threshold for
 an 8 g MPU9250 sensor.
 
 To use calibration, comment out both axis overrides **and** the shared
@@ -71,6 +73,14 @@ To use calibration, comment out both axis overrides **and** the shared
 threshold retains the legacy selected-axis detector; a newly calibrated model
 uses XYZ magnitude. Values calibrated for one metric are not interchangeable
 with the other. The detector in use is part of the model/status context.
+Both RAW metrics ignore acceleration polarity after subtracting their fresh
+signed reference; selected-axis detection uses `abs(a-b)`. Homing direction
+still controls commanded travel and does not change the source sensor signs.
+Compatible saved XYZ-magnitude profiles retain their thresholds and
+qualification. A saved selected-axis profile with legacy/unknown sign-gated
+qualification is refused before homing unless it records the current polarity
+policy (including the recognized native policy). Recalibrate that axis or
+choose an explicit manual threshold; the plugin does not rewrite old models.
 
 `model: default` selects `[accel_homing_model default]` in the generated
 SAVE_CONFIG block. Leave the generated **DO NOT EDIT** block alone. Models keep
@@ -98,7 +108,7 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `model` | `default` | Saved model name; letters, numbers, underscore and hyphen only. |
 | `x_threshold`, `y_threshold` | Model/sensor default | Manual independent thresholds in g; finite positive with known-range headroom. |
 | `threshold` | Native default 8 g | Historical shared manual fallback; omit when using saved models. |
-| `x_impact_sign`, `y_impact_sign` | `0` | Legacy detector: automatic direction; `1`/`-1` are expert machine-mapped sign overrides. |
+| `x_impact_sign`, `y_impact_sign` | `0` | Accepted compatibility values: `-1`, `0`, `1`. RAW impact detection remains independent of acceleration polarity. |
 | `homing_accel` | `5000` | Homing/release/early-return acceleration cap in mm/s²; nonnegative; `0` leaves the live limit unchanged. Never raises a lower live acceleration. |
 | `back_off_dist` | `5` | Final successful XY release and cross-axis release in mm; 0–20, zero disables. Not a second touch. |
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |
@@ -109,6 +119,12 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `travel_margin` | `1.1` | Full-move travel/time margin multiplier; 1–2. |
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
+
+The compatibility sign options do not select detector polarity. An
+`IMPACT_SIGN`-only SET changes the retained setting but does not register an
+explicit manual threshold or requalify an old selected-axis model. Supply an
+explicit `THRESHOLD` or complete fresh calibration when that model's
+qualification is refused.
 
 `back_off_dist` is bounded by the rail limits and existing firmware release;
 it does not repeat an already sufficient release. It applies to ordinary
