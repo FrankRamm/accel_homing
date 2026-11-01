@@ -52,6 +52,11 @@ full suite run establish different things; identify which were actually done.
   receives a single 0.5 g margin. Trial thresholds stay unchanged; the final
   value must fit sensor headroom without clamping, and metadata reports that
   the higher value was not tested by those homes.
+- Ordinary and Beta calibration may retry with 1–10 attempts remaining within
+  the configured cap (40 by default). Each candidate still needs discovery plus
+  ten checks, with no partial qualification. The last permitted home may
+  succeed; an exhausted incomplete run starts no retry return, threshold
+  increase or recentering.
 - Premature calibration returns reverse current signed start-to-halt commanded
   travel before the next candidate; faults/failed returns do not count as
   completed recovery.

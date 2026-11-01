@@ -95,10 +95,14 @@ Before arming, the derived raw trigger limit and its squared value used by the
 XYZ-magnitude detector must both be finite and positive. This validates numeric
 representation rather than adding a configurable g maximum.
 
-The existing monitored-home budget, 40 attempts by default, includes discovery,
-validation and all retries. Before advancing a rejected candidate, at least
-**11 attempts must remain**: one fresh discovery plus ten validation homes.
-This is checked before a recovery return, threshold increase or recentering.
+The monitored-home budget, 40 attempts by default, includes discovery,
+validation and all retries. A rejected candidate may retry with **1–10 attempts
+remaining**.
+At least one attempt must remain before a retry's recovery return, threshold
+increase or recentering. Every candidate still needs a fresh discovery plus
+ten validation homes. An incomplete candidate aborts at the cap without staging
+or saving a replacement threshold; the last permitted home can complete
+qualification.
 There is no separate recovery-count cap or accumulated recovery-distance
 budget; the monitored-home attempt budget still bounds retries.
 
@@ -203,7 +207,7 @@ There is no additional test of whether the carriage physically arrived.
 Ordinary firmware movement limits and errors still apply to the commanded move.
 
 Before returning, the next threshold must satisfy the existing sensor headroom
-policy and at least 11 attempts must remain for a new discovery and ten checks.
+policy and at least one monitored-home attempt must remain.
 After the return's queued movement and `calibration_settle_time` wait (default
 0.25 s) complete, record the return, raise the threshold by STEP, clear the
 candidate and its measurements, and restart discovery. Early reversals retain
@@ -276,8 +280,10 @@ There is no accumulated distance, count/distance limit or remaining budget,
 nominal clearance or margin in this object. Old saved recovery metadata remains
 readable as historical metadata; it is not used to limit a new calibration.
 Active calibration status and final results also expose `attempt_limit`,
-`attempts_remaining` and `candidate_attempts_required` (11). A final result
-retains `candidate_g` and `restarts` if the next candidate is denied.
+`attempts_remaining` and `candidate_attempts_required` (11). The last field
+describes a complete qualification cycle; it is not a minimum remaining-attempt
+requirement. A final result retains `candidate_g` and `restarts` if the next
+candidate is denied.
 
 ## Limits of this method
 

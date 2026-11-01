@@ -39,6 +39,12 @@ known-range limits. `SAVE_CONFIG=0` is accepted; `SAVE_CONFIG=1` is rejected.
 6. Restores temporary state and reports the outcome, including failures or
    incomplete trials.
 
+The monitored-home cap is 40 by default. A retry may use any remaining attempts,
+including 1–10. At least one must remain before a retry return, threshold
+increase or recentering. Each candidate still needs a fresh discovery plus ten checks.
+An incomplete candidate aborts at the cap; the last permitted home can complete
+a proposal.
+
 The noise margin is the larger of 20% or 0.1 g above the observed forward
 peak, rounded upward onto the selected grid. Automatic selection requires a
 known sensor range. Physical current is not measured; a changed homing-current

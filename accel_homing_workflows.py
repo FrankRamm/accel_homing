@@ -537,15 +537,14 @@ class AccelHomingWorkflows:
     def _calibration_attempt_status(self, session):
         return {"attempt_limit": self.max_attempts,
                 "attempts_remaining": max(0, self.max_attempts - session["attempts"]),
+                # Describes a complete candidate; retries do not reserve these homes.
                 "candidate_attempts_required": REQUIRED_SUCCESSES + 1}
 
-    def _require_calibration_candidate_attempts(self, session):
-        budget = self._calibration_attempt_status(session)
-        if budget["attempts_remaining"] < budget["candidate_attempts_required"]:
+    def _require_calibration_attempts(self, session):
+        if not self._calibration_attempt_status(session)["attempts_remaining"]:
             raise self._error(
-                "calibration attempt budget cannot complete another candidate: %d attempts remain, "
-                "%d required for fresh impact discovery and ten checks. No automatic return or "
-                "threshold increase" % (budget["attempts_remaining"], budget["candidate_attempts_required"]))
+                "calibration attempt budget exhausted: maximum homing attempts reached; "
+                "no automatic return, recenter or threshold increase")
 
     def _model_context(self, axis):
         rail = self.owner.rails_by_axis[axis]
@@ -884,10 +883,10 @@ class AccelHomingWorkflows:
                    "impact after >20 mm then ten centered endstop checks with spread <= 2 mm; "
                    "no quietness or acceleration-derived motion proof; returns settle for %.3f s; "
                    "early triggers reverse their recorded signed start-to-halt travel; "
-                   "%d total homing attempts, with %d required before another candidate" % (
+                   "%d total homing attempts; retries continue while attempts remain" % (
                        session["axis"].upper(), session["candidate"], session["threshold_step_g"],
                         session["calibration_settle_time_s"],
-                        self.max_attempts, REQUIRED_SUCCESSES + 1))
+                        self.max_attempts))
 
     def _wait_center(self, reason):
         self._restore()
@@ -1634,6 +1633,8 @@ class AccelHomingWorkflows:
         # Called only after _quality accepted this exact axis's current home.
         session = self.session
         self._check_running(session)
+        if session["mode"] == "calibration":
+            self._require_calibration_attempts(session)
         if (self.owner.homing_active or self.owner.attempt is not None
                 or self.owner.saved_accel is not None):
             raise self._error("return to center requires completed homing with restored normal acceleration")
@@ -1683,11 +1684,11 @@ class AccelHomingWorkflows:
     def _next_calibration_candidate(self, reason, apply=True):
         session = self.session
         self._check_running(session)
+        self._require_calibration_attempts(session)
         candidate = float(Decimal(str(session["candidate"])) + Decimal(str(session["threshold_step_g"])))
         if not math.isfinite(candidate) or candidate <= session["candidate"]:
             raise self._error(reason + "; next calibration candidate must be finite and increase the threshold")
         self._validate_calibration_threshold(candidate, "next calibration candidate")
-        self._require_calibration_candidate_attempts(session)
         if apply:
             session.update(candidate=candidate, successes=0, candidate_qualified=False,
                            candidate_attempt=None, validation_records=[], repeatability_spread_mm=None,
@@ -1726,7 +1727,7 @@ class AccelHomingWorkflows:
                 raise self._error("early return was interrupted or its current result changed")
 
         current()
-        self._require_calibration_candidate_attempts(session)
+        self._require_calibration_attempts(session)
         info = self.owner.rails_by_axis[axis].get_homing_info()
         try:
             self.owner._limit_accel()
@@ -1788,7 +1789,7 @@ class AccelHomingWorkflows:
                 session["candidate_qualified"] = True
                 session["candidate_attempt"] = record["workflow_attempt"]
                 self._info("%s %.2f g candidate selected by impact after %.3f mm (>20 mm); "
-                           "centering this axis for ten endstop checks; discovery hit is excluded" % (
+                           "ten centered endstop checks required; discovery hit is excluded" % (
                                axis.upper(), session["candidate"],
                                record.get("travel_mm_exact", record["travel_mm"])))
                 self._recenter(axis)
@@ -2384,7 +2385,7 @@ class AccelHomingWorkflows:
         if (type(halt) not in (int, float) or not math.isfinite(halt)
                 or halt != terminal[2].get("halt_travel_mm_signed")):
             raise self._error("Beta rejection requires its current finite signed halt displacement")
-        self._require_calibration_candidate_attempts(session)
+        self._require_calibration_attempts(session)
         def current():
             self._beta_check(session)
             if (self.owner.last.get(axis) is not terminal[2]

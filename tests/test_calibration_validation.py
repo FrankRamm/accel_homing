@@ -41,9 +41,11 @@ class ImmediateValidationTests(unittest.TestCase):
     def test_immediate_rejection_respects_sensor_headroom_and_attempts_before_return(self):
         for ceiling in ("sensor-headroom", "attempts"):
             with self.subTest(ceiling=ceiling):
-                rig = Rig({"calibration_max_attempts": 12} if ceiling == "attempts" else {})
+                rig = Rig()
                 if ceiling == "sensor-headroom":
                     rig.owner.full_scale_g = 1.25
+                else:
+                    rig.workflow.max_attempts = 3
                 rig.home_results.extend([{}, {"travel_mm": 150.}, {"travel_mm": 152.0001}])
                 with self.assertRaisesRegex(CommandError, "headroom|attempt budget"):
                     rig.calibrate(save=0)
