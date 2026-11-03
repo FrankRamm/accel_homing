@@ -369,8 +369,33 @@ class ConfigGraph:
         return sections[0]
 
 
+def is_sensor_section(name):
+    parts = name.split()
+    return (bool(parts) and parts[0] in SENSORS
+            and (parts[0] != "beacon" or len(parts) == 1
+                 or (len(parts) == 3 and parts[1] == "sensor")))
+
+
+def is_beacon_model_section(name):
+    parts = name.split()
+    return ((len(parts) == 3 and parts[:2] == ["beacon", "model"])
+            or (len(parts) == 5 and parts[:2] == ["beacon", "sensor"] and parts[3] == "model"))
+
+
+def read_only_section_name(sections, sensor_only=False):
+    """Recognize exact sensor/model fragments without merging or editing options."""
+    name = sections[0].name
+    if ((is_sensor_section(name) or (not sensor_only and is_beacon_model_section(name)))
+            and all(section.name == name
+                    and SECTION.match(section.document.lines[section.start]).group(1) == name
+                    for section in sections)):
+        return name
+    return None
+
+
 def choose_sensor(graph, selected=None, existing=None):
-    configured = [name for name in graph.sections if name.split()[0] in SENSORS]
+    configured = [name for name, sections in graph.sections.items()
+                  if any(is_sensor_section(section.name) for section in sections)]
     preferred = selected
     if preferred is None and existing:
         preferred = existing.get("accel_chip")
@@ -381,13 +406,13 @@ def choose_sensor(graph, selected=None, existing=None):
         if preferred not in graph.sections:
             raise InstallError("Accelerometer [%s] is not configured. Configure its sensor/firmware first, "
                                "or select --accel-chip from: %s" % (preferred, ", ".join(configured) or "none"))
-        return graph.one(preferred).name
+        return read_only_section_name(graph.sections[preferred], sensor_only=True) or graph.one(preferred).name
     if len(configured) != 1:
         raise InstallError("Expected one configured accelerometer, found %d (%s). Use --accel-chip "
                            "'adxl345 toolhead' (full existing section). A Cartographer/scanner probe alone "
                            "is not an accelerometer; configure its separate [adxl345 ...] first." %
                            (len(configured), ", ".join(configured) or "none"))
-    return graph.one(configured[0]).name
+    return read_only_section_name(graph.sections[configured[0]], sensor_only=True) or graph.one(configured[0]).name
 
 
 def validate_generic_names(graph, existing):

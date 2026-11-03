@@ -229,6 +229,96 @@ class HostFixture(unittest.TestCase):
         self.assertIn("#x_threshold: 8.0\n#y_threshold: 8.0", created)
         self.assertNotRegex(created, r"(?m)^x_threshold:")
 
+    def test_split_sensor_headers_select_exact_name_without_editing_sensor_options(self):
+        fragment = self.config.parent / "sensor-options.cfg"
+        for sensor in ("beacon", "adxl345 ToolHead"):
+            for flags in ((), ("--accel-chip", sensor)):
+                with self.subTest(sensor=sensor, flags=flags):
+                    original = (CONFIG.replace("[beacon]", "[" + sensor + "]")
+                                + "\n[include sensor-options.cfg]\n" + SAVED).encode()
+                    self.config.write_bytes(original)
+                    fragment.write_bytes(("# Preserve sensor options and CRLF\r\n[" + sensor
+                                          + "]\r\naxes_map: x, -y, z\r\n").encode())
+                    sensor_options = fragment.read_bytes()
+                    self.axes.write_text(AXES.replace("homing_speed: 150", "homing_speed: 50"))
+                    changes, _, selected = self.plan(*flags)
+                    self.assertEqual(selected, sensor)
+                    self.assertIn(("accel_chip: " + sensor + "\n").encode(),
+                                  changes[self.config.parent / installer.MANAGED]["data"])
+                    self.assertNotIn(fragment, changes)
+                    self.assertEqual(fragment.read_bytes(), sensor_options)
+                    self.assertEqual(self.config.read_bytes(), original)
+                    self.assertTrue(changes[self.config]["data"].endswith(SAVED.encode()))
+                    with self.assertRaisesRegex(installer.InstallError, "exactly one"):
+                        installer.ConfigGraph(self.config).one(sensor)
+
+    def test_split_named_beacon_uses_existing_legacy_sensor_selection(self):
+        self.config.write_bytes((CONFIG + "\n[beacon sensor Second]\nserial: fixture-second\n"
+                                 "[beacon sensor Second]\nx_offset: -20\n"
+                                 "[beacon_accel_homing]\nbeacon: beacon sensor Second\nx_threshold: 6.1\n"
+                                 + SAVED).encode())
+        changes, _, sensor = self.plan()
+        self.assertEqual(sensor, "beacon sensor Second")
+        self.assertIn(b"accel_chip: beacon sensor Second\n", changes[self.config]["data"])
+        self.assertIn(b"beacon: beacon sensor Second\nx_threshold: 6.1\n", changes[self.config]["data"])
+
+    def test_active_beacon_models_do_not_count_as_accelerometers(self):
+        for sensor in ("beacon", "beacon sensor ToolHead"):
+            with self.subTest(sensor=sensor):
+                original = (CONFIG.replace("[beacon]", "[" + sensor + "]")
+                            + "\n[" + sensor + "]\nx_offset: -20\n[" + sensor
+                            + " model default]\nmodel_coef: 1.234\n" + SAVED).encode()
+                self.config.write_bytes(original)
+                changes, _, selected = self.plan()
+                self.assertEqual(selected, sensor)
+                self.assertIn(("[" + sensor + " model default]\nmodel_coef: 1.234\n").encode(),
+                              changes[self.config]["data"])
+                self.assertEqual(self.config.read_bytes(), original)
+
+    def test_split_sensor_does_not_accept_invalid_beacon_names_or_padded_headers(self):
+        for header in ("BEACON", "beacon imaginary", "beacon Sensor ToolHead", "beacon "):
+            with self.subTest(header=header):
+                self.config.write_text(CONFIG.replace("[beacon]", "[" + header + "]")
+                                       + "\n[" + header + "]\nx_offset: -20\n" + SAVED)
+                with self.assertRaisesRegex(installer.InstallError, "exactly one"):
+                    self.plan("--accel-chip", header.strip())
+
+    def test_split_sensor_does_not_hide_distinct_sensors_or_case_collisions(self):
+        self.config.write_text(CONFIG + "\n[beacon]\nx_offset: -20\n"
+                               "[beacon sensor second]\nserial: fixture-second\n" + SAVED)
+        with self.assertRaisesRegex(installer.InstallError, "configured accelerometer, found 2"):
+            self.plan()
+        for sensor, conflicting in (("beacon", "Beacon"),
+                                    ("adxl345 ToolHead", "adxl345 toolhead")):
+            self.config.write_text(CONFIG.replace("[beacon]", "[" + sensor + "]")
+                                   + "\n[" + conflicting + "]\naxes_map: x, -y, z\n" + SAVED)
+            for flags in ((), ("--accel-chip", sensor)):
+                with self.subTest(sensor=sensor, flags=flags), \
+                     self.assertRaisesRegex(installer.InstallError, "exactly one"):
+                    self.plan(*flags)
+
+    def test_case_collision_does_not_hide_another_sensor_based_on_header_order(self):
+        for first, second in (("beacon", "BEACON"), ("BEACON", "beacon")):
+            with self.subTest(first=first):
+                self.config.write_text(CONFIG.replace("[beacon]", "[" + first + "]")
+                                       + "\n[" + second + "]\nx_offset: -20\n"
+                                       "[adxl345 toolhead]\ncs_pin: fixture:None\n" + SAVED)
+                with self.assertRaisesRegex(installer.InstallError, "configured accelerometer, found 2"):
+                    self.plan()
+
+    def test_explicit_unique_third_party_sensor_keeps_physical_uniqueness_check(self):
+        custom = "custom_accel ThirdParty"
+        self.config.write_text(CONFIG + "\n[" + custom + "]\nserial: fixture-custom\n" + SAVED)
+        self.assertEqual(installer.choose_sensor(installer.ConfigGraph(self.config), custom), custom)
+        self.config.write_text(CONFIG + ("\n[" + custom + "]\nserial: fixture-custom\n") * 2 + SAVED)
+        with self.assertRaisesRegex(installer.InstallError, "exactly one"):
+            installer.choose_sensor(installer.ConfigGraph(self.config), custom)
+
+    def test_repeated_physical_include_is_still_rejected(self):
+        self.config.write_text(CONFIG + "\n[include axes.cfg]\n" + SAVED)
+        with self.assertRaisesRegex(installer.InstallError, "included more than once"):
+            self.plan()
+
     def test_generic_default_preserves_speed_text_and_slower_axis(self):
         self.config.write_text(CONFIG.replace("[beacon]", "[adxl345 toolhead]") + SAVED)
         speed_line = b"  homing_speed = 050.000 # operator speed\r\n"
@@ -1594,6 +1684,37 @@ class UninstallFixture(unittest.TestCase):
     def test_manual_values_below_three_survive_legacy_section_install_and_update(self):
         self._assert_manual_thresholds_preserved_by_install_and_update("beacon_accel_homing")
 
+    def _assert_split_sensor_lifecycle(self):
+        original = self.capture()
+        self.install("split-first")
+        self.install("split-upgrade")
+        plan, _ = self.uninstall()
+        self.assertEqual(len(plan["history"]), 2)
+        self.assertEqual(self.capture(), original)
+
+    def test_colocated_split_beacon_install_upgrade_uninstall_restores_main_config(self):
+        self.config.write_bytes((CONFIG + "\n[beacon]\nx_offset: -20\n" + SAVED).encode())
+        self._assert_split_sensor_lifecycle()
+
+    def test_colocated_split_beacon_install_upgrade_uninstall_restores_rail_config(self):
+        self.axes.write_bytes((AXES + "\n[beacon]\nx_offset: -20\n"
+                              "[beacon]\ny_offset: 5\n").replace("\n", "\r\n").encode())
+        self._assert_split_sensor_lifecycle()
+
+    def test_split_beacon_include_survives_install_upgrade_and_uninstall(self):
+        fragment = self.config.parent / "sensor-options.cfg"
+        fragment.write_bytes(b"[beacon]\nx_offset: -20\n")
+        self.config.write_bytes((CONFIG + "\n[include sensor-options.cfg]\n" + SAVED).encode())
+        original = fragment.read_bytes()
+        self._assert_split_sensor_lifecycle()
+        self.assertEqual(fragment.read_bytes(), original)
+
+    def test_split_active_beacon_model_install_upgrade_uninstall_restores_fragments(self):
+        self.config.write_bytes((CONFIG + "\n[beacon]\nx_offset: -20\n"
+                                 "[beacon model default]\nmodel_coef: 1.234\n"
+                                 "[beacon model default]\nmodel_temp: 25\n" + SAVED).encode())
+        self._assert_split_sensor_lifecycle()
+
     def test_install_and_uninstall_preserve_safe_z_probe_and_saved_config_bytes(self):
         probe_home, _saved = HostFixture.cartographer_safe_z_fixture(self)
         original = self.capture()
@@ -1942,6 +2063,36 @@ class UninstallFixture(unittest.TestCase):
             with self.subTest(before=before, after=after), \
                  self.assertRaisesRegex(installer.InstallError, "Unrecognized section changes"):
                 helper._valid_config_change(before, after, self.config, self.config, api)
+
+    def test_split_sensor_history_rejects_sensor_edits_and_duplicate_mutable_sections(self):
+        helper = installer.load_uninstaller()
+        api = installer.uninstall_api()
+        before = b"[beacon]\nserial: fixture\n[beacon]\nx_offset: -20\n"
+        after = before + b"\n[include accel_homing.cfg]\n\n"
+        helper._valid_config_change(before, after, self.config, self.config, api)
+        for changed in (after.replace(b"x_offset: -20", b"x_offset: -10"),
+                        after.replace(b"serial: fixture", b"serial: other"),
+                        after.replace(b"[beacon]", b"[Beacon]", 1),
+                        after.replace(b"[beacon]\nx_offset: -20\n", b""),
+                        before + b"[beacon]\ny_offset: 5\n\n[include accel_homing.cfg]\n\n"):
+            with self.subTest(changed=changed), \
+                 self.assertRaisesRegex(installer.InstallError, "outside installer ownership|Unrecognized section"):
+                helper._valid_config_change(before, changed, self.config, self.config, api)
+        for name in ("beacon model default", "beacon sensor ToolHead model default"):
+            original = ("[" + name + "]\nmodel_coef: 1.234\n[" + name + "]\nmodel_temp: 25\n").encode()
+            installed = original + b"\n[include accel_homing.cfg]\n\n"
+            helper._valid_config_change(original, installed, self.config, self.config, api)
+            with self.subTest(name=name), \
+                 self.assertRaisesRegex(installer.InstallError, "outside installer ownership"):
+                helper._valid_config_change(original, installed.replace(b"1.234", b"5.678"),
+                                            self.config, self.config, api)
+        for name in ("stepper_x", "tmc2209 stepper_x", "accel_homing", "custom_accel ToolHead",
+                     "BEACON", "beacon imaginary", "beacon ", "beacon model default ",
+                     "beacon sensor ToolHead Model default"):
+            duplicate = ("[" + name + "]\n[" + name + "]\n").encode()
+            with self.subTest(name=name), \
+                 self.assertRaisesRegex(installer.InstallError, "Unrecognized section"):
+                helper._valid_config_change(duplicate, duplicate, self.config, self.config, api)
 
     def test_managed_line_edit_or_changed_section_refuses_before_writes(self):
         self.install()

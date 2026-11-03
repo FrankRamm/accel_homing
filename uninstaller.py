@@ -245,7 +245,11 @@ def _valid_config_change(before, after, path, main, api):
         expected.append("include " + api.MANAGED)
         document.insertions.setdefault(document.active_end, []).append(
             document.newline + "[include " + api.MANAGED + "]" + document.newline + document.newline)
-    if new_names != expected or len(set(old_names)) != len(old_names):
+    groups = {}
+    for section in document.sections:
+        groups.setdefault(section.name.lower(), []).append(section)
+    if new_names != expected or any(len(sections) > 1 and api.read_only_section_name(sections) is None
+                                    for sections in groups.values()):
         _fail(api, "Unrecognized section changes in installation backup: %s" % path)
     for original, changed in zip(document.sections, installed.sections):
         name = original.name.lower()
