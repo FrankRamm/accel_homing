@@ -65,11 +65,8 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both axes must use this plugin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Measure repeated commanded-travel variation and save an accuracy PNG; X, Y or XY, 2–50 samples per axis. |
-| `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal; use `AXIS=Y` for Y. Beta PNG and diagnostics only, no saved threshold/model or restart. |
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
-| `BEACON_ACCEL_HOMING_STATUS` | Show detector/preparation diagnostics; retained legacy command. |
-| `SET_BEACON_ACCEL_HOMING AXIS=X THRESHOLD=1` | Legacy alias of `SET_ACCEL_HOMING`. |
 
 **CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
 0.5 g once to the candidate after ten checks pass; those homes test the candidate,
@@ -78,20 +75,6 @@ XY again after restart before calibrating the other axis. Explicit X/Y/shared
 manual thresholds override ordinary saved models; comment them out and issue
 `RESTART` while idle to use calibration. See
 [configuration](docs/CONFIGURATION.md#thresholds-and-saved-models).
-
-An early ACCURACY trigger with valid current capture/halt/center evidence can
-reverse its recorded commanded halt travel, report the failure in the console, then start
-normal calibration at the actual failed threshold **plus 0.25 g**. Successful
-recovery calibration saves and restarts Klipper. Prepare XY again and rerun the
-exact accuracy command printed in the console; it does not rerun automatically.
-[Recovery details](docs/ACCURACY.md#early-trigger-automatic-recalibration).
-
-Charts are saved only after the requested workflow and its required cleanup/save
-succeed. Failed, rejected or cancelled runs keep console diagnostics without
-saving a partial PNG, including temporary per-home images.
-Acceleration curves show absolute deviation after subtracting the signed
-resting reference. Native marker estimates and finite sensor rails carry
-separate range notes; commanded-travel statistics keep their mm scale.
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.
@@ -138,7 +121,4 @@ This project builds on that work and retains its GPLv3 license and attribution.
 
 Thank you to everyone who has tested the plugin, shared results and helped
 improve it. Special thanks to **Ingstromentalist**, **Acke**, and **mc-red** for
-their time, patience and continued testing. Your reports make this work possible.
-
-Maintained by [FrankRamm](https://github.com/FrankRamm).
-[Full attribution and provenance](NOTICE) · [GPLv3](LICENSE).
+their time, patience and continued testing. Your reports make this work possible. This is a Vibecoded app, still in experimental release.
