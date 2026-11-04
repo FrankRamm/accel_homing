@@ -29,7 +29,7 @@ installer-created registration, not a pre-existing manual entry it does not own.
 | --- | --- |
 | `CENTERED=1` required | Physically center XY, leave both axes unhomed, establish Z/nozzle clearance and suitable XY currents, then issue the intended command once with CENTERED=1. |
 | XY already homed | Follow your printer's appropriate procedure to release/unhome XY while supporting Z, then manually center. Do not assume a generic motor-off command affects only XY. |
-| G28 handler/wrapper rejected | Stock G28 or one verified built-in safe_z_home/homing_override wrapper is required. Macros and unknown/nested handlers remain unsupported; the installation acknowledgement flag does not enable them. |
+| Custom G28 setup did not run | Workflows call native selected-axis homing and bypass public G28 macros/wrappers. Prepare XY currents/enables and nozzle clearance independently; ordinary G28 keeps its configured sequence. |
 | Invalid geometry/insufficient travel | Correct the actual rail limits, endstop position/direction and midpoint distance. Calibration needs more than 20 mm from configured midpoint to stop. |
 | Threshold exceeds range/headroom | Check actual configured/active sensor range. Use a justified value within the 80% software policy. Native clients can change the stream range. |
 | Saved model mismatch or unexpected active threshold | Inspect selected sensor/model and manual X/Y/shared threshold precedence. Comment manual values to use a calibrated model; do not edit generated model metadata. |

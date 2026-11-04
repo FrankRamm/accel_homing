@@ -589,7 +589,8 @@ def make_plan(source, selected, args):
         raise InstallError("Custom homing path: %s. No files changed. Review/adapt its G28 sequence, "
                            "motor current and enable setup, and moves; only then use --acknowledge-homing-override "
                            "to acknowledge installation. The installer cannot validate custom G28 "
-                           "macro behavior, and supervised workflows still reject that macro path."
+                           "macro behavior during normal homing. Supervised workflows bypass that "
+                           "macro and use native selected-axis homing."
                            % ", ".join(custom_g28))
     plugins = [graph.one(name, False) for name in ("accel_homing", "beacon_accel_homing")]
     plugins = [section for section in plugins if section]
@@ -610,11 +611,11 @@ def make_plan(source, selected, args):
     speeds = validate_homing_speeds(graph, args, family, existing)
     changes, messages = {}, []
     if safe_z_home is not None:
-        messages.append("Preserved [safe_z_home]. Supervised X/Y workflows verify its stock G28 "
-                        "predecessor and omit the wrapper's z_hop; ordinary G28 remains unchanged.")
+        messages.append("Preserved [safe_z_home]. Supervised X/Y workflows use native selected-axis "
+                        "homing and omit the wrapper's z_hop; ordinary G28 remains unchanged.")
     if homing_override is not None:
         messages.append("Preserved [homing_override] and its normal G28 sequence. Supervised X/Y "
-                        "workflows require its verified stock G28 predecessor and bypass all override "
+                        "workflows use native selected-axis homing and bypass all override "
                         "G-code, including current/enable setup, SYNC_MOTORS and Z/Beacon actions. "
                         "Prepare suitable test currents/enables and nozzle clearance independently.")
     prefix = ("beacon_accel" if existing and existing.name.lower() == "beacon_accel_homing"
@@ -1224,8 +1225,8 @@ def arguments(argv=None):
     parser.add_argument("--max-startup-travel", type=float,
                         help="opt into generic max_startup_travel in mm (finite 0.1..5); otherwise preserve an explicit configured limit or leave disabled")
     parser.add_argument("--acknowledge-homing-override", action="store_true",
-                        help="acknowledge reviewed gcode_macro G28 behavior for installation only; "
-                        "not needed for built-in homing_override/safe_z_home and does not enable workflows")
+                        help="acknowledge installation after reviewing gcode_macro G28 behavior during ordinary homing; "
+                        "not needed for built-in homing_override/safe_z_home; workflows bypass public G28")
     parser.add_argument("--replace-existing-links", action="store_true", help="back up/replace plugin links from another source")
     parser.add_argument("--no-restart", action="store_true", help="install/update without automatic host-service restart; activate manually")
     parser.add_argument("--dry-run", action="store_true", help="validate/print plan, no writes")

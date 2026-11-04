@@ -2,6 +2,7 @@
 import collections
 import contextlib
 import copy
+import functools
 import importlib.util
 import json
 import math
@@ -219,7 +220,7 @@ class HomingOverride:
 
 
 def load_workflow_fixture():
-    """Exercise real relative identity imports using isolated synthetic modules."""
+    """Exercise the relative native API import using isolated synthetic modules."""
     package_name = "accel_homing_workflow_fixture"
     package = types.ModuleType(package_name)
     package.__path__ = [str(Path(__file__).resolve().parent.parent)]
@@ -450,6 +451,10 @@ class Rig:
 
     def lookup_object(self, name, default=None):
         return self.objects.get(name, default)
+
+    def lookup_objects(self, module=None):
+        return [(name, obj) for name, obj in self.objects.items()
+                if module is None or name == module or name.startswith(module + " ")]
 
     def load_object(self, config, name):
         if name not in self.objects and name.startswith("accel_homing_model "):
@@ -759,7 +764,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
         self.assertIs(rig.objects["probe"], probe)
         self.assertIs(rig.objects["cartographer"], probe)
 
-    def test_unknown_and_nested_predecessors_are_rejected_before_side_effects(self):
+    def test_unknown_and_nested_safe_predecessors_are_bypassed(self):
         for kind in ("function", "other_owner", "nested", "missing"):
             with self.subTest(kind=kind):
                 rig = Rig()
@@ -772,13 +777,14 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     safe.prev_G28 = SafeZHoming(rig).cmd_G28
                 else:
                     del safe.prev_G28
-                before = rig.effects()
-                with self.assertRaisesRegex(CommandError, "G28 predecessor"):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.effects(), before)
+                previous = getattr(safe, "prev_G28", None)
+                rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
                 self.assertEqual(safe.calls, [])
+                self.assertIs(getattr(safe, "prev_G28", None), previous)
+                self.assertTrue(all(coords[2] is None for coords, _speed in rig.toolhead.moves))
 
-    def test_custom_safe_wrapper_owner_type_and_methods_are_rejected(self):
+    def test_custom_safe_wrapper_owner_type_and_methods_are_irrelevant(self):
         class SafeSubclass(SafeZHoming):
             pass
 
@@ -799,39 +805,41 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     safe.gcode = object()
                 elif kind == "instance_method":
                     safe.cmd_G28 = lambda gcmd: None
-                before = rig.effects()
                 context = mock.patch.object(SafeZHoming, "cmd_G28", lambda obj, gcmd: None) \
                     if kind == "class_method" else contextlib.nullcontext()
-                with context, self.assertRaisesRegex(CommandError, "G28"):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.effects(), before)
+                with context:
+                    rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
                 self.assertEqual(safe.calls, [])
 
-    def test_unknown_stock_owners_and_patched_stock_methods_are_rejected(self):
+    def test_native_entry_point_bypasses_instance_and_class_g28_replacements(self):
         class StockSubclass(StockHoming):
-            pass
+            cmd_G28 = mock.Mock(side_effect=AssertionError("subclass G28 was dispatched"))
 
-        for kind in ("subclass", "object", "instance_method", "class_method", "missing_import"):
+        for kind in ("subclass", "object", "instance_method", "class_method", "missing_method"):
             with self.subTest(kind=kind):
                 rig = Rig()
+                replacement = mock.Mock(side_effect=AssertionError("replacement G28 was dispatched"))
                 if kind == "subclass":
                     rig.objects["homing"] = StockSubclass(rig)
                 elif kind == "object":
-                    rig.objects["homing"] = types.SimpleNamespace(printer=rig, cmd_G28=rig.stock_home)
+                    rig.objects["homing"] = types.SimpleNamespace(printer=rig, cmd_G28=replacement)
                 elif kind == "instance_method":
-                    rig.objects["homing"].cmd_G28 = rig.stock_home
-                before = rig.effects()
+                    rig.objects["homing"].cmd_G28 = replacement
+                elif kind == "missing_method":
+                    rig.objects["homing"] = types.SimpleNamespace(printer=rig)
                 if kind == "class_method":
-                    context = mock.patch.object(StockHoming, "cmd_G28", lambda obj, gcmd: None)
-                elif kind == "missing_import":
-                    context = mock.patch.object(workflow_module, "_PrinterHoming", None)
+                    context = mock.patch.object(StockHoming, "cmd_G28", replacement)
                 else:
                     context = contextlib.nullcontext()
-                with context, self.assertRaisesRegex(CommandError, "stock G28"):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.effects(), before)
+                with context:
+                    rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
+                self.assertEqual([record["axis"] for record in rig.home_calls], ["x", "y"])
+                replacement.assert_not_called()
+                StockSubclass.cmd_G28.assert_not_called()
 
-    def test_missing_or_divergent_handler_registries_fail_closed(self):
+    def test_missing_or_divergent_handler_registries_are_unused_and_preserved(self):
         for wrapped in (False, True):
             for kind in ("ready_missing", "active_missing", "ready_empty", "active_empty",
                          "unknown_ready", "unknown_active", "inactive_wrapper"):
@@ -854,19 +862,82 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     else:
                         rig.use_safe_z_home()
                         rig.gcode.ready_gcode_handlers["G28"] = rig.objects["homing"].cmd_G28
-                    before = rig.effects()
-                    with self.assertRaisesRegex(CommandError, "G28"):
-                        rig.calibrate(save=0)
-                    self.assertEqual(rig.effects(), before)
+                    registries = {name: getattr(rig.gcode, name, None)
+                                  for name in ("ready_gcode_handlers", "gcode_handlers")}
+                    contents = {name: dict(value) if isinstance(value, dict) else value
+                                for name, value in registries.items()}
+                    rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                    self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
+                    for name, value in registries.items():
+                        self.assertIs(getattr(rig.gcode, name, None), value)
+                        self.assertEqual(getattr(rig.gcode, name, None), contents[name])
 
-    def test_chain_changes_during_capture_setup_or_command_creation_abort_before_home(self):
+    def test_callable_g28_wrappers_and_renamed_aliases_preserve_the_normal_route(self):
+        class CallableWrapper:
+            def __init__(self, callback):
+                self.callback = callback
+
+            def __call__(self, gcmd):
+                return self.callback(gcmd)
+
+        for kind in ("function", "bound_method", "callable_object", "partial"):
+            with self.subTest(kind=kind):
+                rig = Rig()
+                original = rig.objects["homing"].cmd_G28
+                calls = []
+                def wrapper(gcmd):
+                    calls.append(gcmd.get_commandline())
+                    return original(gcmd)
+                if kind == "bound_method":
+                    callback = types.MethodType(lambda _owner, gcmd: wrapper(gcmd), object())
+                elif kind == "callable_object":
+                    callback = CallableWrapper(wrapper)
+                elif kind == "partial":
+                    callback = functools.partial(wrapper)
+                else:
+                    callback = wrapper
+                rig.gcode.ready_gcode_handlers.update({"G28": callback, "G28_BASE": original})
+                macro = types.SimpleNamespace(alias="G28", in_script=False)
+                rig.objects["gcode_macro g28"] = macro
+                registries = (rig.gcode.ready_gcode_handlers, rig.gcode.gcode_handlers)
+                registered = dict(registries[0])
+                z_position, z_limit = rig.toolhead.position[2:], rig.toolhead.kin.limits[2]
+                records = []
+                rig.register_event_handler("homing:home_rails_end",
+                                           lambda axis: records.append(dict(rig.owner.last[axis])))
+                rig.calibrate(axis="Y", save=0)
+                self.assertEqual(rig.scripts, ["G28 Y"] * 11)
+                self.assertEqual(rig.created_commands, [("G28", "G28 Y", {"Y": ""})] * 11)
+                self.assertEqual(rig.homing_events, [(event, "y") for _ in range(11)
+                                                   for event in ("begin", "end")])
+                self.assertEqual([record["axis"] for record in rig.home_calls], ["y"] * 11)
+                self.assertEqual(len(records), 11)
+                self.assertTrue(all(record["pass"] == 1 for record in records))
+                self.assertEqual(calls, [])
+                self.assertEqual(rig.dispatched_scripts, [])
+                self.assertEqual(rig.toolhead.position[2:], z_position)
+                self.assertEqual(rig.toolhead.kin.limits[2], z_limit)
+                self.assertEqual(rig.z_homes, [])
+                self.assertTrue(all(coords[0] is None and coords[2] is None
+                                    for coords, _speed in rig.toolhead.moves))
+                self.assertIs(rig.gcode.ready_gcode_handlers, registries[0])
+                self.assertIs(rig.gcode.gcode_handlers, registries[1])
+                self.assertEqual(rig.gcode.ready_gcode_handlers, registered)
+                self.assertIs(rig.objects["gcode_macro g28"], macro)
+                rig.run_script("G28 X")
+                self.assertEqual(calls, ["G28 X"])
+                self.assertEqual(rig.gcode.ready_gcode_handlers, registered)
+
+    def test_public_chain_changes_during_capture_or_command_creation_do_not_affect_native_home(self):
         for stage in ("capture", "command"):
             with self.subTest(stage=stage):
                 rig = Rig()
                 safe = rig.use_safe_z_home()
+                wrapper = mock.Mock(side_effect=AssertionError("public G28 was dispatched"))
                 def mutate_after(callback, *args):
                     result = callback(*args)
-                    safe.prev_G28 = lambda gcmd: None
+                    safe.prev_G28 = wrapper
+                    rig.gcode.ready_gcode_handlers["G28"] = wrapper
                     return result
                 if stage == "capture":
                     callback = rig.owner.start_capture
@@ -874,31 +945,28 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                 else:
                     callback = rig.gcode.create_gcode_command
                     rig.gcode.create_gcode_command = lambda *args: mutate_after(callback, *args)
-                with self.assertRaisesRegex(CommandError, "G28 predecessor"):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.home_calls, [])
+                rig.calibrate(save=0)
+                self.assertEqual(len(rig.home_calls), 11)
                 self.assertEqual(safe.calls, [])
-                self.assertEqual(rig.toolhead.moves, [])
-                self.assertEqual(rig.capture_stops, 1)
+                wrapper.assert_not_called()
+                self.assertTrue(all(coords[2] is None for coords, _speed in rig.toolhead.moves))
+                self.assertEqual(rig.capture_stops, 11)
                 self.assertFalse(rig.capture_active)
                 self.assertIsNone(rig.workflow.session)
-                self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
                 self.assertEqual(rig.owner.back_off_dist, 5.0)
-                self.assertEqual(rig.workflow.last_result["result"], "aborted")
+                self.assertEqual(rig.workflow.last_result["result"], "calibrated")
 
-    def test_chain_is_revalidated_between_trials_and_after_manual_center_wait(self):
+    def test_native_owner_is_revalidated_between_trials_and_after_manual_center_wait(self):
         for mode in ("calibration", "test", "waiting"):
-            for mutation in ("previous", "active", "override"):
+            for mutation in ("missing", "wrong_printer"):
                 with self.subTest(mode=mode, mutation=mutation):
                     rig = Rig()
                     safe = rig.use_safe_z_home()
                     def mutate(axis=None):
-                        if mutation == "previous":
-                            safe.prev_G28 = lambda gcmd: None
-                        elif mutation == "active":
-                            rig.gcode.gcode_handlers = {"G28": lambda gcmd: None}
+                        if mutation == "missing":
+                            del rig.objects["homing"]
                         else:
-                            rig.objects["homing_override"] = object()
+                            rig.objects["homing"].printer = object()
                     if mode == "waiting":
                         rig.home_results.append({"travel_mm": 2.0})
                         rig.wait_calibration(save=0)
@@ -910,7 +978,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     else:
                         rig.on_home = mutate
                         resume = lambda: rig.calibrate(save=0)
-                    with self.assertRaisesRegex(CommandError, "G28"):
+                    with self.assertRaisesRegex(CommandError, "native homing API"):
                         resume()
                     self.assertEqual(len(rig.home_calls), 1)
                     self.assertEqual(safe.calls, [])
@@ -919,6 +987,31 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
                     self.assertEqual(rig.owner.back_off_dist, 5.0)
                     self.assertEqual(rig.workflow.last_result["result"], "aborted")
+
+    def test_unavailable_native_api_or_command_factory_fails_before_side_effects(self):
+        for kind in ("missing_owner", "wrong_printer", "missing_api", "noncallable_api",
+                     "missing_command", "noncallable_command"):
+            with self.subTest(kind=kind):
+                rig = Rig()
+                public = mock.Mock(side_effect=AssertionError("public fallback was dispatched"))
+                rig.gcode.ready_gcode_handlers["G28"] = public
+                rig.gcode.ready_gcode_handlers["G28_BASE"] = public
+                if kind == "missing_owner":
+                    del rig.objects["homing"]
+                elif kind == "wrong_printer":
+                    rig.objects["homing"].printer = object()
+                elif kind == "missing_command":
+                    del rig.gcode.create_gcode_command
+                elif kind == "noncallable_command":
+                    rig.gcode.create_gcode_command = None
+                context = mock.patch.object(workflow_module, "_PRINTER_G28",
+                                            None if kind == "missing_api" else object()) \
+                    if kind in ("missing_api", "noncallable_api") else contextlib.nullcontext()
+                before = rig.effects()
+                with context, self.assertRaisesRegex(CommandError, "native homing"):
+                    rig.calibrate(save=0)
+                self.assertEqual(rig.effects(), before)
+                public.assert_not_called()
 
     def test_direct_stock_error_propagates_and_cleanup_preserves_registered_wrapper(self):
         for error_type in (CommandError, RuntimeError):
@@ -1035,7 +1128,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
         self.assertEqual(rig.gcode.gcode_handlers["G28"], handler)
         self.assertEqual(rig.gcode.ready_gcode_handlers["G28"], handler)
 
-    def test_unknown_and_nested_override_predecessors_fail_before_effects(self):
+    def test_unknown_and_nested_override_predecessors_are_bypassed(self):
         for kind in ("function", "other_owner", "override", "safe_z_home", "missing"):
             with self.subTest(kind=kind):
                 rig = Rig()
@@ -1050,19 +1143,19 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     override.prev_G28 = SafeZHoming(rig).cmd_G28
                 else:
                     del override.prev_G28
-                before = rig.effects()
-                with self.assertRaisesRegex(CommandError, "stock G28 predecessor"):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.effects(), before)
+                previous = getattr(override, "prev_G28", None)
+                rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
+                self.assertIs(getattr(override, "prev_G28", None), previous)
                 self.assertEqual(override.calls, [])
                 override.template.run_gcode_from_command.assert_not_called()
 
-    def test_custom_override_owner_methods_and_missing_native_import_fail_closed(self):
+    def test_custom_override_owner_types_and_methods_do_not_affect_native_homing(self):
         class OverrideSubclass(HomingOverride):
             pass
 
         for kind in ("subclass", "object", "owner", "dispatcher", "instance_method",
-                     "class_method", "missing_import"):
+                     "class_method"):
             with self.subTest(kind=kind):
                 rig = Rig()
                 override = rig.use_homing_override()
@@ -1082,17 +1175,14 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     override.cmd_G28 = lambda gcmd: None
                 if kind == "class_method":
                     context = mock.patch.object(HomingOverride, "cmd_G28", lambda obj, gcmd: None)
-                elif kind == "missing_import":
-                    context = mock.patch.object(workflow_module, "_HomingOverride", None)
                 else:
                     context = contextlib.nullcontext()
-                before = rig.effects()
-                with context, self.assertRaisesRegex(CommandError, "homing_override.*stock G28 predecessor"):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.effects(), before)
+                with context:
+                    rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
                 self.assertEqual(override.calls, [])
 
-    def test_override_and_safe_z_home_cannot_be_combined_in_either_order(self):
+    def test_native_homing_does_not_depend_on_which_wrapper_registered_g28_last(self):
         for first in ("safe_z_home", "homing_override"):
             rig = Rig()
             if first == "safe_z_home":
@@ -1101,13 +1191,13 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
             else:
                 override = rig.use_homing_override()
                 rig.use_safe_z_home()
-            before = rig.effects()
-            with self.assertRaisesRegex(CommandError, "cannot combine safe_z_home and homing_override"):
-                rig.calibrate(save=0)
-            self.assertEqual(rig.effects(), before)
+            rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+            self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
+            self.assertEqual(override.calls, [])
+            self.assertEqual(rig.objects["safe_z_home"].calls, [])
             override.template.run_gcode_from_command.assert_not_called()
 
-    def test_active_missing_or_divergent_override_registrations_are_rejected(self):
+    def test_missing_or_divergent_override_registrations_do_not_control_workflow_homing(self):
         for kind in ("ready_missing", "active_missing", "ready_empty", "active_empty",
                      "unknown_ready", "unknown_active", "stock_ready", "stock_active"):
             with self.subTest(kind=kind):
@@ -1129,44 +1219,79 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     rig.gcode.ready_gcode_handlers = {"G28": rig.objects["homing"].cmd_G28}
                 else:
                     rig.gcode.gcode_handlers = {"G28": rig.objects["homing"].cmd_G28}
-                before = rig.effects()
-                with self.assertRaisesRegex(CommandError, "G28"):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.effects(), before)
+                registries = {name: getattr(rig.gcode, name, None)
+                              for name in ("ready_gcode_handlers", "gcode_handlers")}
+                contents = {name: dict(value) if isinstance(value, dict) else value
+                            for name, value in registries.items()}
+                rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
                 self.assertEqual(override.calls, [])
+                for name, value in registries.items():
+                    self.assertIs(getattr(rig.gcode, name, None), value)
+                    self.assertEqual(getattr(rig.gcode, name, None), contents[name])
 
-    def test_active_or_unverifiable_override_recursion_is_refused_even_with_valid_xy(self):
-        for state in (True, None, 0, "", "missing"):
+    def test_active_override_recursion_is_refused_even_with_valid_xy(self):
+        for state in (True, 1, "running"):
             for xy_homed in (False, True):
                 with self.subTest(state=state, xy_homed=xy_homed):
                     rig = Rig()
                     override = rig.use_homing_override()
-                    if state == "missing":
-                        del override.in_script
-                    else:
-                        override.in_script = state
+                    override.in_script = state
                     if xy_homed:
                         rig.toolhead.kin.limits[:2] = [(0.0, 300.0), (0.0, 200.0)]
                     before = rig.effects()
-                    with self.assertRaisesRegex(CommandError, "active or unverifiable homing_override G28 script"):
+                    with self.assertRaisesRegex(CommandError, "active homing_override G28 script"):
                         rig.calibrate(save=0)
                     self.assertEqual(rig.effects(), before)
                     override.template.run_gcode_from_command.assert_not_called()
 
-    def test_override_is_revalidated_after_capture_setup_and_command_creation(self):
+    def test_inactive_or_missing_override_script_state_does_not_block_workflows(self):
+        for state in (False, None, 0, "", "missing"):
+            with self.subTest(state=state):
+                rig = Rig()
+                override = rig.use_homing_override()
+                if state == "missing":
+                    del override.in_script
+                else:
+                    override.in_script = state
+                rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
+                self.assertEqual(override.calls, [])
+                override.template.run_gcode_from_command.assert_not_called()
+
+    def test_only_active_g28_macros_are_refused_including_case_and_spacing_variants(self):
+        for name in ("gcode_macro G28", "gcode_macro g28", "gcode_macro   G28", "gcode_macro\tG28"):
+            for active in (False, True):
+                with self.subTest(name=name, active=active):
+                    rig = Rig()
+                    rig.objects[name] = types.SimpleNamespace(in_script=active)
+                    before = rig.effects()
+                    if active:
+                        with self.assertRaisesRegex(CommandError, "active G28 macro script"):
+                            rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                        self.assertEqual(rig.effects(), before)
+                    else:
+                        rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+                        self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
+        rig = Rig()
+        rig.objects["gcode_macro OTHER"] = types.SimpleNamespace(in_script=True)
+        rig.workflow.cmd_TEST(GCmd(CENTERED=1))
+        self.assertEqual(rig.scripts, ["G28 X", "G28 Y"])
+
+    def test_active_script_or_native_owner_is_rechecked_after_capture_and_command_creation(self):
         for stage in ("capture", "command"):
-            for mutation in ("previous", "active", "recursion"):
+            for mutation in ("override", "macro", "native_owner"):
                 with self.subTest(stage=stage, mutation=mutation):
                     rig = Rig()
                     override = rig.use_homing_override()
                     def mutate_after(callback, *args):
                         result = callback(*args)
-                        if mutation == "previous":
-                            override.prev_G28 = lambda gcmd: None
-                        elif mutation == "active":
-                            rig.gcode.gcode_handlers = {"G28": lambda gcmd: None}
-                        else:
+                        if mutation == "override":
                             override.in_script = True
+                        elif mutation == "macro":
+                            rig.objects["gcode_macro g28"] = types.SimpleNamespace(in_script=True)
+                        else:
+                            del rig.objects["homing"]
                         return result
                     if stage == "capture":
                         callback = rig.owner.start_capture
@@ -1174,7 +1299,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     else:
                         callback = rig.gcode.create_gcode_command
                         rig.gcode.create_gcode_command = lambda *args: mutate_after(callback, *args)
-                    with self.assertRaisesRegex(CommandError, "G28"):
+                    with self.assertRaisesRegex(CommandError, "active .*script|native homing API"):
                         rig.calibrate(save=0)
                     self.assertEqual(rig.home_calls, [])
                     self.assertEqual(override.calls, [])
@@ -1187,19 +1312,17 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     self.assertEqual(rig.owner.back_off_dist, 5.0)
                     self.assertEqual(rig.workflow.last_result["result"], "aborted")
 
-    def test_override_chain_is_revalidated_between_trials_and_manual_center_wait(self):
+    def test_active_scripts_are_rechecked_between_trials_and_manual_center_wait(self):
         for mode in ("calibration", "test", "waiting"):
-            for mutation in ("previous", "active", "recursion"):
+            for mutation in ("override", "macro"):
                 with self.subTest(mode=mode, mutation=mutation):
                     rig = Rig()
                     override = rig.use_homing_override()
                     def mutate(axis=None):
-                        if mutation == "previous":
-                            override.prev_G28 = lambda gcmd: None
-                        elif mutation == "active":
-                            rig.gcode.gcode_handlers = {"G28": lambda gcmd: None}
-                        else:
+                        if mutation == "override":
                             override.in_script = True
+                        else:
+                            rig.objects["gcode_macro G28"] = types.SimpleNamespace(in_script=True)
                     if mode == "waiting":
                         rig.home_results.append({"travel_mm": 2.0})
                         rig.wait_calibration(save=0)
@@ -2106,16 +2229,16 @@ class GuardTests(unittest.TestCase):
         rig.calibrate()
         self.assertEqual(rig.workflow.last_result["result"], "calibrated")
 
-    def test_unrecognized_overrides_macros_and_unrelated_g28_wrappers_rejected(self):
+    def test_configured_overrides_macros_and_unrelated_g28_wrappers_are_bypassed(self):
         for key in ("homing_override", "gcode_macro G28", "wrapped_handler"):
             rig = Rig()
             if key == "wrapped_handler":
                 rig.gcode.ready_gcode_handlers["G28"] = lambda g: None
             else:
                 rig.objects[key] = object()
-            with self.assertRaisesRegex(CommandError, "G28"):
-                rig.calibrate()
-            self.assertEqual(rig.scripts, [])
+            rig.calibrate(save=0)
+            self.assertEqual(rig.scripts, ["G28 X"] * 11)
+            self.assertEqual(rig.workflow.last_result["result"], "calibrated")
 
     def test_retract_or_minimum_second_home_are_rejected_before_initial_g28(self):
         for field in ("retract_dist", "min_home_dist"):

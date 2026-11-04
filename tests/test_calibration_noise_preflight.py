@@ -137,13 +137,13 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
             self.assertEqual(rig.workflow.noise_seeds, {})
 
     def test_invalid_inputs_reject_before_noise_and_never_forward_save_to_noise_command(self):
-        for kind in ("centered", "homed", "geometry", "stock", "policy", "grid", "save"):
+        for kind in ("centered", "homed", "geometry", "native", "policy", "grid", "save"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
                 rig = NoiseRig({"charts_directory": temp})
                 params = {"AXIS": "X", "CENTERED": 0 if kind == "centered" else 1, "SAVE_CONFIG": 0}
                 if kind == "homed": rig.toolhead.kin.limits[0] = (0., 300.)
                 elif kind == "geometry": rig.owner.rails_by_axis["x"].bounds = (0., 40.)
-                elif kind == "stock": rig.gcode.gcode_handlers["G28"] = lambda g: None
+                elif kind == "native": rig.objects.pop("homing")
                 elif kind == "policy": rig.policy_error = "synthetic unsupported motion policy"
                 elif kind == "grid": params["STEP"] = 0
                 elif kind == "save": params["SAVE_CONFIG"] = 2

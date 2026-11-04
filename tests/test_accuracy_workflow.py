@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -109,7 +110,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     rig.workflow.cmd_ACCURACY(GCmd(**params))
                 self.assertEqual(before, rig.effects())
 
-    def test_preflight_reuses_idle_unhomed_stock_policy_and_geometry_checks(self):
+    def test_preflight_reuses_idle_unhomed_native_policy_and_geometry_checks(self):
         setters = (lambda r: setattr(r, "print_state", "printing"),
                    lambda r: setattr(r, "paused", True),
                    lambda r: setattr(r, "sd_active", True),
@@ -121,9 +122,9 @@ class AccuracyWorkflowTests(unittest.TestCase):
                    lambda r: setattr(r, "policy_error", "speed too high"),
                    lambda r: r.toolhead.kin.limits.__setitem__(0, (0.0, 300.0)),
                    lambda r: setattr(r.owner.rails_by_axis["x"].info, "retract_dist", 1.0),
-                   lambda r: r.objects.__setitem__("homing_override", object()),
-                   lambda r: r.objects.__setitem__("gcode_macro G28", object()),
-                   lambda r: r.gcode.gcode_handlers.__setitem__("G28", lambda g: None))
+                   lambda r: r.objects.__setitem__("homing_override", types.SimpleNamespace(in_script=True)),
+                   lambda r: r.objects.__setitem__("gcode_macro G28", types.SimpleNamespace(in_script=True)),
+                   lambda r: r.objects.pop("homing"))
         for setter in setters:
             with self.subTest(setter=setter):
                 rig = AccuracyRig()
@@ -307,6 +308,25 @@ class AccuracyWorkflowTests(unittest.TestCase):
                     self.assertEqual(result["axis_results"]["y"]["statistics"]["mean_mm"], 100.0)
                     self.assertEqual("z" in rig.toolhead.kin.get_status(0)["homed_axes"], z_homed)
                     self.assert_restored(rig)
+
+    def test_public_g28_wrappers_and_aliases_are_preserved_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rig = AccuracyRig({"charts_directory": temp})
+            override = rig.use_homing_override()
+            public = mock.Mock(side_effect=AssertionError("public G28 was dispatched"))
+            override.prev_G28 = public
+            rig.objects["gcode_macro g28"] = types.SimpleNamespace(in_script=False)
+            rig.gcode.ready_gcode_handlers.update({"G28": public, "G28_BASE": public})
+            registered = dict(rig.gcode.ready_gcode_handlers)
+            rig.accuracy(axis="XY")
+            self.assertEqual(rig.scripts, ["G28 X"] * 3 + ["G28 Y"] * 3)
+            self.assertEqual(rig.dispatched_scripts, [])
+            self.assertEqual(override.calls, [])
+            public.assert_not_called()
+            self.assertEqual(rig.gcode.ready_gcode_handlers, registered)
+            self.assertEqual(rig.workflow.last_result["result"], "complete")
+            self.assertTrue(all(record["pass"] == 1 for record in rig.workflow.last_result["records"]))
+            self.assert_restored(rig)
 
     def test_single_y_and_exact_manual_threshold_are_used_without_tuning(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -154,9 +154,11 @@ acceleration or automatically choose a slower speed. See
 [timing and optional travel policies](DETAILS.md#timing-and-optional-travel-policies).
 
 Built-in `[safe_z_home]` or `[homing_override]` needs no acknowledgement flag.
-The plugin preserves their ordinary G28 behavior. Workflows bypass their scripts
-and need independent XY preparation; custom G28 macros remain unsupported by
-workflows even if installation was acknowledged. See
+The plugin preserves their ordinary G28 behavior. Custom G28 macros still need
+`--acknowledge-homing-override` for installation after reviewing their normal
+homing sequence. Workflows use native selected-axis homing and bypass public
+G28 wrappers/macros, so prepare XY currents/enables and clearance independently.
+See
 [workflow restrictions](COMPATIBILITY.md#workflow-restrictions).
 
 Development opt-outs are not a shared-instance migration mechanism. In

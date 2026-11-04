@@ -119,6 +119,29 @@ class BetaRig(Rig):
 
 
 class BetaCalibrationTests(unittest.TestCase):
+    def test_native_beta_homes_ignore_public_g28_wrappers_and_aliases(self):
+        for axis in "XY":
+            with self.subTest(axis=axis):
+                rig = BetaRig()
+                override = rig.use_homing_override()
+                public = mock.Mock(side_effect=AssertionError("public G28 was dispatched"))
+                override.prev_G28 = public
+                rig.objects["gcode_macro G28"] = types.SimpleNamespace(in_script=False)
+                rig.gcode.ready_gcode_handlers.update({"G28": public, "G28_BASE": public})
+                registered = dict(rig.gcode.ready_gcode_handlers)
+                rig.beta(axis)
+                self.assertEqual(rig.scripts, ["G28 " + axis] * 11)
+                self.assertEqual(rig.created_commands, [("G28", "G28 " + axis, {axis: ""})] * 11)
+                self.assertEqual(rig.dispatched_scripts, [])
+                self.assertEqual(override.calls, [])
+                public.assert_not_called()
+                self.assertEqual(rig.gcode.ready_gcode_handlers, registered)
+                self.assertEqual(rig.workflow.last_result["result"], "beta_proposed")
+                self.assertEqual(rig.configfile.saved, {})
+                self.assertEqual(rig.toolhead.position[2:], [40., 6.])
+                self.assertTrue(all(coords[2] is None and coords[1 if axis == "X" else 0] is None
+                                    for coords, _speed in rig.toolhead.moves))
+
     def test_beta_three_full_speed_recordings_then_eleven_homes_report_without_staging(self):
         for axis in "XY":
             with self.subTest(axis=axis):

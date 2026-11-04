@@ -71,19 +71,19 @@ CALIBRATE, TEST, CHARTS, ACCURACY and BETA require:
 - Correct finite rail geometry, endstop direction and sufficient
   midpoint-to-endstop travel. Calibration needs more than 20 mm.
 - Idle, unpaused operation, an empty motion queue and no competing homing/session.
-- A verified stock G28 handler, directly or beneath exactly one recognized
-  built-in `safe_z_home` or `homing_override` wrapper.
 
-The two built-in wrappers cannot coexist. Workflows reject G28 macros,
-replaced handlers, nested/unknown wrappers and an override already running its
-script. The installer's `--acknowledge-homing-override` acknowledges installation
-review only; it does not enable unsupported workflow handlers.
+The two built-in wrappers cannot coexist. Workflows still reject invocation from
+an active `homing_override` or G28 macro script as competing homing. The installer
+requires `--acknowledge-homing-override` to acknowledge review of custom G28
+macros for ordinary homing; this installation acknowledgement does not control
+workflow admission.
 
-For workflow homes the plugin verifies the installed built-in handler chain and
-calls stock single-axis homing directly. This skips safe Z hops and all override
-G-code/forced `set_position_*` setup, including `SYNC_MOTORS`, current hooks and
-Beacon Z actions. Prepare XY currents/enables and nozzle clearance separately.
-The workflow itself never requests a Z move; stock fatal-homing handling can
+Workflow homes call native selected-axis homing directly, independently of the
+public G28 handler or wrapper chain. This skips custom G28 macros, safe Z hops
+and all override G-code/forced `set_position_*` setup, including `SYNC_MOTORS`,
+current hooks and Beacon Z actions. Prepare XY currents/enables and nozzle
+clearance separately.
+The workflow itself never requests a Z move; native fatal-homing handling can
 still disable motors, so Z must remain supported.
 
 Ordinary public `G28` continues through its configured wrapper/script. A normal

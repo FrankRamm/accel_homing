@@ -144,7 +144,8 @@ budget; the monitored-home attempt budget still bounds retries.
    following ten measurements. All cycles share the attempt budget and
    sensor-range headroom policy described above.
 
-Discovery and validation use the same verified stock single-axis G28 path.
+Discovery and validation use the same native selected-axis homing path,
+independently of public G28 macros or wrappers.
 There is no standalone 20 mm probe move or successful no-contact endpoint.
 Only returns after qualifying impacts target the configured midpoint.
 CALIBRATE and ACCURACY share the helper for midpoint returns. These returns use
@@ -152,7 +153,7 @@ ordinary acceleration restored after homing, then wait `calibration_settle_time`
 (default 0.25 s) before the next acquisition. They do not apply the homing
 acceleration cap to midpoint returns. Homing speed and its acceleration cap
 are unchanged. No return command changes the other XY coordinate or Z.
-Cancellation/failure restores settings; stock G28's fatal error handling may
+Cancellation/failure restores settings; native homing's fatal error handling may
 turn off all motors, including Z. Keep Z supported as for ordinary homing faults.
 
 ## Travel plausibility before midpoint returns
@@ -193,8 +194,8 @@ slip or an obstruction can still produce plausible recorded travel.
 
 ## Automatic early-impact returns
 
-For a premature impact, take the selected axis's current coordinate after stock
-G28 and subtract its recorded signed start-to-halt displacement. Command one
+For a premature impact, take the selected axis's current coordinate after native
+homing and subtract its recorded signed start-to-halt displacement. Command one
 move to that target. The displacement includes movement between the threshold
 crossing and the halt; it is not just the trigger distance. If 2 mm was
 commanded before the halt, command 2 mm in the opposite direction.
