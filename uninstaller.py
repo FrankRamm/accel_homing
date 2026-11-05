@@ -447,9 +447,24 @@ def validate_installation_history(selected, api):
                 if after["kind"] != "file" or before["kind"] not in ("file", "absent"):
                     _fail(api, "Invalid Git exclude history", directory)
                 old = _bytes(before) if before["kind"] == "file" else b""
-                missing = ["klippy/extras/" + name for name in api.MODULES if "klippy/extras/" + name not in old.decode("utf-8").splitlines()]
-                expected = old + (b"\n" if old and not old.endswith(b"\n") else b"") + ("\n".join(missing) + "\n").encode()
-                if not missing or _bytes(after) != expected:
+                module_sets = [tuple(api.MODULES)]
+                center = "accel_homing_center.py"
+                # Main installations made before the center workflow linked
+                # exactly these six modules. Accept their original exclude
+                # journal without admitting arbitrary historical subsets.
+                legacy = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
+                          "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py")
+                if (tuple(api.MODULES) == legacy + (center,) and not any(
+                        Path(change["path"]) == extras / center for change in manifest["changes"])):
+                    module_sets.append(legacy)
+                expected = set()
+                for names in module_sets:
+                    missing = ["klippy/extras/" + name for name in names
+                               if "klippy/extras/" + name not in old.decode("utf-8").splitlines()]
+                    if missing:
+                        expected.add(old + (b"\n" if old and not old.endswith(b"\n") else b"")
+                                     + ("\n".join(missing) + "\n").encode())
+                if _bytes(after) not in expected:
                     _fail(api, "Git exclude backup contains unowned changes", directory)
                 kind = "exclude"
             elif path == generated and before["kind"] == "absent":

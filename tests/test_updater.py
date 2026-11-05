@@ -965,7 +965,8 @@ class UpdaterFixture(unittest.TestCase):
 
     def test_completed_legacy_uninstall_history_does_not_block_a_fresh_native_install(self):
         with mock.patch.object(updater, "ORIGIN", updater.LEGACY_ORIGIN), \
-                mock.patch.object(updater, "BRANCH", updater.LEGACY_BRANCH):
+                mock.patch.object(updater, "BRANCH", updater.LEGACY_BRANCH), \
+                mock.patch.object(updater, "BRANCHES", frozenset((updater.LEGACY_BRANCH,))):
             self.install_config(self.updater_plan())
             with mock.patch.object(installer, "proc_instances", return_value=[]), \
                     mock.patch.object(installer, "service_instances", return_value=[]):

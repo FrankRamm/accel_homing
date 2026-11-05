@@ -5,7 +5,7 @@ commands belong in the Linux host shell instead.
 
 ## Prepare every moving workflow
 
-Before CALIBRATE, TEST, CHARTS, ACCURACY or BETA:
+Before CALIBRATE, CALIBRATE_CENTER, TEST, CHARTS, ACCURACY or BETA:
 
 1. Keep the printer idle and unpaused, with no queued motion or other active
    homing workflow.
@@ -28,6 +28,7 @@ for your machine and independent Z support. See the complete
 | `ACCEL_HOMING_STATUS` | Read-only workflow/model/settings, result and plot paths. |
 | `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. |
+| `ACCEL_HOMING_CALIBRATE_CENTER AXIS=ALL CENTERED=1` | Development: ten direct alternating traverses per selected axis after one excluded initial home; no separate backoff/retract. `AXIS=X|Y|XY|ALL`, default both; `SEARCH_MARGIN=20` mm finite extra allowance per move. Report-only by default; `SAVE_CONFIG=1` explicitly saves consistent endpoints after all axes and cleanup succeed. See [coordinate calibration](CENTER.md). |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
 | `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |

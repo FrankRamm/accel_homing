@@ -23,6 +23,11 @@ import urllib.parse
 import uuid
 
 try:
+    from .accel_homing_center import CenterCalibration
+except ImportError:
+    from accel_homing_center import CenterCalibration
+
+try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
@@ -245,6 +250,7 @@ class AccelHomingWorkflows:
         self.noise_seeds = {}
         self.in_home = False
         self.home_axis = None
+        self.center = CenterCalibration(self)
         self.timer = self.reactor.register_timer(self._timeout)
         self.printer.register_event_handler("klippy:shutdown", self._shutdown)
         self.printer.register_event_handler("klippy:disconnect", self._disconnect)
@@ -255,6 +261,8 @@ class AccelHomingWorkflows:
                  "Calibrate one X or Y homing threshold with ten qualified homes"),
                 ("ACCEL_HOMING_BETA_CALIBRATE", self.cmd_BETA_CALIBRATE,
                  "Beta motion-noise experiment: PNG and threshold proposal only"),
+                ("ACCEL_HOMING_CALIBRATE_CENTER", self.center.command,
+                 "Development: estimate X/Y travel and midpoint from ten direct bidirectional traverses"),
                 ("ACCEL_HOMING_CALIBRATE_NOISE", self.cmd_NOISE,
                  "Measure three stationary one-second noise windows and suggest calibration starts"),
                 ("ACCEL_HOMING_CANCEL", self.cmd_CANCEL,
@@ -590,6 +598,9 @@ class AccelHomingWorkflows:
 
     def _finish(self, result, release=False):
         session = self.session
+        if session is not None and session["mode"] == "center":
+            self.center.interrupt(result)
+            return
         if session is not None and session.get("finishing"):
             session["finish_interrupted"] = result.get("reason", "workflow interrupted during PNG export")
             return
@@ -2024,7 +2035,7 @@ class AccelHomingWorkflows:
                 return extractor
         raise self._error("Beta requires the actual toolhead motion_report trapq extractor before motion")
 
-    def _beta_current_context(self, axis):
+    def _beta_current_context(self, axis, purpose="Beta"):
         settings = self._status("configfile").get("settings", {})
         steppers = {stepper.get_name() for stepper in self.owner.toolhead.get_kinematics().get_steppers()
                     if stepper.is_active_axis(axis)}
@@ -2045,7 +2056,7 @@ class AccelHomingWorkflows:
         helper = None
         if factory is not None and callable(getattr(factory, "_set_homing_current", None)):
             if not callable(getattr(self.owner.toolhead, "get_active_rails_for_axis", None)):
-                raise self._error("Beta native homing-current helper lacks its active-rail API before motion")
+                raise self._error("%s native homing-current helper lacks its active-rail API before motion" % purpose)
             state = factory(self.printer)
             helper = state._set_homing_current
         context = {"configured": configured, "settings_available": isinstance(settings, dict) and bool(settings),
@@ -2056,8 +2067,8 @@ class AccelHomingWorkflows:
             self.session["beta_driver_current_context"] = context
         if changed and helper is None:
             context["matching"] = "unsupported_changed_homing_current"
-            raise self._error("Beta found changed homing_current but the installed native homing-current "
-                              "helper is unavailable; current conditions cannot be matched before motion")
+            raise self._error("%s found changed homing_current but the installed native homing-current "
+                              "helper is unavailable; current conditions cannot be matched before motion" % purpose)
         return helper, context
 
     def _beta_motion_plan(self, session):
@@ -2725,8 +2736,10 @@ class AccelHomingWorkflows:
         if self.session is None:
             gcmd.respond_info("No accelerometer homing workflow is active")
             return
+        center = self.session["mode"] == "center"
         self._finish({"result": "cancelled", "reason": "operator cancelled"})
-        gcmd.respond_info("Accelerometer homing workflow cancelled; settings restored")
+        gcmd.respond_info("Accelerometer center calibration stop requested; native move cleanup will restore settings"
+                         if center else "Accelerometer homing workflow cancelled; settings restored")
 
     def _start_xy(self, gcmd, mode, axes=("x", "y")):
         self._require_centered(gcmd)
@@ -3207,7 +3220,12 @@ class AccelHomingWorkflows:
             key: session.get(key) for key in ("mode", "state", "axis", "candidate", "successes",
                                              "candidate_qualified", "attempts", "run_id", "expires",
                                              "repeatability_spread_mm")}
-        if session is not None and session["mode"] == "accuracy":
+        if session is not None and session["mode"] == "center":
+            active = {key: session.get(key) for key in ("mode", "state", "axis", "attempts", "run_id", "phase")}
+            active.update(axes=list(session["axes"]), traverses_per_axis=10,
+                          completed_traverses=dict(session["center_completed"]),
+                          save_requested=session["save_config"], separate_backoff_moves=0)
+        elif session is not None and session["mode"] == "accuracy":
             active = {key: session.get(key) for key in ("mode", "state", "axis", "attempts", "run_id")}
             active.update(axes=list(session["axes"]),
                           samples_requested=session["samples_requested"],

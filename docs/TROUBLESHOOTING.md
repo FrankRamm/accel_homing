@@ -10,12 +10,13 @@ centered or that SAVE_CONFIG succeeded.
 | Symptom | Check and next action |
 | --- | --- |
 | More than one Klipper instance/sensor found | Use the reported full paths and `--config`, `--service`, `--klippy-socket`, `--klipper-path` and/or `--accel-chip`. Explicit selections must describe the same instance. |
-| Source/origin/branch/upstream rejected | Use the complete clean `~/accel_homing` native clone with canonical HTTPS origin, `main` and `origin/main`. Review local changes; do not force-reset them away. |
+| Source/origin/branch/upstream rejected | Use the complete clean `~/accel_homing` native clone with canonical HTTPS origin and either `main`/`origin/main` or `dev`/`origin/dev`. `--branch` must match the checkout. Review local changes; do not force-reset them away. |
 | Legacy MISC ownership found | Preserve thresholds/models/config/backups and successfully uninstall with the old installation's uninstaller before standalone installation. See [migration](INSTALLATION.md#migrate-from-the-misc-plugin). |
 | Shared checkout/consumer conflict | Keep the source and every affected instance intact. Do not replace shared links while another instance uses them; use a supported dedicated installation. |
 | Service restart cannot be verified | Review the exact unit, checkout, config and socket. For an unsupported manager use `--no-restart`, then activate the selected processes manually while idle. |
 | Install succeeded but old code seems loaded | A full Klipper host-process restart is needed after source/link changes; console RESTART alone does not reload imported modules. |
-| Update entry missing after manual edit | Ensure one `[update_manager accel_homing]` across includes, correct standalone path/origin/main, and restart the matching Moonraker process. |
+| Update entry missing after manual edit | Ensure one `[update_manager accel_homing]` across includes, correct standalone path/origin and `primary_branch` matching the chosen `main` or `dev` checkout, then restart the matching Moonraker process. `channel: dev` does not select the branch. |
+| Branch change conflicts with an existing updater entry | Preserve the receipt and backup history. Automatic branch changes need an unchanged installer-created registration; review a pre-existing manual entry separately. Follow [dev branch recovery](INSTALLATION.md#test-the-dev-branch) before returning to the older `main` code. |
 | Update controls disabled or version unknown | Inspect Moonraker logs and its repository/tag/version status. See [official Git-repo configuration](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration). Do not point it at the historical MISC subtree. |
 | Plot dependency/render preflight failed | Rerun the installer with the exact selected Klipper interpreter if needed. Check connectivity, supported binary wheels and output permissions; global package pins are not a repair shortcut. |
 

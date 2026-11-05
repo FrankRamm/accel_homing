@@ -6,13 +6,16 @@ initial homing and calibration with an accessible emergency stop.
 
 ## Install
 
+This `dev` branch includes the experimental
+[center calibration workflow](docs/CENTER.md). It is separate from `main`.
+
 Run in the Linux printer host's shell as the existing Klipper service user,
 with the printer idle:
 
 ```bash
 cd ~
-git clone https://github.com/FrankRamm/accel_homing.git
-~/accel_homing/install.sh
+git clone --branch dev https://github.com/FrankRamm/accel_homing.git
+~/accel_homing/install.sh --branch dev
 ```
 
 The installer backs up its changes, configures X/Y homing and Moonraker
@@ -22,6 +25,21 @@ Linux sudo password. It does not home the printer.
 Read the [first calibration instructions](docs/SIMPLE_CALIBRATION.md) before
 moving the printer. Existing MISC installations must follow the
 [migration instructions](docs/INSTALLATION.md#migrate-from-the-misc-plugin) first.
+
+For an existing clean native `~/accel_homing` installation, select `dev` explicitly:
+
+```bash
+git -C ~/accel_homing fetch origin
+git -C ~/accel_homing switch dev
+git -C ~/accel_homing pull --ff-only
+~/accel_homing/install.sh --branch dev
+```
+
+With only `origin/dev` present, `git switch dev` creates its tracking branch.
+Keep the checkout, links and backup history in place. The installer updates
+its owned Moonraker registration to follow `dev`; it refuses local changes or
+a conflicting manual registration. See [branch switching and recovery](docs/INSTALLATION.md#test-the-dev-branch)
+before returning to the older `main` installer.
 
 For later updates, use **accel_homing → Update** in Mainsail or Fluidd while idle.
 
@@ -36,7 +54,7 @@ type: git_repo
 channel: dev
 path: ~/accel_homing
 origin: https://github.com/FrankRamm/accel_homing.git
-primary_branch: main
+primary_branch: dev
 is_system_service: False
 managed_services: klipper
 ```
@@ -45,6 +63,8 @@ Add the base `[update_manager]` section once if absent. After manual edits,
 restart the matching Moonraker service while idle. `~` is Moonraker's service
 user's home; use the printed absolute path if needed. A pre-existing manual
 entry survives uninstall.
+`channel: dev` selects Moonraker's Git update mode; `primary_branch: dev`
+selects this repository's branch. For a `main` installation use `primary_branch: main`.
 [Update details](docs/INSTALLATION.md#moonraker-updates) ·
 [Moonraker reference](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
 
@@ -61,6 +81,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Show settings, model, workflow progress, results and PNG paths. |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X; use `AXIS=Y` for Y. Measures fresh noise, then qualifies a threshold. |
+| `ACCEL_HOMING_CALIBRATE_CENTER AXIS=ALL CENTERED=1` | Dev: one excluded initial home, then ten alternating direct end-to-end traverses per selected axis, with no backoff/retract moves. Reports geometry; `SAVE_CONFIG=1` explicitly requests saving. See [center calibration](docs/CENTER.md). |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Measure three stationary one-second noise windows and export a PNG; no movement or threshold change. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both axes must use this plugin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
@@ -68,7 +89,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 
-**CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
+**ACCEL_HOMING_CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
 0.5 g once to the candidate after ten checks pass; those homes test the candidate,
 not the higher saved value. The other axis is unchanged. Prepare
 XY again after restart before calibrating the other axis. Explicit X/Y/shared
@@ -105,6 +126,7 @@ Keep the printed backup paths if you may need to undo the uninstall.
 [Configuration](docs/CONFIGURATION.md) ·
 [Console commands](docs/COMMANDS.md) ·
 [Calibration](docs/SIMPLE_CALIBRATION.md) ·
+[Center calibration (dev)](docs/CENTER.md) ·
 [Accuracy](docs/ACCURACY.md) ·
 [Plots](docs/PLOTS.md) ·
 [Beta experiment](docs/BETA.md) ·

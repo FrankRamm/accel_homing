@@ -25,6 +25,7 @@ def _current_users():
 
 ORIGIN = "https://github.com/FrankRamm/accel_homing.git"
 BRANCH = "main"
+BRANCHES = frozenset(("main", "dev"))
 LEGACY_ORIGIN = "https://github.com/FrankRamm/MISC.git"
 LEGACY_BRANCH = "codex/universal-accel-homing"
 SECTION = "update_manager accel_homing"
@@ -313,11 +314,12 @@ def assert_identity(moon, selected, api):
             _fail(api, "Moonraker configuration changed after planning: %s" % path)
 
 
-def stanza(repo):
+def stanza(repo, branch=None):
+    branch = BRANCH if branch is None else branch
     return ("# Managed by the accelerometer homing installer.\n"
             "[update_manager accel_homing]\n"
             "type: git_repo\nchannel: dev\npath: %s\norigin: %s\nprimary_branch: %s\n"
-            "is_system_service: False\nmanaged_services: klipper\n" % (repo, ORIGIN, BRANCH)).encode()
+            "is_system_service: False\nmanaged_services: klipper\n" % (repo, ORIGIN, branch)).encode()
 
 
 def main_suffix(add_base, add_include):
@@ -330,17 +332,17 @@ def main_suffix(add_base, add_include):
     return text.encode() if add_base or add_include else b""
 
 
-def direct_suffix(repo, add_base, add_stanza):
+def direct_suffix(repo, add_base, add_stanza, branch=None):
     if not add_base and not add_stanza:
         return b""
     text = b"\n# accel_homing managed Moonraker update registration\n"
     if add_base:
         text += b"[update_manager]\n"
-    return text + (stanza(repo) if add_stanza else b"")
+    return text + (stanza(repo, branch) if add_stanza else b"")
 
 
-def matching_stanza(section, repo, api, moon):
-    expected = api.ConfigDocument(section.document.path, stanza(repo)).sections[0]
+def matching_stanza(section, repo, api, moon, branch=None):
+    expected = api.ConfigDocument(section.document.path, stanza(repo, branch)).sections[0]
     header = section.document.lines[section.start]
     if (not header.startswith("[") or api.SECTION.match(header).group(1) != SECTION
             or set(section.options) != set(expected.options)):
@@ -376,6 +378,8 @@ def journal_layout(context, selected, api):
     common = {"moon_config", "moon_data", "moon_socket", "managed_repo", "origin", "branch", "append"}
     direct = isinstance(context, dict) and context.get("layout") == "direct"
     keys = common | ({"layout"} if direct else {"include_file"})
+    if isinstance(context, dict) and "previous_branch" in context:
+        keys.add("previous_branch")
     if not isinstance(context, dict) or set(context) != keys:
         _fail(api, "invalid updater journal context")
     repo = managed_path(selected)
@@ -384,17 +388,24 @@ def journal_layout(context, selected, api):
     main = Path(context["moon_config"])
     include = main.parent / INCLUDE
     if (not main.is_absolute() or (not direct and context["include_file"] != str(include))
-            or context["managed_repo"] != str(repo) or context["origin"] != ORIGIN or context["branch"] != BRANCH
+            or context["managed_repo"] != str(repo) or context["origin"] != ORIGIN
+            or not isinstance(context["branch"], str) or context["branch"] not in BRANCHES
             or context["moon_socket"] != str(selected["socket"])):
         _fail(api, "updater journal is outside selected instance ownership")
+    if ("previous_branch" in context and (not isinstance(context["previous_branch"], str)
+                                         or context["previous_branch"] not in BRANCHES
+                                         or context["previous_branch"] == context["branch"])):
+        _fail(api, "invalid updater branch transition")
     try:
         suffix = base64.b64decode(context["append"], validate=True)
     except (ValueError, TypeError):
         _fail(api, "invalid updater main-config journal")
-    suffixes = ({direct_suffix(repo, base, entry) for base in (False, True) for entry in (False, True)}
+    suffixes = ({direct_suffix(repo, base, entry, context["branch"]) for base in (False, True) for entry in (False, True)}
                 if direct else {main_suffix(base, inc) for base in (False, True) for inc in (False, True)})
     if suffix not in suffixes:
         _fail(api, "unowned Moonraker main-config edit")
+    if direct and "previous_branch" in context and suffix.count(stanza(repo, context["branch"])) != 1:
+        _fail(api, "branch transition does not own the complete Moonraker stanza")
     return dict(keys=keys, main=main, include=include, suffix=suffix, direct=direct)
 
 
@@ -423,7 +434,8 @@ def activation_needed(selected, context, api):
         value = json.loads(path.read_text())
         return not (value.get("status") == "restarted" and value.get("config") == context["moon_config"]
                     and value.get("instance") == instance_key(selected)
-                    and value.get("registration_sha256") == hashlib.sha256(stanza(Path(context["managed_repo"]))).hexdigest())
+                    and value.get("registration_sha256") == hashlib.sha256(
+                        stanza(Path(context["managed_repo"]), context["branch"])).hexdigest())
     return True
 
 
@@ -488,6 +500,26 @@ def assert_clone_consumers(source, selected, api):
                   "preserve the other instance before installing" % peer["config"])
 
 
+def assert_branch_ownership(previous, selected, api):
+    """A branch change may rewrite only an installer-created registration."""
+    checked = api.load_uninstaller().validate_installation_history(selected, api)
+    if checked["updater_context"] != previous:
+        _fail(api, "branch change requires the existing updater's complete matching installation history")
+    receipts = [entry for entry, kind, _directory in checked["validated"] if kind == "updater_receipt"]
+    if not receipts or not api.state_matches(selected["config"].parent / RECEIPT, receipts[-1]["after"]):
+        _fail(api, "branch change requires the unchanged owned updater receipt")
+    records = {record["directory"]: record["manifest"] for record in checked["active"]}
+    for entry, kind, directory in checked["validated"]:
+        context = records[directory].get("updater", {})
+        if previous.get("layout") == "direct" and kind == "moon_main":
+            if ("previous_branch" not in context and context.get("layout") == "direct"
+                    and stanza(Path(previous["managed_repo"]), context["branch"]) in base64.b64decode(context["append"])):
+                return
+        elif previous.get("layout") != "direct" and kind == "moon_generated" and entry["before"]["kind"] == "absent":
+            return
+    _fail(api, "branch change cannot overwrite a pre-existing manual Moonraker entry; preserve/reconcile it separately")
+
+
 def make_plan(source, selected, args, api):
     reject_legacy_installation(selected, api)
     repo = managed_path(selected)
@@ -498,6 +530,10 @@ def make_plan(source, selected, args, api):
     identity = repo_identity(source, api)
     if identity["commit"] != commit:
         _fail(api, "standalone checkout changed during source validation; retry")
+    branch = identity["branch"]
+    if getattr(args, "branch", None) not in (None, branch):
+        _fail(api, "--branch %s does not match checked-out branch %s; switch Git explicitly before installing" %
+              (args.branch, branch))
     assert_clone_consumers(source, selected, api)
     moon = discover_moonraker(selected, api, getattr(args, "moonraker_config", None))
     assert_identity(moon, selected, api)
@@ -520,11 +556,12 @@ def make_plan(source, selected, args, api):
         if owned and original.count(owned) != 1:
             _fail(api, "owned Moonraker main-config registration changed/missing; preserve/reconcile it before updating")
     existing = graph.one(SECTION, False)
+    registered_branch = previous["branch"] if previous else branch
     direct = True
     if existing:
-        if existing.document.path == include and include.read_bytes() == stanza(repo):
+        if existing.document.path == include and include.read_bytes() == stanza(repo, registered_branch):
             direct = False
-        elif existing.document.path != moon["config"] or not matching_stanza(existing, repo, api, moon):
+        elif existing.document.path != moon["config"] or not matching_stanza(existing, repo, api, moon, registered_branch):
             _fail(api, "conflicting existing [%s]; preserve/reconcile it instead of overwriting" % SECTION)
     elif previous:
         _fail(api, "owned Moonraker updater registration is missing; preserve/reconcile it before updating")
@@ -537,17 +574,32 @@ def make_plan(source, selected, args, api):
         for name in base.options:
             base.get(name)  # Reject duplicate base options without changing them.
     add_base = base is None
-    suffix = direct_suffix(repo, add_base, not existing) if direct else main_suffix(add_base, False)
+    suffix = direct_suffix(repo, add_base, not existing, branch) if direct else main_suffix(add_base, False)
     if suffix and previous and previous["append"]:
         _fail(api, "Moonraker base updater configuration changed; reconcile it before updating")
     if suffix:
         changes[moon["config"]] = dict(kind="file", data=original + suffix)
     context = dict(moon_config=str(moon["config"]), moon_data=str(moon["data"]),
                    moon_socket=str(moon["socket"]), managed_repo=str(repo), origin=ORIGIN,
-                   branch=BRANCH, append=base64.b64encode(suffix).decode())
+                   branch=branch, append=base64.b64encode(suffix).decode())
     context.update(dict(layout="direct") if direct else dict(include_file=str(include)))
     if previous and not suffix:
         context["append"] = previous["append"]
+        if "previous_branch" in previous:
+            context["previous_branch"] = previous["previous_branch"]
+    if previous and previous["branch"] != branch:
+        assert_branch_ownership(previous, selected, api)
+        context["previous_branch"] = previous["branch"]
+        if direct:
+            old_suffix = base64.b64decode(previous["append"])
+            old_stanza = stanza(repo, previous["branch"])
+            if old_suffix.count(old_stanza) != 1:
+                _fail(api, "branch change does not own the complete direct Moonraker registration")
+            new_suffix = old_suffix.replace(old_stanza, stanza(repo, branch), 1)
+            changes[moon["config"]] = dict(kind="file", data=original.replace(old_suffix, new_suffix, 1))
+            context["append"] = base64.b64encode(new_suffix).decode()
+        else:
+            changes[include] = dict(kind="file", data=stanza(repo, branch))
     encoded = (json.dumps(dict(version=1, instance=instance_key(selected), commit=commit,
                                **context), sort_keys=True, indent=2) + "\n").encode()
     if receipt_state.get("data") != base64.b64encode(encoded).decode():
@@ -583,14 +635,14 @@ def repo_identity(repo, api):
     origin = git(repo, ["remote", "get-url", "origin"], api)
     branch = git(repo, ["symbolic-ref", "--short", "HEAD"], api)
     upstream = git(repo, ["rev-parse", "--abbrev-ref", "@{upstream}"], api)
-    if origin != ORIGIN or branch != BRANCH or upstream != "origin/" + BRANCH:
+    if origin != ORIGIN or branch not in BRANCHES or upstream != "origin/" + branch:
         _fail(api, "managed checkout origin/branch/upstream differs; nothing was reset or stashed")
     if git(repo, ["status", "--porcelain=v1", "--untracked-files=all"], api):
         _fail(api, "managed checkout is dirty; preserve/reconcile those changes before updating")
     commit = git(repo, ["rev-parse", "HEAD"], api)
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         _fail(api, "standalone checkout did not return a full commit SHA")
-    git(repo, ["merge-base", "--is-ancestor", commit, "origin/" + BRANCH], api)
+    git(repo, ["merge-base", "--is-ancestor", commit, "origin/" + branch], api)
     return dict(commit=commit, origin=origin, branch=branch, upstream=upstream)
 
 
@@ -704,7 +756,8 @@ def record_activation(plan, selected, api, backup, status, **extra):
         backup = active[-1]["directory"]
     path = backup / "moonraker-activation.json"
     data = dict(status=status, service=plan["moon"]["service"], config=str(plan["moon"]["config"]),
-                instance=instance_key(selected), registration_sha256=hashlib.sha256(stanza(plan["repo"])).hexdigest(), **extra)
+                instance=instance_key(selected), registration_sha256=hashlib.sha256(
+                    stanza(plan["repo"], plan["context"]["branch"])).hexdigest(), **extra)
     api.write_state(path, dict(kind="file", mode=0o600,
                     data=base64.b64encode((json.dumps(data, indent=2) + "\n").encode()).decode()))
     return path
@@ -766,6 +819,14 @@ def validate_record(manifest, selected, api, verify_live=True):
     layout = journal_layout(context, selected, api)
     repo = managed_path(selected)
     main, include, suffix = layout["main"], layout["include"], layout["suffix"]
+    branch, previous_branch = context["branch"], context.get("previous_branch")
+    registration = stanza(repo, branch)
+    previous_suffix = (suffix.replace(registration, stanza(repo, previous_branch), 1)
+                       if previous_branch and layout["direct"] else suffix)
+    current_context = {key: value for key, value in context.items() if key != "previous_branch"}
+    previous_context = dict(current_context, branch=previous_branch,
+                            append=base64.b64encode(previous_suffix).decode()) if previous_branch else None
+    registration_changed = any(Path(entry["path"]) in (main, include) for entry in manifest["changes"])
     if verify_live:
         moon = discover_moonraker(selected, api, main)
         if str(moon["data"]) != context["moon_data"]:
@@ -782,7 +843,13 @@ def validate_record(manifest, selected, api, verify_live=True):
         if manifest.get("operation") == "uninstall":
             before, after = after, before
         if path == include:
-            if before["kind"] != "absent" or after["kind"] != "file" or base64.b64decode(after["data"]) != stanza(repo):
+            created = (before["kind"] == "absent"
+                       and (not previous_branch or manifest.get("operation") == "uninstall"))
+            switched = (previous_branch and manifest.get("operation") != "uninstall"
+                        and before["kind"] == "file"
+                        and base64.b64decode(before["data"]) == stanza(repo, previous_branch))
+            if (not (created or switched) or after["kind"] != "file"
+                    or base64.b64decode(after["data"]) != registration):
                 _fail(api, "unowned generated Moonraker updater edit")
         elif path == main:
             if not suffix or before["kind"] != "file" or after["kind"] != "file":
@@ -791,17 +858,29 @@ def validate_record(manifest, selected, api, verify_live=True):
             if manifest.get("operation") == "uninstall":
                 if new.count(suffix) != 1 or new.replace(suffix, b"", 1) != old:
                     _fail(api, "uninstall contains unowned Moonraker text changes")
+            elif previous_branch:
+                if old.count(previous_suffix) != 1 or new != old.replace(previous_suffix, suffix, 1):
+                    _fail(api, "updater branch transition changes unrelated Moonraker settings")
             elif new != old + suffix:
                 _fail(api, "updater journal changes unrelated Moonraker settings")
         else:
-            for state in (before, after):
+            for is_before, state in ((True, before), (False, after)):
                 if state["kind"] == "absent":
                     continue
                 if state["kind"] != "file":
                     _fail(api, "unsafe updater receipt journal")
                 value = json.loads(base64.b64decode(state["data"]))
                 value_context = receipt_context(value, selected, api)
-                if set(value_context) != layout["keys"]:
+                normalized = {key: item for key, item in value_context.items() if key != "previous_branch"}
+                allowed_contexts = (current_context,)
+                if is_before and previous_branch and registration_changed:
+                    allowed_contexts = ((current_context, previous_context)
+                                        if manifest.get("operation") == "uninstall" else (previous_context,))
+                elif is_before and not previous_branch and registration_changed:
+                    # Existing manual registration may acquire only the base
+                    # update_manager section, with no previously owned suffix.
+                    allowed_contexts += (dict(current_context, append=""),)
+                if normalized not in allowed_contexts:
                     _fail(api, "unowned updater receipt contents")
         checked[path] = allowed[path]
     return checked

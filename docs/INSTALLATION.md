@@ -23,19 +23,28 @@ explicit selection. It does not infer electrical wiring or validate mechanics.
 
 ## Install
 
+For the new center calibration workflow, install this `dev` branch:
+
 ```bash
 cd ~
-git clone https://github.com/FrankRamm/accel_homing.git
-~/accel_homing/install.sh
+git clone --branch dev https://github.com/FrankRamm/accel_homing.git
+~/accel_homing/install.sh --branch dev
 ```
+
+To install the existing `main` version instead, use `git clone --branch main`
+with the same URL, then run its `install.sh`. Existing `main` installations
+stay on `main` until the operator explicitly switches their Git branch.
 
 Keep this checkout in place: installed extras are links to its Python modules.
 Moving or deleting the checkout breaks those links. A second `git clone` into
 an existing directory is unnecessary; use the update procedure below.
 
-The default managed source must be the complete clean `~/accel_homing` Git
-checkout of `main`, with exact
-origin `https://github.com/FrankRamm/accel_homing.git` and upstream `origin/main`.
+The managed source must be the complete clean `~/accel_homing` Git checkout
+of `main` or `dev`, with exact origin
+`https://github.com/FrankRamm/accel_homing.git` and the matching upstream
+`origin/main` or `origin/dev`. The installer follows the checked-out branch;
+`--branch main` or `--branch dev` requires that exact choice without switching
+Git. Other branches, detached HEADs and mismatched upstreams are refused.
 The installer refuses conflicting source identity or ownership; it does not
 reset or stash local changes to make them disappear. One managed Klipper
 instance may use this per-user clone; a discovered second instance using its
@@ -119,6 +128,7 @@ pending work before installing or updating.
 | `--klippy-socket PATH` | Select its read-only Klipper API socket. |
 | `--klipper-python PATH` | Select its exact venv Python when discovery cannot establish it. |
 | `--moonraker-config PATH` | Select the Moonraker config correlated with that Klippy socket. |
+| `--branch main` or `--branch dev` | Require this checked-out branch and matching upstream for managed installation/update; no Git branch is changed. |
 | `--accel-chip 'adxl345 toolhead'` | Select a full configured sensor section; preserve suffix case. |
 | `--generic-names` | Rename a legacy plugin section and both X/Y pin aliases transactionally; preserve calibration and reject active legacy macro/object/command references. Installation/update only. |
 | `--axes x,y`, `--axes x`, `--axes y` | Install both axes by default, or only the selected axis. |
@@ -178,7 +188,7 @@ type: git_repo
 channel: dev
 path: /home/YOUR_USER/accel_homing
 origin: https://github.com/FrankRamm/accel_homing.git
-primary_branch: main
+primary_branch: dev
 is_system_service: False
 managed_services: klipper
 ```
@@ -194,9 +204,12 @@ release requires configuration/dependency changes, or after Hard Recovery if
 the private plotting cache needs to be rebuilt. Frontend update controls and
 version detection depend on Moonraker/frontend versions and repository tags;
 see the [official Git-repo configuration](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
-The `dev` channel does not make this experimental plugin a stable release.
+`channel: dev` is Moonraker's Git update mode; it does not select the Git branch.
+The installer sets `primary_branch` to its checked-out `main` or `dev` branch.
+Use `primary_branch: main` for a manual `main` registration. Both branches remain
+experimental.
 
-For a manual update of an established clean `main` checkout:
+For a manual update of an established clean checkout on its current branch:
 
 ```bash
 git -C ~/accel_homing pull --ff-only
@@ -206,6 +219,50 @@ git -C ~/accel_homing pull --ff-only
 If Git or the installer reports local changes, preserve and review them. Do not
 use a forced reset to conceal an ownership or configuration conflict.
 `--no-update-manager` installs do not configure this native update flow.
+
+## Test the dev branch
+
+Keep the printer idle. For an existing clean native installation, keep its
+checkout path and complete backup history, and run:
+
+```bash
+git -C ~/accel_homing fetch origin
+git -C ~/accel_homing switch dev
+git -C ~/accel_homing pull --ff-only
+~/accel_homing/install.sh --branch dev
+```
+
+If no local `dev` exists and `origin/dev` is the unique matching remote branch,
+`git switch dev` creates it with upstream `origin/dev`. An existing local
+`dev` must already track `origin/dev`. The installer verifies the source and
+updates only its recorded, unchanged Moonraker registration from
+`primary_branch: main` to `primary_branch: dev`. The module links retain the
+same checkout path; the new center helper is added. Existing thresholds,
+models and ordinary homing behavior are preserved. See
+[center calibration](CENTER.md) before running that moving command.
+
+A pre-existing manual updater entry is preserved. An existing managed
+receipt for that entry blocks automatic branch switching. Complete the
+managed uninstall using the available `dev` installer first; the manual
+entry survives. Then review its `primary_branch` change and reinstall `dev`
+while idle. Do not delete the updater receipt or transaction history to
+bypass a reported conflict.
+
+Returning to the current older `main` requires recovery **while the `dev`
+installer is still available**: that older code cannot read `dev` updater
+receipts or the new center-module journals. For an unchanged immediate
+upgrade, use the `dev` installer's printed `--rollback BACKUP_DIRECTORY`
+command to restore that upgrade's configuration, registration and links.
+Only after rollback succeeds, switch the caller-owned checkout back to
+`main`, pull with `--ff-only`, and use the `main` installer while idle. If
+later transactions prevent that rollback, complete the managed uninstall
+using `dev` first, then switch and reinstall `main`.
+
+Rollback and uninstall restore their owned configuration; they never reset
+or switch Git. Preserve the source, backups and any operator edits, and
+follow the printed host-service restart instructions to activate the chosen
+version. A Git switch immediately changes symlinked source files even before
+the installer runs; keep the printer idle throughout the entire procedure.
 
 ## Migrate from the MISC plugin
 

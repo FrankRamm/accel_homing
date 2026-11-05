@@ -21,7 +21,8 @@ import time
 import uuid
 
 MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
-           "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py")
+           "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py",
+           "accel_homing_center.py")
 SENSORS = {"beacon", "adxl345", "lis2dw", "lis3dh", "mpu9250", "icm20948"}
 SAVE_MARKER = "#*# <---------------------- SAVE_CONFIG ---------------------->"
 MANAGED = "accel_homing.cfg"
@@ -1213,6 +1214,8 @@ def arguments(argv=None):
     parser.add_argument("--klippy-socket", default=os.environ.get("KLIPPY_SOCKET"), help="read-only Klipper API socket (-a)")
     parser.add_argument("--klipper-python", help="exact selected Klipper venv interpreter when it cannot be detected; never bootstrap/global Python")
     parser.add_argument("--no-update-manager", action="store_true", help="install without managed git source/Moonraker registration (offline/development opt-out)")
+    parser.add_argument("--branch", choices=("main", "dev"),
+                        help="require this checked-out managed branch; default follows the current main/dev checkout without switching Git")
     parser.add_argument("--moonraker-config", help="select the actual Moonraker config; must match this Klippy API socket")
     parser.add_argument("--accel-chip", help="full configured section, e.g. 'adxl345 toolhead'")
     parser.add_argument("--generic-names", action="store_true",
@@ -1242,6 +1245,8 @@ def arguments(argv=None):
         parser.error("--max-report-travel and --max-startup-travel apply only to installation/update")
     if (args.rollback or args.uninstall) and args.generic_names:
         parser.error("--generic-names applies only to installation/update")
+    if args.branch and (args.rollback or args.uninstall or args.no_update_manager):
+        parser.error("--branch applies only to managed installation/update")
     return args
 
 
@@ -1466,7 +1471,8 @@ def main(argv=None):
                                  expected=getattr(planning_args, "_migration_expected", {}).get(
                                      link, changes.get(link, {}).get("expected", snapshot(link))))
         changes.update(updater["changes"])
-        print("Managed update source: %s\nMoonraker config: %s" % (updater["repo"], updater["moon"]["config"]))
+        print("Managed update source: %s\nManaged branch: %s\nMoonraker config: %s" %
+              (updater["repo"], updater["context"]["branch"], updater["moon"]["config"]))
     print("Accelerometer: [%s] (physical mounting/orientation not inferred)" % sensor)
     for message in messages:
         print("Note: " + message)

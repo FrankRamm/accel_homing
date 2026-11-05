@@ -65,6 +65,7 @@ NATIVE_PROOF_SCAN_BUDGET = 1024      # same-window comparisons per reactor event
 STEP_EPOCH_PRECISION = 0.000050      # s, bound on the first commanded-step search
 AXES = {"x": 0, "y": 1}
 FAILURES = {
+    "cancelled": "accelerometer homing workflow was cancelled",
     "no_data": "no fresh accelerometer data",
     "no_baseline": "no fresh quiet accelerometer baseline before the move",
     "baseline_overflow": "stationary baseline exceeded its bounded sample capacity",
