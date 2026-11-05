@@ -350,16 +350,14 @@ class SimpleWorkflowTests(unittest.TestCase):
         self.assertEqual(rig.workflow.last_result["threshold_g"], 2.0)
         self.assertEqual(rig.workflow.last_result["restarts"], 2)
 
-    def test_failed_set_cannot_exceed_sensor_headroom_or_global_attempt_budget(self):
-        for ceiling in ("sensor-headroom", "attempts"):
-            rig = Rig({"calibration_max_attempts": 12} if ceiling == "attempts" else {})
-            if ceiling == "sensor-headroom":
-                rig.owner.full_scale_g = 1.25
-            rig.home_results.extend([{}] + [{"travel_mm": 150.}] * 9 + [{"travel_mm": 153.}])
-            with self.assertRaisesRegex(CommandError, "headroom|attempt budget"):
-                rig.calibrate(save=0)
-            self.assertEqual(rig.configfile.saved, {})
-            self.assertLessEqual(len(rig.home_calls), rig.workflow.max_attempts)
+    def test_failed_set_cannot_exceed_sensor_headroom(self):
+        rig = Rig()
+        rig.owner.full_scale_g = 1.25
+        rig.home_results.extend([{}] + [{"travel_mm": 150.}] * 9 + [{"travel_mm": 153.}])
+        with self.assertRaisesRegex(CommandError, "headroom"):
+            rig.calibrate(save=0)
+        self.assertEqual(rig.configfile.saved, {})
+        self.assertEqual(len(rig.home_calls), 11)
 
     def test_same_command_automatically_raises_threshold_after_early_impact(self):
         rig = Rig()

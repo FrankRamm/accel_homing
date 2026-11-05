@@ -1,5 +1,5 @@
 # Supervised calibration and measured charts for accelerometer homing. GPLv3.
-"""Bounded X/Y workflows. No workflow command ever requests a Z move.
+"""Supervised X/Y workflows. No workflow command ever requests a Z move.
 
 An accelerometer and motor step count cannot establish physical position.
 The operator confirms the initial center. Premature calibration triggers reverse
@@ -60,6 +60,10 @@ CALIBRATION_REPEATABILITY_MM = 2.0
 CALIBRATION_THRESHOLD_MARGIN_G = 0.5
 SIMPLE_CALIBRATION = "impact20_vector_v2"
 REQUIRED_SUCCESSES = 10
+# Diagnostic captures only: retain the final discovery + ten checks and context.
+# Each of its two display envelopes is <=4096 points; 16 homes leave ample
+# room for the three motion traces under the renderer's existing 32 MiB limit.
+BETA_HOME_HISTORY_LIMIT = 16
 REPEATABILITY_LIMIT_MM = 1.5
 MIN_TRAVEL = 10.0
 NOISE_ITERATIONS = 3
@@ -204,8 +208,9 @@ class AccelHomingWorkflows:
         if config.get("calibration_max_threshold", None) is not None:
             logging.warning("accel_homing: calibration_max_threshold is deprecated and ignored; "
                             "calibration retains the sensor-range headroom policy")
-        self.max_attempts = config.getint("calibration_max_attempts", 40,
-                                          minval=12, maxval=100)
+        if config.get("calibration_max_attempts", None) is not None:
+            logging.warning("accel_homing: calibration_max_attempts is deprecated and ignored; "
+                            "calibration has no total homing-attempt limit")
         self.confirm_timeout = config.getfloat("calibration_confirm_timeout", 300.0,
                                                minval=30.0, maxval=1800.0)
         self.travel_tolerance = config.getfloat("calibration_travel_tolerance", 0.20,
@@ -498,16 +503,29 @@ class AccelHomingWorkflows:
                 "accounting": "completed_commanded_returns", "physical_position_verified": False}
 
     def _calibration_attempt_status(self, session):
-        return {"attempt_limit": self.max_attempts,
-                "attempts_remaining": max(0, self.max_attempts - session["attempts"]),
-                # Describes a complete candidate; retries do not reserve these homes.
+        # Retain the public fields with JSON null meaning no attempt limit/countdown.
+        return {"attempt_limit": None, "attempts_remaining": None,
+                # Describes a complete candidate, not a retry admission requirement.
                 "candidate_attempts_required": REQUIRED_SUCCESSES + 1}
 
-    def _require_calibration_attempts(self, session):
-        if not self._calibration_attempt_status(session)["attempts_remaining"]:
-            raise self._error(
-                "calibration attempt budget exhausted: maximum homing attempts reached; "
-                "no automatic return, recenter or threshold increase")
+    @staticmethod
+    def _append_beta_home(session, item):
+        homes = session["beta_homes"]
+        homes.append(item)
+        omitted = max(0, len(homes) - BETA_HOME_HISTORY_LIMIT)
+        if omitted:
+            session["beta_homes_omitted"] += omitted
+            del homes[:omitted]
+
+    @staticmethod
+    def _beta_home_history(session):
+        homes, omitted = session["beta_homes"], session["beta_homes_omitted"]
+        first = homes[0]["record"]["workflow_attempt"] if homes else None
+        last = homes[-1]["record"]["workflow_attempt"] if homes else None
+        return {"scope": "diagnostic_captures_only", "retention_limit": BETA_HOME_HISTORY_LIMIT,
+                "total_homes": omitted + len(homes), "retained_homes": len(homes),
+                "omitted_homes": omitted, "retained_attempt_range": [first, last] if homes else None,
+                "omitted_attempt_range": [1, first - 1] if omitted else None}
 
     def _model_context(self, axis):
         rail = self.owner.rails_by_axis[axis]
@@ -588,6 +606,7 @@ class AccelHomingWorkflows:
                               recovery=self._calibration_recovery_status(session))
                 if session.get("beta"):
                     result.update(beta=True, beta_phase=session.get("beta_phase"),
+                                  beta_home_history=self._beta_home_history(session),
                                   motion_noise=session.get("beta_motion_summary"),
                                   motion_plan=session.get("beta_motion_plan"),
                                   repeatability_spread_mm=session.get("repeatability_spread_mm"))
@@ -846,10 +865,9 @@ class AccelHomingWorkflows:
                    "impact after >20 mm then ten centered endstop checks with spread <= 2 mm; "
                    "no quietness or acceleration-derived motion proof; returns settle for %.3f s; "
                    "early triggers reverse their recorded signed start-to-halt travel; "
-                   "%d total homing attempts; retries continue while attempts remain" % (
+                   "no total homing-attempt limit" % (
                        session["axis"].upper(), session["candidate"], session["threshold_step_g"],
-                        session["calibration_settle_time_s"],
-                        self.max_attempts))
+                        session["calibration_settle_time_s"]))
 
     def _wait_center(self, reason):
         self._restore()
@@ -1267,7 +1285,8 @@ class AccelHomingWorkflows:
         if axis not in AXES:
             raise self._error("workflow homing requires exactly one X or Y axis")
         session = self.session
-        if session["attempts"] >= session.get("attempt_limit", self.max_attempts):
+        attempt_limit = session.get("attempt_limit")
+        if attempt_limit is not None and session["attempts"] >= attempt_limit:
             raise self._error("maximum homing attempts reached")
         self._check_running(session)
         if threshold is not None:
@@ -1377,7 +1396,7 @@ class AccelHomingWorkflows:
                 self._validate_accuracy_capture(session, axis, source_record, detector_record,
                                                 record, capture, record["workflow_threshold_g"])
             record["beta_telemetry"] = self.owner.beta_home_telemetry(capture, record)
-            session["beta_homes"].append(compact_beta_home(capture, record))
+            self._append_beta_home(session, compact_beta_home(capture, record))
         if session["mode"] != "accuracy":
             session["records"].append(record)
         self._info("%s home: result %s; onset %s g; peak %s g; threshold %s g; "
@@ -1596,8 +1615,6 @@ class AccelHomingWorkflows:
         # Called only after _quality accepted this exact axis's current home.
         session = self.session
         self._check_running(session)
-        if session["mode"] == "calibration":
-            self._require_calibration_attempts(session)
         if (self.owner.homing_active or self.owner.attempt is not None
                 or self.owner.saved_accel is not None):
             raise self._error("return to center requires completed homing with restored normal acceleration")
@@ -1647,7 +1664,6 @@ class AccelHomingWorkflows:
     def _next_calibration_candidate(self, reason, apply=True):
         session = self.session
         self._check_running(session)
-        self._require_calibration_attempts(session)
         candidate = float(Decimal(str(session["candidate"])) + Decimal(str(session["threshold_step_g"])))
         if not math.isfinite(candidate) or candidate <= session["candidate"]:
             raise self._error(reason + "; next calibration candidate must be finite and increase the threshold")
@@ -1690,7 +1706,6 @@ class AccelHomingWorkflows:
                 raise self._error("early return was interrupted or its current result changed")
 
         current()
-        self._require_calibration_attempts(session)
         info = self.owner.rails_by_axis[axis].get_homing_info()
         try:
             self.owner._limit_accel()
@@ -1735,7 +1750,7 @@ class AccelHomingWorkflows:
             if quality == "early":
                 session["early_return_cleanup"] = True
                 try:
-                    # Threshold/attempt checks must not change the candidate
+                    # Threshold checks must not change the candidate
                     # if the recorded displacement or ordinary firmware move fails.
                     self._next_calibration_candidate(reason, apply=False)
                     self._return_early_calibration(axis, record)
@@ -1744,9 +1759,9 @@ class AccelHomingWorkflows:
                     self._invalidate_calibration_axis(session)
                 self._info(reason + "; reversed commanded start-to-halt travel to the estimated "
                            "starting point; restart impact discovery at %.2f g; completed "
-                           "%d returns, last signed return %.6f mm; %d attempts remain" % (
+                           "%d returns, last signed return %.6f mm; %d total homing attempts" % (
                                 candidate, session["recovery"]["count"], session["recovery"]["last_return_mm_signed"],
-                                self._calibration_attempt_status(session)["attempts_remaining"]))
+                                session["attempts"]))
                 continue
             if discovery:
                 session["candidate_qualified"] = True
@@ -2348,7 +2363,6 @@ class AccelHomingWorkflows:
         if (type(halt) not in (int, float) or not math.isfinite(halt)
                 or halt != terminal[2].get("halt_travel_mm_signed")):
             raise self._error("Beta rejection requires its current finite signed halt displacement")
-        self._require_calibration_attempts(session)
         def current():
             self._beta_check(session)
             if (self.owner.last.get(axis) is not terminal[2]
@@ -2401,7 +2415,7 @@ class AccelHomingWorkflows:
                         "workflow_attempt") == session["attempts"]:
                     session["beta_homes"][-1]["record"].update(partial)
                 else:
-                    session["beta_homes"].append({"record": partial, "capture": {"samples": []}})
+                    self._append_beta_home(session, {"record": partial, "capture": {"samples": []}})
                 raise
             del capture
             quality, reason = self._quality(axis, record)
@@ -2456,7 +2470,8 @@ class AccelHomingWorkflows:
         if session.get("beta_exported"):
             return result
         session["beta_exported"] = True
-        result = dict(result, beta=True, save_config=False, model_staged=False)
+        result = dict(result, beta=True, save_config=False, model_staged=False,
+                      beta_home_history=self._beta_home_history(session))
         if session.get("finish_interrupted"):
             primary = result.get("reason")
             result.update(result="aborted", operation_reason=primary,
@@ -2474,6 +2489,7 @@ class AccelHomingWorkflows:
                 paths = write_beta_motion(
                     self.charts_directory, session["run_id"], session["axis"],
                     session["beta_motion_iterations"], homes=session["beta_homes"],
+                    home_history=self._beta_home_history(session),
                     result=result["result"], reason=result.get("reason"),
                     proposed_threshold_g=result.get("proposed_threshold_g"), renderer=self.renderer,
                     check_running=check_report)
@@ -2547,7 +2563,7 @@ class AccelHomingWorkflows:
                       "beta_reason", "beta_running_spread_mm", "beta_rejected_return_mm_signed",
                       "beta_telemetry", "capture_valid")
         trials = [{key: item["record"].get(key) for key in trial_keys if key in item["record"]}
-                  for item in session["beta_homes"][:self.max_attempts]]
+                  for item in session["beta_homes"]]
         motions = []
         for item in session["beta_motion_iterations"][:NOISE_ITERATIONS]:
             record = dict(item["record"])
@@ -2571,6 +2587,7 @@ class AccelHomingWorkflows:
                               "capture_sample_limit": getattr(self.owner, "capture_limit", None)},
             "motion_plan": plan, "driver_current_context": session.get("beta_driver_current_context"),
             "seed": summary, "motions": motions, "trials": trials,
+            "home_history": self._beta_home_history(session),
             "current_motion": session.get("beta_current_motion"),
             "capture_health": optional("capture diagnostics", lambda: self.owner.beta_capture_diagnostics()),
             "qualification": {"expected_center_travel_mm": expected,
@@ -2620,11 +2637,12 @@ class AccelHomingWorkflows:
             for number, phase in enumerate(phases, 1):
                 emit("motion.%d.phase.%d" % (index, number), phase)
         for index, trial in enumerate(diagnostics["trials"], 1):
+            attempt = trial.get("workflow_attempt", index)
             metrics = trial.get("beta_telemetry", {})
-            emit("attempt.%d" % index, {key: value for key, value in trial.items() if key != "beta_telemetry"})
+            emit("attempt.%d" % attempt, {key: value for key, value in trial.items() if key != "beta_telemetry"})
             if isinstance(metrics, dict):
                 for key, value in metrics.items():
-                    emit("attempt.%d.%s" % (index, key), value)
+                    emit("attempt.%d.%s" % (attempt, key), value)
 
     def cmd_BETA_CALIBRATE(self, gcmd):
         axis = gcmd.get("AXIS", "").lower()
@@ -2643,7 +2661,8 @@ class AccelHomingWorkflows:
         session = self.session
         session.update(beta=True, save_config=False, state="running", beta_phase="preflight",
                        beta_generation=self.owner.operation_generation,
-                       beta_motion_iterations=[], beta_homes=[], beta_model_object=self.model,
+                       beta_motion_iterations=[], beta_homes=[], beta_homes_omitted=0,
+                       beta_model_object=self.model,
                        beta_arguments={key: gcmd.get(key, None) for key in (
                            "AXIS", "CENTERED", "START_THRESHOLD", "STEP", "SAVE_CONFIG")})
         try:
@@ -2802,7 +2821,7 @@ class AccelHomingWorkflows:
         threshold = session["saved_thresholds"][axis]
         candidate = float(Decimal(str(threshold)) + Decimal("0.25"))
         self._validate_calibration_threshold(candidate, "accuracy recovery START_THRESHOLD")
-        if candidate <= threshold or self.max_attempts < REQUIRED_SUCCESSES + 1:
+        if candidate <= threshold:
             raise self._error("accuracy recovery cannot complete a fresh calibration candidate")
         center, expected = self._geometry(axis)
         if expected <= CALIBRATION_MIN_TRAVEL_MM:
@@ -3215,6 +3234,8 @@ class AccelHomingWorkflows:
                     "calibration_settle_time_s")})
                 active.update(self._calibration_attempt_status(session))
                 active["recovery"] = self._calibration_recovery_status(session)
+                if session.get("beta"):
+                    active["beta_home_history"] = self._beta_home_history(session)
                 active.update(algorithm=session.get("algorithm"), restarts=session.get("restarts", 0),
                               minimum_impact_travel_mm=CALIBRATION_MIN_TRAVEL_MM,
                               discovery_impact_required=True, recenter_policy="selected_axis_midpoint",

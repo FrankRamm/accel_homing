@@ -1451,18 +1451,14 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(rig.owner.threshold_g["x"], 8.0)
             self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
 
-    def test_sensor_headroom_and_attempt_budget_abort(self):
-        for ceiling in ("sensor_scale", "attempts"):
-            rig = Rig()
-            if ceiling == "sensor_scale":
-                rig.owner.full_scale_g = 0.625
-            if ceiling == "attempts":
-                rig.workflow.max_attempts = 1
-            rig.home_results.append({"travel_mm": 2.0})
-            with self.assertRaisesRegex(CommandError, "headroom|maximum|attempt budget"):
-                rig.calibrate()
-            self.assertIsNone(rig.workflow.session)
-            self.assertEqual(rig.toolhead.moves, [])
+    def test_sensor_headroom_aborts(self):
+        rig = Rig()
+        rig.owner.full_scale_g = 0.625
+        rig.home_results.append({"travel_mm": 2.0})
+        with self.assertRaisesRegex(CommandError, "headroom"):
+            rig.calibrate()
+        self.assertIsNone(rig.workflow.session)
+        self.assertEqual(rig.toolhead.moves, [])
 
     def test_no_data_and_incomplete_capture_abort_and_close_capture(self):
         for result in (CommandError("no accelerometer data"), None):
@@ -1770,7 +1766,8 @@ class CalibrationGridTests(unittest.TestCase):
                     status = rig.workflow.get_status(0)["active"]
                     self.assertEqual(status["start_threshold_g"], start)
                     self.assertEqual(status["threshold_step_g"], step)
-                    self.assertEqual(status["attempt_limit"], 40)
+                    self.assertIsNone(status["attempt_limit"])
+                    self.assertIsNone(status["attempts_remaining"])
                     self.assertFalse(status["quiet_range_enforced"])
                     self.assertFalse(status["explicit_calibration_grid"])
                     self.assertFalse(rig.workflow.calibration_reference(axis.lower()))

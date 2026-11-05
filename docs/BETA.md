@@ -34,16 +34,17 @@ known-range limits. `SAVE_CONFIG=0` is accepted; `SAVE_CONFIG=1` is rejected.
    candidate. Braking/return peaks remain diagnostic and do not seed it.
    An explicit START_THRESHOLD overrides selection but not acquisition.
 5. Performs discovery and repeatability trials with rejected-hit recovery,
-   within the normal candidate/attempt/sensor limits. A successful proposal
+   with the normal candidate/sensor validity checks. A successful proposal
    requires discovery plus ten qualified checks with range at most 2.00 mm.
 6. Restores temporary state and reports the outcome, including failures or
    incomplete trials.
 
-The monitored-home cap is 40 by default. A retry may use any remaining attempts,
-including 1–10. At least one must remain before a retry return, threshold
-increase or recentering. Each candidate still needs a fresh discovery plus ten checks.
-An incomplete candidate aborts at the cap; the last permitted home can complete
-a proposal.
+There is no total monitored-home limit. Discovery, retries and all ten checks
+can continue beyond 40 attempts. The legacy `calibration_max_attempts` option
+is accepted without numeric validation and ignored, with a deprecation warning.
+Each candidate still needs a fresh discovery plus ten passing checks.
+Cancellation, disconnects, sensor/motion faults and invalid thresholds still
+stop the workflow.
 
 The noise margin is the larger of 20% or 0.1 g above the observed forward
 peak, rounded upward onto the selected grid. Automatic selection requires a
@@ -63,6 +64,7 @@ an abort when reporting remains available. They include:
 - Planned and observed motion phases, driver/current context and noise passes.
 - Candidate thresholds, discovery/validation trials, spread and rejection reasons.
 - Cleanup/restoration state, partial-output errors and the final proposal/result.
+- Total, retained and omitted home-capture counts and actual attempt ranges.
 - `physical_position_verified: false`.
 
 Generic Beta stationary references, moving windows and home captures accept
@@ -77,10 +79,17 @@ experiments save no PNG. Bounded console diagnostics still explain the abort,
 including available trials and cleanup results. A rendering/reporting failure
 is itself reported when possible.
 
+Only the newest 16 home captures are retained for the PNG and diagnostics,
+including the final discovery and all ten qualifying checks. Older captures
+are counted as omitted; status/final `beta_home_history`, console diagnostics
+and the PNG disclose this display window. Attempt labels keep their original
+numbers. Qualification records and total attempt/restart counts remain intact;
+the display window never limits homing or retries.
+
 The PNG shows absolute components after signed resting-offset subtraction;
 negative times before each exact crossing remain visible. Full-sample event
 statistics retain their existing definitions. Range notes cover every motion
-and captured home, including finite rails without a native sentinel. Native
+and retained home capture, including finite rails without a native sentinel. Native
 markers are bounded endpoint estimates with unknown true sign/peak; finite
 rails have unknown excess amplitude. Reference observations are disclosed
 separately and can overlap capture counts. See [plots](PLOTS.md).

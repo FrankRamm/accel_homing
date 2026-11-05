@@ -839,11 +839,13 @@ def compact_beta_home(capture, record):
 
 
 def write_beta_motion(directory, run_id, axis, iterations, homes=(), result="complete", reason=None,
-                      proposed_threshold_g=None, simulated=False, renderer=None, check_running=None):
+                      proposed_threshold_g=None, simulated=False, renderer=None, check_running=None,
+                      home_history=None):
     """Publish one Beta-branded suggestion PNG; never produce other formats."""
     _identity(run_id, axis)
     if (not isinstance(iterations, (tuple, list)) or len(iterations) > 3
-            or not isinstance(homes, (tuple, list)) or len(homes) > 100
+            or not isinstance(homes, (tuple, list))
+            or (home_history is not None and not isinstance(home_history, dict))
             or result not in ("complete", "beta_proposed")
             or (reason is not None and (not isinstance(reason, str) or len(reason) > 4000))
             or (proposed_threshold_g is not None and
@@ -902,6 +904,7 @@ def write_beta_motion(directory, run_id, axis, iterations, homes=(), result="com
     clock = _clock()
     title = "Accel Homing Beta %s - Suggested Threshold" % axis.upper()
     payload = {"kind": "beta", "axis": axis, "motions": motions, "homes": home_traces,
+               "home_history": home_history,
                "incomplete_homes": incomplete_homes,
                "motion_range_summary": _range_summary([
                    (item["record"], item["capture"]) for item in motions], "beta_motion_captures", "motions"),
@@ -1360,14 +1363,15 @@ def _plot_beta(figure, payload):
         _absolute_limits(axis)
     events = axes[3]
     _axes_style(events, "XYZ magnitude (g)")
-    events.set_xlabel("Beta home, including rejected candidates")
+    events.set_xlabel("Beta homing attempt, including rejected candidates")
     homes = payload["homes"]
     home_range = payload.get("home_range_summary") or _range_summary([
         (item["record"], item["capture"]) for item in homes], "beta_home_captures", "homes")
     motion_range = payload.get("motion_range_summary") or _range_summary([
         (item["record"], item["capture"]) for item in payload["motions"]], "beta_motion_captures", "motions")
     if homes:
-        indices = list(range(1, len(homes) + 1))
+        indices = [item["record"].get("workflow_attempt", index)
+                   for index, item in enumerate(homes, 1)]
         for key, label, color in (("pre_onset_noise", "Noise strictly before crossing", "#577d34"),
                                   ("onset_window", "Peak in exact onset window", "#b66b24"),
                                   ("post_stop_response", "Response after observed queue completion", "#9a5083")):
@@ -1382,9 +1386,17 @@ def _plot_beta(figure, payload):
         events.legend(loc="best", fontsize=7, ncol=2)
     else:
         events.text(.5, .5, "No valid beta home event capture", ha="center", transform=events.transAxes)
+    history = payload.get("home_history")
+    history_lines = []
+    if history is not None:
+        history_lines.append("Diagnostic captures: %d/%d retained; %d older homes omitted; "
+                             "retained attempts %s; omitted attempts %s." % (
+                                 history["retained_homes"], history["total_homes"], history["omitted_homes"],
+                                 history["retained_attempt_range"], history["omitted_attempt_range"]))
     _axes_summary(events, ["Suggested threshold: %s g | Proposal only | %d captured beta homes" % (
                             suggestion, len(homes)),
                           "Event statistics are computed per sample before any display reduction."] +
+                         history_lines +
                          _range_observation_lines(home_range) +
                          ["Incomplete attempt %s: %s" % (
                              _number(item.get("workflow_attempt")), str(item.get("beta_reason") or item.get("result"))[:160])

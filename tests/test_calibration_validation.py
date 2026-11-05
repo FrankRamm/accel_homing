@@ -38,21 +38,16 @@ class ImmediateValidationTests(unittest.TestCase):
                 self.assertEqual(rig.workflow.last_result["restarts"], 1)
                 self.assertTrue(any("after %d checks" % failed_check in line for line in rig.output))
 
-    def test_immediate_rejection_respects_sensor_headroom_and_attempts_before_return(self):
-        for ceiling in ("sensor-headroom", "attempts"):
-            with self.subTest(ceiling=ceiling):
-                rig = Rig()
-                if ceiling == "sensor-headroom":
-                    rig.owner.full_scale_g = 1.25
-                else:
-                    rig.workflow.max_attempts = 3
-                rig.home_results.extend([{}, {"travel_mm": 150.}, {"travel_mm": 152.0001}])
-                with self.assertRaisesRegex(CommandError, "headroom|attempt budget"):
-                    rig.calibrate(save=0)
-                self.assertEqual(len(rig.home_calls), 3)
-                self.assertEqual(len(rig.toolhead.moves), 2)
-                self.assertEqual([call["threshold"] for call in rig.home_calls], [1.] * 3)
-                self.assertEqual(rig.configfile.saved, {})
+    def test_immediate_rejection_respects_sensor_headroom_before_return(self):
+        rig = Rig()
+        rig.owner.full_scale_g = 1.25
+        rig.home_results.extend([{}, {"travel_mm": 150.}, {"travel_mm": 152.0001}])
+        with self.assertRaisesRegex(CommandError, "headroom"):
+            rig.calibrate(save=0)
+        self.assertEqual(len(rig.home_calls), 3)
+        self.assertEqual(len(rig.toolhead.moves), 2)
+        self.assertEqual([call["threshold"] for call in rig.home_calls], [1.] * 3)
+        self.assertEqual(rig.configfile.saved, {})
 
 
 class CalibrationTravelPlausibilityTests(unittest.TestCase):

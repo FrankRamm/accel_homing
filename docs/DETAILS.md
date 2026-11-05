@@ -165,10 +165,10 @@ the higher saved value, which those homes did not test.
 Premature impacts reverse recorded signed **start-to-halt** command travel,
 not merely trigger travel; the workflow then settles, increases the candidate
 and starts a new discovery. A running spread above 2 mm likewise rejects the
-candidate. A retry may use any remaining monitored-home attempts within the
-configured cap (40 by default). Exhaustion aborts an incomplete candidate before
-a retry return, threshold increase or recentering. Qualification still requires
-discovery plus ten checks; the last permitted home may complete it.
+candidate. Ordinary and Beta calibration have no total monitored-home limit;
+the deprecated `calibration_max_attempts` option is accepted without numeric
+validation and ignored with a warning. Qualification still requires discovery
+plus ten checks. Cancellation, disconnects and sensor/motion faults still abort.
 No encoder verifies those returns or the intended stop.
 
 SAVE_CONFIG stores a named per-axis model and normal calibration defaults to

@@ -14,7 +14,7 @@ from test_workflows import GCmd, Rig, workflow_module
 
 
 class CalibrationRecoveryLimitTests(unittest.TestCase):
-    def test_twelve_measured_returns_reach_four_g_within_default_attempt_budget(self):
+    def test_twelve_measured_returns_reach_four_g_without_an_attempt_limit(self):
         for axis, positive, cartesian in itertools.product("xy", (False, True), (False, True)):
             with self.subTest(axis=axis, positive=positive, cartesian=cartesian):
                 rig = machine(axis, positive, cartesian)
@@ -28,8 +28,8 @@ class CalibrationRecoveryLimitTests(unittest.TestCase):
                 self.assertEqual(result["successes"], 10)
                 self.assertEqual(result["restarts"], 12)
                 self.assertEqual(result["attempts"], 23)
-                self.assertEqual(result["attempt_limit"], 40)
-                self.assertEqual(result["attempts_remaining"], 17)
+                self.assertIsNone(result["attempt_limit"])
+                self.assertIsNone(result["attempts_remaining"])
                 self.assertEqual(result["candidate_attempts_required"], 11)
                 self.assertEqual(result["recovery"], {
                     "count": 12, "last_return_mm_signed": -4. if positive else 4.,
@@ -62,12 +62,12 @@ class CalibrationRecoveryLimitTests(unittest.TestCase):
         self.assertEqual(workflow._next_calibration_candidate("early impact"), 3.25)
         self.assertEqual(session["candidate"], 3.25)
         self.assertEqual(session["restarts"], 9)
-        self.assertEqual(workflow.get_status(0)["active"]["attempts_remaining"], 31)
+        self.assertIsNone(workflow.get_status(0)["active"]["attempts_remaining"])
 
 
-class CalibrationAttemptBudgetTests(unittest.TestCase):
-    def rig(self, beta, limit=40):
-        return (BetaRig if beta else Rig)({"calibration_max_attempts": limit})
+class CalibrationUnlimitedAttemptsTests(unittest.TestCase):
+    def rig(self, beta, options=None):
+        return (BetaRig if beta else Rig)(options)
 
     def run_calibration(self, rig, beta, axis):
         if beta:
@@ -75,124 +75,121 @@ class CalibrationAttemptBudgetTests(unittest.TestCase):
         else:
             rig.calibrate(axis.upper(), save=0)
 
-    def track_moves_before_home(self, rig):
-        counts = []
-        rig.on_home = lambda _axis: counts.append(len(rig.toolhead.moves))
-        return counts
-
-    def assert_exhausted(self, rig, limit):
-        result = rig.workflow.last_result
-        self.assertEqual(result["result"], "aborted")
-        self.assertEqual(result["attempts"], limit)
-        self.assertEqual(result["attempt_limit"], limit)
-        self.assertEqual(result["attempts_remaining"], 0)
-        # This describes a complete qualification window, not a retry reserve.
-        self.assertEqual(result["candidate_attempts_required"], 11)
-        self.assertEqual([call["attempt"] for call in rig.home_calls], list(range(1, limit + 1)))
-        self.assertIsNone(rig.workflow.session)
-        self.assertEqual(rig.configfile.saved, {})
-        self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
-        self.assertNotIn("SAVE_CONFIG", rig.scripts)
-
-    def test_all_six_remaining_homes_run_before_incomplete_validation_aborts_at_forty(self):
-        for beta, axis in itertools.product((False, True), "xy"):
-            with self.subTest(beta=beta, axis=axis):
-                rig = self.rig(beta)
-                # Reject a running window on home 34, exactly where the former
-                # reserve guard reported six attempts left. Use all six for new
-                # discovery and five checks, then abort without a 41st home.
-                expected = rig.workflow._geometry(axis)[1]
-                rig.home_results.extend([{"travel_mm": 0.}] * 27 + [{}] * 6 +
-                                        [{"travel_mm": expected + 2.001}] + [{}] * 7)
-                moves_before_home = self.track_moves_before_home(rig)
-                with self.assertRaisesRegex(CommandError, "attempt budget exhausted"):
-                    self.run_calibration(rig, beta, axis)
-                self.assert_exhausted(rig, 40)
-                result = rig.workflow.last_result
-                self.assertEqual([call["threshold"] for call in rig.home_calls],
-                                 [1. + .25 * number for number in range(27)] + [7.75] * 7 + [8.] * 6)
-                self.assertFalse(rig.home_calls[34]["candidate_qualified"])
-                self.assertEqual([call["successes"] for call in rig.home_calls[34:]], [0, 0, 1, 2, 3, 4])
-                self.assertEqual(result["candidate_g"], 8.)
-                self.assertEqual(result["restarts"], 28)
-                self.assertEqual(result["recovery"]["count"], 28 if beta else 27)
-                self.assertEqual(len(rig.home_results), 1)
-                self.assertEqual(len(rig.toolhead.moves), moves_before_home[-1])
-                json.dumps(result, allow_nan=False)
-
-    def test_tenth_validation_at_the_configured_cap_can_complete(self):
-        for beta, axis, limit in itertools.product((False, True), "xy", (12, 40)):
-            with self.subTest(beta=beta, axis=axis, limit=limit):
-                rig = self.rig(beta, limit)
-                early_count = limit - 11
+    def test_discovery_and_all_ten_checks_complete_beyond_forty_homes(self):
+        for beta, axis, early_count in itertools.product((False, True), "xy", (34, 39, 41)):
+            with self.subTest(beta=beta, axis=axis, early_count=early_count):
+                rig = self.rig(beta, {"calibration_max_attempts": 12})
+                # Includes the reported 9.5 g candidate, discovery on home 40,
+                # and early-return/threshold progression after home 40.
                 rig.home_results.extend([{"travel_mm": 0.}] * early_count + [{}] * 12)
-                moves_before_home = self.track_moves_before_home(rig)
+                states = []
+                rig.on_home = lambda _axis: states.append(rig.workflow.get_status(0)["active"])
                 self.run_calibration(rig, beta, axis)
                 result = rig.workflow.last_result
                 candidate = 1. + .25 * early_count
                 self.assertEqual(result["result"], "beta_proposed" if beta else "calibrated")
                 self.assertEqual(result["successes"], 10)
-                self.assertEqual(result["attempts"], limit)
-                self.assertEqual(result["attempts_remaining"], 0)
-                self.assertEqual(len(rig.home_calls), limit)
+                self.assertEqual(result["attempts"], early_count + 11)
+                self.assertIsNone(result["attempt_limit"])
+                self.assertIsNone(result["attempts_remaining"])
+                self.assertEqual(result["candidate_attempts_required"], 11)
+                self.assertEqual([call["attempt"] for call in rig.home_calls],
+                                 list(range(1, early_count + 12)))
                 self.assertEqual([call["threshold"] for call in rig.home_calls[-11:]], [candidate] * 11)
+                self.assertFalse(rig.home_calls[-11]["candidate_qualified"])
+                self.assertEqual([call["successes"] for call in rig.home_calls[-11:]],
+                                 [0, 0] + list(range(1, 10)))
                 self.assertEqual(result["restarts"], early_count)
                 self.assertEqual(result["recovery"]["count"], early_count)
-                # Successful qualification still performs the normal final
-                # release; it does not recenter for an additional home.
-                self.assertEqual(len(rig.toolhead.moves), moves_before_home[-1] + 1)
+                self.assertTrue(all(state["attempt_limit"] is None and
+                                    state["attempts_remaining"] is None for state in states))
+                self.assertGreater(states[-1]["attempts"], 40)
                 self.assertEqual(len(rig.home_results), 1)
                 self.assertIsNone(rig.workflow.session)
+                self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
+                self.assertNotIn("SAVE_CONFIG", rig.scripts)
                 if beta:
                     self.assertEqual(result["proposed_threshold_g"], candidate)
                     self.assertEqual(rig.configfile.saved, {})
+                    trials = result["beta_diagnostics"]["trials"]
+                    self.assertEqual([trial["workflow_attempt"] for trial in trials[-11:]],
+                                     list(range(early_count + 1, early_count + 12)))
                 else:
                     self.assertEqual(result["tested_threshold_g"], candidate)
                     self.assertEqual(result["threshold_g"], candidate + .5)
                     self.assertIn(("accel_homing_model default", axis + "_threshold"), rig.configfile.saved)
+                json.dumps(result, allow_nan=False)
 
-    def test_final_discovery_does_not_recenter_without_another_attempt(self):
+    def test_deprecated_maximum_is_consumed_without_numeric_validation(self):
+        for beta, legacy in itertools.product((False, True),
+                                              (0, 1, 12, 40, 1000, -1, "obsolete", "nan", "inf")):
+            with self.subTest(beta=beta, legacy=legacy), \
+                    mock.patch.object(workflow_module.logging, "warning") as warning:
+                rig = self.rig(beta, {"calibration_max_attempts": legacy})
+                warning.assert_called_once()
+                self.assertIn("calibration_max_attempts is deprecated and ignored", warning.call_args[0][0])
+                self.assertFalse(hasattr(rig.workflow, "max_attempts"))
+                self.run_calibration(rig, beta, "x")
+                self.assertEqual(len(rig.home_calls), 11)
+                self.assertEqual(rig.workflow.last_result["successes"], 10)
+
+    def test_rejected_validation_restarts_discovery_and_ten_checks_past_forty(self):
         for beta, axis in itertools.product((False, True), "xy"):
             with self.subTest(beta=beta, axis=axis):
-                rig = self.rig(beta, 12)
-                rig.home_results.extend([{"travel_mm": 0.}] * 11 + [{}, {}])
-                moves_before_home = self.track_moves_before_home(rig)
-                with self.assertRaisesRegex(CommandError, "attempt budget exhausted"):
-                    self.run_calibration(rig, beta, axis)
-                self.assert_exhausted(rig, 12)
-                result = rig.workflow.last_result
-                self.assertEqual(result["candidate_g"], 3.75)
-                self.assertEqual(rig.home_calls[-1]["successes"], 0)
-                self.assertEqual(result["restarts"], 11)
-                self.assertEqual(result["recovery"]["count"], 11)
-                self.assertFalse(rig.home_calls[-1]["candidate_qualified"])
-                self.assertEqual(len(rig.toolhead.moves), moves_before_home[-1])
-                self.assertEqual(len(rig.home_results), 1)
-
-    def test_last_rejected_home_does_not_return_recenter_or_raise_threshold(self):
-        for beta, axis, rejection in itertools.product((False, True), "xy", ("early", "spread")):
-            with self.subTest(beta=beta, axis=axis, rejection=rejection):
-                rig = self.rig(beta, 12)
+                rig = self.rig(beta)
                 expected = rig.workflow._geometry(axis)[1]
-                rejected = {"travel_mm": 4. if rejection == "early" else expected + 2.001}
-                rig.home_results.extend([{"travel_mm": 0.}] + [{}] * 10 + [rejected, {}])
-                moves_before_home = self.track_moves_before_home(rig)
-                with self.assertRaisesRegex(CommandError, "attempt budget exhausted"):
-                    self.run_calibration(rig, beta, axis)
-                self.assert_exhausted(rig, 12)
+                rig.home_results.extend([{"travel_mm": 0.}] * 27 + [{}] * 6 +
+                                        [{"travel_mm": expected + 2.001}] + [{}] * 11)
+                self.run_calibration(rig, beta, axis)
                 result = rig.workflow.last_result
-                self.assertEqual([call["threshold"] for call in rig.home_calls], [1.] + [1.25] * 11)
-                self.assertEqual(result["candidate_g"], 1.25)
-                self.assertEqual(rig.home_calls[-1]["successes"], 9)
-                self.assertEqual(result["restarts"], 1)
-                self.assertEqual(result["recovery"]["count"], 1)
-                self.assertEqual(result["recovery"]["last_return_mm_signed"], 0.)
-                self.assertEqual(len(rig.toolhead.moves), moves_before_home[-1])
-                self.assertEqual(len(rig.home_results), 1)
+                self.assertEqual([call["threshold"] for call in rig.home_calls],
+                                 [1. + .25 * number for number in range(27)] + [7.75] * 7 + [8.] * 11)
+                self.assertFalse(rig.home_calls[34]["candidate_qualified"])
+                self.assertEqual([call["successes"] for call in rig.home_calls[34:]],
+                                 [0, 0] + list(range(1, 10)))
+                self.assertEqual(result["attempts"], 45)
+                self.assertEqual(result["successes"], 10)
+                self.assertEqual(result["restarts"], 28)
+                self.assertEqual(result["recovery"]["count"], 28 if beta else 27)
+
+    def test_cancel_disconnect_shutdown_and_errors_still_stop_after_forty(self):
+        for beta, ending in itertools.product((False, True), ("cancel", "disconnect", "shutdown", "error")):
+            with self.subTest(beta=beta, ending=ending):
+                rig = self.rig(beta)
+                rig.home_results.extend([{"travel_mm": 0.}] * 40 + [{}] * 12)
+                moves_at_stop = []
+
+                def stop(_axis):
+                    if len(rig.home_calls) != 42:
+                        return
+                    moves_at_stop.append(len(rig.toolhead.moves))
+                    if ending == "cancel":
+                        rig.workflow.cmd_CANCEL(GCmd())
+                    elif ending == "error":
+                        raise CommandError("synthetic sensor error after forty homes")
+                    else:
+                        getattr(rig.workflow, "_" + ending)()
+
+                rig.on_home = stop
+                with self.assertRaises(CommandError):
+                    self.run_calibration(rig, beta, "x")
+                result = rig.workflow.last_result
+                self.assertIn(result["result"], ("cancelled", "aborted"))
+                self.assertEqual(result["attempts"], 42)
+                self.assertEqual(result["candidate_g"], 11.)
+                self.assertEqual(result["restarts"], 40)
+                self.assertIsNone(result["attempt_limit"])
+                self.assertIsNone(result["attempts_remaining"])
+                self.assertEqual(len(rig.home_calls), 42)
+                self.assertEqual(len(rig.toolhead.moves), moves_at_stop[0])
+                self.assertIsNone(rig.workflow.session)
+                self.assertFalse(rig.capture_active)
+                self.assertEqual(rig.configfile.saved, {})
+                self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
+                self.assertNotIn("SAVE_CONFIG", rig.scripts)
                 if beta:
-                    last = result["beta_diagnostics"]["trials"][-1]
-                    self.assertEqual(last["beta_decision"], "rejected")
-                    self.assertNotIn("beta_rejected_return_mm_signed", last)
+                    self.assertEqual(result["beta_home_history"], result["beta_diagnostics"]["home_history"])
+                    self.assertEqual(result["beta_home_history"]["total_homes"], 42)
 
 
 class CalibrationThresholdLimitTests(unittest.TestCase):

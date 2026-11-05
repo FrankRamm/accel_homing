@@ -197,26 +197,21 @@ class MidtravelRecoveryTests(unittest.TestCase):
         self.assertEqual(rig.workflow.last_result["recovery"]["last_return_mm_signed"], 90.)
         self.assertEqual(session["run_id"], run_id)
 
-    def test_sensor_headroom_and_attempt_rejections_leave_candidate_and_return_count_unchanged(self):
-        for fault in ("sensor-headroom", "attempts"):
-            with self.subTest(fault=fault):
-                rig = Rig()
-                if fault == "sensor-headroom":
-                    rig.owner.full_scale_g = 2.8125
-                if fault == "attempts":
-                    rig.workflow.max_attempts = 1
-                rig.home_results.append({"travel_mm": 51.175, "halt_travel_mm_signed": -51.175})
-                with self.assertRaises(CommandError):
-                    rig.calibrate(save=0, START_THRESHOLD=2.25, STEP=.25)
-                self.assertEqual(len(rig.home_calls), 1)
-                self.assertEqual(rig.toolhead.moves, [])
-                result = rig.workflow.last_result
-                self.assertEqual(result["candidate_g"], 2.25)
-                self.assertEqual(result["restarts"], 0)
-                self.assertEqual(result["recovery"]["count"], 0)
-                self.assertIsNone(result["recovery"]["last_return_mm_signed"])
-                self.assertEqual(rig.disabled, [])
-                self.assertEqual(rig.configfile.saved, {})
+    def test_sensor_headroom_rejection_leaves_candidate_and_return_count_unchanged(self):
+        rig = Rig()
+        rig.owner.full_scale_g = 2.8125
+        rig.home_results.append({"travel_mm": 51.175, "halt_travel_mm_signed": -51.175})
+        with self.assertRaises(CommandError):
+            rig.calibrate(save=0, START_THRESHOLD=2.25, STEP=.25)
+        self.assertEqual(len(rig.home_calls), 1)
+        self.assertEqual(rig.toolhead.moves, [])
+        result = rig.workflow.last_result
+        self.assertEqual(result["candidate_g"], 2.25)
+        self.assertEqual(result["restarts"], 0)
+        self.assertEqual(result["recovery"]["count"], 0)
+        self.assertIsNone(result["recovery"]["last_return_mm_signed"])
+        self.assertEqual(rig.disabled, [])
+        self.assertEqual(rig.configfile.saved, {})
 
     def test_midtravel_cleanup_evidence_is_marked_before_capture_stream_or_wait_failures(self):
         for failure in ("capture-data", "capture-stop", "stream-stop", "post-home-wait"):

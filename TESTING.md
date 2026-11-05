@@ -52,11 +52,12 @@ full suite run establish different things; identify which were actually done.
   receives a single 0.5 g margin. Trial thresholds stay unchanged; the final
   value must fit sensor headroom without clamping, and metadata reports that
   the higher value was not tested by those homes.
-- Ordinary and Beta calibration may retry with 1–10 attempts remaining within
-  the configured cap (40 by default). Each candidate still needs discovery plus
-  ten checks, with no partial qualification. The last permitted home may
-  succeed; an exhausted incomplete run starts no retry return, threshold
-  increase or recentering.
+- Ordinary and Beta calibration have no total homing-attempt limit. Discovery
+  and all ten validation checks can complete after more than 40 homes; the
+  deprecated `calibration_max_attempts` option is consumed without numeric
+  validation and ignored. Attempt counts remain diagnostic, with null limit
+  and remaining fields. Cancellation, disconnects and faults still stop
+  progression without partial qualification.
 - Premature calibration returns reverse current signed start-to-halt commanded
   travel before the next candidate; faults/failed returns do not count as
   completed recovery.
@@ -88,7 +89,9 @@ full suite run establish different things; identify which were actually done.
   references without double counting; legacy provenance can be unavailable.
 - Beta produces a labelled PNG only for a successful restored proposal; failures
   retain bounded console diagnostics without staging/saving thresholds/models
-  or restarting.
+  or restarting. Its newest 16 diagnostic home captures retain real attempt
+  numbers and report omitted/retained counts and ranges, including after more
+  than 100 homes; qualification still uses every required trial record.
 - Standalone installation uses a complete canonical native Git clone, root
   entrypoints and main/origin/main updater configuration. Legacy MISC ownership
   is not silently adopted; uninstall leaves source deletion to the operator.

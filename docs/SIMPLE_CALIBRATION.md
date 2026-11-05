@@ -70,7 +70,7 @@ after measurement. Its reference and moving detector use receipt liveness,
 while cutoffs exclude earlier windows/pre-arm impacts. Native Beacon's age
 policy is unchanged. See [timing details](DETAILS.md#timing-and-optional-travel-policies).
 
-## Threshold and attempt bounds
+## Threshold validity and homing attempts
 
 Calibration starts and saved model thresholds must be finite and at least
 0.5 g. `STEP` remains a finite value from 0.1 to 3 g. Calibration has no
@@ -95,16 +95,14 @@ Before arming, the derived raw trigger limit and its squared value used by the
 XYZ-magnitude detector must both be finite and positive. This validates numeric
 representation rather than adding a configurable g maximum.
 
-The monitored-home budget, 40 attempts by default, includes discovery,
-validation and all retries. A rejected candidate may retry with **1–10 attempts
-remaining**.
-At least one attempt must remain before a retry's recovery return, threshold
-increase or recentering. Every candidate still needs a fresh discovery plus
-ten validation homes. An incomplete candidate aborts at the cap without staging
-or saving a replacement threshold; the last permitted home can complete
-qualification.
-There is no separate recovery-count cap or accumulated recovery-distance
-budget; the monitored-home attempt budget still bounds retries.
+Ordinary and Beta calibration have no total homing-attempt limit. The former
+`calibration_max_attempts` option is accepted without numeric validation and
+ignored, with a deprecation warning. Discovery, validation and retries can
+continue beyond 40 homes; every candidate still needs a fresh discovery plus
+ten passing validation homes. Cancellation, disconnects, sensor/motion faults
+and invalid thresholds still stop the workflow. There is no recovery-count
+cap or accumulated recovery-distance budget. The separate bounded stationary
+sensor acquisition retries are unchanged.
 
 ## Impact discovery and validation
 
@@ -141,8 +139,8 @@ budget; the monitored-home attempt budget still bounds retries.
    axis, and restart **impact discovery** with an empty window. Passing still
    requires **ten** validation impacts with a spread **at most 2.00 mm**;
    exactly 2.00 mm passes. The new discovery impact also stays outside its
-   following ten measurements. All cycles share the attempt budget and
-   sensor-range headroom policy described above.
+   following ten measurements. All cycles retain the sensor-range headroom
+   policy described above.
 
 Discovery and validation use the same native selected-axis homing path,
 independently of public G28 macros or wrappers.
@@ -280,11 +278,20 @@ new saved model metadata contains only completed-return telemetry:
 There is no accumulated distance, count/distance limit or remaining budget,
 nominal clearance or margin in this object. Old saved recovery metadata remains
 readable as historical metadata; it is not used to limit a new calibration.
-Active calibration status and final results also expose `attempt_limit`,
-`attempts_remaining` and `candidate_attempts_required` (11). The last field
-describes a complete qualification cycle; it is not a minimum remaining-attempt
-requirement. A final result retains `candidate_g` and `restarts` if the next
-candidate is denied.
+Active calibration status and final results keep the diagnostic `attempts`
+count. The compatibility fields `attempt_limit` and `attempts_remaining` are
+`null`, meaning no total limit or countdown. `candidate_attempts_required`
+(11) describes one discovery plus ten validation homes. A final result retains
+`candidate_g` and `restarts` if the next candidate is denied.
+
+Beta retains only the newest 16 home captures for its PNG and console
+diagnostics, including the final discovery and all ten qualifying checks.
+This bounds display storage independently of the number of homing attempts;
+it does not discard trial records used to qualify a candidate. Status and final
+results expose `beta_home_history`; console diagnostics and the PNG report the
+total, retained and omitted capture counts and their actual attempt ranges.
+Attempt labels retain their original numbers. Ordinary calibration keeps its
+existing trial history.
 
 ## Limits of this method
 

@@ -221,6 +221,24 @@ class BetaRawCaptureTests(unittest.TestCase):
 
 
 class BetaPNGTests(unittest.TestCase):
+    def test_report_preparation_has_no_one_hundred_home_count_ceiling(self):
+        record, capture = beta_event()
+        record["beta_telemetry"] = make_homing().beta_home_telemetry(capture, record)
+        compact = charts.compact_beta_home(capture, record)
+        homes = []
+        for attempt in range(1, 102):
+            item = copy.deepcopy(compact)
+            item["record"]["workflow_attempt"] = attempt
+            homes.append(item)
+        renderer = RecordingRenderer()
+        with tempfile.TemporaryDirectory() as temp:
+            paths = charts.write_beta_motion(temp, "beta_event", "x", [], homes=homes,
+                                            result="beta_proposed", proposed_threshold_g=1.,
+                                            simulated=True, renderer=renderer)
+            self.assertEqual(set(paths), {"png"})
+            self.assertEqual(len(renderer.payloads[0]["homes"]), 101)
+            self.assertEqual(renderer.payloads[0]["homes"][-1]["record"]["workflow_attempt"], 101)
+
     def test_seed_excludes_braking_and_preserves_non_axis_vector_peak_in_png(self):
         iterations = [beta_motion(offset) for offset in (0., 2., 4.)]
         statistics = charts.beta_motion_statistics(iterations[0]["capture"], iterations[0]["record"])

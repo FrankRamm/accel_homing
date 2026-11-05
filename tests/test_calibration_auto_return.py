@@ -111,19 +111,14 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
                 self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
                 self.assertEqual(rig.disabled, [])
 
-    def test_sensor_headroom_and_attempt_budget_are_checked_before_any_reverse(self):
-        for kind in ("sensor-headroom", "attempts"):
-            with self.subTest(kind=kind):
-                rig = Rig()
-                if kind == "sensor-headroom":
-                    rig.owner.full_scale_g = 1.25
-                if kind == "attempts":
-                    rig.workflow.max_attempts = 1
-                rig.home_results.append({"travel_mm": 20., "halt_travel_mm_signed": -20.})
-                with self.assertRaises(CommandError):
-                    rig.calibrate(save=0)
-                self.assertEqual(rig.toolhead.moves, [])
-                self.assertEqual(rig.configfile.saved, {})
+    def test_sensor_headroom_is_checked_before_any_reverse(self):
+        rig = Rig()
+        rig.owner.full_scale_g = 1.25
+        rig.home_results.append({"travel_mm": 20., "halt_travel_mm_signed": -20.})
+        with self.assertRaises(CommandError):
+            rig.calibrate(save=0)
+        self.assertEqual(rig.toolhead.moves, [])
+        self.assertEqual(rig.configfile.saved, {})
 
     def test_stale_or_changed_halt_evidence_fails_closed_and_preserves_other_motors(self):
         changes = {

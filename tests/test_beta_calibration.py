@@ -119,6 +119,53 @@ class BetaRig(Rig):
 
 
 class BetaCalibrationTests(unittest.TestCase):
+    def test_more_than_one_hundred_homes_keep_final_qualification_and_bounded_report_history(self):
+        rig = BetaRig()
+        rig.home_results.extend([{"travel_mm": 0.}] * 105 + [{}] * 11)
+        reports, states = [], []
+        rig.on_home = lambda _axis: states.append(rig.workflow.get_status(0)["active"])
+
+        def writer(directory, run_id, axis, iterations, **options):
+            options["check_running"]()
+            session = rig.workflow.session
+            # Diagnostic eviction must never change the full qualification
+            # records or the discovery's global attempt index.
+            self.assertEqual(len(session["records"]), 116)
+            self.assertEqual(session["candidate_attempt"], 106)
+            self.assertEqual([item["workflow_attempt"] for item in session["validation_records"]],
+                             list(range(107, 117)))
+            self.assertEqual([item["record"]["workflow_attempt"] for item in options["homes"]],
+                             list(range(101, 117)))
+            reports.append(options["home_history"])
+            return {"png": "Beta-calibration-%s.png" % run_id}
+
+        with rig.beta_helpers(), mock.patch.object(workflow_module, "write_beta_motion", side_effect=writer):
+            rig.workflow.cmd_BETA_CALIBRATE(GCmd(AXIS="X", CENTERED=1, START_THRESHOLD=1., STEP=.1))
+        result = rig.workflow.last_result
+        history = {"scope": "diagnostic_captures_only", "retention_limit": 16,
+                   "total_homes": 116, "retained_homes": 16, "omitted_homes": 100,
+                   "retained_attempt_range": [101, 116], "omitted_attempt_range": [1, 100]}
+        self.assertEqual(reports, [history])
+        self.assertEqual(result["result"], "beta_proposed")
+        self.assertEqual(result["attempts"], 116)
+        self.assertEqual(result["restarts"], 105)
+        self.assertEqual(result["successes"], 10)
+        self.assertEqual(result["proposed_threshold_g"], 11.5)
+        self.assertIsNone(result["attempt_limit"])
+        self.assertIsNone(result["attempts_remaining"])
+        self.assertEqual(result["beta_home_history"], history)
+        self.assertEqual(result["beta_diagnostics"]["home_history"], history)
+        self.assertEqual([item["workflow_attempt"] for item in result["beta_diagnostics"]["trials"]],
+                         list(range(101, 117)))
+        self.assertTrue(all(state["beta_home_history"]["retained_homes"] <= 16 for state in states))
+        sections = [json.loads(line.split("Beta diagnostic ", 1)[1])["section"]
+                    for line in rig.output if "Beta diagnostic " in line]
+        self.assertIn("attempt.116", sections)
+        self.assertNotIn("attempt.1", sections)
+        self.assertEqual(rig.configfile.saved, {})
+        self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
+        self.assertIsNone(rig.workflow.session)
+
     def test_native_beta_homes_ignore_public_g28_wrappers_and_aliases(self):
         for axis in "XY":
             with self.subTest(axis=axis):

@@ -138,7 +138,7 @@ No plugin final release requests a Z move.
 | --- | --- | --- |
 | `calibration_start_threshold` | `1.0` | Noise-selection grid origin in g; at least 0.5. |
 | `calibration_step` | `0.25` | Candidate increment in g; 0.1–3. |
-| `calibration_max_attempts` | `40` | Total monitored homes per calibration; integer 12–100. |
+| `calibration_max_attempts` | Ignored | Deprecated compatibility option; accepted without numeric validation, with a warning. |
 | `calibration_confirm_timeout` | `300` | Pending calibration confirmation timeout in seconds; 30–1800. |
 | `calibration_travel_tolerance` | `0.20` | Midpoint-to-endstop plausibility fraction; 0.05–0.40. |
 | `workflow_reposition_speed` | `50` | Return-to-center speed in mm/s; 1–150. |
@@ -146,8 +146,10 @@ No plugin final release requests a Z move.
 
 There is no configurable calibration g ceiling or fixed 15 g maximum.
 `calibration_max_threshold` is deprecated: it is accepted but ignored with a
-warning. The sensor-range headroom, finite representation and attempt bounds
-still apply. Calibration/model thresholds have a 0.5 g minimum.
+warning. Ordinary and Beta calibration have no total homing-attempt limit;
+`calibration_max_attempts` is also deprecated and ignored. The sensor-range
+headroom and finite representation checks still apply. Calibration/model
+thresholds have a 0.5 g minimum.
 
 ## Generic sensor options
 
