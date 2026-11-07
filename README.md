@@ -80,6 +80,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | Command | What it does / how to use it |
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Show settings, model, workflow progress, results and PNG paths. |
+| `ACCEL_HOMING_TRAVEL` | Dev: open/reopen the guided X/Y endpoint and bed-zero wizard. Configured-speed searches, slow dedicated nozzle-alignment jogs, review and optional combined save. See [travel/origin wizard](docs/TRAVEL.md). |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X; use `AXIS=Y` for Y. Measures fresh noise, then qualifies a threshold. |
 | `ACCEL_HOMING_CALIBRATE_CENTER AXIS=ALL CENTERED=1` | Dev: one excluded initial home, then ten alternating direct end-to-end traverses per selected axis, with no backoff/retract moves. Reports geometry; `SAVE_CONFIG=1` explicitly requests saving. See [center calibration](docs/CENTER.md). |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Measure three stationary one-second noise windows and export a PNG; no movement or threshold change. |
@@ -127,6 +128,7 @@ Keep the printed backup paths if you may need to undo the uninstall.
 [Console commands](docs/COMMANDS.md) ·
 [Calibration](docs/SIMPLE_CALIBRATION.md) ·
 [Center calibration (dev)](docs/CENTER.md) ·
+[Travel and bed-origin wizard (dev)](docs/TRAVEL.md) ·
 [Accuracy](docs/ACCURACY.md) ·
 [Plots](docs/PLOTS.md) ·
 [Beta experiment](docs/BETA.md) ·

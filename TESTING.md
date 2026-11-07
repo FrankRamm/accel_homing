@@ -20,6 +20,7 @@ installer against a real printer merely to satisfy an offline test.
 
 ```bash
 python3 -B -m unittest discover -s tests -p 'test_installer.py' -v
+python3 -B -m unittest discover -s tests -p 'test_travel*.py' -v
 python3 -B -m unittest discover -s tests -p 'test_updater.py' -v
 python3 -B -m unittest discover -s tests -p 'test_accuracy_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_simple_calibration.py' -v
@@ -37,6 +38,14 @@ fresh references, legacy/vector detector behavior, single-pass homing/release,
 noise selection, calibration geometry/early returns/repeatability, accuracy
 capture/recovery/statistics, PNG rendering and the isolated Beta experiment.
 A source test file's presence is not proof that it executed successfully.
+
+Travel-wizard tests cover negative/positive trigger-versus-halt accounting,
+CoreXY/Cartesian conversion, supervised setup, selected-axis bounded jogs,
+X-to-Y continuation, cancellation during recenter segments, individual X/Y/Z
+motor disable/re-enable, external movement/settings and command failures,
+prompt reopening, source/include/pending/model conflicts, combined coordinate
+saves, autosave rollback and compatibility with older installed module links.
+They simulate motion and do not establish physical sensor/stop behavior.
 
 For a reproducible report, retain the exact commit, command/working directory,
 Python/platform/dependency versions, exit status, full test output and any

@@ -27,6 +27,16 @@ try:
 except ImportError:
     from accel_homing_center import CenterCalibration
 
+# A source-only update of an older installation may precede creation of the
+# new extras symlink. Existing homing must keep loading during that interval.
+try:
+    from .accel_homing_travel import TravelCalibration
+except ImportError:
+    try:
+        from accel_homing_travel import TravelCalibration
+    except ImportError:
+        TravelCalibration = None
+
 try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
@@ -251,6 +261,7 @@ class AccelHomingWorkflows:
         self.in_home = False
         self.home_axis = None
         self.center = CenterCalibration(self)
+        self.travel = TravelCalibration(self) if TravelCalibration is not None else None
         self.timer = self.reactor.register_timer(self._timeout)
         self.printer.register_event_handler("klippy:shutdown", self._shutdown)
         self.printer.register_event_handler("klippy:disconnect", self._disconnect)
@@ -263,6 +274,8 @@ class AccelHomingWorkflows:
                  "Beta motion-noise experiment: PNG and threshold proposal only"),
                 ("ACCEL_HOMING_CALIBRATE_CENTER", self.center.command,
                  "Development: estimate X/Y travel and midpoint from ten direct bidirectional traverses"),
+                ("ACCEL_HOMING_TRAVEL", self.travel.command if self.travel is not None else self._travel_unavailable,
+                 "Guided X/Y travel measurement, bed origin and coordinate save"),
                 ("ACCEL_HOMING_CALIBRATE_NOISE", self.cmd_NOISE,
                  "Measure three stationary one-second noise windows and suggest calibration starts"),
                 ("ACCEL_HOMING_CANCEL", self.cmd_CANCEL,
@@ -279,6 +292,10 @@ class AccelHomingWorkflows:
 
     def _error(self, message):
         return self.printer.command_error("accel_homing: " + message)
+
+    def _travel_unavailable(self, gcmd):
+        raise gcmd.error("ACCEL_HOMING_TRAVEL needs its new installed module; rerun the dev installer, "
+                         "then restart Klipper. Existing homing commands remain available.")
 
     def _info(self, message):
         self.gcode.respond_info("accel_homing: " + message)
@@ -598,6 +615,9 @@ class AccelHomingWorkflows:
 
     def _finish(self, result, release=False):
         session = self.session
+        if session is not None and session["mode"] == "travel":
+            self.travel.interrupt(result)
+            return
         if session is not None and session["mode"] == "center":
             self.center.interrupt(result)
             return
@@ -683,6 +703,8 @@ class AccelHomingWorkflows:
             self._finish({"result": "aborted", "reason": "printer disconnected"})
 
     def _timeout(self, eventtime):
+        if self.session is not None and self.session["mode"] == "travel":
+            return self.travel.timeout(eventtime)
         if self.session is None or self.session.get("state") != "waiting":
             return self.reactor.NEVER
         if eventtime >= self.session["expires"]:
@@ -694,6 +716,8 @@ class AccelHomingWorkflows:
     def check_home_axes(self, axes):
         """Called by core before an accelerometer homing session can move."""
         if self.session is not None and (not self.in_home or set(axes) != {self.home_axis}):
+            if self.session["mode"] == "travel":
+                self.travel.interrupt({"result": "aborted", "reason": "external homing attempted"})
             raise self._error("a supervised workflow is active; resume calibration with its "
                               "command or use CANCEL")
         calibrating = bool(self.session and self.session.get("mode") == "calibration")
@@ -3220,7 +3244,13 @@ class AccelHomingWorkflows:
             key: session.get(key) for key in ("mode", "state", "axis", "candidate", "successes",
                                              "candidate_qualified", "attempts", "run_id", "expires",
                                              "repeatability_spread_mm")}
-        if session is not None and session["mode"] == "center":
+        if session is not None and session["mode"] == "travel":
+            active = {key: session.get(key) for key in ("mode", "state", "axis", "stage", "attempts", "run_id", "expires")}
+            active.update(accepted_axes=list(session["results"]), jog_speed_mm_s=session["jog_speed"],
+                          proposed_config=self.travel._result(session)["proposed_config"],
+                          temporary_coordinate_mm=session.get("measurement", {}).get("coordinate"),
+                          physical_position_verified=False)
+        elif session is not None and session["mode"] == "center":
             active = {key: session.get(key) for key in ("mode", "state", "axis", "attempts", "run_id", "phase")}
             active.update(axes=list(session["axes"]), traverses_per_axis=10,
                           completed_traverses=dict(session["center_completed"]),

@@ -215,10 +215,16 @@ class IsolatedDevGitTests(unittest.TestCase):
         self.assertEqual(self.run_git(self.source, "branch", "--show-current"), "dev")
 
     def test_six_module_main_install_upgrades_and_rolls_back_without_switching_git(self):
+        self._old_module_install_upgrades(6)
+
+    def test_seven_module_dev_install_upgrades_and_rolls_back(self):
+        self._old_module_install_upgrades(7)
+
+    def _old_module_install_upgrades(self, previous_count):
         modules = installer.MODULES
-        self.assertEqual(modules[-1], "accel_homing_center.py")
+        self.assertEqual(modules[-1], "accel_homing_travel.py")
         with self.migration_links() as (links, write):
-            with mock.patch.object(installer, "MODULES", modules[:-1]):
+            with mock.patch.object(installer, "MODULES", modules[:previous_count]):
                 _main, _first = self.install(write)
             main_links = copy.deepcopy(links)
             main_files = {path: path.read_bytes() for path in (
@@ -229,14 +235,16 @@ class IsolatedDevGitTests(unittest.TestCase):
             self.assertEqual(plan["context"]["branch"], "dev")
             for path, state in main_links.items():
                 self.assertEqual(links[path], state)
-            center = self.extras / modules[-1]
-            self.assertEqual(links[center]["target"], str(self.source / modules[-1]))
+            added = [self.extras / module for module in modules[previous_count:]]
+            for path in added:
+                self.assertEqual(links[path]["target"], str(self.source / path.name))
             self.assertIn(b"primary_branch: dev\n", self.moon_config.read_bytes())
             self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()),
                              (main_files[self.config], main_files[self.axes]))
             with mock.patch.object(installer, "write_state", side_effect=write):
                 installer.rollback(backup, selected=self.selected)
-            self.assertEqual(links[center]["kind"], "absent")
+            for path in added:
+                self.assertEqual(links[path]["kind"], "absent")
             self.assertEqual({path: path.read_bytes() for path in main_files}, main_files)
             self.assertEqual(self.run_git(self.source, "branch", "--show-current"), "dev")
             self.assertEqual(self.run_git(self.source, "rev-parse", "HEAD"), self.commit)

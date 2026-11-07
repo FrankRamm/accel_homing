@@ -26,6 +26,7 @@ for your machine and independent Z support. See the complete
 | Command | Options and behavior |
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Read-only workflow/model/settings, result and plot paths. |
+| `ACCEL_HOMING_TRAVEL` | Dev guided travel/origin wizard. Starts without motion or reopens an active step. `JOG_SPEED=10` (1–20 mm/s), `SEARCH_MARGIN=20` (0–100 mm), `PROMPT=1`. Actions: `SELECT AXIS=X|Y`, `MEASURE CENTERED=1 CLEAR=1`, `JOG DISTANCE=-10..10`, `ORIGIN CONFIRM=1`, `NEXT`, `STATUS`, `SAVE CONFIRM=1`, `DONE`. See [full sequence and limits](TRAVEL.md). |
 | `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. |
 | `ACCEL_HOMING_CALIBRATE_CENTER AXIS=ALL CENTERED=1` | Development: ten direct alternating traverses per selected axis after one excluded initial home; no separate backoff/retract. `AXIS=X|Y|XY|ALL`, default both; `SEARCH_MARGIN=20` mm finite extra allowance per move. Report-only by default; `SAVE_CONFIG=1` explicitly saves consistent endpoints after all axes and cleanup succeed. See [coordinate calibration](CENTER.md). |

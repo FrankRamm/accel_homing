@@ -454,9 +454,14 @@ def validate_installation_history(selected, api):
                 # journal without admitting arbitrary historical subsets.
                 legacy = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
                           "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py")
-                if (tuple(api.MODULES) == legacy + (center,) and not any(
-                        Path(change["path"]) == extras / center for change in manifest["changes"])):
-                    module_sets.append(legacy)
+                travel = "accel_homing_travel.py"
+                if tuple(api.MODULES) in (legacy + (center,), legacy + (center, travel)):
+                    paths = {Path(change["path"]) for change in manifest["changes"]}
+                    if extras / travel not in paths:
+                        if travel in api.MODULES:
+                            module_sets.append(legacy + (center,))
+                        if extras / center not in paths:
+                            module_sets.append(legacy)
                 expected = set()
                 for names in module_sets:
                     missing = ["klippy/extras/" + name for name in names

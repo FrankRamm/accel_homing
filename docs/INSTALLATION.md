@@ -23,7 +23,7 @@ explicit selection. It does not infer electrical wiring or validate mechanics.
 
 ## Install
 
-For the new center calibration workflow, install this `dev` branch:
+For the center calibration and guided travel/origin workflows, install this `dev` branch:
 
 ```bash
 cd ~
@@ -38,6 +38,13 @@ stay on `main` until the operator explicitly switches their Git branch.
 Keep this checkout in place: installed extras are links to its Python modules.
 Moving or deleting the checkout breaks those links. A second `git clone` into
 an existing directory is unnecessary; use the update procedure below.
+
+The travel wizard adds `accel_homing_travel.py`. Existing installations must
+rerun `~/accel_homing/install.sh --branch dev` after updating their dev checkout
+to create the new extras link, then follow the installer's restart instructions.
+A source-only update without that link keeps existing workflows available;
+`ACCEL_HOMING_TRAVEL` reports the missing installation step. The installer and
+rollback/uninstaller recognize the earlier six- and seven-module installations.
 
 The managed source must be the complete clean `~/accel_homing` Git checkout
 of `main` or `dev`, with exact origin
