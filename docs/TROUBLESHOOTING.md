@@ -23,6 +23,25 @@ Do not delete `~/accel_homing` while extras, restored/shared links or a retained
 manual Moonraker updater entry still reference it. The uninstaller removes
 installer-created registration, not a pre-existing manual entry it does not own.
 
+### Import failure after the first troubleshooting update
+
+Revision `cdfd898` eagerly imported the newly added diagnostic module. A native
+Moonraker Git update could leave that module without an `extras` link. Nested
+import fallbacks then reported `No module named 'accel_homing_workflows'`, even
+when the workflow link existed. Later `main` revisions load diagnostics only
+when requested and can load the file from the same resolved source checkout.
+
+Refresh the updater and update `accel_homing` to current `main`, then ensure the
+selected Klipper/Kalico host service restarts. Console `RESTART` or
+`FIRMWARE_RESTART` alone does not reload imported Python code. This repair does
+not require deleting configuration, recalibrating or reinstalling the plugin.
+
+If the complete source checkout or an original module link is actually missing,
+preserve the full traceback and inspect that separate installation problem.
+The installer refuses writes while a running Klipper reports an error state;
+`--no-restart` does not bypass that check. Do not disable the guard to repair a
+missing file. See [service activation and instance selection](INSTALLATION.md).
+
 ## Configuration and workflow admission
 
 | Symptom | Check and next action |

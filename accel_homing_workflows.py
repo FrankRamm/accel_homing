@@ -10,6 +10,8 @@ import datetime
 import configparser
 from decimal import Decimal
 import html
+import importlib
+import importlib.util
 import json
 import logging
 import math
@@ -22,19 +24,14 @@ import tempfile
 import urllib.parse
 import uuid
 
-try:
-    from .accel_homing_troubleshoot import Recorder as TroubleshootRecorder, snapshot as troubleshoot_snapshot
-except ImportError:
-    from accel_homing_troubleshoot import Recorder as TroubleshootRecorder, snapshot as troubleshoot_snapshot
-
-try:
+if __package__:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
                                       write_noise_capture, beta_motion_statistics,
                                       compact_beta_home, write_beta_motion, prepare_capture,
                                       publish_captures, prepare_noise, publish_noise)
-except ImportError:
+else:  # Standalone offline analysis; do not mask package dependency errors.
     from accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                      PNGRenderer, default_dependency_directory, preflight_renderer,
                                      validate_accuracy, write_accuracy, write_capture, write_noise,
@@ -73,6 +70,62 @@ REPEATABILITY_LIMIT_MM = 1.5
 MIN_TRAVEL = 10.0
 NOISE_ITERATIONS = 3
 NOISE_DURATION = 1.0
+
+
+_TROUBLESHOOT_MODULE = None
+
+
+def _load_troubleshoot_module():
+    """Load optional diagnostics only when requested, including git-only upgrades.
+
+    Existing installs link six files into extras. A git update provides the new
+    diagnostic source beside the symlink target without adding its extras link.
+    That exact source sibling is the only fallback; sys.path is never changed.
+    """
+    global _TROUBLESHOOT_MODULE
+    if _TROUBLESHOOT_MODULE is not None:
+        return _TROUBLESHOOT_MODULE
+    name = ((__package__ + ".") if __package__ else "") + "accel_homing_troubleshoot"
+    inserted_from_source = False
+    try:
+        module = importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        # Synthetic offline packages may have been removed from sys.modules
+        # after loading workflows. Missing dependencies inside a found module
+        # must retain their original exception, never trigger another import.
+        missing_parent = bool(__package__ and exc.name == __package__ and __package__ not in sys.modules)
+        if exc.name != name and not missing_parent:
+            raise
+        workflow_source = Path(__file__).resolve(strict=True)
+        source = workflow_source.with_name("accel_homing_troubleshoot.py").resolve(strict=True)
+        if source.parent != workflow_source.parent:
+            raise ImportError("diagnostic source must be beside the installed workflow source") from exc
+        spec = importlib.util.spec_from_file_location(name, str(source))
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load diagnostic source: %s" % source) from exc
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        inserted_from_source = True
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(name) is module:
+                del sys.modules[name]
+            raise
+    if not callable(getattr(module, "Recorder", None)) or not callable(getattr(module, "snapshot", None)):
+        if inserted_from_source and sys.modules.get(name) is module:
+            del sys.modules[name]
+        raise ImportError("accel_homing_troubleshoot must provide Recorder and snapshot")
+    _TROUBLESHOOT_MODULE = module
+    return module
+
+
+def TroubleshootRecorder(*args, **kwargs):
+    return _load_troubleshoot_module().Recorder(*args, **kwargs)
+
+
+def troubleshoot_snapshot(workflow):
+    return _load_troubleshoot_module().snapshot(workflow)
 
 
 def _moonraker_read_bytes(path, limit):
@@ -3001,6 +3054,12 @@ class AccelHomingWorkflows:
                 raise gcmd.error("%s is not supported by ACCEL_HOMING_TROUBLESHOOT" % key)
         samples = gcmd.get_int("SAMPLES", 50, minval=2, maxval=50)
         self._require_centered(gcmd)
+        try:
+            _load_troubleshoot_module()
+        except Exception as exc:
+            raise gcmd.error("ACCEL_HOMING_TROUBLESHOOT diagnostics could not load: %s. "
+                             "Update the complete accel_homing checkout and rerun ./install.sh "
+                             "for this Klipper instance before retrying; no motion was requested" % exc) from exc
         # Same idle/native-home/unhomed/geometry preflight as ACCURACY. PNG
         # dependencies are deliberately optional: evidence must survive failure.
         axes = list(requested)

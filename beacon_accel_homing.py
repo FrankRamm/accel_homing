@@ -23,10 +23,10 @@ import threading
 
 import mcu
 
-try:
+if __package__:
     from .accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
                                         motion_startup_timeout, select_sensor)
-except ImportError:  # Standalone offline replay harness
+else:  # Standalone offline replay harness; preserve package import failures.
     from accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
                                        motion_startup_timeout, select_sensor)
 
@@ -639,9 +639,9 @@ class BeaconAccelHoming:
                                desc="Change the threshold or impact sign until restart")
         gcode.register_command("SET_ACCEL_HOMING", self.cmd_SET,
                                desc="Change independent X/Y thresholds until restart")
-        try:
+        if __package__:
             from .accel_homing_workflows import AccelHomingWorkflows
-        except ImportError:
+        else:
             from accel_homing_workflows import AccelHomingWorkflows
         self.workflows = AccelHomingWorkflows(self, config)
 

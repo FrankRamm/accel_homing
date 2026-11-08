@@ -196,6 +196,12 @@ version detection depend on Moonraker/frontend versions and repository tags;
 see the [official Git-repo configuration](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
 The `dev` channel does not make this experimental plugin a stable release.
 
+The troubleshooting command loads its optional module from the installed
+package or the same resolved source checkout. Existing installations with the
+original six module links therefore support Git-only updates adding this
+diagnostic. A missing or broken diagnostic module produces an error only when
+that command is invoked; it does not prevent ordinary plugin startup.
+
 For a manual update of an established clean `main` checkout:
 
 ```bash

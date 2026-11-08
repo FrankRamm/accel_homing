@@ -7,19 +7,24 @@ ACCURACY and other existing commands keep their existing behavior.
 
 ## Update and run
 
-Update the existing checkout while the printer is idle, then rerun its installer
-so the new diagnostic module is linked into the selected Klipper instance:
+Update the existing checkout while the printer is idle. An existing managed
+installation can use **accel_homing -> Update** in Moonraker's frontend. The
+diagnostic module also loads from the same resolved source checkout when an
+older installation has not yet linked this newly added file into `extras`.
+No installer rerun is required solely for that link.
+
+For a manual source update:
 
 ```bash
 cd ~/accel_homing
 git switch main
 git pull --ff-only origin main
-./install.sh
 ```
 
-Use the existing instance-selection options if this host has multiple instances.
-The installer verifies and restarts the selected host service. A console RESTART
-alone does not reload imported Python modules.
+Then restart the selected Klipper/Kalico **host service**, using its actual
+service name or the frontend's service controls. A console RESTART alone does
+not reload imported Python modules. For installation, dependencies or other
+configuration changes, use the normal [installer procedure](INSTALLATION.md).
 
 Follow the [moving-workflow preparation](COMMANDS.md#prepare-every-moving-workflow):
 both XY axes unhomed, manually centered, Z supported, nozzle clear, suitable
