@@ -23,6 +23,11 @@ import urllib.parse
 import uuid
 
 try:
+    from .accel_homing_troubleshoot import Recorder as TroubleshootRecorder, snapshot as troubleshoot_snapshot
+except ImportError:
+    from accel_homing_troubleshoot import Recorder as TroubleshootRecorder, snapshot as troubleshoot_snapshot
+
+try:
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
@@ -265,6 +270,8 @@ class AccelHomingWorkflows:
                  "Export acceleration PNG charts; optional AXIS=X or AXIS=Y, default both"),
                 ("ACCEL_HOMING_ACCURACY", self.cmd_ACCURACY,
                  "Measure repeated X/Y commanded homing travel and accelerometer captures"),
+                ("ACCEL_HOMING_TROUBLESHOOT", self.cmd_TROUBLESHOOT,
+                 "Collect fixed-setting repeated-home diagnostic evidence without recalibration"),
                 ("ACCEL_HOMING_STATUS", self.cmd_STATUS,
                  "Show calibration progress, model and chart output paths")):
             self.gcode.register_command(name, callback, desc=description)
@@ -592,8 +599,12 @@ class AccelHomingWorkflows:
         session = self.session
         if session is not None and session.get("finishing"):
             session["finish_interrupted"] = result.get("reason", "workflow interrupted during PNG export")
+            if session.get("mode") == "troubleshoot":
+                session["troubleshoot_late_ending"] = dict(result)
             return
         if session is not None:
+            if session.get("troubleshoot_recorder") is not None:
+                session["troubleshoot_recorder"].record_event("workflow_ending", **result)
             if session.get("accuracy_recovery") is not None:
                 result = dict(result, accuracy_recovery=dict(session["accuracy_recovery"]),
                               source_accuracy=session["source_accuracy"])
@@ -624,6 +635,8 @@ class AccelHomingWorkflows:
                     self._disable_xy()
                 except Exception:
                     logging.exception("accel_homing: unable to release/invalidate XY during cleanup")
+            if session is not None and session.get("mode") == "troubleshoot":
+                session["troubleshoot_cleanup_complete"] = True
         except Exception as exc:
             if session is not None and session.get("beta"):
                 session["beta_cleanup_error"] = str(exc)
@@ -635,7 +648,7 @@ class AccelHomingWorkflows:
                 result = dict(result, result="aborted", save_config=False,
                               operation_reason=result.get("reason"),
                               reason="recovery calibration cleanup failed: %s" % exc)
-            elif session is not None and session["mode"] in ("accuracy", "noise", "charts"):
+            elif session is not None and session["mode"] in ("accuracy", "troubleshoot", "noise", "charts"):
                 result = {"result": "aborted", "reason": "workflow cleanup failed: %s" % exc}
             raise
         finally:
@@ -653,6 +666,7 @@ class AccelHomingWorkflows:
             finally:
                 self.last_result = result
                 if session is None or not (session.get("beta")
+                                           or session.get("troubleshoot_recorder")
                                            or session.get("accuracy_recovery_pending")
                                            or (session.get("chart_pending")
                                                and result.get("result") == "complete")):
@@ -748,7 +762,7 @@ class AccelHomingWorkflows:
         """Retain the current recorded displacement before stock G28 cleanup."""
         axis = record.get("axis")
         session = self.session
-        if (session is not None and session.get("mode") == "accuracy"
+        if (session is not None and session.get("mode") in ("accuracy", "troubleshoot")
                 and self.in_home and self.home_axis == axis):
             session["accuracy_halt"] = {
                 "source": record, "generation": self.owner.operation_generation,
@@ -1296,7 +1310,7 @@ class AccelHomingWorkflows:
             self.owner.threshold_g[axis] = threshold
         self.owner.back_off_dist = 0.0
         old_record = self.owner.last.get(axis)
-        if session["mode"] == "accuracy":
+        if session["mode"] in ("accuracy", "troubleshoot"):
             reference = self._accuracy_position_reference()
             session.update(home_old_record=old_record,
                            home_generation=self.owner.operation_generation,
@@ -1311,6 +1325,7 @@ class AccelHomingWorkflows:
             session.pop("early_halt", None)
         self.in_home, self.home_axis = True, axis
         capture_started = False
+        recorder = session.get("troubleshoot_recorder")
         try:
             try:
                 if session.get("beta"):
@@ -1336,11 +1351,13 @@ class AccelHomingWorkflows:
                 finally:
                     try:
                         capture = self.owner.stop_capture() if capture_started else {"samples": [], "dropped": 0}
+                        if recorder is not None:
+                            recorder.retain_capture(capture)
                     finally:
                         if session["mode"] == "calibration" and self.session is not session:
                             self._invalidate_calibration_axis(session)
         except Exception:
-            if session["mode"] == "accuracy" and self.session is session:
+            if session["mode"] in ("accuracy", "troubleshoot") and self.session is session:
                 self._remember_accuracy_record(session, axis, old_record)
             raise
         self._check_running(session)
@@ -1368,7 +1385,7 @@ class AccelHomingWorkflows:
             # Stock G28 assigned an endstop coordinate to an implausible hit.
             # Preserve other-axis/Z state even if capture validation now fails.
             self._mark_implausible_calibration(axis, source_record, calibration_reason)
-        if session["mode"] == "accuracy":
+        if session["mode"] in ("accuracy", "troubleshoot"):
             record = self._remember_accuracy_record(session, axis, old_record, record)
         if session["mode"] == "calibration" and capture.get("fault"):
             raise self._error("sensor fault during calibration capture: %s" % capture["fault"])
@@ -1381,7 +1398,7 @@ class AccelHomingWorkflows:
                     or (previous is not None and sample[0] <= previous):
                 raise self._error("homing capture has invalid or stale sensor samples")
             previous = sample[0]
-        if session["mode"] in ("accuracy", "charts"):
+        if session["mode"] in ("accuracy", "troubleshoot", "charts"):
             self._validate_accuracy_capture(session, axis, source_record, detector_record,
                                             record, capture)
             record["capture_valid"] = True
@@ -1397,7 +1414,7 @@ class AccelHomingWorkflows:
                                                 record, capture, record["workflow_threshold_g"])
             record["beta_telemetry"] = self.owner.beta_home_telemetry(capture, record)
             self._append_beta_home(session, compact_beta_home(capture, record))
-        if session["mode"] != "accuracy":
+        if session["mode"] not in ("accuracy", "troubleshoot"):
             session["records"].append(record)
         self._info("%s home: result %s; onset %s g; peak %s g; threshold %s g; "
                    "commanded travel %s mm" % (
@@ -1427,6 +1444,8 @@ class AccelHomingWorkflows:
             raise self._error("workflow cancelled or interrupted")
         if session.get("beta") and session.get("finishing"):
             raise self._error(session.get("finish_interrupted", "Beta is finishing or was cancelled"))
+        if session.get("mode") == "troubleshoot" and session.get("finishing"):
+            raise self._error(session.get("finish_interrupted", "Troubleshoot is finishing or was cancelled"))
         if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
             raise self._error("printer is shut down")
         if self._printing():
@@ -1553,7 +1572,7 @@ class AccelHomingWorkflows:
         result = record.get("result")
         travel = record.get("travel_mm")
         session = self.session
-        if session is not None and session.get("mode") == "accuracy" and "travel_mm_exact" in record:
+        if session is not None and session.get("mode") in ("accuracy", "troubleshoot") and "travel_mm_exact" in record:
             exact = record["travel_mm_exact"]
             zero_hit = exact == 0 and travel == 0 and result in ("impact", "pressed")
             if (type(exact) not in (int, float) or not math.isfinite(exact) or exact < 0
@@ -1645,13 +1664,13 @@ class AccelHomingWorkflows:
         toolhead.wait_moves()
         self._check_running(session)
         settle = (self.calibration_settle_time
-                  if session["mode"] in ("calibration", "accuracy") else 0.0)
+                  if session["mode"] in ("calibration", "accuracy", "troubleshoot") else 0.0)
         if settle:
             toolhead.dwell(settle)
             self._check_running(session)
             toolhead.wait_moves()
             self._check_running(session)
-        if session["mode"] == "accuracy":
+        if session["mode"] in ("accuracy", "troubleshoot"):
             start = session["accuracy_home_start"][0]
             position = toolhead.get_position()
             trusted = (session["accuracy_started_centered"]
@@ -2973,6 +2992,129 @@ class AccelHomingWorkflows:
         self.session.update(accuracy_recovery=dict(pending), source_accuracy=source_accuracy)
         self._run_calibration()
 
+    def cmd_TROUBLESHOOT(self, gcmd):
+        requested = str(gcmd.get("AXIS", "XY")).strip().lower()
+        if requested not in ("x", "y", "xy"):
+            raise gcmd.error("AXIS must be X, Y or XY")
+        for key in gcmd.get_command_parameters():
+            if key not in ("AXIS", "SAMPLES", "CENTERED"):
+                raise gcmd.error("%s is not supported by ACCEL_HOMING_TROUBLESHOOT" % key)
+        samples = gcmd.get_int("SAMPLES", 50, minval=2, maxval=50)
+        self._require_centered(gcmd)
+        # Same idle/native-home/unhomed/geometry preflight as ACCURACY. PNG
+        # dependencies are deliberately optional: evidence must survive failure.
+        axes = list(requested)
+        self._begin(gcmd, "troubleshoot", axes=axes)
+        session, recorder = self.session, None
+        session.update(state="running", axes=axes, samples_requested=samples,
+                       attempt_limit=len(axes) * (samples + 1), sample_index=0,
+                       configured_speeds={axis: self.owner.rails_by_axis[axis].get_homing_info().speed
+                                          for axis in axes},
+                       pending_record=None, last_arm_time=None,
+                       accuracy_generation=self.owner.operation_generation,
+                       accuracy_preflight_generation=self.preflight_generation,
+                       accuracy_center_reference=None,
+                       axis_results={axis: {"trials": [], "discovery": None, "rejected": None}
+                                     for axis in axes})
+        try:
+            recorder = TroubleshootRecorder(self, session)
+            session["troubleshoot_recorder"] = recorder
+            self.owner.troubleshoot = recorder
+            recorder.record_event("workflow_start", axes=axes, samples_requested=samples,
+                                  thresholds_g=session["saved_thresholds"],
+                                  speeds_mm_s=session["configured_speeds"], homing_accel_mm_s2=self.owner.homing_accel)
+            self._info("Troubleshoot keeps active speeds, acceleration and thresholds fixed; "
+                       "%d measured homes per axis plus one excluded discovery. "
+                       "Bad homes stop without automatic return or recalibration" % samples)
+            session["accuracy_center_reference"] = self._accuracy_position_reference()
+            for axis_index, axis in enumerate(axes):
+                session["axis"] = axis
+                for sample in range(samples + 1):
+                    self._check_running(session)
+                    session.update(sample_index=sample, pending_record=None)
+                    recorder.begin_home(axis, sample)
+                    recorder.current_home["expected_travel_mm"] = self._geometry(axis)[1]
+                    try:
+                        record, capture = self._home(axis)
+                        del capture  # Recorder already retained compact raw rows before validation.
+                        quality, reason = self._quality(axis, record)
+                        recorder.current_home["quality"] = quality
+                        if quality != "good":
+                            session["axis_results"][axis]["rejected"] = record
+                            raise self._error(reason + "; troubleshoot stopped without automatic return "
+                                              "or recalibration; manually recenter before another run")
+                        if sample == 0:
+                            session["axis_results"][axis]["discovery"] = record
+                        else:
+                            session["axis_results"][axis]["trials"].append(record)
+                        recorder.finish_home(record)
+                    except Exception as exc:
+                        pending = session.get("pending_record")
+                        # Faults may occur before the ordinary record exists.
+                        # Do not substitute a previous home's record.
+                        recorder.finish_home(pending, exc)
+                        raise
+                    if sample < samples or axis_index < len(axes) - 1:
+                        before = troubleshoot_snapshot(self)
+                        start = self.owner.toolhead.get_position()[AXES[axis]]
+                        center = self._geometry(axis)[0]
+                        speed = min(self.reposition_speed, session["configured_speeds"][axis])
+                        recorder.record_event("return_planned", axis=axis,
+                                              commanded_delta_mm_signed=center - start,
+                                              target_mm=center, speed_mm_s=speed,
+                                              restored_velocity_and_acceleration=before.get("max_velocity_and_acceleration"), before=before)
+                        recorder.current_home["return_planned"] = {
+                            "commanded_delta_mm_signed": center - start,
+                            "target_mm": center, "speed_mm_s": speed,
+                            "restored_velocity_and_acceleration": before.get("max_velocity_and_acceleration"),
+                            "settle_time_s": self.calibration_settle_time}
+                        self._recenter(axis)
+                        after = troubleshoot_snapshot(self)
+                        recorder.current_home.update(return_completed=True, return_after=after,
+                            return_commanded_delta_mm_signed=self.owner.toolhead.get_position()[AXES[axis]] - start)
+                        recorder.record_event("return_completed", after=after,
+                                              commanded_delta_mm_signed=self.owner.toolhead.get_position()[AXES[axis]] - start)
+            axis, record, _source = session["terminal_home"]
+            recorder.record_event("terminal_release_planned", axis=axis,
+                                  back_off_mm=session["saved_back_off"], before=troubleshoot_snapshot(self))
+            self._release_terminal_home(axis, record)
+            recorder.record_event("terminal_release_completed", after=troubleshoot_snapshot(self))
+            self._finish({"result": "complete", "mode": "troubleshoot"})
+        except Exception as exc:
+            if self.session is session and not session.get("finishing"):
+                self._finish({"result": "aborted", "mode": "troubleshoot", "reason": str(exc)}, release=True)
+            raise
+        finally:
+            # Cancellation may finalize inside native G28. Its capture and core
+            # cleanup unwind before this outer export; never write from a hook.
+            self.owner.troubleshoot = None
+            result = dict(self.last_result or {"result": "aborted"}, mode="troubleshoot",
+                          run_id=session["run_id"], axes=axes, samples_requested=samples,
+                          attempts=session["attempts"],
+                          completed_samples={axis: len(item["trials"]) for axis, item in session["axis_results"].items()},
+                          statistics={axis: self._accuracy_statistics(item["trials"])
+                                      for axis, item in session["axis_results"].items()})
+            try:
+                if recorder is not None:
+                    recorder.record_event("workflow_cleanup_observed", result=result["result"],
+                                          cleanup_complete=session.get("troubleshoot_cleanup_complete", False))
+                    result["artifacts"] = recorder.export(result)
+                    self._info("Troubleshoot evidence folder: %s" % result["artifacts"]["folder"])
+                    if result["artifacts"].get("archive"):
+                        self._info("Troubleshoot shareable ZIP: %s" % result["artifacts"]["archive"])
+                    if result["artifacts"]["render"]["result"] != "complete":
+                        self._info("Troubleshoot PNG export failed; raw CSV and manifest remain available")
+            except Exception as exc:
+                result["export_error"] = str(exc)
+                result["artifact_folder"] = getattr(recorder, "folder", None)
+                self._info("Troubleshoot evidence export failed: %s; partial folder: %s" % (
+                    exc, result["artifact_folder"]))
+            finally:
+                self.last_result = result
+                if self.session is session:
+                    self.session = None
+                self.reactor.update_timer(self.timer, self.reactor.NEVER)
+
     def cmd_ACCURACY(self, gcmd):
         requested = str(gcmd.get("AXIS", "XY")).strip().lower()
         if requested not in ("x", "y", "xy"):
@@ -3207,7 +3349,12 @@ class AccelHomingWorkflows:
             key: session.get(key) for key in ("mode", "state", "axis", "candidate", "successes",
                                              "candidate_qualified", "attempts", "run_id", "expires",
                                              "repeatability_spread_mm")}
-        if session is not None and session["mode"] == "accuracy":
+        if session is not None and session["mode"] == "troubleshoot":
+            active = {key: session.get(key) for key in ("mode", "state", "axis", "attempts", "run_id",
+                                                       "samples_requested", "sample_index")}
+            active["completed_samples"] = {axis: len(item["trials"])
+                                            for axis, item in session["axis_results"].items()}
+        elif session is not None and session["mode"] == "accuracy":
             active = {key: session.get(key) for key in ("mode", "state", "axis", "attempts", "run_id")}
             active.update(axes=list(session["axes"]),
                           samples_requested=session["samples_requested"],

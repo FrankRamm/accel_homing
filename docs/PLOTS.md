@@ -1,9 +1,13 @@
 # PNG plots and stationary noise
 
-All newly generated plots are completed **PNG** images. There are no CSV,
-JSON, SVG or HTML chart sidecars and no full-resolution raw-sample export.
-Only successful workflows publish plots. Rejected, failed, aborted or cancelled
-measurements retain console diagnostics without saving a partial PNG anywhere.
+The standard chart workflows generate completed **PNG** images without raw
+sample sidecars, and publish only successful measurements. Rejected, failed,
+aborted or cancelled standard chart workflows retain console diagnostics.
+
+`ACCEL_HOMING_TROUBLESHOOT` additionally exports JSON, retained full-resolution
+raw samples and diagnostic plots, including available evidence from incomplete
+runs. Its files are separate from the standard chart publication policy. See
+[per-home diagnostic capture](TROUBLESHOOT_CAPTURE.md).
 
 ## Where files are saved
 
@@ -11,8 +15,8 @@ By default, `accel_homing_charts/` is beside the main `printer.cfg`. Set
 `charts_directory` in the existing plugin section to choose a different writable
 directory. The output filesystem needs hard-link support for atomic publication.
 
-Console output and `ACCEL_HOMING_STATUS` report saved paths. Files use the host's
-local timestamp in both title and filename, for example:
+Console output and `ACCEL_HOMING_STATUS` report saved paths. Standard chart files
+use the host's local timestamp in both title and filename, for example:
 
 ```text
 Accel Homing Accuracy X - 2026-10-27 23:59:42.png
@@ -21,6 +25,8 @@ Accel Homing Accuracy X - 2026-10-27 23:59:42.png
 PNG metadata retains UTC provenance and the local timezone offset.
 Rename to a colon-free filename when downloading to Windows. Existing images
 are retained; the plugin does not rotate or delete old final chart outputs.
+TROUBLESHOOT uses a separate run-ID folder and colon-free filenames, with UTC
+provenance in its manifest.
 
 ## Which command produces which plot
 
@@ -30,9 +36,11 @@ are retained; the plugin does not rotate or delete old final chart outputs.
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Yes | Fresh stationary-noise summary after calibration, cleanup and required save succeed; its hints exclude the final 0.5 g saving margin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Yes | Measured acceleration capture for that home; omit AXIS for X then Y. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Yes | One final accuracy overview per requested axis after every axis succeeds. |
+| `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Yes | Packet/stop/return diagnostics, raw samples, per-home impact plots and cross-home summaries; available partial evidence is retained. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Yes | Combined **Beta** moving-noise/trial diagnostic and suggestion report. |
 
-Acceleration curves show `abs(ax-bx)`, `abs(ay-by)` and `abs(az-bz)` in g.
+Standard chart acceleration curves show `abs(ax-bx)`, `abs(ay-by)` and
+`abs(az-bz)` in g.
 The fresh signed resting reference is subtracted **before** taking absolute
 values. Acceleration axes, threshold lines and peak markers are nonnegative.
 New vector-model captures also label XYZ magnitude; selected-axis captures
@@ -48,6 +56,11 @@ not change the signed samples used for detection or statistics.
 A diagnostic chart cannot establish that all vector peaks or physical
 transients were preserved, nor measure end-to-end stopping latency. Synthetic
 fixtures are marked **SIMULATED / NOT PRINTER MEASUREMENT**.
+
+TROUBLESHOOT impact plots show signed XYZ components and XYZ magnitude with
+their available reference, plus separate timing and travel diagnostics. Its
+CSV files retain source samples at their original resolution within the stated
+retention limits; inspect the manifest for omitted ranges.
 
 Native Beacon clipping markers are decoded as bounded sensor-endpoint
 estimates using prior sensor sign. Their true sign and amplitude are unknown;

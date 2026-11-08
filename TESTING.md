@@ -30,12 +30,15 @@ python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -
 python3 -B -m unittest discover -s tests -p 'test_absolute_charts.py' -v
 python3 -B -m unittest discover -s tests -p 'test_sample_age*.py' -v
 python3 -B -m unittest discover -s tests -p 'test_warmup_timing.py' -v
+python3 -B -m unittest discover -s tests -p 'test_troubleshoot*.py' -v
 ```
 
 The tests cover installation/ownership/rollback, adapter contracts and faults,
 fresh references, legacy/vector detector behavior, single-pass homing/release,
 noise selection, calibration geometry/early returns/repeatability, accuracy
 capture/recovery/statistics, PNG rendering and the isolated Beta experiment.
+TROUBLESHOOT adds fixed-setting motion equivalence, passive stop ordering,
+partial evidence retention, bounded collection and post-cleanup export checks.
 A source test file's presence is not proof that it executed successfully.
 
 For a reproducible report, retain the exact commit, command/working directory,
@@ -66,6 +69,12 @@ full suite run establish different things; identify which were actually done.
   requires current evidence, reports failure without a PNG and completes cleanup,
   then starts standard calibration at the failed
   threshold plus exactly 0.25 g. Only successful calibration saves/restarts.
+- TROUBLESHOOT keeps the active threshold, speed and acceleration fixed. It
+  uses the same native homes and successful return/release sequence as ACCURACY,
+  stops on a rejected home without recovery calibration, and retains available
+  partial evidence. Diagnostic failures cannot suppress the stop request.
+  Files and PNGs are exported after motion cleanup; rendering failure preserves
+  the JSON and raw data. Retention limits and omissions are explicit.
 - Stationary noise retries discard complete rejected windows, respect per-window
   and whole-session limits, and keep homing/Beta policies unchanged.
 - Generic valid current-window data is accepted despite old sensor timestamps,
@@ -76,7 +85,7 @@ full suite run establish different things; identify which were actually done.
   guards. Reference arming, stationary windows and Beta use their receipt
   liveness; native Beacon's age protection remains. `max_sample_age` stays a
   nominal planning input, independently of the valid-receipt timeout.
-- Failed measurements do not invoke final PNG publication. Every multi-axis
+- Failed standard chart measurements do not invoke final PNG publication. Every multi-axis
   image is rendered before publication; rollback removes only newly owned files.
 - Capture, ACCURACY, stationary/post-calibration noise and Beta PNGs display
   absolute components after signed-reference subtraction. Acceleration limits,
