@@ -348,7 +348,7 @@ def _config_paths(main, states, api):
             matches = {Path(p).resolve() for p in glob.glob(pattern)}
             matches.update(p for p in states if p.match(pattern))
             matches = sorted(p for p in matches if states.get(p, {}).get("kind") != "absent")
-            if not matches:
+            if not matches and not glob.has_magic(pattern):
                 _fail(api, "Missing include context for %s: %s" % (path, pattern))
             for match in matches:
                 visit(match)

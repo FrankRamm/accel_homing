@@ -83,8 +83,23 @@ pins. A dependency/preflight failure stops before printer configuration writes.
 Default installation/update restarts the exact verified Klipper systemd service
 and activates the correlated Moonraker service when required. It verifies the
 selected unit/process identity and rechecks idle state before activation. It
-may ask for your Linux sudo password before writing files. A process restart
+may ask for your Linux sudo password before writing files when a controlling
+terminal is available. A process restart
 does not itself establish that the printer reached Ready or that homing works.
+
+Restart authorization accepts validated sudo credentials or an explicit
+`NOPASSWD` rule for the exact command executed as root:
+`/absolute/path/to/systemctl --system --no-ask-password restart -- SERVICE`.
+Permission to list commands or run an unrelated command does not establish
+permission for this restart. Authorization is checked again before writing and
+activation; the restart itself always uses noninteractive sudo.
+
+For sudo older than 1.9.15, passwordless detection supports local `sudoers`
+rules with literal commands or `ALL`, including an exact `NOPASSWD` rule after
+a general password-required rule. Complex patterns, bound defaults, ambiguous
+selectors or other policy sources require validated credentials or
+`--no-restart`. A noninteractive SSH session never opens a password prompt;
+if authorization cannot be verified, the installer stops before file writes.
 
 For a process manager the installer cannot verify, or to defer activation:
 
