@@ -3185,7 +3185,8 @@ class AccelHomingWorkflows:
                                               commanded_delta_mm_signed=self.owner.toolhead.get_position()[AXES[axis]] - start)
             axis, record, _source = session["terminal_home"]
             recorder.record_event("terminal_release_planned", axis=axis,
-                                  back_off_mm=session["saved_back_off"], before=troubleshoot_snapshot(self))
+                                  back_off_mm=session["saved_back_off"][axis],
+                                  before=troubleshoot_snapshot(self))
             self._release_terminal_home(axis, record)
             recorder.record_event("terminal_release_completed", after=troubleshoot_snapshot(self))
             self._finish({"result": "complete", "mode": "troubleshoot"})
