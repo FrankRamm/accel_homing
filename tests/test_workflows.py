@@ -22,7 +22,7 @@ from accel_homing_model import AccelHomingModel
 from harness import CommandError, ConfigError, FakeReactor, plugin
 
 # Default per-axis back-off of the simulated owner.
-BACK_OFF = {"x": 5.0, "y": 5.0, "z": 5.0}
+BACK_OFF = {"x": 5.0, "y": 5.0}
 
 
 class FakePNGRenderer:
@@ -432,7 +432,7 @@ class Rig:
         self.owner = types.SimpleNamespace(
             printer=self, reactor=self.reactor, toolhead=self.toolhead, name="accel_homing",
             threshold_g={"x": 8.0, "y": 9.0}, impact_sign={"x": 0, "y": 0},
-            homing_accel=5000.0, back_off_dist={"x": 5.0, "y": 5.0, "z": 5.0}, full_scale_g=16.0,
+            homing_accel=5000.0, back_off_dist={"x": 5.0, "y": 5.0}, full_scale_g=16.0,
             homing_active=False, attempt=None, last={}, operation_generation=0, saved_accel=None,
             endstops={"x": object(), "y": object()},
             rails_by_axis={"x": Rail(), "y": Rail(bounds=(0.0, 200.0))},
@@ -2321,7 +2321,7 @@ class GuardTests(unittest.TestCase):
                       lambda r: r.owner.impact_sign.__setitem__("x", -1),
                       lambda r: r.owner.threshold_g.__setitem__("x", 7.0),
                       lambda r: setattr(r.owner, "homing_accel", 4000.0),
-                      lambda r: setattr(r.owner, "back_off_dist", {"x": 3.0, "y": 5.0, "z": 5.0}),
+                      lambda r: setattr(r.owner, "back_off_dist", {"x": 3.0, "y": 5.0}),
                       lambda r: r.toolhead.kin.limits.__setitem__(0, (0.0, 300.0)),
                       lambda r: setattr(r, "print_state", "printing"),
                       lambda r: setattr(r, "paused", True),
