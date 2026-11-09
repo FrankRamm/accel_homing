@@ -12,6 +12,10 @@ import test_updater as updater_tests
 
 installer = updater_tests.installer
 updater = updater_tests.updater
+# Released main installations with troubleshooting link these seven modules.
+MAIN_TROUBLESHOOT_MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
+                             "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py",
+                             "accel_homing_troubleshoot.py")
 
 
 class DevRegistrationTests(unittest.TestCase):
@@ -215,16 +219,20 @@ class IsolatedDevGitTests(unittest.TestCase):
         self.assertEqual(self.run_git(self.source, "branch", "--show-current"), "dev")
 
     def test_six_module_main_install_upgrades_and_rolls_back_without_switching_git(self):
-        self._old_module_install_upgrades(6)
+        self._old_module_install_upgrades(installer.MODULES[:6])
 
     def test_seven_module_dev_install_upgrades_and_rolls_back(self):
-        self._old_module_install_upgrades(7)
+        self._old_module_install_upgrades(installer.MODULES[:7])
 
-    def _old_module_install_upgrades(self, previous_count):
+    def test_seven_module_main_troubleshoot_install_upgrades_and_rolls_back(self):
+        self._old_module_install_upgrades(MAIN_TROUBLESHOOT_MODULES)
+
+    def _old_module_install_upgrades(self, previous):
         modules = installer.MODULES
-        self.assertEqual(modules[-1], "accel_homing_travel.py")
+        self.assertEqual(modules[6:], ("accel_homing_center.py", "accel_homing_travel.py",
+                                       "accel_homing_troubleshoot.py"))
         with self.migration_links() as (links, write):
-            with mock.patch.object(installer, "MODULES", modules[:previous_count]):
+            with mock.patch.object(installer, "MODULES", previous):
                 _main, _first = self.install(write)
             main_links = copy.deepcopy(links)
             main_files = {path: path.read_bytes() for path in (
@@ -235,9 +243,10 @@ class IsolatedDevGitTests(unittest.TestCase):
             self.assertEqual(plan["context"]["branch"], "dev")
             for path, state in main_links.items():
                 self.assertEqual(links[path], state)
-            added = [self.extras / module for module in modules[previous_count:]]
+            added = [self.extras / module for module in modules if module not in previous]
             for path in added:
                 self.assertEqual(links[path]["target"], str(self.source / path.name))
+            self.assert_all_modules_linked(links)
             self.assertIn(b"primary_branch: dev\n", self.moon_config.read_bytes())
             self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()),
                              (main_files[self.config], main_files[self.axes]))
@@ -248,6 +257,37 @@ class IsolatedDevGitTests(unittest.TestCase):
             self.assertEqual({path: path.read_bytes() for path in main_files}, main_files)
             self.assertEqual(self.run_git(self.source, "branch", "--show-current"), "dev")
             self.assertEqual(self.run_git(self.source, "rev-parse", "HEAD"), self.commit)
+
+    def assert_all_modules_linked(self, links):
+        self.assertEqual(len(installer.MODULES), 9)
+        for module in installer.MODULES:
+            self.assertEqual(links[self.extras / module],
+                             {"kind": "symlink", "target": str(self.source / module)})
+        exclude = (self.repo / ".git/info/exclude").read_text().splitlines()
+        for module in installer.MODULES:
+            self.assertEqual(exclude.count("klippy/extras/" + module), 1)
+
+    def test_fresh_install_links_all_nine_modules(self):
+        with self.migration_links() as (links, write):
+            self.install(write)
+            self.assert_all_modules_linked(links)
+
+    def test_seven_module_main_troubleshoot_install_upgrade_then_uninstall_restores_everything(self):
+        exclude = self.repo / ".git/info/exclude"
+        before = {path: path.read_bytes() if path.exists() else None for path in (
+            self.config, self.axes, self.moon_config, self.config.parent / updater.RECEIPT, exclude)}
+        with self.migration_links() as (links, write):
+            with mock.patch.object(installer, "MODULES", MAIN_TROUBLESHOOT_MODULES):
+                self.install(write)
+            self.select_dev()
+            self.install(write)
+            self.assert_all_modules_linked(links)
+            restore = installer.make_uninstall_plan(self.selected)
+            installer.apply_uninstall_plan(restore, self.selected, writer=write)
+            self.refresh()
+            for module in installer.MODULES:
+                self.assertEqual(links[self.extras / module]["kind"], "absent")
+        self.assertEqual({path: path.read_bytes() if path.exists() else None for path in before}, before)
 
 
 if __name__ == "__main__":

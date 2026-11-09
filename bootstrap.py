@@ -13,7 +13,7 @@ FILES = ("install.sh", "uninstall.sh", "installer.py", "uninstaller.py",
          "accel_homing_updater.py", "accel_homing.py", "beacon_accel_homing.py",
          "accel_homing_backends.py", "accel_homing_workflows.py",
          "accel_homing_model.py", "accel_homing_charts.py", "accel_homing_center.py",
-         "accel_homing_travel.py", "LICENSE", "NOTICE")
+         "accel_homing_travel.py", "accel_homing_troubleshoot.py", "LICENSE", "NOTICE")
 
 
 def main(argv=None):

@@ -22,7 +22,7 @@ import uuid
 
 MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
            "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py",
-           "accel_homing_center.py", "accel_homing_travel.py")
+           "accel_homing_center.py", "accel_homing_travel.py", "accel_homing_troubleshoot.py")
 SENSORS = {"beacon", "adxl345", "lis2dw", "lis3dh", "mpu9250", "icm20948"}
 SAVE_MARKER = "#*# <---------------------- SAVE_CONFIG ---------------------->"
 MANAGED = "accel_homing.cfg"
@@ -354,7 +354,7 @@ class ConfigGraph:
                     pattern = str(path.parent / pattern)
                 self.include_patterns.append(pattern)
                 matches = sorted(glob.glob(pattern))
-                if not matches:
+                if not matches and not glob.has_magic(pattern):
                     raise InstallError("Include has no matches in %s: %s" % (path, section.name))
                 for match in matches:
                     self._visit(match, stack + [path])
@@ -771,10 +771,10 @@ def assert_idle(selected, query=None, service_state=None, require_process_identi
     return "Selected live Klipper reports ready/idle (read-only API query)."
 
 
-def service_command(command, timeout=5, capture=True):
+def service_command(command, timeout=5, capture=True, env=None):
     """Every service-manager command is bounded, argv-only, and non-shell."""
     try:
-        return subprocess.run(command, timeout=timeout, text=True,
+        return subprocess.run(command, timeout=timeout, text=True, env=env,
                               stdout=subprocess.PIPE if capture else None,
                               stderr=subprocess.PIPE if capture else None)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -870,20 +870,163 @@ def service_identity(selected, systemctl):
                 invocation=properties.get("InvocationID", ""), state=active)
 
 
+def sudo_policy_entries(output, full=False):
+    """Read only the bounded sudoers long-list format; unknown policy fails closed."""
+    entries, entry, commands, header = [], None, False, False
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("Sudoers entry:"):
+            entry = {"Commands": []}
+            entries.append(entry)
+            commands = False
+        elif entry is None and full:
+            if line.startswith("Matching Defaults entries for ") and not header:
+                continue
+            if re.fullmatch(r"User .+ may run the following commands on .+:", line) and not header:
+                header = True
+                continue
+            # Bound defaults may alter command matching/execution. Do not try
+            # to interpret their selectors or arbitrary quoted option values.
+            if not header and line.startswith("    ") and "Defaults" not in line:
+                if re.search(r"\b(?:runchroot|runcwd)\b", line):
+                    raise ValueError("unsupported sudoers command filesystem context")
+                continue
+            raise ValueError("unsupported sudoers defaults/listing format")
+        elif entry is not None and line.startswith("    ") and not line.startswith("        "):
+            key, separator, value = line.strip().partition(":")
+            if not separator or key not in ("RunAsUsers", "RunAsGroups", "Options", "Commands", "Matched"):
+                raise ValueError("unsupported sudoers rule field")
+            if key == "Commands":
+                if commands or value.strip():
+                    raise ValueError("ambiguous sudoers command list")
+                commands = True
+            elif key in entry:
+                raise ValueError("duplicate sudoers rule field")
+            else:
+                entry[key] = value.strip()
+        elif entry is not None and commands and (line.startswith("\t") or line.startswith("        ")):
+            entry["Commands"].append(line.strip())
+        else:
+            raise ValueError("unsupported sudoers listing format")
+    if not entries or (full and not header):
+        raise ValueError("sudo did not expose a complete sudoers listing")
+    for entry in entries:
+        if not entry["Commands"] or not entry.get("RunAsUsers"):
+            raise ValueError("incomplete sudoers rule")
+        if full and any(value.strip() not in ("root", "#0", "ALL") for value in entry["RunAsUsers"].split(",")):
+            raise ValueError("unsupported sudoers RunAs user selector")
+        if full and "RunAsGroups" in entry and entry["RunAsGroups"] != "ALL":
+            raise ValueError("unsupported sudoers RunAs group selector")
+        options = [value.strip() for value in entry.get("Options", "").split(",") if value.strip()]
+        known = {"authenticate", "setenv", "noexec", "intercept", "log_input", "log_output", "mail", "follow"}
+        if any(value.lstrip("!") not in known or value.startswith("!!") for value in options):
+            raise ValueError("unsupported sudoers command options")
+        auth = [value for value in options if value in ("authenticate", "!authenticate")]
+        if len(auth) > 1:
+            raise ValueError("ambiguous sudoers authentication options")
+        entry["passwordless"] = auth == ["!authenticate"]
+    return entries
+
+
+def sudo_files_policy():
+    # Older sudo prints all rules, not the winning rule. Only the normal Linux
+    # files source has the single forward-list/reverse-lookup order used below.
+    try:
+        text = Path("/etc/nsswitch.conf").read_text()
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError):
+        return False
+    sources = re.findall(r"^\s*sudoers\s*:\s*([^\n]*)", re.sub(r"#[^\n]*", "", text), re.M)
+    return not sources or [value.strip() for value in sources] == ["files"]
+
+
+def sudo_literal_matches(rule, command):
+    if rule == "ALL":
+        return True
+    # Deliberately exclude globs, regexps, negation, digests and escaping. Sudo
+    # itself still authorizes the exact argv; this only identifies its auth tag.
+    if not re.fullmatch(r"/[A-Za-z0-9_./+-]+(?: [A-Za-z0-9_./:@%+=-]+)*", rule):
+        raise ValueError("unsupported sudoers command pattern")
+    executable, _, arguments = rule.partition(" ")
+    if executable.endswith("/"):
+        raise ValueError("unsupported sudoers command directory")
+    if arguments and arguments != " ".join(command[1:]):
+        return False
+    if executable == command[0]:
+        return True
+    if Path(executable).name != Path(command[0]).name:
+        return False
+    try:
+        return os.path.samefile(executable, command[0])
+    except OSError:
+        raise ValueError("cannot verify sudoers executable alias")
+
+
+def sudo_passwordless_restart(plan):
+    environment = dict(os.environ, LC_ALL="C", LANG="C")
+    command = [plan["sudo"], "-n", "-u", "root", "-ll"]
+    exact = service_command(command + ["--"] + plan["service_command"], env=environment)
+    if exact.returncode:
+        return False, "sudo denied or could not list the exact root restart command"
+    try:
+        if exact.stdout.startswith("Sudoers entry:"):
+            # sudo >= 1.9.15 resolves precedence, aliases and matching itself.
+            entries = sudo_policy_entries(exact.stdout)
+            if len(entries) != 1 or entries[0].get("Matched") != " ".join(plan["service_command"]):
+                raise ValueError("sudo did not identify one exact matching command")
+            allowed = entries[0]["passwordless"]
+        else:
+            # sudo 1.9.5/1.9.13 (Bullseye/Bookworm) prints only the allowed
+            # command here. Its long all-command listing supplies the tags.
+            if exact.stdout.strip() != " ".join(plan["service_command"]):
+                raise ValueError("sudo returned an unrecognized exact-command listing")
+            if not sudo_files_policy():
+                raise ValueError("legacy sudo needs a files-only sudoers policy source")
+            listing = service_command(command, env=environment)
+            if listing.returncode:
+                raise ValueError("sudo could not expose the long policy listing")
+            entries = sudo_policy_entries(listing.stdout, full=True)
+            allowed = False
+            for entry in entries:
+                for rule in entry["Commands"]:
+                    if sudo_literal_matches(rule, plan["service_command"]):
+                        allowed = entry["passwordless"]
+        return allowed, "the matching sudoers rule does not explicitly permit NOPASSWD"
+    except ValueError as exc:
+        return False, str(exc)
+
+
+def sudo_has_terminal():
+    try:
+        descriptor = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except (OSError, AttributeError):
+        return False
+    os.close(descriptor)
+    return True
+
+
 def restart_permission(plan, acquire=False):
-    # sudoers may permit command *listing* without authenticating execution.
-    # Validate the timestamp independently before checking this exact command.
-    validation = service_command([plan["sudo"], "-n", "-v"])
-    if validation.returncode and acquire:
+    # Listing permission alone never proves passwordless execution. A cached
+    # validation or an explicit NOPASSWD tag for this root command is required.
+    validation_command = [plan["sudo"], "-n", "-u", "root", "-v"]
+    validation = service_command(validation_command)
+    if validation.returncode:
+        passwordless, reason = sudo_passwordless_restart(plan)
+        if passwordless:
+            return
+    if validation.returncode and acquire and sudo_has_terminal():
         print("Authorize the detected host-service restart before any idle check or file writes.")
-        validation = service_command([plan["sudo"], "-v"], timeout=60, capture=False)
+        validation = service_command([plan["sudo"], "-u", "root", "-v"], timeout=60, capture=False)
         if validation.returncode:
             raise InstallError("Cannot obtain sudo authorization for the selected service restart; no files changed.")
-        validation = service_command([plan["sudo"], "-n", "-v"])
+        validation = service_command(validation_command)
     if validation.returncode:
-        raise InstallError("Noninteractive sudo authentication is unavailable. Authorize it before retrying, "
-                           "or use --no-restart.")
-    command = [plan["sudo"], "-n", "-l", "--"] + plan["service_command"]
+        raise InstallError("Cannot verify noninteractive sudo authorization for the exact root restart: %s. "
+                           "No credential prompt was attempted without a terminal. Run from an interactive "
+                           "terminal to authorize sudo, or use --no-restart." % reason)
+    command = [plan["sudo"], "-n", "-u", "root", "-l", "--"] + plan["service_command"]
     result = service_command(command)
     if result.returncode:
         raise InstallError("Noninteractive sudo authorization for the exact service restart is unavailable. "
@@ -957,7 +1100,7 @@ def activate_install(selected, plan, backup=None):
         # No interactive authentication, filesystem writes or waits occur between
         # the last idle proof and sending this restart request.
         attempted = True
-        result = service_command([plan["sudo"], "-n", "--"] + plan["service_command"], timeout=45)
+        result = service_command([plan["sudo"], "-n", "-u", "root", "--"] + plan["service_command"], timeout=45)
         if result.returncode:
             raise InstallError("systemctl restart failed (exit %s): %s" % (result.returncode, result.stderr.strip()))
         after = restarted_process(selected, plan)

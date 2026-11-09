@@ -223,10 +223,23 @@ class ConfiguredAccelBackend:
         def callback(message):
             if not self.active or token != self.generation:
                 return False
+            trace = None
+            if getattr(self.owner, "troubleshoot", None) is not None:
+                entry = self._troubleshoot_now()
+                trace = {"pending_before": self.pending, "backend_generation": token,
+                         "attempt": self.owner.attempt}
             try:
-                self._receive(message)
+                if trace is None:
+                    self._receive(message)
+                else:
+                    self._receive(message, trace)
             except Exception:
                 self._fail("invalid_data")
+                if trace is not None:
+                    trace["stage"] = "callback_exception"
+            finally:
+                if trace is not None:
+                    self._troubleshoot_receive(message, trace, entry, self._troubleshoot_now())
             return self.active
 
         self.client = _LegacyClient(callback) if self.legacy else callback
@@ -265,9 +278,54 @@ class ConfiguredAccelBackend:
         self.last_sample_time = None
         self.last_xyz = self.unchanged_since = None
 
-    def _receive(self, message):
+    def _troubleshoot_now(self):
+        try:
+            return self.owner.reactor.monotonic()
+        except Exception:
+            return None
+
+    def _troubleshoot_receive(self, message, trace, entry, exit_time):
+        try:
+            attempt = trace.get("attempt")
+            fields = {"callback_entry_host_monotonic_s": entry,
+                "callback_exit_host_monotonic_s": exit_time,
+                "callback_time_domain": "host_monotonic",
+                "sample_time_domain": "main_mcu_print_time",
+                "hardware_receipt_time_available": False,
+                "timestamp_provenance": "configured_driver_decoded_batch_callback",
+                "driver_timestamp_fields": {key: message[key] for key in
+                    ("#receive_time", "#sent_time") if key in message},
+                "errors": message.get("errors"), "overflows": message.get("overflows"),
+                "sensor_name": self.name, "legacy_api_dump": self.legacy,
+                "backend_generation": trace.get("backend_generation"),
+                "arm_print_time_s": None if attempt is None else attempt.arm_time,
+                "stage": trace.get("stage", "entry"), "fault": self.fault,
+                "observed_rate_hz": self.observed_rate, "last_sample_age_s": self.last_age,
+                "callback_entry_estimated_print_time_s": (None if entry is None else
+                    self.owner.main_mcu.estimated_print_time(entry))}
+            for label, rows in (("original", message.get("data", ())),
+                    ("pending_before", trace.get("pending_before", ())),
+                    ("filtered", trace.get("filtered", ())),
+                    ("merged", trace.get("merged", ())),
+                    ("delivered", trace.get("delivered", ())),
+                    ("pending_after", self.pending)):
+                try:
+                    fields[label + "_sample_count"] = len(rows)
+                    fields[label + "_first_print_time_s"] = rows[0][0] if rows else None
+                    fields[label + "_last_print_time_s"] = rows[-1][0] if rows else None
+                except Exception:
+                    fields[label + "_bounds_available"] = False
+            recorder = getattr(self.owner, "troubleshoot", None)
+            if recorder is not None:
+                recorder.record_batch(self.kind, **fields)
+        except Exception:
+            pass
+
+    def _receive(self, message, trace=None):
         rows = message.get("data", ())
         if not rows:
+            if trace is not None:
+                trace["stage"] = "empty"
             return  # Never refresh the watchdog for an empty message.
         current = tuple(int(message.get(key, 0)) for key in ("errors", "overflows"))
         if min(current) < 0:
@@ -278,6 +336,9 @@ class ConfiguredAccelBackend:
             return self._fail("data_error")
         self.error_counts = current
         values = []
+        if trace is not None:
+            trace["filtered"] = values
+            trace["stage"] = "validating_rows"
         reference = self.owner.preparation
         noise_session = self.owner.noise_session is not None
         noise_window = self.owner.noise_window if noise_session else None
@@ -322,6 +383,9 @@ class ConfiguredAccelBackend:
                 self.last_xyz, self.unchanged_since = xyz, sample[0]
             values.append(sample)
         values = self.pending + values
+        if trace is not None:
+            trace["merged"] = values
+            trace["stage"] = "merged"
         self.pending = []
         if not values:
             return
@@ -353,6 +417,8 @@ class ConfiguredAccelBackend:
             return self._fail("frozen")
         if len(values) < 2:
             self.pending = values
+            if trace is not None:
+                trace["stage"] = "pending_single_sample"
             return
         self.pending = []
         duration = values[-1][0] - values[0][0]
@@ -373,9 +439,14 @@ class ConfiguredAccelBackend:
                                                for row in before for v in row[1:]))
             if len(after) < 2:
                 self.pending = after
+                if trace is not None:
+                    trace["stage"] = "pending_after_arm"
                 return
             values = after
         data = tuple(value / GRAVITY / self.count_g for row in values for value in row[1:])
+        if trace is not None:
+            trace["delivered"] = values
+            trace["stage"] = "detector_dispatched"
         self.owner._inspect({
             "start_clock": self.print_time_to_clock(values[0][0]) & 0xFFFFFFFF,
             "delta_clock": self.print_time_to_clock(values[-1][0] - values[0][0]),

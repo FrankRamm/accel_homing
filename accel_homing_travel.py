@@ -9,9 +9,9 @@ import datetime
 import json
 import math
 
-try:
+if __package__:
     from .accel_homing_center import AXES, CenterCalibration
-except ImportError:
+else:  # Standalone offline analysis; do not mask package dependency errors.
     from accel_homing_center import AXES, CenterCalibration
 
 

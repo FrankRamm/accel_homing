@@ -24,6 +24,25 @@ Do not delete `~/accel_homing` while extras, restored/shared links or a retained
 manual Moonraker updater entry still reference it. The uninstaller removes
 installer-created registration, not a pre-existing manual entry it does not own.
 
+### Import failure after the first troubleshooting update
+
+Revision `cdfd898` eagerly imported the newly added diagnostic module. A native
+Moonraker Git update could leave that module without an `extras` link. Nested
+import fallbacks then reported `No module named 'accel_homing_workflows'`, even
+when the workflow link existed. Later `main` revisions load diagnostics only
+when requested and can load the file from the same resolved source checkout.
+
+Refresh the updater and update `accel_homing` to current `main`, then ensure the
+selected Klipper/Kalico host service restarts. Console `RESTART` or
+`FIRMWARE_RESTART` alone does not reload imported Python code. This repair does
+not require deleting configuration, recalibrating or reinstalling the plugin.
+
+If the complete source checkout or an original module link is actually missing,
+preserve the full traceback and inspect that separate installation problem.
+The installer refuses writes while a running Klipper reports an error state;
+`--no-restart` does not bypass that check. Do not disable the guard to repair a
+missing file. See [service activation and instance selection](INSTALLATION.md).
+
 ## Configuration and workflow admission
 
 | Symptom | Check and next action |
@@ -96,7 +115,7 @@ No inline preview does not necessarily mean no PNG: read the saved path.
 Use formatted Mainsail output or the frontend file browser. Remote/header-only
 authentication may not authorize a browser image GET. See [plot access](PLOTS.md).
 
-Failed, rejected or cancelled measurements save no partial PNG. Preserve the
+Standard chart workflows save no partial PNG on failure, rejection or cancellation. Preserve the
 console/status diagnostics, including the failed window, retries and cleanup
 results. PNG export failures and unsupported output filesystem operations are
 reported separately. An optional preview/link error after a successful saved
@@ -120,6 +139,13 @@ source/baseline before retrying. Do not delete links/history to silence an
 ownership error. See [uninstall and recovery](INSTALLATION.md#uninstall).
 
 ## Reporting a problem
+
+For intermittent homing or repeatability problems, use the supervised
+[`ACCEL_HOMING_TROUBLESHOOT`](TROUBLESHOOT_CAPTURE.md) command after the usual
+manual preparation. It collects per-home timing, position/return metadata,
+raw acceleration, environment information and graphs into one bundle. Preserve
+the complete bundle even if a home fails or a graph cannot render. Diagnostic
+collection does not recalibrate or save thresholds.
 
 Include the plugin commit (`git -C ~/accel_homing rev-parse HEAD`), host/fork
 version, selected sensor and mounting, relevant configuration with secrets

@@ -661,7 +661,7 @@ class UpdaterFixture(unittest.TestCase):
                 mock.patch.object(installer, "service_command", return_value=types.SimpleNamespace(returncode=0)) as command, \
                 contextlib.redirect_stdout(io.StringIO()):
             updater.activate(plan, self.selected, restart, installer.uninstall_api(), backup)
-        self.assertEqual(command.call_args.args[0], ["sudo", "-n", "--"] + restart["service_command"])
+        self.assertEqual(command.call_args.args[0], ["sudo", "-n", "-u", "root", "--"] + restart["service_command"])
         self.assertEqual(json.loads((backup / "moonraker-activation.json").read_text())["status"], "restarted")
         self.assertFalse(self.updater_plan()["restart_needed"])
         output = io.StringIO()

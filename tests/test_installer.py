@@ -1214,6 +1214,29 @@ class HostFixture(unittest.TestCase):
         with mock.patch.object(installer, "MODULES", ()):
             self.assertEqual(self.plan()[0], {})
 
+    def test_empty_wildcard_includes_allow_install_and_remain_in_graph(self):
+        (self.config.parent / "empty").mkdir()
+        for pattern in ("K-ShakeTune/*.cfg", "empty/*.cfg", "empty/optional?.cfg"):
+            with self.subTest(pattern=pattern):
+                original = (CONFIG + "\n[include " + pattern + "]\n" + SAVED).encode()
+                self.config.write_bytes(original)
+                graph = installer.ConfigGraph(self.config)
+                self.assertEqual(set(graph.documents), {self.config, self.axes})
+                self.assertIn(str(self.config.parent / pattern), graph.include_patterns)
+                changes = self.plan()[0]
+                self.assertIn(self.config.parent / installer.MANAGED, changes)
+                self.assertEqual(self.config.read_bytes(), original)
+
+    def test_missing_literal_include_still_refuses_before_install_writes(self):
+        for pattern in ("missing.cfg", "missing-directory/required.cfg"):
+            with self.subTest(pattern=pattern):
+                original = (CONFIG + "\n[include " + pattern + "]\n" + SAVED).encode()
+                self.config.write_bytes(original)
+                with self.assertRaisesRegex(installer.InstallError, "Include has no matches"):
+                    self.plan()
+                self.assertEqual(self.config.read_bytes(), original)
+                self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
     def test_cli_dry_run_writes_nothing_and_does_not_query_live_status(self):
         before = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*"))
         with mock.patch.object(installer, "discover_target", return_value=self.selected), \
@@ -1232,6 +1255,38 @@ class HostFixture(unittest.TestCase):
         self.assertEqual((self.extras / installer.MODULES[0]).resolve(), self.source / installer.MODULES[0])
         installer.rollback(backup)
         self.assertFalse((self.extras / installer.MODULES[0]).is_symlink())
+
+
+class SudoPolicyFixture(unittest.TestCase):
+    def test_legacy_nss_source_must_be_absent_or_unambiguously_files_only(self):
+        for content, allowed in (("passwd: files\n", True), ("sudoers: files # local\n", True),
+                                 ("sudoers: files sss\n", False), ("sudoers: ldap\n", False),
+                                 ("sudoers: files [SUCCESS=return]\n", False),
+                                 ("sudoers: files\nsudoers: files\n", False)):
+            with self.subTest(content=content), mock.patch.object(Path, "read_text", return_value=content):
+                self.assertEqual(installer.sudo_files_policy(), allowed)
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("unreadable")):
+            self.assertFalse(installer.sudo_files_policy())
+
+    def test_controlling_terminal_is_checked_even_when_standard_input_is_redirected(self):
+        with mock.patch.object(installer.sys, "stdin", io.StringIO()), \
+             mock.patch.object(installer.os, "open", return_value=7) as opening, \
+             mock.patch.object(installer.os, "close") as closing:
+            self.assertTrue(installer.sudo_has_terminal())
+        opening.assert_called_once_with("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        closing.assert_called_once_with(7)
+        with mock.patch.object(installer.os, "open", side_effect=OSError("SSH without terminal")):
+            self.assertFalse(installer.sudo_has_terminal())
+
+    def test_legacy_executable_alias_identity_is_checked_and_unknown_identity_refuses(self):
+        command = ["/usr/bin/systemctl", "--system", "restart", "--", "klipper.service"]
+        rule = "/bin/systemctl --system restart -- klipper.service"
+        with mock.patch.object(installer.os.path, "samefile", return_value=True) as same:
+            self.assertTrue(installer.sudo_literal_matches(rule, command))
+        same.assert_called_once_with("/bin/systemctl", "/usr/bin/systemctl")
+        with mock.patch.object(installer.os.path, "samefile", side_effect=OSError("missing")):
+            with self.assertRaisesRegex(ValueError, "executable alias"):
+                installer.sudo_literal_matches(rule, command)
 
 
 class RestartFixture(unittest.TestCase):
@@ -1259,6 +1314,11 @@ class RestartFixture(unittest.TestCase):
         self.events, self.commands, self.idle_checks = [], [], 0
         self.states = ["standby"]
         self.auth_return = self.list_return = self.acquire_return = self.restart_return = 0
+        self.terminal = True
+        self.restart_argv = ["/offline/systemctl", "--system", "--no-ask-password",
+                             "restart", "--", self.selected["service"]]
+        self.policy_output = self.policy_entry(passwordless=False, matched=True)
+        self.full_policy_output = ""
         self.restart_error, self.after_idle = None, None
         self.info_config = self.config
         self.start_process = True
@@ -1273,6 +1333,8 @@ class RestartFixture(unittest.TestCase):
             mock.patch.object(installer, "webhook_query", side_effect=self.query),
             mock.patch.object(installer.subprocess, "run", side_effect=self.command),
             mock.patch.object(installer, "make_plan", side_effect=self.file_plan),
+            mock.patch.object(installer, "sudo_has_terminal", side_effect=lambda: self.terminal),
+            mock.patch.object(installer, "sudo_files_policy", return_value=True),
         )
         for patch in patches:
             patch.start()
@@ -1294,20 +1356,31 @@ class RestartFixture(unittest.TestCase):
                       "\n".join("%s=%s" % pair for pair in self.unit.items()))
             return subprocess.CompletedProcess(command, 0, output, "")
         self.assertEqual(command[0], "/offline/sudo")
-        if command[1:] == ["-n", "-v"]:
+        if command[1:] == ["-n", "-u", "root", "-v"]:
             self.events.append("auth")
             return subprocess.CompletedProcess(command, self.auth_return, "", "auth unavailable")
-        if command[1:] == ["-v"]:
+        if command[1:] == ["-u", "root", "-v"]:
             self.events.append("credentials")
             if self.acquire_return == 0:
                 self.auth_return = 0
             return subprocess.CompletedProcess(command, self.acquire_return, "", "credentials denied")
-        if command[1:4] == ["-n", "-l", "--"]:
+        if command[1:5] == ["-n", "-u", "root", "-ll"]:
+            self.assertEqual(kwargs["env"]["LC_ALL"], "C")
+            self.assertEqual(kwargs["env"]["LANG"], "C")
+            if len(command) == 5:
+                self.events.append("policy-list")
+                output = self.full_policy_output
+            else:
+                self.events.append("policy")
+                self.assertEqual(command[5:], ["--"] + self.restart_argv)
+                output = self.policy_output
+            return subprocess.CompletedProcess(command, self.list_return, output, "restart denied")
+        if command[1:6] == ["-n", "-u", "root", "-l", "--"]:
             self.events.append("permission")
-            self.assertEqual(command[4:], ["/offline/systemctl", "--system", "--no-ask-password",
+            self.assertEqual(command[6:], ["/offline/systemctl", "--system", "--no-ask-password",
                                            "restart", "--", self.selected["service"]])
             return subprocess.CompletedProcess(command, self.list_return, "", "restart denied")
-        self.assertEqual(command, ["/offline/sudo", "-n", "--", "/offline/systemctl", "--system",
+        self.assertEqual(command, ["/offline/sudo", "-n", "-u", "root", "--", "/offline/systemctl", "--system",
                                    "--no-ask-password", "restart", "--", self.selected["service"]])
         self.assertEqual(json.loads((self.backup() / "manifest.json").read_text())["status"], "installed")
         self.events.append("restart")
@@ -1346,6 +1419,22 @@ class RestartFixture(unittest.TestCase):
     def receipt(self):
         return json.loads((self.backup() / "activation.json").read_text())
 
+    def policy_entry(self, command=None, passwordless=True, matched=False, runas="root", groups=None):
+        command = " ".join(self.restart_argv) if command is None else command
+        output = "Sudoers entry:\n    RunAsUsers: %s\n" % runas
+        if groups is not None:
+            output += "    RunAsGroups: %s\n" % groups
+        output += "    Options: %sauthenticate\n    Commands:\n\t%s\n" % ("!" if passwordless else "", command)
+        if matched:
+            output += "    Matched: " + " ".join(self.restart_argv) + "\n"
+        return output
+
+    def legacy_policy(self, entries):
+        self.policy_output = " ".join(self.restart_argv) + "\n"
+        self.full_policy_output = ("Matching Defaults entries for fixture on host:\n"
+                                   "    env_reset, mail_badpass, secure_path=/usr/bin:/bin\n\n"
+                                   "User fixture may run the following commands on host:\n\n" + "\n".join(entries))
+
     def test_default_install_restarts_exact_instance_after_commit_and_fresh_idle(self):
         self.auth_return = 1  # Listing policy alone must never bypass authentication.
         self.assertEqual(self.cli(), 0)
@@ -1356,6 +1445,124 @@ class RestartFixture(unittest.TestCase):
         self.assertEqual(self.receipt()["status"], "restarted")
         self.assertEqual(self.receipt()["pid"], 124)
         self.assertIn("Ready/module behavior", self.output)
+        self.assertEqual(json.loads((self.backup() / "manifest.json").read_text())["status"], "installed")
+
+    def test_valid_cached_auth_still_requires_exact_permission_without_prompt(self):
+        self.assertEqual(self.cli(), 0)
+        self.assertNotIn("credentials", self.events)
+        self.assertNotIn("policy", self.events)
+        self.assertEqual(self.events.count("permission"), 3)
+
+    def test_modern_exact_nopasswd_all_runas_works_when_validation_fails_without_tty(self):
+        self.auth_return, self.terminal = 1, False
+        self.policy_output = self.policy_entry(matched=True, runas="ALL", groups="ALL")
+        self.assertEqual(self.cli(), 0)
+        self.assertNotIn("credentials", self.events)
+        self.assertEqual(self.events.count("policy"), 3)
+        self.assertEqual(self.events.count("restart"), 1)
+        self.assertEqual(self.events[self.events.index("restart") - 1], "idle")
+
+    def test_modern_exact_policy_uses_sudos_root_match_for_mixed_runas_selectors(self):
+        self.auth_return, self.terminal = 1, False
+        self.policy_output = self.policy_entry(matched=True, runas="root, operator", groups="root")
+        self.assertEqual(self.cli(), 0)
+        self.assertNotIn("credentials", self.events)
+
+    def test_passwordless_permission_revoked_before_first_write_stops_without_backup(self):
+        self.auth_return, self.terminal = 1, False
+        self.policy_output = self.policy_entry(matched=True)
+        plan = installer.prepare_restart(self.selected)
+        self.policy_output = self.policy_entry(passwordless=False, matched=True)
+        changes = self.file_plan(self.source, self.selected, installer.arguments([]))[0]
+        before = self.config.read_bytes(), self.axes.read_bytes()
+        with self.assertRaisesRegex(installer.InstallError, "does not explicitly permit NOPASSWD"):
+            installer.apply_plan(changes, self.config, selected=self.selected,
+                                 before_write=lambda: installer.assert_restart_safe(self.selected, plan))
+        self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), before)
+        self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+        self.assertNotIn("restart", self.events)
+        self.assertNotIn("idle", self.events)
+
+    def test_legacy_mixed_policy_uses_last_matching_rule_with_all_runas(self):
+        self.auth_return, self.terminal = 1, False
+        self.legacy_policy([self.policy_entry("ALL", passwordless=False, runas="ALL", groups="ALL"),
+                            self.policy_entry(runas="ALL", groups="ALL"),
+                            self.policy_entry("/usr/bin/true", passwordless=False)])
+        self.assertEqual(self.cli(), 0)
+        self.assertEqual(self.events.count("policy-list"), 3)
+        self.assertNotIn("credentials", self.events)
+
+    def test_legacy_later_passwd_or_executable_alias_blocks_before_writes(self):
+        self.auth_return, self.terminal = 1, False
+        for later in ("ALL", " ".join(self.restart_argv).replace("/offline/", "/alias/")):
+            with self.subTest(later=later), mock.patch.object(installer.os.path, "samefile", return_value=True):
+                self.legacy_policy([self.policy_entry(), self.policy_entry(later, passwordless=False)])
+                with self.assertRaisesRegex(installer.InstallError, "does not explicitly permit NOPASSWD"):
+                    self.cli()
+                self.assertNotIn("credentials", self.events)
+                self.assertNotIn("restart", self.events)
+                self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_unknown_ambiguous_or_mismatched_policy_never_proves_passwordless(self):
+        self.auth_return, self.terminal = 1, False
+        valid = self.policy_entry(matched=True)
+        cases = ("", valid.replace("!authenticate", "authenticate"),
+                 valid.replace("!authenticate", "!authenticate, authenticate"), valid + valid,
+                 valid.replace("Matched: " + " ".join(self.restart_argv), "Matched: /usr/bin/true"),
+                 valid.replace("RunAsUsers: root", "RunAsUsers:"),
+                 valid.replace("Options:", "Unexpected:"), valid.replace("Sudoers entry:", "Entrada sudoers:"))
+        for output in cases:
+            with self.subTest(output=output):
+                self.policy_output = output
+                with self.assertRaisesRegex(installer.InstallError, "Cannot verify noninteractive sudo"):
+                    self.cli()
+                self.assertNotIn("credentials", self.events)
+                self.assertNotIn("restart", self.events)
+                self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_legacy_unknown_patterns_defaults_and_policy_sources_fail_closed(self):
+        self.auth_return, self.terminal = 1, False
+        for pattern in ("/offline/systemctl *", "!/offline/systemctl", "^/offline/systemctl$", "SYSTEM_COMMANDS"):
+            with self.subTest(pattern=pattern):
+                self.legacy_policy([self.policy_entry(), self.policy_entry(pattern)])
+                with self.assertRaisesRegex(installer.InstallError, "unsupported sudoers command pattern"):
+                    self.cli()
+        self.legacy_policy([self.policy_entry()])
+        self.full_policy_output = "Runas and Command-specific defaults for fixture:\n    Defaults!ALL authenticate\n" + self.full_policy_output
+        with self.assertRaisesRegex(installer.InstallError, "unsupported sudoers defaults"):
+            self.cli()
+        for option in ("runchroot=/isolated", "runcwd=/isolated"):
+            with self.subTest(option=option):
+                self.legacy_policy([self.policy_entry()])
+                self.full_policy_output = self.full_policy_output.replace("env_reset,", option + ", env_reset,")
+                with self.assertRaisesRegex(installer.InstallError, "command filesystem context"):
+                    self.cli()
+        self.legacy_policy([self.policy_entry()])
+        with mock.patch.object(installer, "sudo_files_policy", return_value=False):
+            with self.assertRaisesRegex(installer.InstallError, "files-only"):
+                self.cli()
+        self.assertNotIn("credentials", self.events)
+        self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_no_terminal_does_not_attempt_credential_acquisition(self):
+        self.auth_return, self.terminal = 1, False
+        with self.assertRaisesRegex(installer.InstallError, "No credential prompt.*--no-restart"):
+            self.cli()
+        self.assertNotIn("credentials", self.events)
+        self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_passwordless_policy_revoked_before_activation_retains_files_without_restart(self):
+        self.auth_return = 1
+        self.policy_output = self.policy_entry(matched=True)
+        def revoke(count):
+            if count == 1:
+                self.policy_output = self.policy_entry(passwordless=False, matched=True)
+        self.after_idle = revoke
+        with self.assertRaisesRegex(installer.InstallError, "Files are installed.*blocked"):
+            self.cli()
+        self.assertNotIn("credentials", self.events)
+        self.assertNotIn("restart", self.events)
+        self.assertEqual(self.receipt()["status"], "blocked")
         self.assertEqual(json.loads((self.backup() / "manifest.json").read_text())["status"], "installed")
 
     def test_live_environment_based_unit_uses_process_provenance_without_shell(self):
@@ -2121,12 +2328,12 @@ class UninstallFixture(unittest.TestCase):
         self.assertNotIn("#*# [accel_homing_model old]", text)
         self.assertNotIn("accel_chip:", text)
 
-    def test_new_active_model_or_plugin_section_and_broken_restored_include_refuse(self):
+    def test_new_active_model_or_plugin_section_and_missing_literal_include_refuse(self):
         self.install()
         current = self.config.read_bytes()
         for added in ("\n[accel_homing_model manual]\nx_threshold: 6.1\n",
                       "\n[beacon_accel_homing]\nx_threshold: 6.2\n",
-                      "\n[include accel_*.cfg]\n"):
+                      "\n[include missing-required.cfg]\n"):
             text = current.decode().replace(installer.SAVE_MARKER, added + installer.SAVE_MARKER)
             self.config.write_bytes(text.encode())
             before = self.capture()
@@ -2134,6 +2341,41 @@ class UninstallFixture(unittest.TestCase):
                 installer.make_uninstall_plan(self.selected)
             self.assertEqual(self.capture(), before)
         self.config.write_bytes(current)
+
+    def test_optional_wildcards_survive_install_update_and_historical_uninstall(self):
+        (self.config.parent / "empty").mkdir()
+        self.config.write_bytes((CONFIG + "\n[include K-ShakeTune/*.cfg]\n[include empty/*.cfg]\n"
+                                "[include accel_*.cfg]\n" + SAVED).encode())
+        original = self.capture()
+        self.install()
+        self.install("upgrade")
+        plan, _ = self.uninstall()
+        self.assertEqual(len(plan["history"]), 2)
+        self.assertEqual(self.capture(), original)
+        self.assertNotIn(self.config.parent / installer.MANAGED, installer.ConfigGraph(self.config).documents)
+
+    def test_new_optional_wildcard_is_preserved_after_managed_file_removal(self):
+        self.install()
+        text = self.config.read_text().replace(installer.SAVE_MARKER,
+                                              "[include accel_*.cfg]\n" + installer.SAVE_MARKER)
+        self.config.write_text(text)
+        self.uninstall()
+        self.assertIn("[include accel_*.cfg]", self.config.read_text())
+        self.assertFalse((self.config.parent / installer.MANAGED).exists())
+        installer.ConfigGraph(self.config)
+
+    def test_history_missing_literals_and_duplicate_or_recursive_wildcards_refuse(self):
+        helper, api = installer.load_uninstaller(), installer.uninstall_api()
+        for added, error in (("[include missing-required.cfg]\n", "Missing include"),
+                             ("[include axes*.cfg]\n", "Ambiguous config include"),
+                             ("[include printer*.cfg]\n", "Ambiguous config include")):
+            with self.subTest(added=added):
+                state = dict(installer.snapshot(self.config),
+                             data=base64.b64encode((CONFIG + added + SAVED).encode()).decode())
+                before = self.capture()
+                with self.assertRaisesRegex(installer.InstallError, error):
+                    helper._config_paths(self.config, {self.config: state}, api)
+                self.assertEqual(self.capture(), before)
 
     def test_missing_original_link_source_refuses_but_deleted_intermediate_release_does_not(self):
         for name in installer.MODULES:

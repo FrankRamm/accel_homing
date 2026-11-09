@@ -23,10 +23,10 @@ import threading
 
 import mcu
 
-try:
+if __package__:
     from .accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
                                         motion_startup_timeout, select_sensor)
-except ImportError:  # Standalone offline replay harness
+else:  # Standalone offline replay harness; preserve package import failures.
     from accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
                                        motion_startup_timeout, select_sensor)
 
@@ -578,6 +578,9 @@ class BeaconAccelHoming:
         self.sensor_clock = self.clock_to_time = None
         self.sensor_fault = None
         self.sample_timing_fault = None
+        # Set only by the opt-in troubleshooting workflow. Callbacks retain
+        # bounded observations in memory; export stays outside the move.
+        self.troubleshoot = None
         self.scale = self.session_scale = None
         self.clip_values = (CLIPPED, -CLIPPED - 1)
         self.native_decode_previous = (0, 0, 0)
@@ -637,9 +640,9 @@ class BeaconAccelHoming:
                                desc="Change the threshold or impact sign until restart")
         gcode.register_command("SET_ACCEL_HOMING", self.cmd_SET,
                                desc="Change independent X/Y thresholds until restart")
-        try:
+        if __package__:
             from .accel_homing_workflows import AccelHomingWorkflows
-        except ImportError:
+        else:
             from accel_homing_workflows import AccelHomingWorkflows
         self.workflows = AccelHomingWorkflows(self, config)
 
@@ -1368,6 +1371,8 @@ class BeaconAccelHoming:
         return None
 
     def _handle_move_end(self, hmove):
+        diagnostic_time = (self._troubleshoot_now()
+                           if getattr(self, "troubleshoot", None) is not None else None)
         attempt, self.pending_move = self.pending_move, None
         if attempt is None or attempt.endstop not in hmove.get_mcu_endstops():
             return
@@ -1382,6 +1387,8 @@ class BeaconAccelHoming:
         record["halt_travel_mm_signed"] = self._travel(positions, attempt.axis, halt=True)
         attempt.halt_delta = self._travel(positions, attempt.axis, halt=True)
         self.last_pass = attempt
+        if getattr(self, "troubleshoot", None) is not None:
+            self._troubleshoot_home_end(attempt, hmove, diagnostic_time)
         self.workflows.note_calibration_halt(record, positions)
         self.workflows.check_home_result(record)
         logging.info("beacon_accel_homing: %s, %.4f s after arm", describe(record),
@@ -1527,7 +1534,13 @@ class BeaconAccelHoming:
             except Exception as exc:
                 attempt.proof_step_error = type(exc).__name__
         if hasattr(self.toolhead, "get_position"):
-            attempt.start_position = self.toolhead.get_position()[AXES[axis]]
+            start_position = self.toolhead.get_position()
+            attempt.start_position = start_position[AXES[axis]]
+            if getattr(self, "troubleshoot", None) is not None:
+                try:
+                    attempt.troubleshoot_start_position = tuple(start_position)
+                except Exception:
+                    pass
             attempt.expected_travel = abs(attempt.start_position - info.position_endstop)
         return attempt
 
@@ -1543,6 +1556,8 @@ class BeaconAccelHoming:
                     self.capture_attempts += 1
                 self.capture_attempt = attempt
         self.reactor.update_timer(self.watchdog, self.reactor.NOW)
+        if getattr(self, "troubleshoot", None) is not None:
+            self._troubleshoot_arm(attempt)
 
     def disarm(self):
         with self.lock:
@@ -1559,6 +1574,11 @@ class BeaconAccelHoming:
         return attempt
 
     def finish(self, endstop, attempt, result):
+        if getattr(self, "troubleshoot", None) is not None:
+            self._troubleshoot_event("endstop_result", axis=endstop.axis,
+                pass_no=None if attempt is None else attempt.pass_no,
+                arm_print_time_s=None if attempt is None else attempt.arm_time,
+                result_code=result, host_monotonic_s=self._troubleshoot_now())
         if result >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
             raise self.printer.command_error("Communication timeout during homing")
         if attempt is not None and attempt.reason in FAILURES:
@@ -1838,19 +1858,130 @@ class BeaconAccelHoming:
         return True
 
     def _fire(self, attempt, reason, code):
-        with self.lock:
-            # A move that already ended must never stop the next one.
-            if attempt.done or attempt is not self.attempt:
-                return
-            attempt.done = True
-            attempt.reason = reason
-            attempt.endstop.trigger(code)
-        if attempt.motion_deadline is not None or self.backend is not None:
-            # Diagnostics follow dispatch and cannot prevent the physical stop.
-            try:
-                attempt.request_time = self.main_mcu.estimated_print_time(self.reactor.monotonic())
-            except Exception:
-                attempt.request_time = None
+        diagnostic = None
+        try:
+            with self.lock:
+                # A move that already ended must never stop the next one.
+                if attempt.done or attempt is not self.attempt:
+                    return
+                attempt.done = True
+                attempt.reason = reason
+                if getattr(self, "troubleshoot", None) is None:
+                    attempt.endstop.trigger(code)
+                else:
+                    # Only read the host clock before the existing request.
+                    returned = False
+                    before = self._troubleshoot_now()
+                    try:
+                        attempt.endstop.trigger(code)
+                        returned = True
+                    finally:
+                        diagnostic = (before, self._troubleshoot_now(), returned)
+            if attempt.motion_deadline is not None or self.backend is not None:
+                # Preserve the existing observation before the optional sink.
+                try:
+                    attempt.request_time = self.main_mcu.estimated_print_time(self.reactor.monotonic())
+                except Exception:
+                    attempt.request_time = None
+        finally:
+            if diagnostic is not None:
+                self._troubleshoot_stop(attempt, reason, code, *diagnostic)
+
+    def _troubleshoot_now(self):
+        try:
+            return self.reactor.monotonic()
+        except Exception:
+            return None
+
+    def _troubleshoot_event(self, kind, **fields):
+        try:
+            recorder = getattr(self, "troubleshoot", None)
+            if recorder is not None:
+                recorder.record_event(kind, **fields)
+        except Exception:
+            pass
+
+    def _troubleshoot_arm(self, attempt):
+        try:
+            self._troubleshoot_event("arm", axis=attempt.axis, pass_no=attempt.pass_no,
+                host_monotonic_s=attempt.last_data, arm_print_time_s=attempt.arm_time,
+                deadline_print_time_s=attempt.deadline, arm_sensor_clock=attempt.arm_clock,
+                sensor_name=self.sensor_name,
+                backend="beacon_native" if self.backend is None else self.backend.kind,
+                baseline_raw=attempt.bases, count_g=attempt.count_g,
+                threshold_raw=attempt.limit_raw, threshold_g=attempt.limit_raw * attempt.count_g,
+                raw_axis_index=attempt.index, map_sign=attempt.map_sign,
+                vector_mode=attempt.vector_mode, speed_mm_s=attempt.effective_speed,
+                accel_mm_s2=attempt.effective_accel,
+                start_position_mm=getattr(attempt, "troubleshoot_start_position", None),
+                axis_start_position_mm=attempt.start_position,
+                proof_start_step_counts=attempt.proof_step_positions,
+                reference_signal_quality=attempt.reference_signal_quality)
+        except Exception:
+            pass
+
+    def _troubleshoot_stop(self, attempt, reason, code, before, after, returned):
+        try:
+            # estimated_print_time is a local clocksync conversion, not an MCU
+            # query. Evaluate it after dispatch using the captured host time.
+            print_time = (None if before is None else
+                          self.main_mcu.estimated_print_time(before))
+            self._troubleshoot_event("stop_request", axis=attempt.axis,
+                pass_no=attempt.pass_no, reason=reason, result_code=code,
+                arm_print_time_s=attempt.arm_time, arm_sensor_clock=attempt.arm_clock,
+                request_before_host_monotonic_s=before,
+                request_after_host_monotonic_s=after,
+                request_estimated_print_time_s=print_time,
+                dispatch_returned=returned,
+                onset_print_time_s=(None if attempt.onset_batch is None else self.onset_time(attempt)),
+                onset_sample=attempt.onset_sample, onset_batch=attempt.onset_batch,
+                timestamp_provenance="host_stop_dispatch; local_main_mcu_clocksync_estimate",
+                mcu_halt_print_time_s=None)
+        except Exception:
+            pass
+
+    def _troubleshoot_onset(self, attempt, params, source):
+        try:
+            count = sample_count(params["data"])
+            first, interval = self._batch_timing(params, count)
+            self._troubleshoot_event("threshold_crossing", axis=attempt.axis,
+                pass_no=attempt.pass_no,
+                arm_print_time_s=attempt.arm_time, arm_sensor_clock=attempt.arm_clock,
+                onset_print_time_s=first + attempt.onset_batch[2] * interval,
+                onset_sample=attempt.onset_sample, onset_batch=attempt.onset_batch,
+                source_sample_count=sample_count(source["data"]),
+                threshold_g=attempt.limit_raw * attempt.count_g,
+                onset_g=attempt.onset_raw * attempt.count_g,
+                vector_mode=attempt.vector_mode,
+                sample_time_provenance=("native_sensor_clock" if self.backend is None
+                                        else "configured_full_precision_sample_times"))
+        except Exception:
+            pass
+
+    def _troubleshoot_home_end(self, attempt, hmove, eventtime):
+        try:
+            positions = []
+            for sp in getattr(hmove, "stepper_positions", ()):
+                distance = sp.stepper.get_step_dist()
+                start, trigger, halt = sp.start_pos, sp.trig_pos, sp.halt_pos
+                positions.append({"stepper": sp.stepper_name, "step_distance_mm": distance,
+                    "start_steps": start, "trigger_steps": trigger, "halt_steps": halt,
+                    "start_mm": None if start is None else start * distance,
+                    "trigger_mm": None if trigger is None else trigger * distance,
+                    "halt_mm": None if halt is None else halt * distance})
+            get_position = getattr(self.toolhead, "get_position", None)
+            self._troubleshoot_event("home_end", axis=attempt.axis, pass_no=attempt.pass_no,
+                arm_print_time_s=attempt.arm_time, arm_sensor_clock=attempt.arm_clock,
+                callback_host_monotonic_s=eventtime, result=attempt.reason,
+                steppers=positions, trigger_travel_mm_signed=attempt.record.get("trigger_travel_mm_signed"),
+                halt_travel_mm_signed=attempt.record.get("halt_travel_mm_signed"),
+                start_position_mm=getattr(attempt, "troubleshoot_start_position", None),
+                host_observed_position_mm=None if get_position is None else tuple(get_position()),
+                position_provenance="homing_move_end_before_final_coordinate_assignment",
+                halt_time_provenance="unavailable; callback_time_is_host_observation_only",
+                mcu_halt_print_time_s=None)
+        except Exception:
+            pass
 
     def _watchdog(self, eventtime):
         """Data-independent safety net: stops the move if the stream dies or travel runs out."""
@@ -1910,15 +2041,92 @@ class BeaconAccelHoming:
 
     # Sample path: Beacon serial thread, every batch (about 400 per second).
     def _batch_hook(self, params):
+        trace = None
+        if getattr(self, "troubleshoot", None) is not None:
+            entry, attempt = self._troubleshoot_now(), self.attempt
+            trace = {"stream_generation": self.native_stream_generation,
+                     "backend_generation": getattr(self.backend, "generation", None)}
         try:
-            self._inspect(params)
-        except Exception:
-            logging.exception("beacon_accel_homing: batch inspection failed")
-            self._sensor_fault("invalid_data")
-        if self.helper._stream_en:
-            self.saved_handler(params)
+            try:
+                if trace is None:
+                    self._inspect(params)
+                else:
+                    self._inspect_data(params, trace)
+            except Exception:
+                logging.exception("beacon_accel_homing: batch inspection failed")
+                self._sensor_fault("invalid_data")
+                if trace is not None:
+                    trace["stage"] = "callback_exception"
+            if self.helper._stream_en:
+                self.saved_handler(params)
+        finally:
+            if trace is not None:
+                self._troubleshoot_inspect(params, trace, attempt, entry, self._troubleshoot_now())
 
     def _inspect(self, params):
+        if getattr(self, "troubleshoot", None) is None:
+            return self._inspect_data(params)
+        entry = self._troubleshoot_now()
+        attempt = self.attempt
+        trace = {"stream_generation": self.native_stream_generation,
+                 "backend_generation": getattr(self.backend, "generation", None)}
+        completed = False
+        try:
+            result = self._inspect_data(params, trace)
+            completed = True
+            return result
+        finally:
+            # Production callback exception handlers must issue their normal
+            # fault stop before any rejected-batch diagnostics are appended.
+            if completed:
+                exit_time = self._troubleshoot_now()
+                self._troubleshoot_inspect(params, trace, attempt, entry, exit_time)
+
+    def _troubleshoot_inspect(self, params, trace, attempt, entry, exit_time):
+        try:
+            fields = {"callback_entry_host_monotonic_s": entry,
+                "callback_exit_host_monotonic_s": exit_time,
+                "callback_entry_estimated_print_time_s": (None if entry is None else
+                    self.main_mcu.estimated_print_time(entry)),
+                "callback_time_domain": "host_monotonic",
+                "sample_time_domain": "main_mcu_print_time",
+                "hardware_receipt_time_available": False,
+                "timestamp_provenance": ("native_sensor_clock_and_driver_host_fields"
+                    if self.backend is None else "configured_adapter_detector_dispatch"),
+                "driver_timestamp_fields": {key: params[key] for key in
+                    ("#receive_time", "#sent_time") if key in params},
+                "receive_time_field_provenance": ("driver_host_receive_field"
+                    if self.backend is None else "adapter_generated_host_time_before_detector"),
+                "sensor_fault": self.sensor_fault,
+                "axis": None if attempt is None else attempt.axis,
+                "pass_no": None if attempt is None else attempt.pass_no,
+                "arm_print_time_s": None if attempt is None else attempt.arm_time,
+                "stream_generation": trace.get("stream_generation"),
+                "backend_generation": trace.get("backend_generation"),
+                "attempt_reason": None if attempt is None else attempt.reason,
+                "detector_stage": trace.get("stage", "entry"),
+                "errors": params.get("errors"), "overflows": params.get("overflows")}
+            for label, packet in (("original", params), ("filtered", trace.get("filtered"))):
+                if packet is None:
+                    continue
+                try:
+                    count = sample_count(packet["data"])
+                    first, interval = self._batch_timing(packet, count)
+                    fields.update({label + "_sample_count": count,
+                        label + "_first_print_time_s": first,
+                        label + "_last_print_time_s": first + max(0, count - 1) * interval,
+                        label + "_start_clock": packet["start_clock"],
+                        label + "_delta_clock": packet["delta_clock"]})
+                except Exception:
+                    fields[label + "_bounds_available"] = False
+            recorder = getattr(self, "troubleshoot", None)
+            if recorder is not None:
+                recorder.record_batch("beacon_native" if self.backend is None
+                                      else "klipper_batch_detector", **fields)
+        except Exception:
+            pass
+
+    def _inspect_data(self, params, trace=None):
         native_owned = self.backend is None and (self.stream_on or self.homing_active
             or self.noise_session is not None or self.capture_batches is not None
             or self.attempt is not None or self.tail is not None)
@@ -1937,7 +2145,10 @@ class BeaconAccelHoming:
                 self._sensor_fault("scale")
                 return
         try:
-            self._inspect_batch(params)
+            if trace is None:
+                self._inspect_batch(params)
+            else:
+                self._inspect_batch(params, trace)
         finally:
             # Optional raw references are retained only after detector/trigger
             # processing.  Conversion for charts is deferred to stop_capture.
@@ -1968,6 +2179,12 @@ class BeaconAccelHoming:
         attempt = self.attempt
         if attempt is not None and not attempt.done:
             self._fire(attempt, reason, mcu.MCU_trsync.REASON_HOST_REQUEST)
+        if getattr(self, "troubleshoot", None) is not None:
+            self._troubleshoot_event("sensor_fault", reason=reason,
+                host_monotonic_s=self._troubleshoot_now(),
+                arm_print_time_s=None if attempt is None else attempt.arm_time,
+                axis=None if attempt is None else attempt.axis,
+                pass_no=None if attempt is None else attempt.pass_no)
         # Stop dispatch keeps its original priority. Diagnostics are optional
         # and use snapshots because main-thread cleanup may replace the owner.
         state, token = self.beta_capture, self.beta_motion_capture
@@ -2013,8 +2230,10 @@ class BeaconAccelHoming:
         logging.info("accel_homing: sample timing fault %s",
                      json.dumps(self.sample_timing_fault, sort_keys=True))
 
-    def _inspect_batch(self, params):
+    def _inspect_batch(self, params, trace=None):
         if self.noise_session is not None:
+            if trace is not None:
+                trace["stage"] = "noise_window"
             self._inspect_noise_batch(params)
             return
         data = params["data"]
@@ -2025,6 +2244,8 @@ class BeaconAccelHoming:
         if self.backend is None:
             self.last_batch = now
         attempt = self.attempt
+        if trace is not None:
+            trace["stage"] = "unarmed" if attempt is None else "armed"
         if attempt is None:
             if self.tail is not None:
                 self._track_impact(self.tail, params, data, count)
@@ -2042,6 +2263,8 @@ class BeaconAccelHoming:
         if self.backend is None:
             attempt.last_data = now
         if attempt.done:
+            if trace is not None:
+                trace["stage"] = "after_stop"
             self._track_impact(attempt, params, data, count)
             return
         helper = self.helper
@@ -2069,6 +2292,8 @@ class BeaconAccelHoming:
             # including a single remaining sample, instead of dropping it.
             skip = int(math.ceil(((attempt.arm_clock - start_clock) & 0xFFFFFFFF) / interval))
             if skip >= count:
+                if trace is not None:
+                    trace["stage"] = "before_arm"
                 return
             width = 3 if isinstance(data, tuple) else 6
             data = data[skip * width:]
@@ -2080,6 +2305,9 @@ class BeaconAccelHoming:
             if self.backend is not None and "_sample_start_time_s" in params:
                 source_time, source_interval = self._batch_timing(source_params, source_count)
                 params["_sample_start_time_s"] = source_time + skip * source_interval
+        if trace is not None:
+            trace["filtered"] = params
+            trace["stage"] = "eligible_after_arm"
         if strict:
             if self.backend is None:
                 start_time = self.clock_to_time(start_clock)
@@ -2140,6 +2368,8 @@ class BeaconAccelHoming:
                 params["_native_decode_previous"] = tuple(decoded[source_skip * 3 - 3:source_skip * 3])
         if self.backend is not None:
             attempt.last_data = self.last_batch = now
+        if trace is not None:
+            trace["stage"] = "validated_detector_input"
         if attempt.vector_mode:
             if attempt.gap:
                 self._fire(attempt, "sample_gap", mcu.MCU_trsync.REASON_HOST_REQUEST)
@@ -2240,6 +2470,8 @@ class BeaconAccelHoming:
                 onset_clock = params["start_clock"] + int(round(position * interval))
                 attempt.impact_until = (onset_clock + self.impact_window) & 0xFFFFFFFF
                 self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
+                if getattr(self, "troubleshoot", None) is not None:
+                    self._troubleshoot_onset(attempt, params, source_params)
                 self._track_impact(attempt, params, raw, count)
                 return
             peak = max(peak, math.sqrt(level2))
@@ -2272,6 +2504,8 @@ class BeaconAccelHoming:
         attempt.onset_raw = abs(value)
         attempt.impact_until = (start_clock + self.impact_window) & 0xFFFFFFFF
         self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
+        if getattr(self, "troubleshoot", None) is not None:
+            self._troubleshoot_onset(attempt, params, source)
         self._track_impact(attempt, params, None, count, values)
 
     def _track_impact(self, attempt, params, data, count, values=None):
