@@ -4964,7 +4964,8 @@ class AccelHomingWorkflows:
             if compare_mode and session.get("delivery_state"):
                 self._experimental_delivery_check(session, session["delivery_state"]["normal"])
             recorder.record_event("terminal_release_planned", axis=axis,
-                                  back_off_mm=session["saved_back_off"], before=troubleshoot_snapshot(self))
+                                  back_off_mm=session["saved_back_off"][axis],
+                                  before=troubleshoot_snapshot(self))
             self._release_terminal_home(axis, record)
             recorder.record_event("terminal_release_completed", after=troubleshoot_snapshot(self))
             self._finish({"result": "complete", "mode": mode})
