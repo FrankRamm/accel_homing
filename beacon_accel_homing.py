@@ -579,9 +579,8 @@ class BeaconAccelHoming:
                             for a in AXES}
         self.homing_accel = config.getfloat("homing_accel", 5000.0, minval=0.0)
         shared_back_off = config.getfloat("back_off_dist", 5.0, minval=0.0)
-        # z is present for symmetry with the other per-axis maps; only x/y are used.
         self.back_off_dist = {a: config.getfloat("%s_back_off_dist" % a, shared_back_off,
-                                                 minval=0.0) for a in ("x", "y", "z")}
+                                                 minval=0.0) for a in AXES}
         self.baseline_batches = config.getint("baseline_batches", 25, minval=10, maxval=200)
         self.baseline_time = config.getfloat("baseline_time", 0.1, minval=0.05, maxval=1.0)
         self.baseline_noise_floor = config.getfloat("baseline_noise_floor", 0.7,
@@ -4169,6 +4168,9 @@ class BeaconAccelHoming:
         gcmd.respond_info("accel_homing: signal filters %s; notch preserves the active detector metric;"
                           " mapped calibration uses its selected stream component" %
                           json.dumps({axis: self.filter_settings(axis) for axis in AXES}, sort_keys=True))
+        gcmd.respond_info("accel_homing: back-off X %.12g mm, Y %.12g mm"
+                          " (final and cross-axis release; 0 disables)"
+                          % (self.back_off_dist["x"], self.back_off_dist["y"]))
         gcmd.respond_info("accel_homing: baseline policy: legacy ordinary homing requires quiet XYZ;"
                           " mapped-axis calibration and saved models require a post-settle"
                           " %.2f ms / %d sample reference without a quiet-range limit;"
