@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 from harness import CommandError, arm_axis, batch, counts, make_homing
-from test_workflows import GCmd, Rig, workflow_module
+from test_workflows import BACK_OFF, GCmd, Rig, workflow_module
 
 
 class AccuracyRig(Rig):
@@ -86,7 +86,7 @@ class AccuracyWorkflowTests(unittest.TestCase):
         self.assertFalse(rig.workflow.in_home)
         self.assertFalse(rig.capture_active)
         self.assertEqual(rig.owner.threshold_g, thresholds or {"x": 8.0, "y": 9.0})
-        self.assertEqual(rig.owner.back_off_dist, 5.0)
+        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
         self.assertEqual(rig.configfile.saved, {})
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
         self.assertEqual(rig.dispatched_scripts, [])

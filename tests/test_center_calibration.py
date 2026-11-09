@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 from harness import CommandError
-from test_workflows import GCmd, Rail, Rig
+from test_workflows import BACK_OFF, GCmd, Rail, Rig
 
 
 class NativeConfigfile:
@@ -114,7 +114,7 @@ class NativeMove:
         phase = session["phase"]
         rig.measure_calls.append({"axis": axis, "phase": phase, "direction": direction,
                                   "target": list(target), "speed": speed, "probe_pos": probe_pos,
-                                  "back_off_dist": owner.back_off_dist,
+                                  "back_off_dist": dict(owner.back_off_dist),
                                   "accel": rig.toolhead.accel})
         if rig.on_measure:
             rig.on_measure(axis, phase)
@@ -241,7 +241,7 @@ class CenterCalibrationTests(unittest.TestCase):
         self.assertEqual(rig.scripts, [])
         self.assertEqual(rig.configfile.set_calls, [])
         self.assertEqual(rig.configfile.native_calls, 0)
-        self.assertEqual(rig.owner.back_off_dist, 5.)
+        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
         self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
         self.assertEqual(rig.owner.rails_by_axis, rails)
         self.assertEqual(rig.toolhead.position[2:], original_ze)
@@ -255,7 +255,7 @@ class CenterCalibrationTests(unittest.TestCase):
             self.assertEqual(item["search"]["extra_allowance_mm"], 20.)
             calls = [call for call in rig.measure_calls if call["axis"] == axis]
             self.assertEqual([call["direction"] for call in calls], [-1, 1] * 5 + [-1])
-            self.assertTrue(all(call["back_off_dist"] == 0 and call["probe_pos"] for call in calls))
+            self.assertTrue(all(not any(call["back_off_dist"].values()) and call["probe_pos"] for call in calls))
         self.assertFalse(result["physical_position_verified"])
         self.assertFalse(result["save_config"])
         json.dumps(result, allow_nan=False)
@@ -386,7 +386,7 @@ class CenterCalibrationTests(unittest.TestCase):
                 self.assertEqual(len(rig.measure_calls), 4)
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(rig.configfile.set_calls, [])
-                self.assertEqual(rig.owner.back_off_dist, 5.)
+                self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                 self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
                 self.assertIsNone(rig.workflow.session)
                 self.assertEqual(rig.workflow.last_result["axis_results"], {})
@@ -404,7 +404,7 @@ class CenterCalibrationTests(unittest.TestCase):
                     rig.center(AXIS="X", SAVE_CONFIG=1)
                 self.assertEqual(rig.measure_calls, [])
                 self.assertEqual(rig.configfile.set_calls, [])
-                self.assertEqual(rig.owner.back_off_dist, 5.)
+                self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
 
     def test_pending_config_and_include_conflicts_refuse_save_before_motion(self):
         for conflict in ("pending", "include"):
@@ -434,7 +434,7 @@ class CenterCalibrationTests(unittest.TestCase):
         def assert_clean():
             self.assertIsNone(rig.workflow.session)
             self.assertEqual(rig.owner.rails_by_axis, rails)
-            self.assertEqual(rig.owner.back_off_dist, 5.)
+            self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
             self.assertEqual(rig.toolhead.accel, 50000.)
             self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
             self.assertFalse(rig.owner.homing_active)

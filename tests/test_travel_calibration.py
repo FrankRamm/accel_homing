@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 from harness import CommandError
-from test_workflows import GCmd, Stepper, workflow_module
+from test_workflows import BACK_OFF, GCmd, Stepper, workflow_module
 from test_center_calibration import CenterRig, NativeState, NativeMove
 
 
@@ -63,7 +63,7 @@ class TravelCalibrationTests(unittest.TestCase):
             rig.command("MEASURE", CLEAR=1)
         self.assertEqual(rig.measure_calls, [])
         self.assertIsNone(rig.workflow.session)
-        self.assertEqual(rig.owner.back_off_dist, 5.)
+        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
 
     def test_negative_then_positive_uses_configured_speed_no_retract_or_z(self):
         rig = TravelRig()
@@ -71,7 +71,7 @@ class TravelCalibrationTests(unittest.TestCase):
         rig.set_rail("x", positive=True, low=-17.)
         rig.measure()
         self.assertEqual([c["direction"] for c in rig.measure_calls], [-1, 1])
-        self.assertTrue(all(c["speed"] == 100 and c["probe_pos"] and c["back_off_dist"] == 0
+        self.assertTrue(all(c["speed"] == 100 and c["probe_pos"] and not any(c["back_off_dist"].values())
                             for c in rig.measure_calls))
         self.assertEqual([c["target"][0] for c in rig.measure_calls], [-320, 320])
         self.assertEqual(rig.toolhead.moves, [])
@@ -166,7 +166,7 @@ class TravelCalibrationTests(unittest.TestCase):
         self.assertEqual(rig.workflow.last_result["persistence"], "native_save_requested")
         self.assertTrue(rig.workflow.last_result["save_config"])
         self.assertEqual(len(rig.configfile.set_calls), 6)
-        self.assertEqual(rig.owner.back_off_dist, 5.)
+        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
         self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
 
     def test_model_metadata_rebase_preserves_calibration_provenance(self):
@@ -309,7 +309,7 @@ class TravelCalibrationTests(unittest.TestCase):
                 self.assertIsNone(rig.workflow.session)
                 self.assertEqual(rig.toolhead.moves, [])
                 self.assertEqual(rig.configfile.set_calls, [])
-                self.assertEqual(rig.owner.back_off_dist, 5.)
+                self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
 
     def test_cancel_during_search_or_first_recenter_chunk_stops_progression(self):
         rig = TravelRig()

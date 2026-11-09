@@ -668,7 +668,7 @@ class AccelHomingWorkflows:
                 self._status("toolhead").get("homed_axes", ""),
                 tuple(sorted(self.owner.threshold_g.items())),
                 tuple(sorted(self.owner.impact_sign.items())),
-                self.owner.homing_accel, self.owner.back_off_dist)
+                self.owner.homing_accel, tuple(sorted(self.owner.back_off_dist.items())))
 
     def _restore(self):
         session = self.session
@@ -683,7 +683,7 @@ class AccelHomingWorkflows:
             self.owner._end_session()
         finally:
             self.owner.threshold_g.update(session["saved_thresholds"])
-            self.owner.back_off_dist = session["saved_back_off"]
+            self.owner.back_off_dist = dict(session["saved_back_off"])
             self.in_home, self.home_axis = False, None
 
     def _finish(self, result, release=False):
@@ -962,7 +962,7 @@ class AccelHomingWorkflows:
                         "validation_records": [], "repeatability_spread_mm": None,
                         "records": [], "paths": [], "candidate": self.start_threshold,
                         "saved_thresholds": dict(self.owner.threshold_g),
-                        "saved_back_off": self.owner.back_off_dist,
+                        "saved_back_off": dict(self.owner.back_off_dist),
                         "chart_preflight_check": (self.chart_preflight_check
                                                    if mode in ("charts", "accuracy") else None),
                         "save_config": (mode == "calibration" and bool(gcmd.get_int(
@@ -1064,7 +1064,7 @@ class AccelHomingWorkflows:
                 self._status("toolhead").get("homed_axes", ""),
                 tuple(sorted(self.owner.threshold_g.items())),
                 tuple(sorted(self.owner.impact_sign.items())),
-                self.owner.homing_accel, self.owner.back_off_dist, tuple(sorted(motors)))
+                self.owner.homing_accel, tuple(sorted(self.owner.back_off_dist.items())), tuple(sorted(motors)))
 
     def _preflight_noise(self, session=None):
         if self.session is not None and self.session is not session:
@@ -1409,7 +1409,7 @@ class AccelHomingWorkflows:
         session["attempts"] += 1
         if threshold is not None:
             self.owner.threshold_g[axis] = threshold
-        self.owner.back_off_dist = 0.0
+        self.owner.back_off_dist = dict.fromkeys(self.owner.back_off_dist, 0.0)
         old_record = self.owner.last.get(axis)
         if session["mode"] in ("accuracy", "troubleshoot"):
             reference = self._accuracy_position_reference()
@@ -1533,7 +1533,7 @@ class AccelHomingWorkflows:
                 or self.owner.last.get(axis) is not current[2]):
             raise self._error("terminal home is not the current qualified result")
         generation = self.owner.operation_generation
-        self.owner.release_workflow_home(axis, current[2], session["saved_back_off"], session)
+        self.owner.release_workflow_home(axis, current[2], session["saved_back_off"][axis], session)
         self.owner.toolhead.wait_moves()
         self._check_running(session)
         if (self.owner.last.get(axis) is not current[2] or self.owner._homed(axis) is not True

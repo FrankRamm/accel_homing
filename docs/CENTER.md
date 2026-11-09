@@ -37,7 +37,7 @@ For each selected axis:
 
 There are **zero separate backoff, release or retract moves** before, between or
 after the traverses, including initial positioning and final completion. The
-module's ordinary `back_off_dist` is suppressed only for this workflow and
+module's ordinary per-axis back-off values (`back_off_dist`, `x_back_off_dist`, `y_back_off_dist`) are suppressed only for this workflow and
 restored during cleanup. `BACKOFF` is not a supported parameter. A stationary
 dwell and a new accelerometer reference precede the next search. Final contact
 with the stop is intentional; an error does not initiate a return or recovery

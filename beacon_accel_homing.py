@@ -539,7 +539,10 @@ class BeaconAccelHoming:
         self.impact_sign = {a: config.getint("%s_impact_sign" % a, 0, minval=-1, maxval=1)
                             for a in AXES}
         self.homing_accel = config.getfloat("homing_accel", 5000.0, minval=0.0)
-        self.back_off_dist = config.getfloat("back_off_dist", 5.0, minval=0.0, maxval=20.0)
+        shared_back_off = config.getfloat("back_off_dist", 5.0, minval=0.0)
+        # z is present for symmetry with the other per-axis maps; only x/y are used.
+        self.back_off_dist = {a: config.getfloat("%s_back_off_dist" % a, shared_back_off,
+                                                 minval=0.0) for a in ("x", "y", "z")}
         self.baseline_batches = config.getint("baseline_batches", 25, minval=10, maxval=200)
         self.baseline_time = config.getfloat("baseline_time", 0.1, minval=0.05, maxval=1.0)
         self.baseline_noise_floor = config.getfloat("baseline_noise_floor", 0.7,
@@ -550,11 +553,13 @@ class BeaconAccelHoming:
         self.travel_margin = config.getfloat("travel_margin", 1.1, minval=1.0, maxval=2.0)
         self.watchdog_margin = config.getfloat("watchdog_margin", 0.15, minval=0.0, maxval=2.0)
         scalar_options = {"homing_accel": self.homing_accel,
-                          "back_off_dist": self.back_off_dist, "baseline_time": self.baseline_time,
+                          "back_off_dist": shared_back_off, "baseline_time": self.baseline_time,
                           "baseline_noise_floor": self.baseline_noise_floor,
                           "enable_settle_time": self.enable_settle_time,
                           "stream_timeout": self.stream_timeout, "travel_margin": self.travel_margin,
                           "watchdog_margin": self.watchdog_margin}
+        for axis, value in self.back_off_dist.items():
+            scalar_options["%s_back_off_dist" % axis] = value
         for option, value in scalar_options.items():
             if not math.isfinite(value):
                 raise config.error("accel_homing: %s must be finite" % option)
@@ -737,17 +742,19 @@ class BeaconAccelHoming:
             self.ordinary_home = None
 
     def _retract_completed_home(self, context):
-        distance = context.get("distance", self.back_off_dist)
-        if (not distance or not context["rails"]
+        if (not context["rails"]
                 or (hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown())):
             return
-        if not math.isfinite(distance) or distance < 0.0:
-            raise self.printer.command_error("accel_homing: invalid final back-off distance")
         position = self.toolhead.get_position()
         coord, speeds = [None, None, None], []
         for axis, (rail, record) in context["rails"].items():
             if self.last.get(axis) is not record or self._homed(axis) is not True:
                 continue
+            distance = context.get("distance", self.back_off_dist[axis])
+            if not distance:
+                continue
+            if not math.isfinite(distance) or distance < 0.0:
+                raise self.printer.command_error("accel_homing: invalid final back-off distance")
             info = rail.get_homing_info()
             low, high = rail.get_range()
             speed = getattr(info, "retract_speed", None) or info.speed
@@ -757,7 +764,8 @@ class BeaconAccelHoming:
                     or low >= high or speed <= 0.0):
                 raise self.printer.command_error("accel_homing: invalid final back-off geometry/speed")
             away = -1.0 if info.positive_dir else 1.0
-            target = min(max(info.position_endstop + away * distance, low), high)
+            target = info.position_endstop + away * distance
+            self._check_back_off_range(axis, target, low, high)
             target_free = (target - info.position_endstop) * away
             free = (current - info.position_endstop) * away
             # Kalico may already have retracted. Never move back toward a stop
@@ -788,6 +796,13 @@ class BeaconAccelHoming:
                     raise self.printer.command_error("accel_homing: final back-off was interrupted")
             finally:
                 self._restore_accel()
+
+    def _check_back_off_range(self, axis, target, low, high):
+        # Kalico's retract fails a target outside the rail limits; never clamp.
+        if target < low - 1e-9 or target > high + 1e-9:
+            raise self.printer.command_error(
+                "accel_homing: Move out of range: %s back-off target %.3f outside %.3f..%.3f"
+                % (axis.upper(), target, low, high))
 
     def release_workflow_home(self, axis, source_record, distance, session):
         """Release only a terminal workflow home after its caller qualifies it."""
@@ -1095,7 +1110,7 @@ class BeaconAccelHoming:
         An axis left pushed into its stop keeps the belts and the gantry loaded,
         which disturbs the next axis (false triggers, lost steps)."""
         others = [(axis, rail) for axis, rail in self.rails_by_axis.items()
-                  if axis != homing_axis and self.back_off_dist and self._homed(axis)]
+                  if axis != homing_axis and self.back_off_dist[axis] and self._homed(axis)]
         if not others:
             return
         coord, speeds = [None, None, None], []
@@ -1105,11 +1120,13 @@ class BeaconAccelHoming:
             away = -1.0 if info.positive_dir else 1.0
             # Distance from the stop into the travel range, negative past the stop.
             free = (position[AXES[axis]] - info.position_endstop) * away
-            if free >= self.back_off_dist - 0.01:
+            distance = self.back_off_dist[axis]
+            if free >= distance - 0.01:
                 continue
             low, high = rail.get_range()
-            target = info.position_endstop + away * self.back_off_dist
-            coord[AXES[axis]] = min(max(target, low), high)
+            target = info.position_endstop + away * distance
+            self._check_back_off_range(axis, target, low, high)
+            coord[AXES[axis]] = target
             speeds.append(getattr(info, "retract_speed", None) or info.speed)
         if speeds:
             self.toolhead.manual_move(coord, min(speeds))
@@ -3564,7 +3581,7 @@ class BeaconAccelHoming:
             "threshold_g": dict(self.threshold_g),
             "impact_sign": dict(self.impact_sign),
             "homing_accel": self.homing_accel,
-            "back_off_dist": self.back_off_dist,
+            "back_off_dist": dict(self.back_off_dist),
             "homing": self.homing_active,
             "baseline": (None if self.baseline_status is None else
                          {key: dict(value) if isinstance(value, dict) else value
