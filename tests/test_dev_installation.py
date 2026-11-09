@@ -12,10 +12,11 @@ import test_updater as updater_tests
 
 installer = updater_tests.installer
 updater = updater_tests.updater
-# Released main installations with troubleshooting link these seven modules.
-MAIN_TROUBLESHOOT_MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
-                             "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py",
-                             "accel_homing_troubleshoot.py")
+# Released installations linked these module sets; the current set adds to them.
+LEGACY_MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
+                  "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py")
+DEV_CENTER_MODULES = LEGACY_MODULES + ("accel_homing_center.py",)
+MAIN_TROUBLESHOOT_MODULES = LEGACY_MODULES + ("accel_homing_troubleshoot.py",)
 
 
 class DevRegistrationTests(unittest.TestCase):
@@ -219,18 +220,17 @@ class IsolatedDevGitTests(unittest.TestCase):
         self.assertEqual(self.run_git(self.source, "branch", "--show-current"), "dev")
 
     def test_six_module_main_install_upgrades_and_rolls_back_without_switching_git(self):
-        self._old_module_install_upgrades(installer.MODULES[:6])
+        self._old_module_install_upgrades(LEGACY_MODULES)
 
     def test_seven_module_dev_install_upgrades_and_rolls_back(self):
-        self._old_module_install_upgrades(installer.MODULES[:7])
+        self._old_module_install_upgrades(DEV_CENTER_MODULES)
 
     def test_seven_module_main_troubleshoot_install_upgrades_and_rolls_back(self):
         self._old_module_install_upgrades(MAIN_TROUBLESHOOT_MODULES)
 
     def _old_module_install_upgrades(self, previous):
         modules = installer.MODULES
-        self.assertEqual(modules[6:], ("accel_homing_center.py", "accel_homing_travel.py",
-                                       "accel_homing_troubleshoot.py"))
+        self.assert_current_modules()
         with self.migration_links() as (links, write):
             with mock.patch.object(installer, "MODULES", previous):
                 _main, _first = self.install(write)
@@ -258,8 +258,13 @@ class IsolatedDevGitTests(unittest.TestCase):
             self.assertEqual(self.run_git(self.source, "branch", "--show-current"), "dev")
             self.assertEqual(self.run_git(self.source, "rev-parse", "HEAD"), self.commit)
 
+    def assert_current_modules(self):
+        self.assertEqual(installer.MODULES[:len(LEGACY_MODULES)], LEGACY_MODULES)
+        for module in ("accel_homing_center.py", "accel_homing_travel.py", "accel_homing_troubleshoot.py"):
+            self.assertIn(module, installer.MODULES)
+
     def assert_all_modules_linked(self, links):
-        self.assertEqual(len(installer.MODULES), 9)
+        self.assert_current_modules()
         for module in installer.MODULES:
             self.assertEqual(links[self.extras / module],
                              {"kind": "symlink", "target": str(self.source / module)})
@@ -267,7 +272,7 @@ class IsolatedDevGitTests(unittest.TestCase):
         for module in installer.MODULES:
             self.assertEqual(exclude.count("klippy/extras/" + module), 1)
 
-    def test_fresh_install_links_all_nine_modules(self):
+    def test_fresh_install_links_every_current_module(self):
         with self.migration_links() as (links, write):
             self.install(write)
             self.assert_all_modules_linked(links)

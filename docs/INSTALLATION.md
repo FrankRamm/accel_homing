@@ -41,8 +41,11 @@ an existing directory is unnecessary; use the update procedure below.
 
 The travel wizard adds `accel_homing_travel.py`. Existing installations must
 rerun `~/accel_homing/install.sh --branch dev` after updating their dev checkout
-to create the new extras link, then follow the installer's restart instructions.
-A source-only update without that link keeps existing workflows available;
+to create the new extras links, then follow the installer's restart instructions.
+A dev installation updated from `main` needs the center, travel and
+troubleshooting links (`accel_homing_center.py`, `accel_homing_travel.py`,
+`accel_homing_troubleshoot.py`) that its earlier installation lacks.
+A source-only update without these links keeps existing workflows available;
 `ACCEL_HOMING_TRAVEL` reports the missing installation step. Center
 calibration (`accel_homing_center.py`) behaves the same way: without its link,
 `ACCEL_HOMING_CALIBRATE_CENTER` and `ACCEL_HOMING_TRAVEL` report the missing
