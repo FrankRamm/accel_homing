@@ -276,7 +276,7 @@ class RangeAndQualificationTests(unittest.TestCase):
                 self.assertFalse(obj.workflows.simple_detection("x"))
                 self.assertNotIn("polarity_policy", obj.workflows.model.metadata["x"])
                 obj.workflows.session = {"mode": "accuracy", "saved_thresholds": dict(obj.threshold_g),
-                                         "saved_back_off": obj.back_off_dist}
+                                         "saved_back_off": dict(obj.back_off_dist)}
                 obj.workflows._restore()
                 obj.workflows.session = None
                 obj.workflows.check_home_axes({"x": None})
