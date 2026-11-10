@@ -1,4 +1,0 @@
-*.sh text eol=lf
-*.py text eol=lf
-*.md text eol=lf
-*.cfg text eol=lf
