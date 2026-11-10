@@ -1008,6 +1008,8 @@ def sudo_has_terminal():
 
 
 def restart_permission(plan, acquire=False):
+    if plan["sudo"] is None:
+        return  # Running as root: the restart needs no privilege escalation.
     # Listing permission alone never proves passwordless execution. A cached
     # validation or an explicit NOPASSWD tag for this root command is required.
     validation_command = [plan["sudo"], "-n", "-u", "root", "-v"]
@@ -1033,9 +1035,28 @@ def restart_permission(plan, acquire=False):
                            "Authorize it before retrying, or use --no-restart. %s" % result.stderr.strip())
 
 
+def running_as_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def init_script():
+    for path in ("/etc/init.d/S55klipper_service", "/opt/etc/init.d/S55klipper_service"):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def prepare_restart(selected):
-    systemctl, sudo = shutil.which("systemctl"), shutil.which("sudo")
-    if not systemctl or not sudo:
+    systemctl = shutil.which("systemctl")
+    sudo = None if running_as_root() else shutil.which("sudo")
+    if not systemctl or not selected.get("service"):
+        if running_as_root():
+            # No systemd service to verify (for example Creality K1 init.d): never refuse, activate manually.
+            print("No systemd Klipper service detected; skipping automatic restart. Restart Klipper manually "
+                  "while the printer is idle (see below).")
+            return None
+        raise InstallError("Automatic restart requires systemctl and sudo. Use --no-restart for manual host activation.")
+    if not running_as_root() and not sudo:
         raise InstallError("Automatic restart requires systemctl and sudo. Use --no-restart for manual host activation.")
     identity = service_identity(selected, systemctl)
     if (identity["pid"] != selected.get("pid")
@@ -1100,7 +1121,8 @@ def activate_install(selected, plan, backup=None):
         # No interactive authentication, filesystem writes or waits occur between
         # the last idle proof and sending this restart request.
         attempted = True
-        result = service_command([plan["sudo"], "-n", "-u", "root", "--"] + plan["service_command"], timeout=45)
+        elevate = [plan["sudo"], "-n", "-u", "root", "--"] if plan["sudo"] else []
+        result = service_command(elevate + plan["service_command"], timeout=45)
         if result.returncode:
             raise InstallError("systemctl restart failed (exit %s): %s" % (result.returncode, result.stderr.strip()))
         after = restarted_process(selected, plan)
@@ -1372,6 +1394,9 @@ def arguments(argv=None):
                         help="acknowledge installation after reviewing gcode_macro G28 behavior during ordinary homing; "
                         "not needed for built-in homing_override/safe_z_home; workflows bypass public G28")
     parser.add_argument("--replace-existing-links", action="store_true", help="back up/replace plugin links from another source")
+    parser.add_argument("--skip-plotting", action="store_true",
+                        help="do not require/prepare matplotlib PNG rendering (e.g. Creality K1 without a venv); "
+                        "CALIBRATE/CHARTS/ACCURACY/NOISE/TROUBLESHOOT then refuse at their runtime preflight")
     parser.add_argument("--no-restart", action="store_true", help="install/update without automatic host-service restart; activate manually")
     parser.add_argument("--dry-run", action="store_true", help="validate/print plan, no writes")
     parser.add_argument("--rollback", metavar="BACKUP_DIRECTORY", help="restore one unchanged installation transaction")
@@ -1396,7 +1421,10 @@ def print_restart_advice(selected):
     if service and selected.get("service_scope") == "user":
         print("Run this host command as the Klipper service user: systemctl --user restart -- %s" % shlex.quote(str(service)))
     elif service:
-        print("Run this host command yourself: sudo systemctl restart -- %s" % shlex.quote(str(service)))
+        print("Run this host command yourself: %ssystemctl restart -- %s"
+              % ("" if running_as_root() else "sudo ", shlex.quote(str(service))))
+    elif init_script():
+        print("Run this host command yourself: %s restart" % init_script())
     else:
         print("Use this printer's actual host service manager to restart the Klipper process; "
               "the installer could not determine a service name.")
@@ -1458,19 +1486,27 @@ def inspect_plotting_python(selected, explicit=None):
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise InstallError("Cannot interrogate selected Klipper Python %s: %s" % (executable, exc))
     uid = os.getuid() if hasattr(os, "getuid") else None
-    if (not isinstance(details, dict) or details.get("uid") != uid or uid == 0
+    if (not isinstance(details, dict) or details.get("uid") != uid
             or details.get("prefix_uid") != uid or details.get("writable") is not True
             or details.get("venv_config") is not True or not details.get("cache_tag")
             or details.get("prefix") == details.get("base_prefix")
             or _lexical_python(details.get("executable", "")) != executable):
-        raise InstallError("Selected Python %s is not a verified writable venv owned by the Klipper service user. "
-                           "No global/root pip fallback is permitted." % executable)
+        raise InstallError("Selected Python %s is not a verified writable venv owned by the user running the installer. "
+                           "No global pip fallback is permitted; use --skip-plotting if this host has no "
+                           "matplotlib/venv (charts and calibration then stay unavailable)." % executable)
     details["command"] = executable
     return details
 
 
 def prepare_plotting(selected, args, before_write=None, source=None):
     """Reuse Agg or atomically prepare private wheels, never mutate venv pins."""
+    if getattr(args, "skip_plotting", False):
+        print("PNG plotting setup skipped (--skip-plotting). Homing works; CALIBRATE, CHARTS, ACCURACY, "
+              "NOISE and TROUBLESHOOT will refuse before moving until matplotlib is available. "
+              "Set x_threshold/y_threshold manually.")
+        if before_write is not None and not args.dry_run:
+            before_write()
+        return {"available": False, "reason": "--skip-plotting"}
     try:
         details = inspect_plotting_python(selected, getattr(args, "klipper_python", None))
     except InstallError as exc:
@@ -1545,8 +1581,6 @@ def prepare_plotting(selected, args, before_write=None, source=None):
 
 def main(argv=None):
     args = arguments(argv)
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        raise InstallError("Run as the Klipper service user, not root. Only the detected host-service restart uses sudo.")
     selected = discover_target(args)
     print("Checkout: %s\nMain config: %s\nDetection: %s\nService: %s\nExecutable: %s" %
           (selected["repo"], selected["config"], selected["origin"], selected["service"] or "none", selected["executable"] or "stopped host"))
@@ -1688,7 +1722,7 @@ def main(argv=None):
     else:
         receipt = activation_path(selected, backup)
         save_activation(receipt, selected, "skipped", reason="--no-restart")
-        print("Automatic activation skipped by --no-restart. Activation receipt: %s" % receipt)
+        print("Automatic activation skipped (--no-restart or no systemd service). Activation receipt: %s" % receipt)
         print_restart_advice(selected)
     print("Full uninstall (including upgrades): bash %s --config %s --klipper-path %s" %
           tuple(shlex.quote(str(v)) for v in (Path(__file__).resolve().parent / "uninstall.sh", selected["config"], selected["repo"])))

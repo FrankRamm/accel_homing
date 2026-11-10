@@ -665,9 +665,16 @@ class UpdaterFixture(unittest.TestCase):
         self.assertEqual(json.loads((backup / "moonraker-activation.json").read_text())["status"], "restarted")
         self.assertFalse(self.updater_plan()["restart_needed"])
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        with mock.patch.object(updater.os, "geteuid", return_value=1000, create=True), \
+                contextlib.redirect_stdout(output):
             updater.print_activation_advice(plan["context"], self.selected, installer.uninstall_api())
         self.assertIn("sudo systemctl restart -- moonraker-test.service", output.getvalue())
+        output = io.StringIO()
+        with mock.patch.object(updater.os, "geteuid", return_value=0, create=True), \
+                contextlib.redirect_stdout(output):
+            updater.print_activation_advice(plan["context"], self.selected, installer.uninstall_api())
+        self.assertIn("systemctl restart -- moonraker-test.service", output.getvalue())
+        self.assertNotIn("sudo", output.getvalue())
 
     def test_journal_owned_snapshot_links_migrate_without_authorizing_foreign_links(self):
         with self.migration_links() as (links, write):

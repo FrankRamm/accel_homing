@@ -641,8 +641,14 @@ def validate_source_rollback(manifest, selected, api):
 
 
 def prepare_restart(moon, selected, api):
-    systemctl, sudo = shutil.which("systemctl"), shutil.which("sudo")
-    if not systemctl or not sudo or not moon.get("service") or moon.get("service_scope") != "system":
+    systemctl = shutil.which("systemctl")
+    root = hasattr(os, "geteuid") and os.geteuid() == 0
+    sudo = None if root else shutil.which("sudo")
+    if not systemctl or (not root and not sudo) or not moon.get("service") or moon.get("service_scope") != "system":
+        if root:
+            # No systemd Moonraker service to verify (for example Creality K1 init.d): never refuse root.
+            print("No systemd Moonraker service detected; skipping automatic Moonraker restart.")
+            return None
         _fail(api, "automatic activation needs the unique system Moonraker service; use --no-restart for manual activation")
     identity = service_identity(moon, selected, api, systemctl)
     plan = dict(systemctl=systemctl, sudo=sudo, identity=identity,
@@ -715,7 +721,8 @@ def print_activation_advice(context, selected, api):
     service = moon.get("service")
     if service and api.SERVICE_NAME.fullmatch(service):
         command = ("systemctl --user restart -- " if moon.get("service_scope") == "user"
-                   else "sudo systemctl restart -- ") + shlex.quote(service)
+                   else ("" if hasattr(os, "geteuid") and os.geteuid() == 0 else "sudo ")
+                   + "systemctl restart -- ") + shlex.quote(service)
         print("Moonraker registration changed. While this printer is idle, restart its detected Moonraker "
               "service from the UI or run: %s" % command)
     else:
@@ -734,7 +741,8 @@ def activate(plan, selected, restart, api, backup):
                 state["data"] = base64.b64encode(state["data"]).decode()
             if not api.state_matches(destination, state):
                 _fail(api, "installed updater files changed before activation")
-        result = api.service_command([restart["sudo"], "-n", "-u", "root", "--"] + restart["service_command"], timeout=60)
+        elevate = [restart["sudo"], "-n", "-u", "root", "--"] if restart["sudo"] else []
+        result = api.service_command(elevate + restart["service_command"], timeout=60)
         if result.returncode:
             _fail(api, "Moonraker restart command failed: %s" % result.stderr.strip())
         deadline = time.monotonic() + 15.0
