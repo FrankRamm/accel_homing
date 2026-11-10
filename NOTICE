@@ -1,0 +1,42 @@
+Accelerometer Homing - authorship and provenance
+
+Original Beacon Accelerometer Homing plugin and Beacon impact-detection
+algorithm: CloakedWayne, https://github.com/CloakedWayne
+
+Original upstream project:
+https://github.com/Monolith3D/MISC/tree/main/Beacon_Accel_Homing
+
+This extension is based on upstream commit:
+f5d97db465bc5499fb6ac4b7cc85698ef7a60cd4
+https://github.com/Monolith3D/MISC/commit/f5d97db465bc5499fb6ac4b7cc85698ef7a60cd4
+
+The original commit is authored and committed by CloakedWayne and includes:
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Original authorship and this provenance are preserved; the original commit is
+linked above.
+
+Historical printer testing of the original Beacon version was credited to
+FrankRamm and Ingstromentalist. Those results are not physical validation of
+this extension, its generic accelerometer backends, or its new workflows.
+
+Thank you to all testers and contributors who have shared their time, results
+and feedback. Special thanks to Ingstromentalist, Acke, and mc-red for their
+patience and continued testing. Their work is gratefully acknowledged; this
+credit does not claim that every sensor, printer or workflow is validated.
+
+Standalone extension maintained by FrankRamm:
+https://github.com/FrankRamm/accel_homing
+
+Historical development location, retained for provenance only:
+https://github.com/FrankRamm/MISC/tree/codex/universal-accel-homing
+
+The extension adds generic configured-accelerometer backends, supervised
+calibration/test/chart/accuracy workflows, independent saved models, an
+isolated beta calibration experiment, and transactional installation with
+native Moonraker updates. The original Beacon algorithm is credited to
+CloakedWayne; this extension does not claim upstream endorsement. Historical
+reports and synthetic tests do not certify present hardware behavior.
+
+License: GNU General Public License version 3, preserved from the original
+plugin. The complete license text is provided in LICENSE. Existing source
+license notices and original authorship are retained.
