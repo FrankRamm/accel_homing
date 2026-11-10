@@ -1545,8 +1545,6 @@ def prepare_plotting(selected, args, before_write=None, source=None):
 
 def main(argv=None):
     args = arguments(argv)
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        raise InstallError("Run as the Klipper service user, not root. Only the detected host-service restart uses sudo.")
     selected = discover_target(args)
     print("Checkout: %s\nMain config: %s\nDetection: %s\nService: %s\nExecutable: %s" %
           (selected["repo"], selected["config"], selected["origin"], selected["service"] or "none", selected["executable"] or "stopped host"))
