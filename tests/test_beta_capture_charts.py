@@ -95,6 +95,7 @@ class BetaEventTelemetryTests(unittest.TestCase):
     def test_ordinary_whole_packet_peak_behavior_is_unchanged(self):
         obj = make_homing()
         attempt = types.SimpleNamespace(impact_until=10, vector_mode=True, bases=(0., 0., 0.),
+                                        notch=None,
                                         last_samples=[0, 0, 0], impact_peak=0., count_g=1.,
                                         record={"impact_peak_g": 0.})
         obj._track_impact(attempt, {"start_clock": 0, "delta_clock": 100},

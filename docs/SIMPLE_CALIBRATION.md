@@ -32,7 +32,10 @@ must succeed before the model is staged/saved, and the PNG is published only
 after required cleanup and saving succeed. An aborted calibration saves no PNG.
 
 Without an explicit `START_THRESHOLD`, fresh noise selects the initial
-candidate using the same baseline-subtracted XYZ magnitude as the detector.
+candidate using the baseline-subtracted raw XYZ magnitude. With the optional
+[notch](NOTCH.md) disabled, this is also the detector metric. With a notch
+enabled, it remains an unfiltered starting heuristic, not an upper bound on
+filtered noise; discovery and qualification use the notch-filtered signal.
 The configured grid starts at 1.00 g with 0.25 g steps by default. Existing
 `calibration_start_threshold` and `calibration_step` settings remain the grid
 origin and spacing. An explicit `STEP` changes that spacing and still permits
@@ -60,6 +63,13 @@ stop. The later recorded impact peak does not delay stopping. Channel
 permutations and sign reversals do not change this metric; no homing-axis
 mapping or impact-sign choice is needed. Ordinary motion can also cross the
 threshold: it is not an independent classifier of mechanical contact.
+
+With the optional [notch filter](NOTCH.md) enabled for this homing axis, the
+baseline-subtracted signed XYZ components pass through the notch before the
+magnitude comparison. The first filtered crossing requests the stop, without
+an additional confirmation window. Raw samples are retained for diagnosis;
+filter settings are recorded with the qualified model. A different filter
+configuration requires a new calibration for affected saved thresholds.
 
 There is no acceleration-derived velocity integration, noise-envelope motion
 proof or startup-motion deadline in this detector. Missing valid deliveries,

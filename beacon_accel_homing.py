@@ -25,10 +25,14 @@ import mcu
 
 if __package__:
     from .accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
-                                        motion_startup_timeout, select_sensor)
+                                        motion_startup_timeout, select_sensor, load_filter_module)
 else:  # Standalone offline replay harness; preserve package import failures.
     from accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
-                                       motion_startup_timeout, select_sensor)
+                                       motion_startup_timeout, select_sensor, load_filter_module)
+
+_filter = load_filter_module()
+CausalNotch, DISABLED = _filter.CausalNotch, _filter.DISABLED
+coefficients, profile, replay, same_rate = _filter.coefficients, _filter.profile, _filter.replay, _filter.same_rate
 
 SAMPLE = struct.Struct("<hhh")
 CLIPPED = 0x7FFF
@@ -77,6 +81,7 @@ FAILURES = {
     "data_error": "accelerometer reported errors or overflows",
     "sample_gap": "accelerometer samples are missing or irregular",
     "sample_rate": "accelerometer sample rate is too low",
+    "filter_rate": "accelerometer sample rate changed or is invalid for the notch filter",
     "no_motion": "toolhead motion was not verified before the startup deadline",
     "proof_overflow": "native startup motion-proof history exceeded its bounded capacity",
 }
@@ -407,6 +412,10 @@ class Attempt:
         self.bases = None           # resting reading of all three sensor axes
         self.sums = [0.0, 0.0, 0.0]  # integrated readings since the pass started
         self.vector_mode = False   # XYZ magnitude; no acceleration-derived motion proof
+        self.notch = None
+        self.filter_first_sample = None
+        self.filter_last_time = self.filter_tail_error = None
+        self.filter_last_clock = None
         self.signal_quality = None
         self.signal_packet = None
         self.reference_signal_quality = None
@@ -565,6 +574,19 @@ class BeaconAccelHoming:
         # Load the sensor first so its MCU is configured before our connect handler.
         self.sensor = self.printer.load_object(config, self.sensor_name)
         self.backend = None if self.is_beacon else ConfiguredAccelBackend(self, config, self.sensor)
+        frequency = config.getfloat("notch_frequency", 0.0)
+        q = config.getfloat("notch_q", 10.0)
+        try:
+            profile(frequency, q)  # Validate shared values even if both axes override them.
+            self.notch_profiles = {
+                axis: profile(config.getfloat(axis + "_notch_frequency", frequency),
+                              config.getfloat(axis + "_notch_q", q)) for axis in AXES}
+            if self.backend is not None and self.backend.rate is not None:
+                for settings in self.notch_profiles.values():
+                    if settings != DISABLED:
+                        coefficients(settings, self.backend.rate)
+        except ValueError as exc:
+            raise config.error("accel_homing: %s" % exc)
         if self.backend is not None and config.get("threshold", None) is None:
             default_threshold = min(8.0, self.backend.full_scale * 0.5)
             for axis in AXES:
@@ -1299,7 +1321,46 @@ class BeaconAccelHoming:
                                           % (message, detail))
 
     def _uses_vector_detector(self, axis):
-        return self.workflows.simple_detection(axis)
+        return self.filter_settings(axis) != DISABLED or self.workflows.simple_detection(axis)
+
+    def filter_settings(self, axis):
+        return dict(self.notch_profiles[axis])
+
+    def _prepare_notch(self, attempt, reference):
+        settings = self.filter_settings(attempt.axis)
+        if settings == DISABLED:
+            return
+        rate = (reference.count - 1) / (reference.last - reference.first)
+        try:
+            attempt.notch = CausalNotch(settings, rate)
+        except ValueError as exc:
+            raise self.printer.command_error("accel_homing: %s" % exc)
+        self.workflows.check_filter_rate(attempt.axis, rate)
+
+    @staticmethod
+    def _filter_metadata(attempt):
+        return dict(DISABLED) if attempt.notch is None else attempt.notch.metadata()
+
+    def _filter_packet_valid(self, attempt, params, count, skip=0):
+        start, interval = self._batch_timing(params, count)
+        if interval <= 0 or not same_rate(1.0 / interval, attempt.notch.rate):
+            return False
+        first = start + skip * interval
+        if self.backend is None:
+            # Clock synchronization may adjust the print-time offset between
+            # callbacks. Sensor-clock differences preserve continuity through
+            # those adjustments and through the 32-bit clock wrap.
+            ticks = params["delta_clock"] / (count - 1.0)
+            first_clock = params["start_clock"] + skip * ticks
+            if (attempt.filter_last_clock is not None
+                    and abs(((first_clock - attempt.filter_last_clock) % 0x100000000) / ticks - 1) > 0.02):
+                return False
+            attempt.filter_last_clock = (params["start_clock"] + params["delta_clock"]) & 0xFFFFFFFF
+        elif (attempt.filter_last_time is not None
+              and abs((first - attempt.filter_last_time) / interval - 1.0) > 0.02):
+            return False
+        attempt.filter_last_time = start + (count - 1) * interval
+        return True
 
     def _reference_noise_limit(self, axis):
         original = BASELINE_NOISE_RATIO * self.threshold_g[axis]
@@ -1528,6 +1589,7 @@ class BeaconAccelHoming:
                           deadline, beacon_mcu.print_time_to_clock(deadline) & 0xFFFFFFFF,
                           index, map_sign, direction, limit_raw, count_g)
         attempt.vector_mode = vector_mode
+        self._prepare_notch(attempt, reference)
         reference_quality = self._signal_quality("stationary_reference", count_g)
         for observation in reference._observations:
             if observation is not None:
@@ -1928,6 +1990,7 @@ class BeaconAccelHoming:
                 threshold_raw=attempt.limit_raw, threshold_g=attempt.limit_raw * attempt.count_g,
                 raw_axis_index=attempt.index, map_sign=attempt.map_sign,
                 vector_mode=attempt.vector_mode, speed_mm_s=attempt.effective_speed,
+                signal_filter=self._filter_metadata(attempt),
                 accel_mm_s2=attempt.effective_accel,
                 start_position_mm=getattr(attempt, "troubleshoot_start_position", None),
                 axis_start_position_mm=attempt.start_position,
@@ -2390,6 +2453,13 @@ class BeaconAccelHoming:
             if attempt.gap:
                 self._fire(attempt, "sample_gap", mcu.MCU_trsync.REASON_HOST_REQUEST)
                 return
+            if attempt.notch is not None:
+                if not self._filter_packet_valid(attempt, source_params, source_count, source_skip):
+                    self._fire(attempt, "filter_rate", mcu.MCU_trsync.REASON_HOST_REQUEST)
+                    return
+                if attempt.filter_first_sample is None:
+                    attempt.filter_first_sample = (source_params["start_clock"], source_params["delta_clock"],
+                                                   source_skip, source_count)
             self._inspect_vector(attempt, params, raw, count, source_params, source_skip)
             return
         values = raw[attempt.index::3]
@@ -2476,7 +2546,15 @@ class BeaconAccelHoming:
                 attempt.vector_unchanged_since = self.clock_to_time(
                     params["start_clock"] + int(round(position * interval)))
             previous = xyz
-            level2 = sum((value - base) ** 2 for value, base in zip(xyz, attempt.bases))
+            if attempt.notch is not None:
+                try:
+                    delta = attempt.notch.process(tuple(value - base for value, base in zip(xyz, attempt.bases)))
+                except ValueError:
+                    self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+                    return
+                level2 = sum(value * value for value in delta)
+            else:
+                level2 = sum((value - base) ** 2 for value, base in zip(xyz, attempt.bases))
             if level2 >= limit2:
                 attempt.onset_batch = (params["start_clock"], params["delta_clock"], position, count)
                 attempt.onset_sample = (source_params["start_clock"], source_params["delta_clock"],
@@ -2488,7 +2566,9 @@ class BeaconAccelHoming:
                 self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
                 if getattr(self, "troubleshoot", None) is not None:
                     self._troubleshoot_onset(attempt, params, source_params)
-                self._track_impact(attempt, params, raw, count)
+                if attempt.notch is not None:
+                    attempt.impact_peak = attempt.onset_raw
+                self._track_impact(attempt, params, raw, count, vector_start=position + 1)
                 return
             peak = max(peak, math.sqrt(level2))
         attempt.noise_checked = max(attempt.noise_checked, peak)
@@ -2524,7 +2604,7 @@ class BeaconAccelHoming:
             self._troubleshoot_onset(attempt, params, source)
         self._track_impact(attempt, params, None, count, values)
 
-    def _track_impact(self, attempt, params, data, count, values=None):
+    def _track_impact(self, attempt, params, data, count, values=None, vector_start=0):
         """Largest reading shortly after the onset, for status."""
         if attempt.impact_until is None or not clock_after(attempt.impact_until, params["start_clock"]):
             return
@@ -2542,8 +2622,21 @@ class BeaconAccelHoming:
         if attempt.vector_mode:
             raw = (data if isinstance(data, (tuple, list, memoryview)) else
                    [v for row in SAMPLE.iter_unpack(sample_slice(data, count)) for v in row])
-            peak = max(math.sqrt(sum((raw[n + axis] - attempt.bases[axis]) ** 2
-                                     for axis in range(3))) for n in range(0, count * 3, 3))
+            if attempt.notch is not None:
+                if vector_start == 0 and not self._filter_packet_valid(attempt, params, count):
+                    attempt.filter_tail_error = "filter_rate"
+                    return
+                peak = attempt.impact_peak
+                for n in range(vector_start * 3, count * 3, 3):
+                    try:
+                        delta = attempt.notch.process(tuple(raw[n + a] - attempt.bases[a] for a in range(3)))
+                    except ValueError:
+                        attempt.filter_tail_error = "invalid_data"
+                        return  # Tail diagnostics cannot undo an already dispatched stop.
+                    peak = max(peak, math.sqrt(sum(value * value for value in delta)))
+            else:
+                peak = max(math.sqrt(sum((raw[n + axis] - attempt.bases[axis]) ** 2
+                                         for axis in range(3))) for n in range(0, count * 3, 3))
             if peak > attempt.impact_peak:
                 attempt.impact_peak = peak
                 if attempt.record is not None:
@@ -3323,6 +3416,7 @@ class BeaconAccelHoming:
                         "polarity_policy": POLARITY_POLICY,
                         "reference_signal_quality": attempt.reference_signal_quality,
                         "impact_metric": "xyz_magnitude" if attempt.vector_mode else "selected_axis",
+                        "signal_filter": self._filter_metadata(attempt),
                         "homing_speed_mm_s": attempt.effective_speed,
                         "homing_accel_mm_s2": attempt.effective_accel,
                         "attempt_count": attempt_count}
@@ -3332,8 +3426,14 @@ class BeaconAccelHoming:
                                        contexts[0][1] if self.backend is None and contexts
                                        and contexts[0] is not None else None)
         onset_matches, onset_index = 0, None
+        filter_matches, filter_index = 0, None
+        first_filtered = None if attempt is None else attempt.filter_first_sample
         for batch_index, (start_clock, delta_clock, data, count_g) in enumerate(batches):
             count = sample_count(data)
+            if first_filtered is not None and (start_clock, delta_clock, count) == (
+                    first_filtered[0], first_filtered[1], first_filtered[3]):
+                filter_matches += 1
+                filter_index = len(samples) + first_filtered[2]
             if valid_onset_sample and (start_clock, delta_clock, count) == (
                     onset_sample[0], onset_sample[1], onset_sample[3]):
                 onset_matches += 1
@@ -3376,7 +3476,24 @@ class BeaconAccelHoming:
             signal.update(amplitude_limited=True, excess_amplitude_unknown=True)
         if detector is not None:
             detector.update(signal)
+        filtered = {}
+        if attempt is not None and attempt.notch is not None:
+            metadata = self._filter_metadata(attempt)
+            metadata.update(first_sample=first_filtered, first_sample_matches=filter_matches,
+                            first_sample_index=filter_index if filter_matches == 1 else None)
+            filtered = {"signal_filter": metadata, "filtered_samples": [],
+                        "filtered_units": "signed baseline-subtracted machine-axis g"}
+            if filter_matches == 1 and baseline is not None:
+                try:
+                    filtered["filtered_samples"] = replay(samples, baseline, metadata, filter_index)
+                except ValueError as exc:
+                    fault = str(exc)
+            elif not fault:
+                fault = "notch capture lacks its exact initial sample"
+            if attempt.filter_tail_error:
+                fault = attempt.filter_tail_error
         return {"samples": samples, "dropped": dropped, "baseline_g": baseline, "fault": fault,
+                **filtered,
                 **signal, "reference_signal_quality": reference_signal,
                 "detector": detector,
                 # Used only for in-process provenance; workflows remove this
@@ -3482,6 +3599,7 @@ class BeaconAccelHoming:
             "result": attempt.reason or "no_trigger",
             "threshold_g": round(attempt.limit_raw * to_g, 2),
             "impact_metric": "xyz_magnitude" if attempt.vector_mode else "selected_axis",
+            "signal_filter": self._filter_metadata(attempt),
             "physical_position_verified": False,
             "direction": 0,
             "polarity_policy": POLARITY_POLICY,
@@ -3577,6 +3695,7 @@ class BeaconAccelHoming:
 
     def get_status(self, eventtime):
         return {
+            "signal_filter": {axis: self.filter_settings(axis) for axis in AXES},
             "threshold_g": dict(self.threshold_g),
             "impact_sign": dict(self.impact_sign),
             "homing_accel": self.homing_accel,
@@ -3599,6 +3718,9 @@ class BeaconAccelHoming:
         kind = "beacon_raw" if self.backend is None else self.backend.kind
         gcmd.respond_info("accel_homing: sensor %s, backend %s, X %.12g g, Y %.12g g"
                           % (self.sensor_name, kind, self.threshold_g["x"], self.threshold_g["y"]))
+        gcmd.respond_info("accel_homing: signal filters %s; enabled notch uses XYZ magnitude;"
+                          " stationary noise seeds use raw XYZ magnitude" %
+                          json.dumps({axis: self.filter_settings(axis) for axis in AXES}, sort_keys=True))
         gcmd.respond_info("accel_homing: back-off X %.12g mm, Y %.12g mm"
                           " (final and cross-axis release; 0 disables)"
                           % (self.back_off_dist["x"], self.back_off_dist["y"]))

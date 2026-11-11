@@ -17,8 +17,8 @@ For a manual source update:
 
 ```bash
 cd ~/accel_homing
-git switch main
-git pull --ff-only origin main
+git switch dev
+git pull --ff-only origin dev
 ```
 
 Then restart the selected Klipper/Kalico **host service**, using its actual
@@ -47,6 +47,10 @@ diagnostic; it does not start ACCURACY's early-trigger recovery calibration.
 `ACCEL_HOMING_CANCEL` requests cancellation when the command can be handled;
 it is not an emergency stop.
 
+On this `dev` branch it also retains the active [notch profile](NOTCH.md), when
+configured. Filter selection does not change during the diagnostic run. Compare
+separate raw and filtered runs after qualifying the appropriate thresholds.
+
 ## Evidence to share
 
 The console and `ACCEL_HOMING_STATUS` report the output folder and bundle paths.
@@ -74,6 +78,14 @@ The main files are `manifest.json`, `packets.jsonl.gz`, one `home-NNN-x.csv.gz`
 or `home-NNN-y.csv.gz` and PNG per attempted home, `summary.png`, `README.txt`
 and `renderer.log`. When the host log is accessible, the bundle also includes
 `klippy-run.log` and selected startup metadata in `klippy-startup.txt`.
+
+For a notch-enabled home, the CSV also contains `filtered_x_g`, `filtered_y_g`,
+`filtered_z_g` and `filtered_magnitude_g`. These are signed components after
+resting-reference subtraction and their magnitude; pre-arm entries are blank.
+The original `x_g`, `y_g`, `z_g` columns still include the original gravity/bias.
+The manifest records frequency, Q, coefficients, measured sample rate and the
+initial sample identity needed to reproduce the filter. Retained-data limits
+also apply to these diagnostic columns; inspect omissions before replaying a run.
 
 Collection is bounded to avoid unlimited memory use. The manifest records
 retention limits and omissions; "raw" means the retained samples have not

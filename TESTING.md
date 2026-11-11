@@ -33,6 +33,9 @@ PYTHONPATH=tests python3 -B -m unittest -v \
   test_backends test_motion_policy test_sample_age70 test_sample_age_removal \
   test_warmup_timing test_trigger
 
+# Optional notch response, lifecycle, model identity and upgrade compatibility.
+PYTHONPATH=tests python3 -B -m unittest -v test_notch
+
 # Workflow return, cancellation and Beta capture contracts.
 PYTHONPATH=tests python3 -B -m unittest -v \
   test_workflows test_calibration_auto_return test_calibration_limits \
@@ -78,6 +81,14 @@ capture/recovery/statistics, PNG rendering and the isolated Beta experiment.
 TROUBLESHOOT adds fixed-setting motion equivalence, passive stop ordering,
 partial evidence retention, bounded collection and post-cleanup export checks.
 A source test file's presence is not proof that it executed successfully.
+
+The optional dev notch needs independent signal-response and integration checks:
+target-band attenuation with retained off-band response, first-crossing timing,
+packet partition invariance, fresh state per home, raw sensor-fault handling,
+rate/Nyquist validation, saved-model filter identity and mixed-axis persistence.
+Disabled profiles must retain the existing detector, while filtered diagnostics
+must retain original samples and reproduce the causal decision. These software
+checks do not select a frequency or establish physical impact discrimination.
 
 Travel-wizard tests cover negative/positive trigger-versus-halt accounting,
 CoreXY/Cartesian conversion, supervised setup, selected-axis bounded jogs,

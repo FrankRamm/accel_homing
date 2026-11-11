@@ -22,7 +22,8 @@ import uuid
 
 MODULES = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
            "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py",
-           "accel_homing_center.py", "accel_homing_travel.py", "accel_homing_troubleshoot.py")
+           "accel_homing_center.py", "accel_homing_travel.py", "accel_homing_troubleshoot.py",
+           "accel_homing_filter.py")
 SENSORS = {"beacon", "adxl345", "lis2dw", "lis3dh", "mpu9250", "icm20948"}
 SAVE_MARKER = "#*# <---------------------- SAVE_CONFIG ---------------------->"
 MANAGED = "accel_homing.cfg"

@@ -7,7 +7,8 @@ initial homing and calibration with an accessible emergency stop.
 ## Install
 
 This `dev` branch includes the experimental
-[center calibration workflow](docs/CENTER.md). It is separate from `main`.
+[center calibration workflow](docs/CENTER.md) and an optional
+[notch filter](docs/NOTCH.md), disabled by default. It is separate from `main`.
 
 Run in the Linux printer host's shell as the existing Klipper service user,
 with the printer idle:
@@ -126,6 +127,7 @@ Keep the printed backup paths if you may need to undo the uninstall.
 [Installation and migration](docs/INSTALLATION.md) ·
 [Supported sensors and limits](docs/COMPATIBILITY.md) ·
 [Configuration](docs/CONFIGURATION.md) ·
+[Notch filter (dev)](docs/NOTCH.md) ·
 [Console commands](docs/COMMANDS.md) ·
 [Calibration](docs/SIMPLE_CALIBRATION.md) ·
 [Center calibration (dev)](docs/CENTER.md) ·

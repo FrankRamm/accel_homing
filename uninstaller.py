@@ -460,7 +460,8 @@ def validate_installation_history(selected, api):
                 # troubleshooting. An older set applies only when this journal
                 # changed none of the links that set lacks.
                 paths = {Path(change["path"]) for change in manifest["changes"]}
-                for names in (legacy, legacy + (center,), legacy + (center, travel), legacy + (troubleshoot,)):
+                for names in (legacy, legacy + (center,), legacy + (center, travel), legacy + (troubleshoot,),
+                              legacy + (center, travel, troubleshoot)):
                     newer = set(api.MODULES) - set(names)
                     if (set(names) < set(api.MODULES)
                             and not any(extras / name in paths for name in newer)):

@@ -19,6 +19,13 @@ or a hard real-time endstop.
 | Explicit config thresholds / older selected-axis models | Absolute machine-axis deviation about a fresh quiet reference, with legacy motion/pressed policies. |
 | Beta calibration | Isolated moving-noise experiment and proposal; does not replace or save the ordinary model. |
 
+This table describes profiles with the optional notch disabled. An enabled
+[notch profile](NOTCH.md) selects the XYZ detector for its machine axis, including
+explicit manual thresholds, and filters signed baseline-subtracted components
+before the magnitude comparison. The same biquad is applied to all XYZ
+components. Beta refuses a filtered axis before movement. Filter settings and
+sensor cadence are part of a saved filtered model's qualification.
+
 The vector detector evaluates
 `sqrt((ax-bx)^2 + (ay-by)^2 + (az-bz)^2)` in g about a fixed fresh reference.
 The first sample reaching the threshold requests stopping; a later peak does

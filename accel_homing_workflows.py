@@ -646,6 +646,32 @@ class AccelHomingWorkflows:
                 "homing_accel_mm_s2": self.owner.homing_accel,
                 "impact_sign": self.owner.impact_sign[axis]}
 
+    def _filter_settings(self, axis):
+        getter = getattr(self.owner, "filter_settings", None)
+        return {"type": "disabled"} if getter is None else getter(axis)
+
+    def _check_filter_model(self, axis):
+        if (self.model is None or axis not in self.model.thresholds or axis in self.manual_axes
+                or self._temporary_manual_threshold(axis)):
+            return
+        saved = self.model.metadata[axis].get("signal_filter", {"type": "disabled"})
+        if saved != self._filter_settings(axis):
+            raise self._error("Saved %s threshold uses a different signal filter; recalibrate with "
+                              "ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1 or set an explicit "
+                              "%s_threshold for the configured metric" % (axis.upper(), axis.upper(), axis))
+
+    def check_filter_rate(self, axis, rate):
+        if self.session and self.session.get("mode") == "calibration":
+            return
+        self._check_filter_model(axis)
+        if (self.model is None or axis not in self.model.thresholds or axis in self.manual_axes
+                or self._temporary_manual_threshold(axis)):
+            return
+        from_filter = self.model.metadata[axis].get("filter_sample_rate_hz")
+        if from_filter is None or abs(rate / from_filter - 1) > 0.02:
+            raise self._error("Saved %s notch threshold uses a different sensor sample rate; recalibrate"
+                              % axis.upper())
+
     def _validate_model_connection(self):
         if self.model is None:
             return
@@ -802,6 +828,8 @@ class AccelHomingWorkflows:
                               "command or use CANCEL")
         calibrating = bool(self.session and self.session.get("mode") == "calibration")
         for axis in axes:
+            if not calibrating:
+                self._check_filter_model(axis)
             if (calibrating or axis in self.manual_axes or self._temporary_manual_threshold(axis)
                     or self.model is None or axis not in self.model.thresholds):
                 continue
@@ -949,6 +977,9 @@ class AccelHomingWorkflows:
             calibration_grid = self._calibration_grid(gcmd)
         axes = axes if axes is not None else [axis] if axis else ["x", "y"]
         self._preflight(axes, continuation=previous_accuracy is not None)
+        if mode != "calibration":
+            for selected_axis in axes:
+                self._check_filter_model(selected_axis)
         if mode == "calibration" and self._geometry(axis)[1] <= CALIBRATION_MIN_TRAVEL_MM:
             raise gcmd.error("center-to-endstop travel must exceed 20 mm for impact discovery")
         self._require_unhomed_xy()
@@ -976,6 +1007,9 @@ class AccelHomingWorkflows:
             self._clear_noise_seeds()
 
     def _announce_calibration(self, session):
+        self._info("%s signal filter: %s; stationary noise seed remains a raw XYZ starting heuristic, "
+                   "not a bound on filtered transients" %
+                   (session["axis"].upper(), json.dumps(self._filter_settings(session["axis"]), sort_keys=True)))
         self._info("%s calibration starts at %.6g g with %.6g g steps; XYZ magnitude; "
                    "impact after >20 mm then ten centered endstop checks with spread <= 2 mm; "
                    "no quietness or acceleration-derived motion proof; returns settle for %.3f s; "
@@ -1027,6 +1061,7 @@ class AccelHomingWorkflows:
 
     def _noise_context(self):
         return {"sensor": self.owner.noise_sensor_context(),
+                "signal_filter": {axis: self._filter_settings(axis) for axis in AXES},
                 "calibration_start_threshold": self.start_threshold,
                 "calibration_step": self.threshold_step,
                 "calibration_settle_time_s": self.calibration_settle_time,
@@ -1146,6 +1181,8 @@ class AccelHomingWorkflows:
                                                 for index, axis in enumerate("xyz", 1)))
                              for row in samples)
         return {"run_id": session["run_id"], "noise_iteration": iteration,
+                "noise_metric": "raw_xyz_magnitude_starting_heuristic",
+                "signal_filter": {axis: self._filter_settings(axis) for axis in AXES},
                 **self._signal_metadata(capture),
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
@@ -1322,6 +1359,8 @@ class AccelHomingWorkflows:
         explicit = session["explicit_start_threshold"]
         session["stationary_noise"] = {
             "run_id": session["run_id"], "iterations": NOISE_ITERATIONS,
+            "noise_metric": "raw_xyz_magnitude_starting_heuristic",
+            "signal_filter": self._filter_settings(session["axis"]),
             "impact_metric": "xyz_magnitude", "noise_magnitude_peak_g": peak,
             "initial_threshold_source": "explicit_start_threshold" if explicit else "stationary_noise",
             "start_threshold_g": start if explicit else candidate,
@@ -1339,6 +1378,7 @@ class AccelHomingWorkflows:
                                       candidate, limit))
             session["noise_seed"] = {
                 "run_id": session["run_id"], "source": "stationary_noise",
+                "noise_metric": "raw_xyz_magnitude_starting_heuristic",
                 "impact_metric": "xyz_magnitude", "noise_magnitude_peak_g": peak,
                 "required_threshold_g": required, "start_threshold_g": candidate,
                 "configured_start_g": start, "candidate_step_g": step, "threshold_limit_g": limit,
@@ -1600,6 +1640,15 @@ class AccelHomingWorkflows:
                 or (session.get("last_arm_time") is not None
                     and arm <= session["last_arm_time"])):
             raise self._error("homing capture does not belong to the current detector/reference")
+        expected_filter = self._filter_settings(axis)
+        observed_filter = detector.get("signal_filter", {"type": "disabled"})
+        if any(observed_filter.get(key) != value for key, value in expected_filter.items()):
+            raise self._error("homing capture does not belong to the current signal filter")
+        if expected_filter.get("type") != "disabled":
+            metadata = capture.get("signal_filter", {})
+            if (metadata.get("first_sample_matches") != 1 or not capture.get("filtered_samples")
+                    or any(metadata.get(key) != value for key, value in observed_filter.items())):
+                raise self._error("homing capture lacks reproducible filtered samples")
         samples = capture["samples"]
         if not samples[0][0] < arm <= samples[-1][0]:
             raise self._error("homing capture lacks the current pre-arm reference or armed samples")
@@ -1993,6 +2042,7 @@ class AccelHomingWorkflows:
             # sensor headroom, not just the lower threshold used by the trials.
             threshold = self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
+                    "signal_filter": self._filter_settings(axis),
                     "polarity_policy": POLARITY_POLICY,
                     "signal_quality": [self._signal_metadata(record) for record in qualified],
                     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -2023,11 +2073,29 @@ class AccelHomingWorkflows:
             metadata["stationary_noise_seed"] = dict(session["noise_seed"])
         if session.get("stationary_noise") is not None:
             metadata["stationary_noise_measurement"] = dict(session["stationary_noise"])
+        if metadata["signal_filter"]["type"] != "disabled":
+            rates = [r.get("signal_filter", {}).get("sample_rate_hz") for r in qualified]
+            if (any(type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0 for rate in rates)
+                    or any(any(r.get("signal_filter", {}).get(key) != value
+                               for key, value in metadata["signal_filter"].items()) for r in qualified)
+                    or any(abs(rate / rates[0] - 1) > 0.02 for rate in rates)):
+                raise self._error("qualified notch homes do not have a consistent sensor sample rate")
+            metadata["filter_sample_rate_hz"] = rates[0]
         encoded_metadata = json.dumps(metadata, separators=(",", ":"), allow_nan=False)
         configfile = self.printer.lookup_object("configfile")
         recovery = session.get("accuracy_recovery")
         encoded_threshold = "%.17g" % threshold
-        configfile.set(self.model_section, "version", "1")
+        staged = getattr(self, "staged_filter_axes", set())
+        if not hasattr(self, "staged_filter_axes") and self.model is not None:
+            staged = {a for a in self.model.thresholds
+                      if self.model.metadata[a].get("signal_filter", {}).get("type", "disabled") != "disabled"}
+        staged = set(staged)
+        if metadata["signal_filter"]["type"] == "disabled":
+            staged.discard(axis)
+        else:
+            staged.add(axis)
+        self.staged_filter_axes = staged
+        configfile.set(self.model_section, "version", "2" if staged else "1")
         configfile.set(self.model_section, axis + "_threshold", encoded_threshold)
         configfile.set(self.model_section, axis + "_successes", str(REQUIRED_SUCCESSES))
         configfile.set(self.model_section, axis + "_metadata", encoded_metadata)
@@ -2768,6 +2836,9 @@ class AccelHomingWorkflows:
         axis = gcmd.get("AXIS", "").lower()
         if axis not in AXES:
             raise gcmd.error("AXIS must be X or Y")
+        if self._filter_settings(axis)["type"] != "disabled":
+            raise gcmd.error("Beta moving-noise calibration does not support notch filtering; "
+                             "use ACCEL_HOMING_CALIBRATE for this axis")
         self._require_centered(gcmd)
         if gcmd.get_int("SAVE_CONFIG", 0, minval=0, maxval=1):
             raise gcmd.error("Beta produces a PNG and threshold suggestion only; SAVE_CONFIG=1 is unsupported")

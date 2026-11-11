@@ -106,8 +106,11 @@ troubleshooting bundle from the affected axis. Stationary noise alone cannot
 characterize vibration while moving. Keep speed, acceleration, sensor settings
 and threshold recorded with the comparison. A filter or component weighting
 changes the detector: it can attenuate an impact or delay the threshold crossing,
-and the existing calibrated threshold would need qualification again. There is
-currently no configurable filter for the saved XYZ detector.
+and the existing calibrated threshold would need qualification again. This
+`dev` branch offers an opt-in [notch filter](NOTCH.md) with shared or per-homing-axis
+frequency/Q settings; it is disabled by default. Choose its frequency from
+moving captures and compare against unfiltered runs. It does not correct
+delayed delivery or missing accelerometer data.
 
 ## Accuracy recovery and save errors
 

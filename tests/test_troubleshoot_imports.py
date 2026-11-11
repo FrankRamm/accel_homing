@@ -33,7 +33,7 @@ class TroubleshootImportTests(unittest.TestCase):
             (extras / "__init__.py").write_text("", encoding="utf-8")
             (extras / "homing.py").write_text(
                 "class PrinterHoming:\n    def cmd_G28(self, gcmd):\n        pass\n", encoding="utf-8")
-            for name in OLD_MODULES + ((DIAGNOSTICS,) if diagnostic_source else ()):
+            for name in OLD_MODULES + ("accel_homing_filter.py",) + ((DIAGNOSTICS,) if diagnostic_source else ()):
                 shutil.copyfile(SOURCE / name, checkout / name)
             for name in OLD_MODULES + ((DIAGNOSTICS,) if diagnostic_link else ()):
                 try:

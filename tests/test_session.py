@@ -377,7 +377,7 @@ class StatusTest(unittest.TestCase):
         self.assertIn("Y 50 mm", lines[0])
 
     def test_status_is_a_copy(self):
-        obj = make_homing()
+        obj = make_homing(options={"y_notch_frequency": 100.})
         self.assertIsNone(obj.get_status(0.0)["sample_timing_fault"])
         obj._record_sample_timing_fault("backend_batch", 0.1, 0.01, 0.02,
                                         cutoff=0.0, reason="too_old")
@@ -389,9 +389,13 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(obj.sample_timing_fault["sample_age_ms"], 90.0)
         obj.sample_timing_fault["reason"] = "future"
         self.assertEqual(status["sample_timing_fault"]["reason"], "too_old")
+        status["signal_filter"]["y"]["frequency_hz"] = 999.
+        self.assertEqual(obj.filter_settings("y")["frequency_hz"], 100.)
+        obj.notch_profiles["y"]["q"] = 20.
+        self.assertEqual(status["signal_filter"]["y"]["q"], 10.)
         self.assertEqual(set(status), {"threshold_g", "impact_sign", "homing_accel", "back_off_dist",
                                        "homing", "baseline", "sample_timing_fault", "last", "sensor",
-                                       "backend", "workflows"})
+                                       "backend", "workflows", "signal_filter"})
 
 
 if __name__ == "__main__":

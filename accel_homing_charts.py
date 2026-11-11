@@ -370,10 +370,31 @@ def _capture_data(capture, record):
         raise ValueError("Invalid accelerometer baseline")
     delta = [(row[0] - samples[0][0],) + tuple(row[i + 1] - baseline[i] for i in range(3))
              for row in samples]
+    filter_metadata = capture.get("signal_filter", {"type": "disabled"})
+    extra = {}
+    if filter_metadata.get("type") != "disabled":
+        filtered = capture.get("filtered_samples")
+        start_index = filter_metadata.get("first_sample_index")
+        if (type(start_index) is not int or not 0 <= start_index < len(samples)
+                or filter_metadata.get("first_sample_matches") != 1
+                or not isinstance(filtered, (tuple, list)) or len(filtered) != len(samples) - start_index
+                or not filtered
+                or any(len(row) != 4 or not all(_finite(value) for value in row)
+                       or row[0] != samples[start_index + index][0] for index, row in enumerate(filtered))):
+            raise ValueError("Notch chart lacks its complete filtered capture and start identity")
+        origin = filtered[0][0]
+        raw_delta = [(row[0] - origin,) + tuple(row[i + 1] - baseline[i] for i in range(3))
+                     for row in samples]
+        extra = {"signal_filter": filter_metadata, "raw_sample_count": len(samples),
+                 "raw_first_sample_time_s": samples[0][0], "raw_trace": _envelope(raw_delta, 64),
+                 "trace_metric": "causal notch XYZ after baseline subtraction; begins at first armed sample"}
+        samples = filtered
+        delta = [(row[0] - origin,) + tuple(row[1:]) for row in filtered]
     metadata = {"sample_count": len(samples), "baseline_g": list(baseline),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "absolute_peak_g": {axis: max(abs(row[index]) for row in delta)
                                     for index, axis in enumerate("xyz", 1)}}
+    metadata.update(extra)
     metadata.update(_range_metadata(capture, record))
     _json(record)
     return _envelope(delta), metadata
@@ -507,7 +528,8 @@ def _prepared_capture(prepared):
             or record.get("workflow_attempt") != receipt.iteration):
         raise ValueError("Deferred capture metadata does not match its receipt")
     trace = receipt.trace
-    if (not isinstance(trace, tuple) or not 2 <= len(trace) <= _MAX_CAPTURE_TRACE_POINTS
+    filtered = metadata.get("signal_filter", {}).get("type", "disabled") != "disabled"
+    if (not isinstance(trace, tuple) or not (1 if filtered else 2) <= len(trace) <= _MAX_CAPTURE_TRACE_POINTS
             or any(not isinstance(row, tuple) or len(row) != 4
                    or not all(_finite(value) for value in row) for row in trace)
             or any(first[0] >= second[0] for first, second in zip(trace, trace[1:]))
@@ -519,7 +541,7 @@ def _prepared_capture(prepared):
     if (type(count) is not int or not len(trace) <= count <= _MAX_SAMPLES
             or not isinstance(baseline, list) or len(baseline) != 3
             or not all(_finite(value) for value in baseline)
-            or not _finite(first) or not _finite(last) or last <= first
+            or not _finite(first) or not _finite(last) or last < first or (last == first and not filtered)
             or not math.isclose(trace[-1][0], last - first, rel_tol=1e-12, abs_tol=1e-9)
             or not isinstance(peaks, dict) or set(peaks) != set("xyz")
             or any(not _finite(peaks[axis]) or not math.isclose(
@@ -1290,6 +1312,14 @@ def _plot_capture(figure, payload):
     if vector:
         axis.plot([row[0] for row in magnitude], [row[1] for row in magnitude],
                   linewidth=1.2, label="XYZ magnitude")
+    raw_trace = captured.get("raw_trace")
+    if raw_trace:
+        axis.plot([row[0] for row in raw_trace],
+                  [math.sqrt(sum(value * value for value in row[1:4])) for row in raw_trace],
+                  color="#777777", alpha=.55, linewidth=.7, label="Raw XYZ magnitude")
+        settings = captured["signal_filter"]
+        axis.set_title("Causal notch %.6g Hz / Q %.6g / sample rate %.6g Hz" %
+                       (settings["frequency_hz"], settings["q"], settings["sample_rate_hz"]), fontsize=9)
     _threshold(axis, record)
     onset = record.get("onset_time_s", record.get("onset_time"))
     elapsed = None
@@ -1317,7 +1347,9 @@ def _plot_capture(figure, payload):
                             _number(peak_value))] + _range_observation_lines(range_summary))
     _absolute_limits(axis)
     axis.legend(loc="best", fontsize=8)
-    _finish_layout(figure, "Absolute components after stationary-baseline subtraction. Commanded travel is not physical stop accuracy.")
+    _finish_layout(figure, ("Notch components and magnitude after resting-offset subtraction; raw magnitude shown in gray. "
+                           if raw_trace else "Absolute components after stationary-baseline subtraction. ")
+                   + "Commanded travel is not physical stop accuracy.")
 
 
 def _plot_beta(figure, payload):
@@ -1492,6 +1524,10 @@ def _plot_accuracy(figure, payload):
         _threshold(axis, trials[0])
         axis.legend(fontsize=8, loc="best")
         _absolute_limits(axis)
+    settings = trials[0].get("signal_filter", {}) if trials else {}
+    if settings.get("type", "disabled") != "disabled":
+        travel.set_title("Causal notch %.6g Hz / Q %.6g; acceleration traces use filtered XYZ" %
+                         (settings["frequency_hz"], settings["q"]), fontsize=9)
     _finish_layout(figure, "Commanded travel only; not physical stop accuracy. Qualifier excluded. Population statistics.", payload.get("reason"))
 
 

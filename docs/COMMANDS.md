@@ -46,6 +46,10 @@ selected-axis model; supply `THRESHOLD` or complete fresh calibration if the
 model's qualification is refused.
 
 No separate centering-confirmation command or popup prompt is required.
+The optional [notch filter](NOTCH.md) is selected through configuration, with
+independent X/Y overrides; there is no additional moving filter command.
+Beta calibration refuses an axis with an enabled notch before movement; use
+ordinary calibration for that axis.
 Only one workflow may own the sensor/motion session at a time. A new command
 during an active run is rejected; do not reissue it while automatic retries run.
 

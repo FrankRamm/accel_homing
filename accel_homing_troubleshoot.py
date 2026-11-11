@@ -257,7 +257,7 @@ class Recorder:
                 "phase": "discovery" if sample == 0 else "measurement",
                 "previous_home_id": previous["home_id"] if previous else None,
                 "previous_return_completed": previous.get("return_completed", False) if previous else None,
-                "before": snapshot(self.workflow), "raw": array("d"),
+                "before": snapshot(self.workflow), "raw": array("d"), "filtered": array("d"),
                 "capture": {"unavailable": "capture did not complete"},
                 "packet_prefix": [], "packet_tail": deque(maxlen=MAX_HOME_BATCHES - INITIAL_HOME_BATCHES),
                 "batches_observed": 0, "batches_retained": 0, "batches_omitted": 0}
@@ -291,8 +291,17 @@ class Recorder:
                         invalid += int(not all(finite(value) for value in row))
                         raw.extend(value if finite(value) else float("nan") for value in row)
             retained = len(raw) // 4
+            metadata = capture.get("signal_filter", {})
+            filtered = capture.get("filtered_samples", ())
+            start = metadata.get("first_sample_index")
+            if type(start) is int and filtered:
+                for first, end in ranges:
+                    for index in range(first, end):
+                        row = filtered[index - start] if start <= index < start + len(filtered) else None
+                        home["filtered"].extend(row[1:] if row is not None else (float("nan"),) * 3)
             self.raw_rows += retained
-            home["capture"] = clean({key: value for key, value in capture.items() if key not in ("samples", "_record")})
+            home["capture"] = clean({key: value for key, value in capture.items()
+                                     if key not in ("samples", "filtered_samples", "_record")})
             home["capture"].update(raw_rows_received=len(samples), raw_rows_retained=retained,
                                    raw_rows_omitted=len(samples) - retained,
                                    invalid_rows=invalid, retention="first reference prefix and last impact tail; original sample indices; no averaging",
@@ -302,6 +311,10 @@ class Recorder:
                                    raw_units="print_time seconds, machine-axis g including gravity/bias",
                                    source="owner.stop_capture before workflow validation",
                                    truncation=bool(len(samples) > retained or capture.get("dropped")))
+            if filtered:
+                home["capture"].update(filtered_rows_retained=len(home["filtered"]) // 3,
+                                       filtered_retention="same original indices as raw; blank before first armed sample",
+                                       filtered_replay_complete=not bool(len(samples) > retained or capture.get("dropped")))
         except Exception as exc:
             home["capture"]["retention_error"] = str(exc)
             self.observer_errors += 1
@@ -384,7 +397,8 @@ class Recorder:
         self.folder = str(folder)
         homes = []
         for home in self.homes:
-            public = {key: value for key, value in home.items() if key not in ("raw", "packet_prefix", "packet_tail")}
+            public = {key: value for key, value in home.items()
+                      if key not in ("raw", "filtered", "packet_prefix", "packet_tail")}
             public["stop_timing"] = self._stop_timing(home["home_id"])
             public["packet_retention"] = {"policy": "first prefix and rolling last tail; omitted middle",
                 "prefix_limit": INITIAL_HOME_BATCHES, "tail_limit": MAX_HOME_BATCHES - INITIAL_HOME_BATCHES,
@@ -394,12 +408,21 @@ class Recorder:
             public["raw_file"] = name
             with gzip.open(folder / name, "wt", encoding="utf-8", newline="") as stream:
                 writer = csv.writer(stream)
-                writer.writerow(("sample_index", "print_time_s", "x_g", "y_g", "z_g"))
+                filtered = home.get("filtered", ())
+                columns = ("sample_index", "print_time_s", "x_g", "y_g", "z_g")
+                if filtered:
+                    columns += ("filtered_x_g", "filtered_y_g", "filtered_z_g", "filtered_magnitude_g")
+                writer.writerow(columns)
                 raw = home["raw"]
                 offset = 0
                 for first, end in home.get("raw_ranges", ()):
                     for original_index in range(first, end):
-                        writer.writerow([original_index] + [value if finite(value) else "" for value in raw[offset:offset + 4]])
+                        row = [original_index] + [value if finite(value) else "" for value in raw[offset:offset + 4]]
+                        if filtered:
+                            xyz = filtered[(offset // 4) * 3:(offset // 4) * 3 + 3]
+                            row += ([*xyz, math.sqrt(sum(value * value for value in xyz))]
+                                    if all(finite(value) for value in xyz) else [""] * 4)
+                        writer.writerow(row)
                         offset += 4
             homes.append(public)
         with gzip.open(folder / "packets.jsonl.gz", "wt", encoding="utf-8") as stream:
@@ -429,12 +452,14 @@ class Recorder:
                       "Discovery is retained and excluded from measured-trial statistics.",
                       "Rejected/partial homes are retained; no automatic recalibration or threshold change.",
                       "Empty CSV cells represent invalid/missing numbers; see capture invalid_rows.",
+                      "Optional filtered columns are signed baseline-subtracted XYZ, with causal zero state at the exact first armed sample. Raw columns are unchanged. Replay requires every intervening raw sample; omitted middle ranges prevent full replay.",
                       "Charts use impact windows; raw retained CSV rows are not decimated."]}
         write_json(folder / "manifest.json", report)
         (folder / "README.txt").write_text(
             "ACCEL_HOMING_TROUBLESHOOT evidence\n\n"
             "Share the entire folder or ZIP. Read manifest.json first.\n"
             "home-*.csv.gz: every retained raw decoded XYZ sample before graph reduction, in g including gravity/bias.\n"
+            "Optional filtered_* columns: causal notch after resting-offset subtraction; blank before arm. Coefficients/rate/start identity are in manifest.json.\n"
             "packets.jsonl.gz: bounded callback timing, pending/filtered packet context.\n"
             "manifest.json: home/return/next-home linkage, detector/reference/quality metadata, errors, config, installed source SHA256, bounds.\n"
             "Each home records capture/core drops and recorder omissions. Missing is not zero.\n"
@@ -619,6 +644,10 @@ def _worker(folder, dependencies):
                     except ValueError:
                         continue
                     if not finite(onset) or onset - .025 <= sample[0] <= onset + .100:
+                        try:
+                            sample += [float(row[key]) for key in ("filtered_x_g", "filtered_y_g", "filtered_z_g")]
+                        except (KeyError, ValueError):
+                            sample += [float("nan")] * 3
                         rows.append(sample)
             # Window retains all samples/outliers. Bound unknown-onset plots by
             # displaying a prefix explicitly; raw files remain unchanged.
@@ -632,6 +661,12 @@ def _worker(folder, dependencies):
             for index, label in enumerate("XYZ"):
                 plot.plot(times, [row[index + 1] - baseline[index] for row in rows], label=label, linewidth=.8)
             plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="XYZ norm", color="black", linewidth=1)
+            if any(all(finite(value) for value in row[4:7]) for row in rows):
+                plot.plot(times, [math.sqrt(sum(value * value for value in row[4:7])) for row in rows],
+                          label="Filtered XYZ magnitude", color="#d17b00", linewidth=1.2)
+                threshold = record.get("threshold_g")
+                if finite(threshold):
+                    plot.axhline(threshold, color="#d17b00", linestyle="--", label="Filtered trigger")
             if finite(onset):
                 plot.axvline(0, color="red", label="retained sensor onset")
             for event in report["events"]:

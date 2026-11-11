@@ -70,9 +70,11 @@ an 8 g MPU9250 sensor.
 
 To use calibration, comment out both axis overrides **and** the shared
 `threshold`, then issue console `RESTART` while idle. An explicit manual
-threshold retains the legacy selected-axis detector; a newly calibrated model
-uses XYZ magnitude. Values calibrated for one metric are not interchangeable
-with the other. The detector in use is part of the model/status context.
+threshold retains the legacy selected-axis detector when its notch is disabled;
+a newly calibrated model uses XYZ magnitude. An enabled notch explicitly selects
+filtered XYZ magnitude, including for a manual threshold. Values calibrated for
+different metrics are not interchangeable. The detector and filter in use are
+part of the model/status context.
 Both RAW metrics ignore acceleration polarity after subtracting their fresh
 signed reference; selected-axis detection uses `abs(a-b)`. Homing direction
 still controls commanded travel and does not change the source sensor signs.
@@ -120,6 +122,23 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `travel_margin` | `1.1` | Full-move travel/time margin multiplier; 1–2. |
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
+
+## Experimental notch filter (dev)
+
+| Option | Default | Meaning and accepted range |
+| --- | --- | --- |
+| `notch_frequency` | `0` | Shared notch frequency in Hz. Finite, nonnegative; zero disables. Enabled frequency must be below half the sensor sample rate. |
+| `notch_q` | `10` | Shared notch quality factor; finite, 0.5–1000. Higher Q rejects a narrower band. |
+| `x_notch_frequency`, `y_notch_frequency` | `notch_frequency` | Per-homing-axis frequency override. Zero explicitly disables filtering for that machine axis. |
+| `x_notch_q`, `y_notch_q` | `notch_q` | Per-homing-axis quality-factor override, with the same accepted range. |
+
+Choose frequency from moving captures; no frequency is selected automatically.
+All three signed sensor components use the selected machine-axis profile before
+the XYZ magnitude is compared to the threshold. Filter settings belong to the
+calibration: changing them requires requalification of affected saved models.
+See [configuration, calibration and comparison](NOTCH.md).
+
+## Compatibility and release settings
 
 The compatibility sign options do not select detector polarity. An
 `IMPACT_SIGN`-only SET changes the retained setting but does not register an
