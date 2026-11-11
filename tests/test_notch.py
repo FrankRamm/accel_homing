@@ -177,6 +177,28 @@ class NotchTests(unittest.TestCase):
         two = obj.prepare(endstop, obj.preparation.last + .001)
         self.assertAlmostEqual(two.notch.rate, 1000.)
         self.assertEqual(two.notch.state, [[0., 0.]] * 3)
+        # AUTO must retain the exact armed source row even when only the last
+        # row of a native packet is eligible and clocksync later shifts time.
+        two.notch = None
+        two.limit_raw = counts(.5)
+        obj.start_capture()
+        obj.arm(two)
+        obj.reactor.now = two.arm_time + .001
+        obj._inspect(batch(two.arm_clock - 7, [(0, 0, counts(1.))] * 7
+                           + [(0, 0, counts(3.))]))
+        obj.disarm()
+        clock_to_time = obj.clock_to_time
+        obj.clock_to_time = lambda clock: clock_to_time(clock) - .000050
+        captured = obj.stop_capture()
+        provenance = captured["auto_notch_replay"]
+        self.assertTrue(provenance["complete"])
+        self.assertEqual(provenance["first_sample_index"], 7)
+        self.assertEqual(provenance["first_sample_matches"], 1)
+        self.assertEqual(provenance["first_sample"], (two.arm_clock - 7, 7, 7, 8))
+        self.assertEqual(provenance["arm_clock"], two.arm_clock)
+        self.assertEqual(provenance["eligibility_source"], "native_sensor_clock")
+        self.assertEqual(provenance["first_sample_time_s"], captured["samples"][7][0])
+        self.assertAlmostEqual(provenance["sample_rate_hz"], 1000.)
         for failure in ("changed_rate", "one_missing_sample", "frozen", "clocksync"):
             obj = make_homing(threshold=8., options={"notch_frequency": 100.})
             native_baseline(obj, (0, 0, 128))

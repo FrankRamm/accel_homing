@@ -701,15 +701,21 @@ class AccelHomingWorkflows:
         if session is None:
             return
         if session["mode"] == "noise":
-            if session.get("sensor_started"):
-                self.owner.stop_noise_measurement()
-            session["sensor_stopped"] = True
+            try:
+                if session.get("sensor_started"):
+                    self.owner.stop_noise_measurement()
+                session["sensor_stopped"] = True
+            finally:
+                if session.get("auto_notch") and (session.get("finishing") or session.get("auto_notch_restore_requested")):
+                    session["auto_notch_controller"].restore(session)
             return
         try:
             self.owner._end_session()
         finally:
             self.owner.threshold_g.update(session["saved_thresholds"])
             self.owner.back_off_dist = dict(session["saved_back_off"])
+            if session.get("auto_notch") and (session.get("finishing") or session.get("auto_notch_restore_requested")):
+                session["auto_notch_controller"].restore(session)
             self.in_home, self.home_axis = False, None
 
     def _finish(self, result, release=False):
@@ -746,6 +752,8 @@ class AccelHomingWorkflows:
                                   repeatability_spread_mm=session.get("repeatability_spread_mm"))
                 if session.get("stationary_noise") is not None:
                     result["stationary_noise"] = dict(session["stationary_noise"])
+                if session.get("auto_notch"):
+                    result["auto_notch"] = session["auto_notch_controller"].summary(session)
             session["finishing"] = True
             session["finish_result"] = result.get("result")
         try:
@@ -1108,7 +1116,7 @@ class AccelHomingWorkflows:
             self._check_running(session)
         if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
             raise self._error("printer is shut down")
-        continuation = session is not None and bool(session.get("accuracy_recovery"))
+        continuation = session is not None and bool(session.get("accuracy_recovery") or session.get("auto_notch"))
         if self._printing() or (not continuation
                                and self._status("idle_timeout").get("state") == "Printing"):
             raise self._error("noise measurement requires an idle printer, not printing or paused")
@@ -1316,7 +1324,7 @@ class AccelHomingWorkflows:
         self._begin_noise(session)
         session["calibration_preflight"] = True
         self._chart_preflight()
-        continuation = bool(session.get("accuracy_recovery"))
+        continuation = bool(session.get("accuracy_recovery") or session.get("auto_notch"))
         self._preflight([session["axis"]], continuation=continuation)
         self._require_unhomed_xy()
         self._preflight_noise(session)
@@ -1539,7 +1547,15 @@ class AccelHomingWorkflows:
                     or (previous is not None and sample[0] <= previous):
                 raise self._error("homing capture has invalid or stale sensor samples")
             previous = sample[0]
-        if session["mode"] in ("accuracy", "troubleshoot", "charts"):
+        if session.get("auto_notch"):
+            self._validate_accuracy_capture(session, axis, source_record, detector_record,
+                                            record, capture, record["workflow_threshold_g"])
+            record.update(capture_valid=True, physical_position_verified=False,
+                          auto_notch_reference=("qualified_raw_trigger_reference"
+                              if session["auto_notch_phase"] == "raw_reference" else "fresh_fixed_profile_qualification"))
+            if early_calibration:
+                record["early_capture_valid"] = True
+        elif session["mode"] in ("accuracy", "troubleshoot", "charts"):
             self._validate_accuracy_capture(session, axis, source_record, detector_record,
                                             record, capture)
             record["capture_valid"] = True
@@ -1557,6 +1573,8 @@ class AccelHomingWorkflows:
             self._append_beta_home(session, compact_beta_home(capture, record))
         if session["mode"] not in ("accuracy", "troubleshoot"):
             session["records"].append(record)
+            if session.get("auto_notch"):
+                session["auto_notch_controller"].bound_records(session)
         self._info("%s home: result %s; onset %s g; peak %s g; threshold %s g; "
                    "commanded travel %s mm" % (
             axis.upper(), record.get("result"), record.get("onset_g"),
@@ -1833,6 +1851,8 @@ class AccelHomingWorkflows:
     def _next_calibration_candidate(self, reason, apply=True):
         session = self.session
         self._check_running(session)
+        if session.get("auto_notch") and session.get("auto_notch_phase") == "qualification":
+            raise self._error(reason + "; AUTO fixed-profile qualification failed; threshold was not changed")
         candidate = float(Decimal(str(session["candidate"])) + Decimal(str(session["threshold_step_g"])))
         if not math.isfinite(candidate) or candidate <= session["candidate"]:
             raise self._error(reason + "; next calibration candidate must be finite and increase the threshold")
@@ -1841,6 +1861,9 @@ class AccelHomingWorkflows:
             session.update(candidate=candidate, successes=0, candidate_qualified=False,
                            candidate_attempt=None, validation_records=[], repeatability_spread_mm=None,
                            restarts=session["restarts"] + 1)
+            if session.get("auto_notch"):
+                session["auto_notch_omitted"] += len(session["auto_notch_homes"])
+                session["auto_notch_homes"] = []
         return candidate
 
     def _return_early_calibration(self, axis, record):
@@ -1932,6 +1955,8 @@ class AccelHomingWorkflows:
                                 candidate, session["recovery"]["count"], session["recovery"]["last_return_mm_signed"],
                                 session["attempts"]))
                 continue
+            if session.get("auto_notch"):
+                session["auto_notch_controller"].retain_home(session, record, _capture, discovery)
             if discovery:
                 session["candidate_qualified"] = True
                 session["candidate_attempt"] = record["workflow_attempt"]
@@ -1959,6 +1984,9 @@ class AccelHomingWorkflows:
             if session["successes"] < REQUIRED_SUCCESSES:
                 self._recenter(axis)
                 continue
+            if session.get("auto_notch") and session["auto_notch_phase"] == "raw_reference":
+                session["auto_notch_controller"].select(session)
+                continue
             self._save_model()
             return
 
@@ -1973,6 +2001,7 @@ class AccelHomingWorkflows:
         axis, threshold = session.get("axis"), session.get("candidate")
         threshold_limit = self._threshold_limit()
         candidate_attempt = session.get("candidate_attempt")
+        record_offset = session.get("auto_notch_record_offset", 0) if session.get("auto_notch") else 0
         records, qualified = session.get("records"), session.get("validation_records")
         if session.get("mode") != "calibration" or session.get("state") != "running" \
                 or not isinstance(axis, str) or axis not in AXES \
@@ -1984,12 +2013,14 @@ class AccelHomingWorkflows:
                 or type(candidate_attempt) is not int or candidate_attempt < 1 \
                 or type(session.get("attempts")) is not int \
                 or session.get("attempts") != candidate_attempt + REQUIRED_SUCCESSES \
-                or not isinstance(records, list) or len(records) != session["attempts"] \
+                or type(record_offset) is not int or record_offset < 0 \
+                or not isinstance(records, list) or len(records) + record_offset != session["attempts"] \
+                or candidate_attempt <= record_offset \
                 or not isinstance(qualified, list) or len(qualified) != REQUIRED_SUCCESSES \
                 or not isinstance(session.get("run_id"), str) or not session["run_id"] \
                 or type(session.get("save_config")) is not bool:
             raise self._error(message)
-        discovery = records[candidate_attempt - 1]
+        discovery = records[candidate_attempt - 1 - record_offset]
         window = [discovery] + qualified
         if len({id(record) for record in window}) != REQUIRED_SUCCESSES + 1 \
                 or any(actual is not expected for actual, expected in
@@ -2019,7 +2050,7 @@ class AccelHomingWorkflows:
         # Final release may yield while its motion completes. Recheck all ten
         # accepted trials before staging any model settings.
         self._qualified_validation_records()
-        threshold = self._calibration_saved_threshold(tested_threshold)
+        threshold = tested_threshold if session.get("auto_notch") else self._calibration_saved_threshold(tested_threshold)
         noise_png = None
         if session.get("deferred_noise_result") is not None:
             generation, preflight = self.owner.operation_generation, self.preflight_generation
@@ -2040,7 +2071,7 @@ class AccelHomingWorkflows:
             self._qualified_validation_records()
             # Rendering can yield; the final value must still fit the current
             # sensor headroom, not just the lower threshold used by the trials.
-            threshold = self._calibration_saved_threshold(tested_threshold)
+            threshold = tested_threshold if session.get("auto_notch") else self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
                     "signal_filter": self._filter_settings(axis),
                     "polarity_policy": POLARITY_POLICY,
@@ -2063,8 +2094,8 @@ class AccelHomingWorkflows:
                     "calibration_step_g": session["threshold_step_g"],
                     "tested_threshold_g": tested_threshold,
                     "saved_threshold_g": threshold,
-                    "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
-                    "saved_threshold_tested": False,
+                    "threshold_margin_g": 0.0 if session.get("auto_notch") else CALIBRATION_THRESHOLD_MARGIN_G,
+                    "saved_threshold_tested": bool(session.get("auto_notch")),
                     "calibration_quiet_range_enforced": session["quiet_range_enforced"],
                     "calibration_settle_time_s": session["calibration_settle_time_s"],
                     "recovery": self._calibration_recovery_status(session),
@@ -2082,6 +2113,9 @@ class AccelHomingWorkflows:
                 raise self._error("qualified notch homes do not have a consistent sensor sample rate")
             metadata["filter_sample_rate_hz"] = rates[0]
         encoded_metadata = json.dumps(metadata, separators=(",", ":"), allow_nan=False)
+        if session.get("auto_notch"):
+            session["auto_notch_controller"].complete(session, metadata, qualified, noise_png)
+            return
         configfile = self.printer.lookup_object("configfile")
         recovery = session.get("accuracy_recovery")
         encoded_threshold = "%.17g" % threshold
@@ -2166,6 +2200,16 @@ class AccelHomingWorkflows:
         return threshold
 
     def cmd_CALIBRATE(self, gcmd):
+        notch = gcmd.get("NOTCH", None)
+        if notch is not None:
+            if str(notch).strip().upper() != "AUTO":
+                raise gcmd.error("NOTCH must be AUTO when specified")
+            if __package__:
+                from .accel_homing_backends import load_companion_module
+            else:
+                from accel_homing_backends import load_companion_module
+            load_companion_module("accel_homing_auto").AutoNotchCalibration(self).run(gcmd)
+            return
         if self.session is None:
             self._clear_noise_seeds()
         axis = gcmd.get("AXIS", "").lower()
@@ -3581,6 +3625,8 @@ class AccelHomingWorkflows:
                               phase="validation" if session["candidate_qualified"] else "discovery")
                 if session.get("stationary_noise") is not None:
                     active["stationary_noise"] = dict(session["stationary_noise"])
+        if active is not None and session.get("auto_notch"):
+            active["auto_notch"] = session["auto_notch_controller"].summary(session)
         return {"model": self.model_name, "manual_threshold_overrides": sorted(self.manual_axes),
                 "active": active, "last_result": self.last_result,
                 "noise_recommendation": self.noise_recommendation,

@@ -132,7 +132,10 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `x_notch_frequency`, `y_notch_frequency` | `notch_frequency` | Per-homing-axis frequency override. Zero explicitly disables filtering for that machine axis. |
 | `x_notch_q`, `y_notch_q` | `notch_q` | Per-homing-axis quality-factor override, with the same accepted range. |
 
-Choose frequency from moving captures; no frequency is selected automatically.
+Choose frequency from moving captures, or use
+`ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO` for automatic selection.
+AUTO defaults to report-only and stages nothing; explicit `SAVE_CONFIG=1`
+measures, qualifies and saves the chosen per-axis profile and model together.
 All three signed sensor components use the selected machine-axis profile before
 the XYZ magnitude is compared to the threshold. Filter settings belong to the
 calibration: changing them requires requalification of affected saved models.

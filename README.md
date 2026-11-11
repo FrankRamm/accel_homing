@@ -8,7 +8,8 @@ initial homing and calibration with an accessible emergency stop.
 
 This `dev` branch includes the experimental
 [center calibration workflow](docs/CENTER.md) and an optional
-[notch filter](docs/NOTCH.md), disabled by default. It is separate from `main`.
+[notch filter](docs/NOTCH.md), disabled by default, with automatic frequency/Q
+selection through `NOTCH=AUTO`. It is separate from `main`.
 
 Run in the Linux printer host's shell as the existing Klipper service user,
 with the printer idle:
@@ -83,6 +84,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_STATUS` | Show settings, model, workflow progress, results and PNG paths. |
 | `ACCEL_HOMING_TRAVEL` | Dev: open/reopen the guided X/Y endpoint and bed-zero wizard. Configured-speed searches, slow dedicated nozzle-alignment jogs, review and optional combined save. See [travel/origin wizard](docs/TRAVEL.md). |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X; use `AXIS=Y` for Y. Measures fresh noise, then qualifies a threshold. |
+| `ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0` | Dev: measure moving noise, select a notch or disabled profile, then qualify it with fresh homes. Report-only by default; explicit `SAVE_CONFIG=1` repeats the run and saves/restarts. See [automatic notch selection](docs/NOTCH.md#automatic-selection). |
 | `ACCEL_HOMING_CALIBRATE_CENTER AXIS=ALL CENTERED=1` | Dev: one excluded initial home, then ten alternating direct end-to-end traverses per selected axis, with no backoff/retract moves. Reports geometry; `SAVE_CONFIG=1` explicitly requests saving. See [center calibration](docs/CENTER.md). |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Measure three stationary one-second noise windows and export a PNG; no movement or threshold change. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both axes must use this plugin. |
@@ -92,13 +94,17 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 
-**ACCEL_HOMING_CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
+**Ordinary CALIBRATE without `NOTCH=AUTO` saves the selected axis and restarts Klipper by default.** It adds
 0.5 g once to the candidate after ten checks pass; those homes test the candidate,
 not the higher saved value. The other axis is unchanged. Prepare
 XY again after restart before calibrating the other axis. Explicit X/Y/shared
 manual thresholds override ordinary saved models; comment them out and issue
 `RESTART` while idle to use calibration. See
 [configuration](docs/CONFIGURATION.md#thresholds-and-saved-models).
+
+`NOTCH=AUTO` defaults to reporting only, stages nothing, and tests the exact
+threshold it would save. It requires fresh measurements and final validation;
+it does not adjust the filter during ordinary homes.
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.

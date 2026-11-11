@@ -1,15 +1,86 @@
 # Experimental notch filter (dev)
 
 The optional notch attenuates a narrow frequency band during accelerometer
-homing. It is disabled by default. There is no automatic frequency selection:
-choose the frequency from moving-noise and impact captures for the affected
-machine, sensor, speed and acceleration.
+homing. It is disabled by default. `NOTCH=AUTO` can select frequency and Q
+during calibration; manual configuration remains available. Profiles apply to
+the measured machine, sensor, speed and acceleration.
 
 A notch can also attenuate an impact, produce ringing or change the threshold
 crossing time. Its usefulness must be established by comparing complete runs;
 a smoother acceleration trace does not establish better physical homing.
 
-## Configuration
+## Automatic selection
+
+After the [manual preparation](COMMANDS.md#prepare-every-moving-workflow), run:
+
+```gcode
+ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0
+```
+
+Use `AXIS=X` for X. This command moves the selected axis. AUTO defaults to
+`SAVE_CONFIG=0`: it reports its result, restores the prior filter/threshold
+settings and stages no configuration. A later bare `SAVE_CONFIG` therefore
+does not apply this report. To measure, qualify and save in one run, prepare
+XY again and explicitly request:
+
+```gcode
+ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO SAVE_CONFIG=1
+```
+
+For saving, remove explicit shared or selected-axis manual thresholds so the
+saved model controls subsequent homing. The command rejects conflicting manual
+overrides and unrelated pending configuration changes before movement.
+Successful saving writes the selected axis filter and model together through
+native configuration saving and restarts Klipper. The other axis is preserved.
+
+The sequence is:
+
+1. Record three independent central strokes at the existing effective homing
+   speed, acceleration and homing-current conditions. The stroke stops halfway
+   from the assumed center to the configured directional endstop and returns
+   to the assumed center. Actual planner segments identify acceleration,
+   cruise and braking; the speed is not reduced to make a short stroke fit.
+2. With the selected notch temporarily disabled, obtain a discovery and ten
+   qualifying reference homes using the ordinary monitored calibration loop.
+   Return to the assumed center and settle before offline analysis.
+3. Derive persistent frequencies from the first two central-stroke cruise
+   recordings. Evaluate a bounded set of frequencies and Q values with the
+   same causal filter used during homing. The first six reference homes are
+   training data; the third stroke and last four homes are held out.
+4. Freeze the selected profile and threshold, then test that choice against
+   the held-out recordings. These recordings can reject the selection, not
+   retune it. Leaving the notch disabled is allowed only if the original raw
+   threshold also passes all independent noise and reference-stop checks.
+5. Require a new discovery and ten new qualifying homes with that fixed
+   profile and threshold. A failed final check aborts instead of changing the
+   selected threshold. AUTO saves exactly the tested threshold, with no
+   additional untested 0.5 g margin.
+
+A clean run therefore includes three central strokes plus 22 homes. The raw
+reference phase can need additional attempts under the existing retry policy.
+AUTO needs usable unfiltered reference homes; it cannot recover every case
+in which raw homing fails. Missing data, insufficient cruise duration, clipping
+or rate changes are reported as unusable evidence. A rejected notch may fall
+back to the already-tested disabled control; if that control also fails, the
+run is rejected without selecting or saving a profile.
+
+Analysis uses signed XYZ spectra. It excludes braking from the noise score
+and retains acceleration/startup checks so filtering cannot hide a new early
+trigger. Reference-home replay ends at the original raw trigger sample;
+post-trigger braking caused by that original stop is not evidence that a
+filtered home would have stopped. These are plausible reference stop events,
+not independent measurements of physical contact. Fresh-home repeatability
+also remains commanded-travel repeatability.
+
+Successful runs include a comparison PNG, JSON selection report and compressed
+raw captures under `charts_directory/notch-auto/`. Failed runs retain the
+available report and captures. Console output and STATUS give artifact paths.
+Retain the whole directory, including rejected candidate reasons and failed-run
+evidence. Selection criteria are conservative
+engineering defaults recorded in the report, not a guarantee of physical
+stopping accuracy.
+
+## Manual configuration
 
 Add options to the existing `[accel_homing]` or `[beacon_accel_homing]` section,
 not a second section. These values leave filtering disabled:

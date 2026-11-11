@@ -12,19 +12,19 @@ does not provide a real-time guarantee for Python, USB/CAN or MCU stopping.
 import math
 
 
-def load_filter_module():
+def load_companion_module(short_name):
     """Allow Git-only updates with the older extras symlinks, without sys.path edits."""
     import importlib
     import importlib.util
     from pathlib import Path
     import sys
-    name = ((__package__ + ".") if __package__ else "") + "accel_homing_filter"
+    name = ((__package__ + ".") if __package__ else "") + short_name
     try:
         return importlib.import_module(name)
     except ModuleNotFoundError as exc:
         if exc.name != name:
             raise
-        source = Path(__file__).resolve().with_name("accel_homing_filter.py")
+        source = Path(__file__).resolve().with_name(short_name + ".py")
         if not source.is_file():
             raise
         spec = importlib.util.spec_from_file_location(name, source)
@@ -36,6 +36,10 @@ def load_filter_module():
             sys.modules.pop(name, None)
             raise
         return module
+
+
+def load_filter_module():
+    return load_companion_module("accel_homing_filter")
 
 
 GRAVITY = 9806.65

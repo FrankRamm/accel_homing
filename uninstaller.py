@@ -461,7 +461,8 @@ def validate_installation_history(selected, api):
                 # changed none of the links that set lacks.
                 paths = {Path(change["path"]) for change in manifest["changes"]}
                 for names in (legacy, legacy + (center,), legacy + (center, travel), legacy + (troubleshoot,),
-                              legacy + (center, travel, troubleshoot)):
+                              legacy + (center, travel, troubleshoot),
+                              legacy + (center, travel, troubleshoot, "accel_homing_filter.py")):
                     newer = set(api.MODULES) - set(names)
                     if (set(names) < set(api.MODULES)
                             and not any(extras / name in paths for name in newer)):

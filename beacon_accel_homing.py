@@ -416,6 +416,8 @@ class Attempt:
         self.filter_first_sample = None
         self.filter_last_time = self.filter_tail_error = None
         self.filter_last_clock = None
+        self.first_armed_sample = None
+        self.reference_sampling = None
         self.signal_quality = None
         self.signal_packet = None
         self.reference_signal_quality = None
@@ -1589,6 +1591,12 @@ class BeaconAccelHoming:
                           deadline, beacon_mcu.print_time_to_clock(deadline) & 0xFFFFFFFF,
                           index, map_sign, direction, limit_raw, count_g)
         attempt.vector_mode = vector_mode
+        if vector_mode:
+            attempt.reference_sampling = {
+                "sample_rate_hz": (reference.count - 1) / (reference.last - reference.first),
+                "sample_rate_source": "fresh_reference_timestamps",
+                "reference_sample_count": reference.count,
+                "reference_first_time_s": reference.first, "reference_last_time_s": reference.last}
         self._prepare_notch(attempt, reference)
         reference_quality = self._signal_quality("stationary_reference", count_g)
         for observation in reference._observations:
@@ -2453,6 +2461,9 @@ class BeaconAccelHoming:
             if attempt.gap:
                 self._fire(attempt, "sample_gap", mcu.MCU_trsync.REASON_HOST_REQUEST)
                 return
+            if attempt.first_armed_sample is None:
+                attempt.first_armed_sample = (source_params["start_clock"], source_params["delta_clock"],
+                                              source_skip, source_count)
             if attempt.notch is not None:
                 if not self._filter_packet_valid(attempt, source_params, source_count, source_skip):
                     self._fire(attempt, "filter_rate", mcu.MCU_trsync.REASON_HOST_REQUEST)
@@ -3428,8 +3439,14 @@ class BeaconAccelHoming:
         onset_matches, onset_index = 0, None
         filter_matches, filter_index = 0, None
         first_filtered = None if attempt is None else attempt.filter_first_sample
+        armed_matches, armed_index = 0, None
+        first_armed = None if attempt is None else attempt.first_armed_sample
         for batch_index, (start_clock, delta_clock, data, count_g) in enumerate(batches):
             count = sample_count(data)
+            if first_armed is not None and (start_clock, delta_clock, count) == (
+                    first_armed[0], first_armed[1], first_armed[3]):
+                armed_matches += 1
+                armed_index = len(samples) + first_armed[2]
             if first_filtered is not None and (start_clock, delta_clock, count) == (
                     first_filtered[0], first_filtered[1], first_filtered[3]):
                 filter_matches += 1
@@ -3477,6 +3494,16 @@ class BeaconAccelHoming:
         if detector is not None:
             detector.update(signal)
         filtered = {}
+        auto_replay = None
+        if attempt is not None and attempt.vector_mode and attempt.reference_sampling is not None:
+            auto_replay = dict(attempt.reference_sampling,
+                first_sample_index=armed_index if armed_matches == 1 else None,
+                first_sample_matches=armed_matches, first_sample=first_armed,
+                first_sample_time_s=(samples[armed_index][0] if armed_matches == 1 else None),
+                eligibility_source=("native_sensor_clock" if self.backend is None else "full_precision_source_time"),
+                arm_clock=attempt.arm_clock if self.backend is None else None,
+                initial_state="zero_at_first_armed_sample", baseline_source="armed_detector_reference",
+                complete=bool(armed_matches == 1 and not dropped and not fault))
         if attempt is not None and attempt.notch is not None:
             metadata = self._filter_metadata(attempt)
             metadata.update(first_sample=first_filtered, first_sample_matches=filter_matches,
@@ -3493,6 +3520,7 @@ class BeaconAccelHoming:
             if attempt.filter_tail_error:
                 fault = attempt.filter_tail_error
         return {"samples": samples, "dropped": dropped, "baseline_g": baseline, "fault": fault,
+                "auto_notch_replay": auto_replay,
                 **filtered,
                 **signal, "reference_signal_quality": reference_signal,
                 "detector": detector,

@@ -187,6 +187,15 @@ def preflight_renderer(renderer=None, check_running=None):
     return True
 
 
+def write_notch_auto(directory, run_id, axis, analysis, renderer=None, check_running=None, simulated=False):
+    _identity(run_id, axis)
+    clock = _clock()
+    payload = {"kind": "notch_auto", "axis": axis, "analysis": analysis,
+               "simulated": bool(simulated), **clock}
+    data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
+    return {"png": _publish(directory, "Accel Homing AUTO " + axis.upper(), clock, data, check_running)}
+
+
 def _clock():
     instant = datetime.datetime.now(datetime.timezone.utc)
     local = instant.astimezone()
@@ -1221,6 +1230,8 @@ def _worker_main(source, target, dependency_directory):
             _plot_noise(figure, payload)
         elif kind == "beta":
             _plot_beta(figure, payload)
+        elif kind == "notch_auto":
+            _plot_notch_auto(figure, payload)
         else:
             raise ValueError("Unknown PNG chart render kind")
         canvas.print_png(target, metadata={
@@ -1241,6 +1252,54 @@ def _title(figure, payload, title):
     if payload.get("simulated"):
         title = "SIMULATED / NOT PRINTER MEASUREMENT\n" + title
     figure.suptitle("%s\n%s" % (title, payload["timestamp"]), fontsize=12)
+
+
+def _plot_notch_auto(figure, payload):
+    from matplotlib.ticker import FuncFormatter
+    report = payload["analysis"]
+    plot_data = report.get("plot", {})
+    _title(figure, payload, "AUTO notch %s: %s, fixed threshold %s g" %
+           (payload["axis"].upper(), report.get("decision"), _number(report.get("threshold_g"), 5)))
+    axes = figure.subplots(3, 1)
+    spectra, motion, timing = axes
+    for index, item in enumerate(plot_data.get("spectra", []), 1):
+        label = "Stroke %d (%s)" % (index, item["role"])
+        frequencies = item["frequency_hz"]
+        spectra.semilogy(frequencies, [max(1e-15, v) for v in item["raw_power_g2_hz"]], linewidth=.8,
+                         label=label + " raw")
+        spectra.semilogy(frequencies, [max(1e-15, v) for v in item["filtered_power_g2_hz"]], linewidth=.8,
+                         linestyle="--", label=label + " candidate")
+    frequency = plot_data.get("profile", {}).get("frequency_hz")
+    if _finite(frequency):
+        spectra.axvline(frequency, color="#333333", linestyle=":", label="Candidate %.5g Hz, Q %s" %
+                        (frequency, _number(plot_data["profile"].get("q"), 4)))
+    spectra.set(xlabel="Frequency (Hz)", ylabel="Signed XYZ summed PSD (g²/Hz)", title="Independent commanded cruise")
+    spectra.yaxis.set_major_formatter(FuncFormatter(lambda value, position: "%.0e" % value))
+    spectra.legend(fontsize=6, ncol=2)
+    traces = plot_data.get("traces", [])
+    moving = next((item for item in traces if item.get("kind") == "motion" and item.get("role") == "holdout"), None)
+    if moving:
+        origin = moving["time_s"][0]
+        times = [t - origin for t in moving["time_s"]]
+        motion.plot(times, moving["raw_magnitude_g"], linewidth=.8, label="Held-out moving trace: raw")
+        motion.plot(times, moving["filtered_magnitude_g"], linewidth=.8, label="Held-out moving trace: candidate")
+        if _finite(moving.get("threshold_g")):
+            motion.axhline(moving["threshold_g"], linestyle=":", color="#333333", label="Evaluated candidate threshold")
+    motion.set(xlabel="Time from virtual arm (s)", ylabel="XYZ magnitude (g)", title="Causal state starts at commanded acceleration")
+    motion.legend(fontsize=7)
+    homes = [item for item in traces if item.get("kind") == "home"]
+    for index, item in enumerate(homes, 1):
+        crossing, reference = item.get("filtered_crossing_time_s"), item.get("reference_stop_time_s")
+        if _finite(crossing) and _finite(reference):
+            timing.plot(index, (crossing - reference) * 1000., "o", color="#1769aa" if item["role"] == "train" else "#d17b00")
+        else:
+            timing.annotate("no crossing", (index, 0), rotation=45, fontsize=6)
+    timing.axhline(0., color="#333333", linestyle=":")
+    timing.set(xlabel="Reference home (1–6 train; 7–10 held out)", ylabel="Candidate crossing minus raw stop (ms)")
+    for axis in axes:
+        axis.grid(alpha=.2)
+    _finish_layout(figure, "Candidate replay ends at the original raw trigger. Reference stops are commanded/plausible, not verified contact. "
+                   + str(plot_data.get("description", "")))
 
 
 def _number(value, significant=3):

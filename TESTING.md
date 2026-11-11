@@ -36,6 +36,9 @@ PYTHONPATH=tests python3 -B -m unittest -v \
 # Optional notch response, lifecycle, model identity and upgrade compatibility.
 PYTHONPATH=tests python3 -B -m unittest -v test_notch
 
+# Automatic notch selection, workflow cleanup and native save transactions.
+PYTHONPATH=tests python3 -B -m unittest -v test_auto_notch test_auto_notch_workflow
+
 # Workflow return, cancellation and Beta capture contracts.
 PYTHONPATH=tests python3 -B -m unittest -v \
   test_workflows test_calibration_auto_return test_calibration_limits \
@@ -89,6 +92,17 @@ rate/Nyquist validation, saved-model filter identity and mixed-axis persistence.
 Disabled profiles must retain the existing detector, while filtered diagnostics
 must retain original samples and reproduce the causal decision. These software
 checks do not select a frequency or establish physical impact discrimination.
+
+Automatic selection tests use complete synthetic acquisitions with independent
+central motion and raw reference-stop roles. They cover repeated spectral peaks,
+actual Welch resolution versus notch bandwidth, signed-channel processing,
+startup transients, frozen selection with held-out veto, disabled-control
+acceptance, exact causal replay, and rejection of incomplete or duplicated
+evidence. Reference replay must stop at the original trigger sample. These
+tests establish software behavior, not physical endstop contact or accuracy.
+The AUTO workflow checks also cover report-only restoration without staging,
+fresh qualification at the exact selected threshold, cancellation, isolated
+analysis dependencies, and native saving/rollback with included configuration.
 
 Travel-wizard tests cover negative/positive trigger-versus-halt accounting,
 CoreXY/Cartesian conversion, supervised setup, selected-axis bounded jogs,

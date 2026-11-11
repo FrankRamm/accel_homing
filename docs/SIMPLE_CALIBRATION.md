@@ -239,6 +239,13 @@ the queued move does not measure physical arrival.
 
 ## Saving and ordinary homing
 
+The following saving/margin rules describe ordinary calibration without
+`NOTCH=AUTO`. The dev [automatic-notch mode](NOTCH.md#automatic-selection)
+first measures independent moving noise and unfiltered reference homes, selects
+a fixed filter/threshold, then requires new validation homes. AUTO defaults to
+report-only with no staged configuration and saves exactly the tested threshold
+only with explicit `SAVE_CONFIG=1`; it adds no untested post-validation margin.
+
 A clean cycle has one discovery impact plus ten endstop checks. `SAVE_CONFIG=1` is still
 the default: successful calibration stages the selected axis model, saves it,
 and restarts Klipper. `SAVE_CONFIG=0` only stages it until an explicit save.
