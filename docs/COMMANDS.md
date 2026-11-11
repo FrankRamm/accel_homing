@@ -5,7 +5,7 @@ commands belong in the Linux host shell instead.
 
 ## Prepare every moving workflow
 
-Before CALIBRATE, CALIBRATE_CENTER, TEST, CHARTS, ACCURACY or BETA:
+Before CALIBRATE, CALIBRATE_CENTER, TEST, CHARTS, ACCURACY, TROUBLESHOOT or BETA:
 
 1. Keep the printer idle and unpaused, with no queued motion or other active
    homing workflow.
@@ -34,6 +34,7 @@ for your machine and independent Z support. See the complete
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
 | `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. |
+| `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Per-home diagnostic capture. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 50. Keeps active homing settings; no calibration, save or restart. Preserves available evidence on failure. |
 | `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal for X or Y. Optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0`; rejects `SAVE_CONFIG=1`. |
 | `ACCEL_HOMING_CANCEL` | Cancel owned workflow/pending preparation and restore temporary settings when handled. Not an emergency stop. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Temporary threshold for X or Y; optional compatibility `IMPACT_SIGN` accepts `-1`, `0`, `1`; until restart. |
@@ -102,6 +103,25 @@ command; it does not rerun accuracy automatically.
 
 `SAVE_CONFIG` is not an ACCURACY option: even `SAVE_CONFIG=0` is rejected.
 Read [accuracy and its recovery limits](ACCURACY.md) before running it.
+
+## Per-home diagnostic capture
+
+```gcode
+ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1
+```
+
+This moving diagnostic uses the existing detector, native selected-axis home,
+midpoint return and settle policy. It records discovery plus the requested
+measured homes, including packet timing, trigger/halt positions, return
+coordinates and full retained accelerometer samples. It does not change
+thresholds, speed or acceleration settings, calibrate a new model, save
+configuration or restart. `SAVE_CONFIG` is unsupported.
+
+A rejected home ends this diagnostic instead of starting ACCURACY's automatic
+recovery calibration. Available rejected, cancelled and failed-run evidence is
+retained. Files and graphs are produced after motion cleanup; console and
+STATUS report the bundle paths. Share the complete bundle, not only a PNG.
+See [diagnostic contents and interpretation](TROUBLESHOOT_CAPTURE.md).
 
 ## Stationary noise and charts
 

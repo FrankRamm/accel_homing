@@ -9,9 +9,9 @@ import datetime
 import json
 import math
 
-try:
+if __package__:
     from .accel_homing_center import AXES, CenterCalibration
-except ImportError:
+else:  # Standalone offline analysis; do not mask package dependency errors.
     from accel_homing_center import AXES, CenterCalibration
 
 
@@ -61,7 +61,7 @@ class TravelCalibration(CenterCalibration):
 
     def _settings(self):
         return (dict(self.owner.threshold_g), dict(self.owner.impact_sign),
-                self.owner.homing_accel, self.owner.back_off_dist,
+                self.owner.homing_accel, tuple(sorted(self.owner.back_off_dist.items())),
                 tuple(self.owner.toolhead.get_max_velocity()),
                 {axis: self.workflows._model_context(axis) for axis in self.owner.rails_by_axis
                  if axis in AXES},
@@ -205,7 +205,7 @@ class TravelCalibration(CenterCalibration):
                        center_original_motion=tuple(self.owner.toolhead.get_max_velocity()),
                        center_cleanup_errors=[], center_impact_sign=dict(self.owner.impact_sign),
                        center_touched=set(), center_completed={}, phase="prepare", busy=False)
-        self.owner.back_off_dist = 0.0
+        self.owner.back_off_dist = dict.fromkeys(self.owner.back_off_dist, 0.0)
         self.owner.sensor_fault = None
         self._wait(session, "select")
 

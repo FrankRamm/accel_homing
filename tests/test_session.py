@@ -367,6 +367,15 @@ class StatusTest(unittest.TestCase):
         self.assertIn("without a quiet-range limit", policy)
         self.assertIn("no acceleration-derived motion proof for XYZ magnitude", policy)
 
+    def test_status_reports_per_axis_back_off(self):
+        obj = make_homing(options={"back_off_dist": "5", "y_back_off_dist": "50"})
+        messages = []
+        obj.cmd_STATUS(types.SimpleNamespace(respond_info=messages.append))
+        lines = [message for message in messages if "back-off" in message]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("X 5 mm", lines[0])
+        self.assertIn("Y 50 mm", lines[0])
+
     def test_status_is_a_copy(self):
         obj = make_homing()
         self.assertIsNone(obj.get_status(0.0)["sample_timing_fault"])

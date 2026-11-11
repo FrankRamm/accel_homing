@@ -20,7 +20,7 @@ from unittest import mock
 from harness import CommandError
 from test_center_calibration import NativeState
 from test_travel_calibration import TravelRig
-from test_workflows import Kin, Stepper, Toolhead, workflow_module
+from test_workflows import BACK_OFF, Kin, Stepper, Toolhead, workflow_module
 
 
 # BEGIN pinned upstream homing excerpt (unchanged).
@@ -419,7 +419,7 @@ class TravelNativeIntegrationTests(unittest.TestCase):
         self.assertIsNone(rig.workflow.session)
         self.assertFalse(rig.owner.homing_active)
         self.assertEqual(rig.toolhead.accel, 50000.0)
-        self.assertEqual(rig.owner.back_off_dist, 5.0)
+        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
         self.assertEqual(rig.configfile.set_calls, [])
         self.assertEqual(len(rig.native_moves), 1)
         self.assertEqual(rig.native_events[-1]["event"], "homing:homing_move_end")

@@ -1589,7 +1589,8 @@ class CaptureTest(unittest.TestCase):
 class InvalidNumericOptionsTest(unittest.TestCase):
     def test_nonfinite_core_controls_are_rejected(self):
         for option in ("threshold", "x_threshold", "y_threshold", "homing_accel",
-                       "back_off_dist", "baseline_time", "stream_timeout",
+                       "back_off_dist", "x_back_off_dist", "y_back_off_dist",
+                       "baseline_time", "stream_timeout",
                        "travel_margin", "watchdog_margin"):
             with self.subTest(option=option):
                 with self.assertRaises(ConfigError):

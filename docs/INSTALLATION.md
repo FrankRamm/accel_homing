@@ -41,10 +41,18 @@ an existing directory is unnecessary; use the update procedure below.
 
 The travel wizard adds `accel_homing_travel.py`. Existing installations must
 rerun `~/accel_homing/install.sh --branch dev` after updating their dev checkout
-to create the new extras link, then follow the installer's restart instructions.
-A source-only update without that link keeps existing workflows available;
-`ACCEL_HOMING_TRAVEL` reports the missing installation step. The installer and
-rollback/uninstaller recognize the earlier six- and seven-module installations.
+to create the new extras links, then follow the installer's restart instructions.
+A dev installation updated from `main` needs the center, travel and
+troubleshooting links (`accel_homing_center.py`, `accel_homing_travel.py`,
+`accel_homing_troubleshoot.py`) that its earlier installation lacks.
+A source-only update without these links keeps existing workflows available;
+`ACCEL_HOMING_TRAVEL` reports the missing installation step. Center
+calibration (`accel_homing_center.py`) behaves the same way: without its link,
+`ACCEL_HOMING_CALIBRATE_CENTER` and `ACCEL_HOMING_TRAVEL` report the missing
+installation step and ordinary homing still loads. The installer and
+rollback/uninstaller recognize the earlier six-module installations, the
+seven- and eight-module `dev` installations and the seven-module `main`
+installations with the troubleshooting link.
 
 The managed source must be the complete clean `~/accel_homing` Git checkout
 of `main` or `dev`, with exact origin
@@ -99,8 +107,23 @@ pins. A dependency/preflight failure stops before printer configuration writes.
 Default installation/update restarts the exact verified Klipper systemd service
 and activates the correlated Moonraker service when required. It verifies the
 selected unit/process identity and rechecks idle state before activation. It
-may ask for your Linux sudo password before writing files. A process restart
+may ask for your Linux sudo password before writing files when a controlling
+terminal is available. A process restart
 does not itself establish that the printer reached Ready or that homing works.
+
+Restart authorization accepts validated sudo credentials or an explicit
+`NOPASSWD` rule for the exact command executed as root:
+`/absolute/path/to/systemctl --system --no-ask-password restart -- SERVICE`.
+Permission to list commands or run an unrelated command does not establish
+permission for this restart. Authorization is checked again before writing and
+activation; the restart itself always uses noninteractive sudo.
+
+For sudo older than 1.9.15, passwordless detection supports local `sudoers`
+rules with literal commands or `ALL`, including an exact `NOPASSWD` rule after
+a general password-required rule. Complex patterns, bound defaults, ambiguous
+selectors or other policy sources require validated credentials or
+`--no-restart`. A noninteractive SSH session never opens a password prompt;
+if authorization cannot be verified, the installer stops before file writes.
 
 For a process manager the installer cannot verify, or to defer activation:
 
@@ -215,6 +238,12 @@ see the [official Git-repo configuration](https://moonraker.readthedocs.io/en/la
 The installer sets `primary_branch` to its checked-out `main` or `dev` branch.
 Use `primary_branch: main` for a manual `main` registration. Both branches remain
 experimental.
+
+The troubleshooting command loads its optional module from the installed
+package or the same resolved source checkout. Existing installations without
+its module link therefore support Git-only updates adding this diagnostic. A
+missing or broken diagnostic module produces an error only when that command
+is invoked; it does not prevent ordinary plugin startup.
 
 For a manual update of an established clean checkout on its current branch:
 

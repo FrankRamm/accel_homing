@@ -473,7 +473,7 @@ class CenterCalibration:
                 kin.limits[AXES[axis]] = (1.0, -1.0)
             self.owner.threshold_g.update(session["saved_thresholds"])
             self.owner.impact_sign.update(session["center_impact_sign"])
-            self.owner.back_off_dist = session["saved_back_off"]
+            self.owner.back_off_dist = dict(session["saved_back_off"])
             self.workflows.in_home, self.workflows.home_axis = False, None
         if errors:
             raise self._error("; ".join(errors))
@@ -507,7 +507,7 @@ class CenterCalibration:
                        center_cleanup_errors=[],
                        center_impact_sign=dict(self.owner.impact_sign), center_touched=set(),
                        center_completed={axis: 0 for axis in axes}, phase="preflight")
-        self.owner.back_off_dist = 0.0
+        self.owner.back_off_dist = dict.fromkeys(self.owner.back_off_dist, 0.0)
         self.owner.sensor_fault = None
         results, operation_error, cleanup_error = {}, None, None
         result = {"result": "aborted", "mode": "center", "run_id": session["run_id"],

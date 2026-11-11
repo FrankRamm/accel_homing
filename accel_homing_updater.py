@@ -787,7 +787,7 @@ def activate(plan, selected, restart, api, backup):
                 state["data"] = base64.b64encode(state["data"]).decode()
             if not api.state_matches(destination, state):
                 _fail(api, "installed updater files changed before activation")
-        result = api.service_command([restart["sudo"], "-n", "--"] + restart["service_command"], timeout=60)
+        result = api.service_command([restart["sudo"], "-n", "-u", "root", "--"] + restart["service_command"], timeout=60)
         if result.returncode:
             _fail(api, "Moonraker restart command failed: %s" % result.stderr.strip())
         deadline = time.monotonic() + 15.0

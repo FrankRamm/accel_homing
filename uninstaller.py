@@ -348,7 +348,7 @@ def _config_paths(main, states, api):
             matches = {Path(p).resolve() for p in glob.glob(pattern)}
             matches.update(p for p in states if p.match(pattern))
             matches = sorted(p for p in matches if states.get(p, {}).get("kind") != "absent")
-            if not matches:
+            if not matches and not glob.has_magic(pattern):
                 _fail(api, "Missing include context for %s: %s" % (path, pattern))
             for match in matches:
                 visit(match)
@@ -455,13 +455,16 @@ def validate_installation_history(selected, api):
                 legacy = ("accel_homing.py", "beacon_accel_homing.py", "accel_homing_backends.py",
                           "accel_homing_workflows.py", "accel_homing_model.py", "accel_homing_charts.py")
                 travel = "accel_homing_travel.py"
-                if tuple(api.MODULES) in (legacy + (center,), legacy + (center, travel)):
-                    paths = {Path(change["path"]) for change in manifest["changes"]}
-                    if extras / travel not in paths:
-                        if travel in api.MODULES:
-                            module_sets.append(legacy + (center,))
-                        if extras / center not in paths:
-                            module_sets.append(legacy)
+                troubleshoot = "accel_homing_troubleshoot.py"
+                # Released module sets: legacy, dev center, dev travel and main
+                # troubleshooting. An older set applies only when this journal
+                # changed none of the links that set lacks.
+                paths = {Path(change["path"]) for change in manifest["changes"]}
+                for names in (legacy, legacy + (center,), legacy + (center, travel), legacy + (troubleshoot,)):
+                    newer = set(api.MODULES) - set(names)
+                    if (set(names) < set(api.MODULES)
+                            and not any(extras / name in paths for name in newer)):
+                        module_sets.append(names)
                 expected = set()
                 for names in module_sets:
                     missing = ["klippy/extras/" + name for name in names
