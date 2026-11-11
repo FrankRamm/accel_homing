@@ -2273,7 +2273,7 @@ class AccelHomingWorkflows:
             self._beta_check(session)
             if plan["current_helper"] is not None:
                 current_attempted = True
-                plan["current_helper"]([index], True)
+                plan["current_helper"]([session["axis"]], True)
                 self._beta_check(session)
             toolhead.wait_moves()
             self._beta_check(session)
@@ -2366,7 +2366,7 @@ class AccelHomingWorkflows:
             try:
                 if current_attempted:
                     try:
-                        plan["current_helper"]([index], False)
+                        plan["current_helper"]([session["axis"]], False)
                         restore["central_driver_current_restored"] = True
                     except Exception as exc:
                         cleanup_errors.append("homing current: %s" % exc)

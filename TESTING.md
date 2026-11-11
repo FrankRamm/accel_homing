@@ -18,6 +18,38 @@ installer against a real printer merely to satisfy an offline test.
 
 ## Focused checks
 
+Select a group by behavior while developing. With `PYTHONPATH=tests`, unittest
+loads only the named test modules; their fixture imports do not run the other
+modules' test cases. These POSIX shell commands also work in WSL:
+
+```bash
+# Sensor motion proof, sample timing and stream guards.
+PYTHONPATH=tests python3 -B -m unittest -v \
+  test_backends test_motion_policy test_sample_age70 test_sample_age_removal \
+  test_warmup_timing test_trigger
+
+# Workflow return, cancellation and Beta capture/current contracts.
+PYTHONPATH=tests python3 -B -m unittest -v \
+  test_workflows test_calibration_auto_return test_calibration_limits \
+  test_beta_calibration test_beta_capture_charts
+
+# Installation/update transactions in disposable local directories.
+PYTHONPATH=tests python3 -B -m unittest -v \
+  test_installer test_updater test_bootstrap_short
+```
+
+Use the full discovery command above before reporting the integrated result.
+Keep stdout, stderr and exit status together when redirecting a run. For example:
+
+```bash
+python3 -B -m unittest discover -s tests -v > tests.log 2>&1
+test_status=$?
+cat tests.log
+exit "$test_status"
+```
+
+Individual-file commands remain useful for a narrower change:
+
 ```bash
 python3 -B -m unittest discover -s tests -p 'test_installer.py' -v
 python3 -B -m unittest discover -s tests -p 'test_updater.py' -v
@@ -45,6 +77,22 @@ For a reproducible report, retain the exact commit, command/working directory,
 Python/platform/dependency versions, exit status, full test output and any
 failures/skips. Grammar parsing, compilation, imports, real PNG rendering and a
 full suite run establish different things; identify which were actually done.
+
+Synthetic fixtures must provide the same inputs as their native counterparts:
+baseline-noise policy tests select their original 20 ms / 3 mm startup settings
+explicitly; Beta moving captures provide at least 50 changing samples; native
+homing retains its session context through cancellation; direct accuracy-return
+checks provide the home-start and generation context; and fake `manual_move`
+accepts XY-only coordinates. Stock homing errors model `motor_off`, including Z
+invalidation, while failed plugin returns preserve Z. These fixture corrections
+retain the original assertions where the modeled native behavior is unchanged.
+Current-default startup coverage remains in `test_motion_policy.py`.
+
+Beta native-current checks require lowercase axis letters for both activation
+and restoration, including partial activation and failed cleanup. The real
+absolute-renderer check requires all four JSON result groups before checking
+axis limits; a successful subprocess with truncated results cannot silently
+skip a plot kind.
 
 ## Current behavior to verify
 

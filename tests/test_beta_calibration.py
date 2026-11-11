@@ -117,6 +117,33 @@ class BetaRig(Rig):
         with self.beta_helpers():
             return self.workflow.cmd_BETA_CALIBRATE(GCmd(AXIS=axis, CENTERED=1, **params))
 
+    @contextlib.contextmanager
+    def native_current(self, activate_fails=False, restore_fails=False):
+        calls = []
+
+        class NativeHoming:
+            def __init__(self, printer):
+                self.toolhead = printer.toolhead
+
+            def _set_homing_current(self, axes, pre_homing):
+                # Native Kalico delegates axis names to the active-rail API.
+                for axis in axes:
+                    self.toolhead.get_active_rails_for_axis(axis)
+                calls.append((list(axes), pre_homing))
+                if pre_homing and activate_fails:
+                    raise CommandError("primary current activation failure")
+                if not pre_homing and restore_fails:
+                    raise CommandError("secondary current restoration failure")
+
+        def active_rails(axis):
+            if axis not in ("x", "y", "z"):
+                raise TypeError("native current helper requires axis letters")
+            return {axis}
+
+        with mock.patch.object(self.toolhead, "get_active_rails_for_axis", active_rails, create=True), \
+                mock.patch.dict(workflow_module._PRINTER_G28.__globals__, {"Homing": NativeHoming}):
+            yield calls
+
 
 class BetaCalibrationTests(unittest.TestCase):
     def test_more_than_one_hundred_homes_keep_final_qualification_and_bounded_report_history(self):
@@ -195,7 +222,9 @@ class BetaCalibrationTests(unittest.TestCase):
                 rig = BetaRig()
                 rig.lines["stepper_x"].enabled = rig.lines["stepper_y"].enabled = False
                 initial, acceleration = rig.toolhead.get_position(), rig.toolhead.accel
-                rig.beta(axis)
+                with rig.native_current() as current_calls:
+                    rig.beta(axis)
+                self.assertEqual(current_calls, [([axis.lower()], True), ([axis.lower()], False)])
                 result = rig.workflow.last_result
                 self.assertEqual(result["result"], "beta_proposed")
                 self.assertEqual(result["proposed_threshold_g"], 1.25)
@@ -218,6 +247,7 @@ class BetaCalibrationTests(unittest.TestCase):
                 self.assertEqual(len(diagnostics["motions"]), 3)
                 self.assertEqual(len(diagnostics["trials"]), 11)
                 self.assertTrue(diagnostics["restoration"]["thresholds_restored"])
+                self.assertTrue(diagnostics["restoration"]["central_driver_current_restored"])
                 self.assertIn(("export", True), rig.beta_events)
                 self.assertIsNone(rig.workflow.session)
                 lines = [line.split("Beta diagnostic ", 1)[1] for line in rig.output if "Beta diagnostic " in line]
@@ -355,31 +385,21 @@ class BetaCalibrationTests(unittest.TestCase):
                 self.assertIsNone(rig.workflow.session)
 
     def test_native_current_partial_activation_is_restored_even_when_cleanup_also_fails(self):
-        for restore_fails in (False, True):
-            with self.subTest(restore_fails=restore_fails):
-                rig = BetaRig()
-                calls = []
-                class NativeHoming:
-                    def __init__(self, printer):
-                        pass
-                    def _set_homing_current(self, axes, pre_homing):
-                        calls.append((list(axes), pre_homing))
-                        if pre_homing:
-                            raise CommandError("primary current activation failure")
-                        if restore_fails:
-                            raise CommandError("secondary current restoration failure")
-                rig.toolhead.get_active_rails_for_axis = lambda axis: set()
-                with mock.patch.dict(workflow_module._PRINTER_G28.__globals__, {"Homing": NativeHoming}), \
-                        self.assertRaisesRegex(CommandError, "primary current activation failure"):
-                    rig.beta()
-                self.assertEqual(calls, [([0], True), ([0], False)])
-                self.assertEqual(rig.toolhead.moves, [])
-                self.assertEqual(rig.toolhead.accel, 50000.)
-                self.assertIn("primary current activation failure", rig.workflow.last_result["reason"])
-                restoration = rig.workflow.last_result["beta_diagnostics"]["restoration"]
-                self.assertEqual(restoration["central_driver_current_restored"], not restore_fails)
-                if restore_fails:
-                    self.assertIn("secondary current restoration failure", str(restoration["cleanup_errors"]))
+        for axis in "XY":
+            for restore_fails in (False, True):
+                with self.subTest(axis=axis, restore_fails=restore_fails):
+                    rig = BetaRig()
+                    with rig.native_current(activate_fails=True, restore_fails=restore_fails) as calls, \
+                            self.assertRaisesRegex(CommandError, "primary current activation failure"):
+                        rig.beta(axis)
+                    self.assertEqual(calls, [([axis.lower()], True), ([axis.lower()], False)])
+                    self.assertEqual(rig.toolhead.moves, [])
+                    self.assertEqual(rig.toolhead.accel, 50000.)
+                    self.assertIn("primary current activation failure", rig.workflow.last_result["reason"])
+                    restoration = rig.workflow.last_result["beta_diagnostics"]["restoration"]
+                    self.assertEqual(restoration["central_driver_current_restored"], not restore_fails)
+                    if restore_fails:
+                        self.assertIn("secondary current restoration failure", str(restoration["cleanup_errors"]))
 
     def test_changed_homing_current_without_native_helper_fails_before_motion(self):
         rig = BetaRig()

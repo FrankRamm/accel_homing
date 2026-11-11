@@ -198,22 +198,22 @@ class BetaRawCaptureTests(unittest.TestCase):
         with mock.patch.object(obj, "collect_noise_window", side_effect=baseline):
             token = obj.start_beta_motion_capture(lambda: None)
         expected_baseline = token["baseline_g"]
-        obj.reactor.now = 2.005
-        obj._inspect(batch(2001, [(counts(.2), 0, counts(1.)), (counts(.4), 0, counts(1.)),
-                                (counts(.2), 0, counts(1.)), (counts(.4), 0, counts(1.)),
-                                (counts(.2), 0, counts(1.))], delta_clock=4))
-        token["motion_end_time_s"] = 2.010
+        # Supply the 50-sample minimum across two distinct receipts; the
+        # second still arrives only while stop waits for the motion end.
+        rows = [(counts(.4 if index % 2 else .2), 0, counts(1.)) for index in range(25)]
+        obj.reactor.now = 2.025
+        obj._inspect(batch(2001, rows, delta_clock=24))
+        token["motion_end_time_s"] = 2.050
 
         def tail():
-            obj._inspect(batch(2006, [(counts(.2), 0, counts(1.)), (counts(.4), 0, counts(1.)),
-                                    (counts(.2), 0, counts(1.)), (counts(.4), 0, counts(1.)),
-                                    (counts(.2), 0, counts(1.))], delta_clock=4))
+            obj.reactor.now = 2.050
+            obj._inspect(batch(2026, rows, delta_clock=24))
 
         obj.reactor.on_pause = tail
         captured = obj.stop_beta_motion_capture(token, lambda: None)
-        self.assertGreaterEqual(captured["last_sample_time_s"], 2.010)
+        self.assertGreaterEqual(captured["last_sample_time_s"], 2.050)
         self.assertEqual(captured["baseline_g"], expected_baseline)
-        self.assertEqual(len(captured["samples"]), 10)
+        self.assertEqual(len(captured["samples"]), 50)
         self.assertIsNone(obj.noise_session)
         self.assertIsNone(obj.beta_motion_capture)
         self.assertIsNone(obj.capture_batches)

@@ -364,8 +364,11 @@ class Toolhead:
 
     def manual_move(self, coords, speed):
         self.moves.append((list(coords), speed))
-        delta = [(value - self.position[i]) if value is not None else 0.0
-                 for i, value in enumerate(coords)]
+        # Stock manual_move also accepts XY-only coordinates (safe_z_home).
+        delta = [0.0] * len(self.position)
+        for i, value in enumerate(coords):
+            if value is not None:
+                delta[i] = value - self.position[i]
         for stepper in self.kin.steppers:
             displacement = ((delta[0] + delta[1] if stepper.name == "stepper_x" else delta[0] - delta[1])
                             if stepper.axes == "xy" else delta["xyz".index(stepper.axes)])
@@ -600,6 +603,7 @@ class Rig:
         for callback in self.handlers["homing:home_rails_begin"]:
             callback(axis)
         self.workflow.check_home_axes({axis: self.owner.rails_by_axis[axis]})
+        session = self.workflow.session
         self.home_calls.append({"axis": axis, "threshold": self.owner.threshold_g[axis],
                                 "homed_axes": self.toolhead.kin.get_status(0)["homed_axes"],
                                 "position": list(self.toolhead.position),
@@ -616,11 +620,14 @@ class Rig:
                   "onset_g": 4.0, "impact_peak_g": 7.0, "moving": True,
                   "threshold_g": self.owner.threshold_g[axis], "arm_time_s": self.capture_stops + 0.001,
                   "onset_time_s": self.capture_stops + 0.002, "direction": -1}
-        if self.workflow.session.get("mode") == "calibration":
+        # A reactor callback may finish the workflow during native homing.
+        # Retain this home's context; production _home checks cancellation
+        # after the native call and performs its cleanup.
+        if session.get("mode") == "calibration":
             record["impact_metric"] = "xyz_magnitude"
         record.update(result)
         value = record.get("travel_mm_exact", record.get("travel_mm"))
-        if (self.workflow.session.get("mode") == "calibration"
+        if (session.get("mode") == "calibration"
                 and type(value) in (int, float) and math.isfinite(value) and value >= 0
                 and (value <= 20 or value < expected * (1. - self.workflow.travel_tolerance))):
             record.setdefault("travel_mm_exact", value)
@@ -1551,6 +1558,14 @@ class CalibrationRecenterTests(unittest.TestCase):
                       "impact_metric": "xyz_magnitude"}
             rig.owner.last[axis] = record
             rig.workflow.session["terminal_home"] = (axis, record, record)
+        elif mode == "accuracy":
+            # _home normally records these before native homing. This test
+            # calls _recenter directly to isolate return acceleration/settle.
+            rig.workflow.session.update(
+                accuracy_home_start=rig.workflow._accuracy_position_reference(),
+                accuracy_started_centered=True,
+                accuracy_generation=rig.owner.operation_generation,
+                accuracy_preflight_generation=rig.workflow.preflight_generation)
         return rig
 
     def test_calibration_and_accuracy_return_with_same_normal_acceleration_and_settle(self):
