@@ -18,6 +18,43 @@ installer against a real printer merely to satisfy an offline test.
 
 ## Focused checks
 
+Select a group by behavior while developing. With `PYTHONPATH=tests`, unittest
+loads only the named test modules; their fixture imports do not run the other
+modules' test cases. These POSIX shell commands also work in WSL:
+
+```bash
+# Per-axis release and interactive center/travel behavior.
+PYTHONPATH=tests python3 -B -m unittest -v \
+  test_back_off_per_axis test_center_calibration \
+  test_travel_calibration test_travel_native_integration
+
+# Sensor motion proof, sample timing and stream guards.
+PYTHONPATH=tests python3 -B -m unittest -v \
+  test_backends test_motion_policy test_sample_age70 test_sample_age_removal \
+  test_warmup_timing test_trigger
+
+# Workflow return, cancellation and Beta capture contracts.
+PYTHONPATH=tests python3 -B -m unittest -v \
+  test_workflows test_calibration_auto_return test_calibration_limits \
+  test_beta_capture_charts
+
+# Installation/update transactions in disposable local directories.
+PYTHONPATH=tests python3 -B -m unittest -v \
+  test_installer test_updater test_dev_installation test_bootstrap_short
+```
+
+Use the full discovery command above before reporting the integrated result.
+Keep stdout, stderr and exit status together when redirecting a run. For example:
+
+```bash
+python3 -B -m unittest discover -s tests -v > tests.log 2>&1
+test_status=$?
+cat tests.log
+exit "$test_status"
+```
+
+Individual-file commands remain useful for a narrower change:
+
 ```bash
 python3 -B -m unittest discover -s tests -p 'test_installer.py' -v
 python3 -B -m unittest discover -s tests -p 'test_travel*.py' -v
@@ -54,6 +91,26 @@ For a reproducible report, retain the exact commit, command/working directory,
 Python/platform/dependency versions, exit status, full test output and any
 failures/skips. Grammar parsing, compilation, imports, real PNG rendering and a
 full suite run establish different things; identify which were actually done.
+
+The 2026-11-10 baseline at `872ac70d7ed138d7386271355c9f331dc8901a2f`
+discovered 1,098 test cases: 1,098 unique test IDs and 1,098 unique test method
+definitions, with no repeated imported or inherited cases. Its 18 reported
+failure/error records came from eight methods (subtests are reported separately):
+
+| Records | Cause in the synthetic tests | Correction |
+| --- | --- | --- |
+| 6 | Baseline-noise fixtures assumed the former 20 ms / 3 mm startup settings while using the current 70 ms / opt-in-limit defaults. | Select the original policy explicitly; retain the original time/travel assertions. Current-default coverage remains in `test_motion_policy.py`. |
+| 1 | Beta moving-capture success fixture supplied 10 samples; the existing minimum is 50. | Supply 50 changing samples over two receipts and retain the end-time, offset and cleanup checks. |
+| 3 | Fake native homing dereferenced a cleared workflow session after cancellation/disconnect/shutdown. | Retain that home's session context so production cancellation and cleanup can complete. |
+| 6 | Direct recenter fixtures omitted the accuracy metadata normally recorded by `_home`. | Provide the home-start and generation context; retain acceleration, movement and settle assertions. |
+| 1 | Fake `manual_move` indexed Z after receiving only XY coordinates from safe-Z homing. | Treat omitted coordinates as unchanged, as the native call does. |
+| 1 | A stock homing error was expected to preserve Z despite the fixture modeling stock `motor_off`. | Assert all motors disabled/unhomed for the stock error, and Z preserved for a failed plugin return. |
+
+These corrections do not remove test methods or change runtime behavior. The
+baseline count is a dated inventory, not a target for future suites. The real
+absolute-renderer check also requires all four JSON result groups before
+checking axis limits; a successful subprocess with truncated results cannot
+silently skip a plot kind.
 
 ## Current behavior to verify
 

@@ -155,12 +155,27 @@ retaining original calibration provenance; this does not rerun or requalify
 threshold calibration. Existing manual thresholds retain precedence.
 
 Before saving, the wizard rejects unrelated pending `SAVE_CONFIG` settings,
-changed source/resolved-include/autosave contents, and selected coordinate or
-model keys that native SAVE_CONFIG cannot replace in included files. Move
-conflicting keys into the main config and restart the wizard, or use report-only
-output to edit configuration manually. Staging errors restore the previous
-in-memory autosave state; a native disk-write error is reported as persistence
-unconfirmed, never as a successful save.
+changed main/include/autosave contents, and changed include symlink targets.
+Native parsing resolves nested and wildcard includes in their configured order.
+When selected coordinate or model-metadata keys occur in included files, the
+explicit save comments every selected duplicate in those files and writes the
+accepted values to the main native `SAVE_CONFIG` block. Other settings,
+comments and include ordering are retained. This does
+not enable Kalico's global `autosave_includes` setting.
+
+Before any include edit, original main/include bytes are backed up in a hidden
+`.accel-homing-save-*` directory beside the main config, with a manifest mapping
+backup files to their original paths. The result reports this directory and the
+modified include files. Native `SAVE_CONFIG` also creates its usual main-config
+backup. Included symlinks are preserved; automatic include migration refuses a
+symlinked main config or hard-linked target files.
+
+Staging errors restore previous pending settings. A reported native save failure
+also attempts to restore the original files, without overwriting an unrecognized
+concurrent edit. Recovery failures are reported as persistence unconfirmed, with
+details and retained backups. Individual replacements are atomic; the entire
+multi-file save is not atomic across a power loss or process crash. Inspect the
+reported backup directory if an interrupted save leaves configuration incomplete.
 
 `ACTION=DONE` closes the wizard without writing or staging configuration.
 After any finish/abort, measured axes require normal homing. Inspect the

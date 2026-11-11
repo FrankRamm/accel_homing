@@ -169,18 +169,6 @@ class TravelCalibration(CenterCalibration):
                 buttons.insert(0, ("Center %s; select %s" % (axis.upper(), other.upper()), base + "NEXT"))
             self._prompt(session, "Review travel coordinates", lines, buttons)
 
-    def _configuration_state(self):
-        config = self.workflows.printer.lookup_object("configfile")
-        try:
-            filename = self.workflows.printer.get_start_args()["config_file"]
-            source = config._read_config_file(filename)
-            regular, _ = config._find_autosave_data(source)
-            resolved = config._build_config_wrapper(regular, filename).fileconfig
-            return (source, self._parser_values(resolved), self._parser_values(config.autosave.fileconfig),
-                    copy.deepcopy(config.status_save_pending), config.save_config_pending)
-        except (AttributeError, KeyError):
-            return None
-
     def _start(self, gcmd):
         w = self.workflows
         if w.session is not None:

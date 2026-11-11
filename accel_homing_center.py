@@ -4,7 +4,10 @@ import copy
 import datetime
 import json
 import math
+import os
 import statistics
+import sys
+import tempfile
 import types
 
 
@@ -14,6 +17,198 @@ REPEATABILITY_MM = 2.0
 MIN_INITIAL_TRAVEL_MM = 20.0
 DEFAULT_SEARCH_MARGIN_MM = 20.0
 POLARITY_POLICY = "absolute_after_reference_subtraction_v1"
+
+
+class _NativeConfigAccess:
+    """Keep native parsing/save behavior across the two configfile APIs."""
+    def __init__(self, configfile):
+        self.configfile = configfile
+        self.modern = not callable(getattr(type(configfile), "cmd_SAVE_CONFIG", None))
+        if self.modern:
+            self.save_owner = configfile.autosave
+            module = sys.modules[type(configfile).__module__]
+            self.reader = module.ConfigFileReader()
+            self.read_name = "read_config_file"
+        else:
+            self.save_owner = configfile
+            self.reader = configfile
+            self.read_name = "_read_config_file"
+        for name in ("status_save_pending", "save_config_pending", "_find_autosave_data",
+                     "_strip_duplicates", "cmd_SAVE_CONFIG"):
+            getattr(self.save_owner, name)
+        self.native_save = types.MethodType(type(self.save_owner).cmd_SAVE_CONFIG, self.save_owner)
+
+    @property
+    def parser(self):
+        return self.configfile.autosave.fileconfig
+
+    def strip(self, data, parser):
+        config = parser if self.modern else types.SimpleNamespace(fileconfig=parser)
+        return self.save_owner._strip_duplicates(data, config)
+
+    def save_source(self, source):
+        """Expected native main-file text, used only to recognize rollback input."""
+        module = sys.modules[type(self.save_owner).__module__]
+        header = module.AUTOSAVE_HEADER
+        if self.modern:
+            autosave = self.reader.build_config_string(self.parser)
+        else:
+            autosave = self.save_owner._build_config_string(self.configfile.autosave)
+        lines = [("#*# " + line).strip() for line in autosave.split("\n")]
+        lines.insert(0, "\n" + header.rstrip())
+        lines.append("")
+        regular, _ = self.save_owner._find_autosave_data(source)
+        return self.strip(regular, self.parser).rstrip() + "\n".join(lines)
+
+    def graph(self, filename, source=None, replacements=None):
+        # Clone the reader: never patch the live firmware's include callbacks.
+        # The native reader owns glob ordering, nested/repeated includes and
+        # section overrides. Record every input, including comment-only edits.
+        read = getattr(self.reader, self.read_name)
+        if source is None:
+            source = read(filename)
+        files = {os.path.abspath(filename): source}
+        reader = copy.copy(self.reader)
+
+        def capture(path):
+            path = os.path.abspath(path)
+            data = read(path)
+            if path in files and files[path] != data:
+                raise ValueError("configuration changed while reading %s" % path)
+            files[path] = data
+            return replacements.get(path, data) if replacements is not None else data
+
+        setattr(reader, self.read_name, capture)
+        regular, _ = self.save_owner._find_autosave_data(source)
+        if self.modern:
+            resolved = reader.build_fileconfig_with_includes(regular, filename)
+        else:
+            resolved = reader._build_config_wrapper(regular, filename).fileconfig
+        return source, files, resolved
+
+    def include_edits(self, filename, source, files, parser, keys):
+        selected = copy.deepcopy(parser)
+        for section in selected.sections():
+            for option in selected.options(section):
+                if (section, option) not in keys:
+                    selected.remove_option(section, option)
+        main = os.path.abspath(filename)
+        replacements = {path: self.strip(data, selected) for path, data in files.items() if path != main}
+        replacements = {path: data for path, data in replacements.items() if data != files[path]}
+        regular, _ = self.save_owner._find_autosave_data(source)
+        _, checked_files, resolved = self.graph(filename, self.strip(regular, parser), replacements)
+        if (set(checked_files) != set(files)
+                or any(checked_files.get(path) != data for path, data in files.items() if path != main)):
+            raise ValueError("included configuration changed during save preflight")
+        conflicts = [(section, option) for section in parser.sections() for option in parser.options(section)
+                     if resolved.has_option(section, option)]
+        if conflicts:
+            raise ValueError("cannot safely replace included options: %s" % ", ".join(
+                "[%s] %s" % key for key in conflicts))
+        return replacements
+
+
+def _atomic_config_write(path, data, mode):
+    # Resolve symlinks before calling this function so their targets are updated
+    # without replacing the links. Hidden temporary files cannot match *.cfg.
+    fd, temporary = tempfile.mkstemp(prefix=".accel-homing-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class _IncludeSaveTransaction:
+    """Back up include migration and restore it after a reported save failure.
+
+    Each replacement is atomic. This is not a multi-file/power-loss transaction;
+    the persistent backups remain available for manual recovery in that case.
+    """
+    def __init__(self, snapshot, replacements):
+        self.originals, self.replacements, self.written = {}, {}, []
+        self.bindings = {}
+        self.main = os.path.realpath(snapshot["filename"])
+        self.backup_dir = None
+        if not replacements:
+            return
+        if os.path.islink(snapshot["filename"]):
+            raise ValueError("include migration requires a regular main config file; use report-only")
+        access = snapshot["access"]
+        for filename in [snapshot["filename"]] + list(replacements):
+            path = os.path.realpath(filename)
+            if path != snapshot["paths"][os.path.abspath(filename)]:
+                raise ValueError("configuration symlink changed before saving %s" % filename)
+            stat = os.stat(path)
+            if stat.st_nlink != 1:
+                raise ValueError("cannot safely replace hard-linked config file %s" % filename)
+            with open(path, "rb") as stream:
+                original = stream.read()
+            # Match the firmware's default text encoding and universal-newline
+            # read while preserving original bytes for backups and rollback.
+            with open(path, "r", newline="") as stream:
+                raw = stream.read()
+                encoding = stream.encoding
+            if raw.replace("\r\n", "\n").replace("\r", "\n") != snapshot["files"][os.path.abspath(filename)]:
+                raise ValueError("configuration changed before saving %s" % filename)
+            self.originals[path] = (original, stat.st_mode)
+            self.bindings[filename] = path
+            if path == self.main:
+                self.expected_main = access.save_source(snapshot["source"]).replace("\n", os.linesep).encode(encoding)
+            if filename in replacements:
+                # Comment the original text, retaining CRLF and all unrelated
+                # lines. Never rewrite/normalize the entire included config.
+                edited = access.strip(raw, snapshot["selected_parser"])
+                self.replacements[path] = edited.encode(encoding)
+        # A hidden directory is omitted by native glob expansion, including
+        # recursive ** patterns. Keep backups on the same filesystem.
+        self.backup_dir = tempfile.mkdtemp(prefix=".accel-homing-save-", dir=os.path.dirname(self.main))
+        for number, (path, (data, mode)) in enumerate(self.originals.items()):
+            backup = os.path.join(self.backup_dir, "%03d.bak" % number)
+            _atomic_config_write(backup, data, mode)
+        with open(os.path.join(self.backup_dir, "manifest.json"), "w") as stream:
+            json.dump({"files": list(self.originals), "main_config": self.main}, stream, indent=2)
+
+    def apply(self):
+        for filename, path in self.bindings.items():
+            if os.path.realpath(filename) != path:
+                raise ValueError("configuration symlink changed before saving %s" % filename)
+            with open(path, "rb") as stream:
+                if stream.read() != self.originals[path][0]:
+                    raise ValueError("configuration changed before saving %s" % path)
+        for path, data in self.replacements.items():
+            with open(path, "rb") as stream:
+                if stream.read() != self.originals[path][0]:
+                    raise ValueError("included configuration changed before writing %s" % path)
+            _atomic_config_write(path, data, self.originals[path][1])
+            self.written.append(path)
+
+    def rollback(self, native_started):
+        errors = []
+        paths = ([self.main] if native_started and self.originals else []) + list(reversed(self.written))
+        for path in paths:
+            try:
+                if any(os.path.realpath(filename) != original_path for filename, original_path in self.bindings.items()
+                       if original_path == path):
+                    raise ValueError("configuration symlink changed during save")
+                if os.path.exists(path):
+                    with open(path, "rb") as stream:
+                        current = stream.read()
+                    expected = self.expected_main if path == self.main else self.replacements[path]
+                    if current not in (expected, self.originals[path][0]):
+                        raise ValueError("file was changed by another writer")
+                elif path != self.main:
+                    raise ValueError("included file was removed by another writer")
+                original, mode = self.originals[path]
+                _atomic_config_write(path, original, mode)
+            except Exception as exc:
+                errors.append("%s: %s" % (path, exc))
+        return errors
 
 
 def _statistics(values):
@@ -177,7 +372,7 @@ class CenterCalibration:
                 raise self._error("homing preparation did not remain active")
             if plan["current_helper"] is not None:
                 current_started = True
-                plan["current_helper"]([AXES[axis]], True)
+                plan["current_helper"]([axis], True)
                 self._check(session)
             if plan["rail_accel"] is not None:
                 accel_started = True
@@ -248,7 +443,7 @@ class CenterCalibration:
                 cleanup.append(("native rail acceleration", lambda: plan["state"]._set_homing_accel(
                     plan["rail_accel"], pre_homing=False)))
             if current_started:
-                cleanup.append(("native homing current", lambda: plan["current_helper"]([AXES[axis]], False)))
+                cleanup.append(("native homing current", lambda: plan["current_helper"]([axis], False)))
             cleanup.extend((("sensor session", owner._end_session),
                             ("live acceleration", lambda: self._restore_live_accel(session["center_original_motion"][1]))))
             errors = []
@@ -343,37 +538,47 @@ class CenterCalibration:
         return keys
 
     def _save_snapshot(self, keys):
-        """Read-only native include check and snapshot; never write config files."""
+        """Read-only native include migration preflight and full input snapshot."""
         w = self.workflows
         configfile = w.printer.lookup_object("configfile")
-        required = ("autosave", "status_save_pending", "save_config_pending", "_read_config_file",
-                    "_find_autosave_data", "_strip_duplicates", "_build_config_wrapper", "cmd_SAVE_CONFIG")
-        if any(not hasattr(configfile, name) for name in required):
+        try:
+            access = _NativeConfigAccess(configfile)
+        except (AttributeError, KeyError):
             raise self._error("SAVE_CONFIG=1 needs supported native autosave snapshot/include APIs; use report-only")
-        if configfile.save_config_pending or configfile.status_save_pending:
+        pending_owner = access.save_owner
+        if pending_owner.save_config_pending or pending_owner.status_save_pending:
             raise self._error("unrelated SAVE_CONFIG changes are pending; save or discard them separately first")
-        parser = configfile.autosave.fileconfig
+        parser = access.parser
         filename = w.printer.get_start_args()["config_file"]
-        data = configfile._read_config_file(filename)
-        regular, _ = configfile._find_autosave_data(data)
+        data, files, resolved = access.graph(filename)
         proposed = copy.deepcopy(parser)
         for section, option in keys:
             if not proposed.has_section(section):
                 proposed.add_section(section)
             proposed.set(section, option, "center_calibration_include_preflight")
-        stripped = configfile._strip_duplicates(regular, types.SimpleNamespace(fileconfig=proposed))
-        included = configfile._build_config_wrapper(stripped, filename).fileconfig
-        conflicts = ["[%s] %s" % key for key in keys if included.has_option(*key)]
-        if conflicts:
-            raise self._error("SAVE_CONFIG=1 cannot safely replace included options: %s. "
-                              "Move these options into the main printer.cfg first, or use report-only" % ", ".join(conflicts))
-        native_save = getattr(type(configfile), "cmd_SAVE_CONFIG", None)
-        if not callable(native_save):
-            raise self._error("native SAVE_CONFIG implementation is unavailable before motion")
+        try:
+            access.include_edits(filename, data, files, proposed, set(keys))
+        except ValueError as exc:
+            raise self._error(str(exc))
         return {"configfile": configfile, "parser": copy.deepcopy(parser),
-                "pending": copy.deepcopy(configfile.status_save_pending),
-                "flag": configfile.save_config_pending, "source": data,
-                "native_save": types.MethodType(native_save, configfile)}
+                "pending": copy.deepcopy(pending_owner.status_save_pending),
+                "flag": pending_owner.save_config_pending, "source": data,
+                "native_save": access.native_save, "access": access,
+                "filename": filename, "files": files, "resolved": self._parser_values(resolved),
+                "paths": {path: os.path.realpath(path) for path in files}}
+
+    def _configuration_state(self):
+        try:
+            configfile = self.workflows.printer.lookup_object("configfile")
+            access = _NativeConfigAccess(configfile)
+            filename = self.workflows.printer.get_start_args()["config_file"]
+            source, files, resolved = access.graph(filename)
+            pending = access.save_owner
+            return (source, files, {path: os.path.realpath(path) for path in files},
+                    self._parser_values(resolved), self._parser_values(access.parser),
+                    copy.deepcopy(pending.status_save_pending), pending.save_config_pending)
+        except (AttributeError, KeyError):
+            return None
 
     @staticmethod
     def _parser_values(parser):
@@ -416,22 +621,43 @@ class CenterCalibration:
         self.workflows._info("Saving measured coordinate proposal through native SAVE_CONFIG; Klipper will restart")
         fresh = self._save_snapshot(keys)
         if (fresh["configfile"] is not configfile or fresh["source"] != snapshot["source"]
+                or fresh["files"] != snapshot["files"] or fresh["resolved"] != snapshot["resolved"]
+                or fresh["paths"] != snapshot["paths"]
                 or self._parser_values(fresh["parser"]) != self._parser_values(snapshot["parser"])):
             raise self._error("configuration changed during measurement; rerun before saving")
         self._check_complete(session)
+        transaction, native_started = None, False
         try:
             for section, option, value in edits:
                 configfile.set(section, option, value)
+            access = snapshot["access"]
+            edit_keys = {(section, option) for section, option, value in edits}
+            replacements = access.include_edits(snapshot["filename"], snapshot["source"], snapshot["files"],
+                                                access.parser, edit_keys)
+            selected = copy.deepcopy(access.parser)
+            for section in selected.sections():
+                for option in selected.options(section):
+                    if (section, option) not in edit_keys:
+                        selected.remove_option(section, option)
+            snapshot["selected_parser"] = selected
+            transaction = _IncludeSaveTransaction(snapshot, replacements)
+            if transaction.backup_dir:
+                result["config_backup_directory"] = transaction.backup_dir
+                result["migrated_include_files"] = sorted(replacements)
+            transaction.apply()
+            native_started = True
             snapshot["native_save"](command)
         except Exception:
-            # Staging is rolled back as one in-memory transaction. The native
-            # firmware owns disk I/O; an I/O failure can leave persistence
-            # uncertain and must never be described as a successful save.
+            rollback_errors = transaction.rollback(native_started) if transaction else []
             configfile.autosave.fileconfig = snapshot["parser"]
-            configfile.status_save_pending = snapshot["pending"]
-            configfile.save_config_pending = snapshot["flag"]
+            access = snapshot["access"]
+            access.save_owner.status_save_pending = snapshot["pending"]
+            access.save_owner.save_config_pending = snapshot["flag"]
             result.update(result="save_failed", save_config=False,
-                          persistence="native_save_failed_disk_state_unconfirmed")
+                          persistence=("save_failed_restored_original_files" if transaction and transaction.originals
+                                       and not rollback_errors else "native_save_failed_disk_state_unconfirmed"))
+            if rollback_errors:
+                result["config_rollback_errors"] = rollback_errors
             raise
         result.update(save_config=True, persistence="native_save_requested",
                       model_metadata_rebased=list(result["model_metadata_rebase_proposed"]))

@@ -19,6 +19,13 @@ independently controllable XY enable lines, selected rails using this module's
 accelerometer endstop, `homing_retract_dist: 0`, and `min_home_dist: 0` where the
 firmware exposes that option.
 
+Native motion integration requires the `Homing(printer)` and
+`HomingMove(printer, endstops)` constructor forms. Kalico `main` revision
+[`991e1823`](https://github.com/KalicoCrew/kalico/blob/991e1823e983a31d26b9264d2b6305fd64e3a09a/klippy/extras/homing.py)
+requires additional constructor arguments and is not supported by this workflow.
+Compatibility with its config-file save API alone does not establish motion API
+compatibility. TRAVEL uses the same native motion integration.
+
 The command performs physical motion only when the operator executes it. No
 physical testing is implied by the development implementation or its source
 regressions.
@@ -156,19 +163,31 @@ validation on startup remains enabled.
 
 Persistence preflight refuses unrelated pending `SAVE_CONFIG` changes, and
 checks again immediately before staging. Supported native config parsing is
-required. If a selected coordinate option or affected model-metadata option
-comes from an include, `SAVE_CONFIG=1` refuses **before any motion**; move those
-options into the main `printer.cfg` or use report-only. The workflow does not
-rewrite included files. Config changes detected during measurement also prevent
+required. Nested and wildcard includes, split sections and repeated options
+are resolved in native order. Config changes detected during measurement,
+including include comments, new wildcard matches or symlink targets, prevent
 automatic saving.
+
+For `SAVE_CONFIG=1`, changed selected coordinates/model metadata originally
+defined in includes are migrated to the main native save block: every duplicate
+of those selected keys is commented in its included file. Other settings and
+comments remain intact, and Kalico's global `autosave_includes` setting is not
+enabled. No included file is modified in report-only mode or during measurement.
 
 The command invokes the native configfile `SAVE_CONFIG` implementation directly,
 without executing a registered `SAVE_CONFIG` macro. The firmware writes the
-normal save block/backups and requests a restart. Staging errors restore the
-prior in-memory autosave state. Native disk writes are not a global transaction:
-an I/O failure can leave disk persistence uncertain even when pending in-memory
-changes have been restored. Such a result is reported as `save_failed`, never as
-a confirmed save. Inspect the firmware error and its backup before proceeding.
+normal save block/backups and requests a restart. Include migration first backs
+up the original main/include bytes in a hidden `.accel-homing-save-*` directory
+beside the main config; its manifest and the reported result identify the files.
+Included symlinks are preserved. For include migration, a symlinked main config
+or hard-linked target file requires report-only/manual persistence.
+
+Staging errors restore prior pending settings. A reported native failure also
+attempts to restore original files; an unrecognized concurrent edit is preserved
+and reported as an incomplete rollback. Backups remain available for recovery.
+Individual include replacements are atomic, but the multi-file save is not a
+power-loss/process-crash transaction. Any failure is reported as `save_failed`,
+with restored or unconfirmed disk state; inspect that result before proceeding.
 
 `ACCEL_HOMING_CANCEL`, disconnect, shutdown, sensor faults, pressed starts,
 missing or incomplete stepper evidence, implausible travel and failed

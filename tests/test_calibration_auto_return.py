@@ -228,7 +228,14 @@ class AutomaticEarlyReturnTests(unittest.TestCase):
                     rig.calibrate(save=0)
                 self.assertEqual(len(rig.home_calls), 1)
                 self.assertEqual(rig.configfile.saved, {})
-                self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], "z")
+                # Native G28 errors run stock motor_off, which invalidates Z
+                # too. A failed plugin return only invalidates its XY axis.
+                expected_homed = "" if kind == "stock-error" else "z"
+                self.assertEqual(rig.toolhead.kin.get_status(0)["homed_axes"], expected_homed)
+                if kind == "stock-error":
+                    self.assertTrue(all(not line.enabled for line in rig.lines.values()))
+                else:
+                    self.assertEqual(rig.disabled, [])
                 self.assertEqual(rig.toolhead.accel, 50000.)
 
     def test_cartesian_recovery_does_not_require_the_unrelated_motor_enabled(self):

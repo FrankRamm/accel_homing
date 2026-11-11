@@ -204,6 +204,10 @@ class CenterRig(Rig):
         self.owner._restore_accel()
 
     def current_helper(self, axes, enabled):
+        # Native Kalico forwards these names to stepper.is_active_axis(),
+        # which encodes an axis letter. Integer axis indices are invalid.
+        if any(axis not in ("x", "y", "z") for axis in axes):
+            raise AssertionError("native homing current requires axis letters")
         self.current_calls.append((tuple(axes), enabled))
         if self.on_current:
             self.on_current(enabled)
@@ -313,7 +317,7 @@ class CenterCalibrationTests(unittest.TestCase):
         rig.center(AXIS="X")
         self.assertEqual(rig.toolhead.accel, 2000.)
         self.assertTrue(all(call["accel"] == 1000. and call["speed"] == 100. for call in rig.measure_calls))
-        self.assertEqual(rig.current_calls, [((0,), True), ((0,), False)] * 11)
+        self.assertEqual(rig.current_calls, [(("x",), True), (("x",), False)] * 11)
         self.assertEqual(rig.native_accel_calls, [(1000., True), (1000., False)] * 11)
         self.assertIsNone(rig.owner.saved_accel)
 

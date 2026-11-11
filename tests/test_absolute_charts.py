@@ -291,8 +291,12 @@ json.dump(results, sys.stdout)
 """
         result = subprocess.run([sys.executable, "-B", "-I", "-c", script, str(Path(charts.__file__).parent)],
                                 input=json.dumps(payloads), text=True, capture_output=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        for kind, axes in zip(("capture", "accuracy", "noise", "beta"), json.loads(result.stdout)):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rendered_axes = json.loads(result.stdout)
+        kinds = ("capture", "accuracy", "noise", "beta")
+        self.assertEqual(len(rendered_axes), len(kinds), result.stdout)
+        for kind, axes in zip(kinds, rendered_axes):
+            self.assertTrue(axes, kind)
             for bottom, top, minimum, peak in axes:
                 with self.subTest(kind=kind, peak=peak):
                     self.assertEqual(bottom, 0.)

@@ -261,8 +261,10 @@ class BaselineFloorTest(unittest.TestCase):
     """Constructed preparation and step histories, never a device recording."""
 
     def machine(self, profile="balanced", axes=(0,), options=None, epoch=10.0):
-        # Keep the prior explicit 0.2 g policy covered after the default changes.
-        obj = generic(options={"baseline_noise_floor": 0.2, **(options or {})})
+        # Keep the original 0.2 g / 20 ms / 3 mm policy explicit. Current
+        # 70 ms defaults and opt-in travel limits have separate policy tests.
+        obj = generic(options={"baseline_noise_floor": 0.2, "max_sample_age": 0.020,
+                               "max_startup_travel": 3.0, **(options or {})})
         obj.threshold_g["x"] = 0.5
         obj.toolhead.get_max_velocity = lambda: (500.0, 5000.0)
         obj.reactor.now = epoch

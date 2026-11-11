@@ -92,6 +92,23 @@ bounds. Above-band travel, missing impact, a sensor fault or failed return
 aborts; inspect the machine and manually prepare XY before a new command.
 Commanded return completion is not physical arrival feedback.
 
+### Noise on another accelerometer axis
+
+A Y move can excite the accelerometer's X component through the toolhead and
+mount. The saved XYZ model compares `sqrt(dx*dx + dy*dy + dz*dz)` with the
+threshold for the machine axis being homed; each component has its stationary
+reference subtracted first. Swapping or reversing sensor axes does not change
+that magnitude. A dominant X component during Y movement therefore does not,
+by itself, identify an `axes_map` error.
+
+Compare raw XYZ during startup, steady travel and the impact in a complete
+troubleshooting bundle from the affected axis. Stationary noise alone cannot
+characterize vibration while moving. Keep speed, acceleration, sensor settings
+and threshold recorded with the comparison. A filter or component weighting
+changes the detector: it can attenuate an impact or delay the threshold crossing,
+and the existing calibrated threshold would need qualification again. There is
+currently no configurable filter for the saved XYZ detector.
+
 ## Accuracy recovery and save errors
 
 An early ACCURACY result does not always authorize an automatic return or
