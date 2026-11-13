@@ -3079,6 +3079,7 @@ class AccelHomingWorkflows:
             recorder = TroubleshootRecorder(self, session)
             session["troubleshoot_recorder"] = recorder
             self.owner.troubleshoot = recorder
+            recorder.start()
             recorder.record_event("workflow_start", axes=axes, samples_requested=samples,
                                   thresholds_g=session["saved_thresholds"],
                                   speeds_mm_s=session["configured_speeds"], homing_accel_mm_s2=self.owner.homing_accel)
@@ -3147,6 +3148,8 @@ class AccelHomingWorkflows:
             # Cancellation may finalize inside native G28. Its capture and core
             # cleanup unwind before this outer export; never write from a hook.
             self.owner.troubleshoot = None
+            if recorder is not None:
+                recorder.timing.close()
             result = dict(self.last_result or {"result": "aborted"}, mode="troubleshoot",
                           run_id=session["run_id"], axes=axes, samples_requested=samples,
                           attempts=session["attempts"],
@@ -3157,6 +3160,7 @@ class AccelHomingWorkflows:
                 if recorder is not None:
                     recorder.record_event("workflow_cleanup_observed", result=result["result"],
                                           cleanup_complete=session.get("troubleshoot_cleanup_complete", False))
+                    recorder.close()  # Detach hooks even if export cannot start.
                     result["artifacts"] = recorder.export(result)
                     self._info("Troubleshoot evidence folder: %s" % result["artifacts"]["folder"])
                     if result["artifacts"].get("archive"):

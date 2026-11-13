@@ -207,9 +207,13 @@ class TroubleshootTests(unittest.TestCase):
     def test_raw_export_failure_detaches_observer_and_restores_state(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = AccuracyRig({"charts_directory": directory})
+            observers = []
+            rig.on_home = lambda axis: observers.append(rig.owner.troubleshoot)
             with mock.patch.object(diagnostics.Recorder, "export", side_effect=OSError("disk full")):
                 rig.workflow.cmd_TROUBLESHOOT(GCmd(AXIS="X", SAMPLES=2, CENTERED=1))
             self.assertIn("disk full", rig.workflow.last_result["export_error"])
+            self.assertTrue(observers[0].closed)
+            self.assertTrue(observers[0].timing.closed)
             self.restored(rig)
 
     def test_installed_source_fingerprints_and_tailored_config(self):

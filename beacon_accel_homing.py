@@ -1991,8 +1991,15 @@ class BeaconAccelHoming:
         if print_time < attempt.arm_time:
             attempt.last_data = max(attempt.last_data, eventtime)
             return eventtime + WATCHDOG_INTERVAL
-        if eventtime - attempt.last_data > self.stream_timeout:
+        last_data = attempt.last_data
+        if eventtime - last_data > self.stream_timeout:
             self._fire(attempt, "no_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+            # Observe only after stop dispatch; do not delay or change the check.
+            self._troubleshoot_event("watchdog_no_data", axis=attempt.axis,
+                arm_print_time_s=attempt.arm_time, host_monotonic_s=eventtime,
+                last_data_host_monotonic_s=last_data, elapsed_s=eventtime - last_data,
+                timeout_s=self.stream_timeout, nominal_interval_s=WATCHDOG_INTERVAL,
+                evaluation_estimated_print_time_s=print_time)
             return self.reactor.NEVER
         if print_time > attempt.deadline + self.stream_timeout:
             self._fire(attempt, "travel", mcu.MCU_trsync.REASON_HOST_REQUEST)

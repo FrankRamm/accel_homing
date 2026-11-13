@@ -9,6 +9,7 @@ from array import array
 from collections import deque
 import csv
 import datetime
+import gc
 import gzip
 import hashlib
 import json
@@ -31,6 +32,10 @@ INITIAL_HOME_BATCHES = 128
 MAX_EVENTS = 3000
 MAX_HOMES = 102
 LOG_LIMIT = 2 * 1024 * 1024
+MAX_TIMING_ROWS = 1024  # Per home, independently of packet/raw retention.
+MAX_SLOW_TIMING_ROWS = 64
+TIMING_INTERVAL = .020
+SLOW_TIMING = .020
 
 
 def finite(value):
@@ -132,13 +137,398 @@ def environment(workflow):
                        "configured_sensor_cached": clean({key: getattr(sensor, key, None) for key in (
                            "name", "data_rate", "rate", "axes_map", "full_scale", "rest_ticks")}),
                        "cached_backend": clean({key: getattr(backend, key, None) for key in (
-                           "name", "sensor_name", "chip", "data_rate", "rate", "scale", "axes_map")})},
+                           "name", "sensor_name", "chip", "data_rate", "rate", "scale", "axes_map", "full_scale")})},
             "model": clean({"name": workflow.model_name, "section": workflow.model_section,
                              "metadata": getattr(workflow.model, "metadata", None),
                              "thresholds": getattr(workflow.model, "thresholds", None)}),
             "workflow": {"reposition_speed_mm_s": workflow.reposition_speed,
                          "settle_time_s": workflow.calibration_settle_time,
                          "travel_tolerance": workflow.travel_tolerance}}
+
+
+class TimingTrace:
+    """Opt-in timing of existing calls; never query, reschedule or suppress them.
+
+    The serial hook forwards the original object before recording scalar metadata.
+    No payloads, file IO, stack walks or JSON formatting run in these hooks.
+    CPU time is process-wide (including other threads), not exclusive stage CPU.
+    """
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.reactor = recorder.workflow.reactor
+        self.lock = threading.RLock()  # GC callbacks can re-enter this observer.
+        self.groups, self.hooks, self.available = {}, [], {}
+        self.closed = False
+        self.errors = 0
+        self.serial_hook = self.timer = None
+        self.gc_started = {}
+        self.gc_callback = self._gc
+        self.active_calls, self.active_at_close, self.next_call = {}, [], 0
+
+    def _stamp(self):
+        try:
+            return self.reactor.monotonic(), time.process_time()
+        except Exception:
+            self.errors += 1
+            return None, None
+
+    def _home(self):
+        try:
+            home = self.recorder.current_home
+            return home["home_id"] if home is not None else 0
+        except Exception:
+            self.errors += 1
+            return 0
+
+    def note(self, stage, start, end, details=None, home_id=None):
+        try:
+            if self.closed or not finite(start[0]) or not finite(end[0]):
+                return
+            home_id = self._home() if home_id is None else home_id
+            with self.lock:
+                if self.closed:
+                    return
+                if home_id not in self.groups:
+                    if len(self.groups) >= MAX_HOMES + 1:
+                        self.errors += 1
+                        return
+                    self.groups[home_id] = {"rows": deque(maxlen=MAX_TIMING_ROWS),
+                        "slow": deque(maxlen=MAX_SLOW_TIMING_ROWS), "observed": 0,
+                        "slow_observed": 0, "stages": {}}
+                group = self.groups[home_id]
+                stages = group["stages"]
+                if stage not in stages:
+                    stages[stage] = {"count": 0, "last_entry_s": None, "max_duration_s": 0.,
+                                     "max_entry_gap_s": 0., "total_duration_s": 0.}
+                stat = stages[stage]
+                gap = None if stat["last_entry_s"] is None else start[0] - stat["last_entry_s"]
+                duration = end[0] - start[0]
+                if duration >= stat["max_duration_s"]:
+                    stat["max_duration_entry_s"] = start[0]
+                if gap is not None and gap >= stat["max_entry_gap_s"]:
+                    stat["max_entry_gap_entry_s"] = start[0]
+                stat.update(count=stat["count"] + 1, last_entry_s=start[0],
+                            max_duration_s=max(stat["max_duration_s"], duration),
+                            max_entry_gap_s=max(stat["max_entry_gap_s"], gap or 0.),
+                            total_duration_s=stat["total_duration_s"] + duration)
+                group["observed"] += 1
+                row = {"sequence": group["observed"], "home_id": home_id, "stage": stage,
+                       "entry_host_monotonic_s": start[0], "exit_host_monotonic_s": end[0],
+                       "duration_s": duration, "entry_gap_s": gap,
+                       "process_cpu_s": (end[1] - start[1] if finite(start[1]) and finite(end[1]) else None),
+                       "details": details or {}}
+                group["rows"].append(row)
+                slow_gap = ((details or {}).get("lateness_s", 0.) if stage == "reactor_heartbeat" else gap)
+                if duration >= SLOW_TIMING or (finite(slow_gap) and slow_gap >= SLOW_TIMING):
+                    group["slow_observed"] += 1
+                    group["slow"].append(row)
+        except Exception:
+            self.errors += 1
+
+    def _wrap(self, obj, attr, stage, details=None):
+        original = getattr(obj, attr, None)
+        if not callable(original):
+            self.available[stage] = "unavailable: compatible method not exposed"
+            return
+        own = attr in getattr(obj, "__dict__", {})
+
+        def observed(*args, **kwargs):
+            if self.closed:
+                return original(*args, **kwargs)
+            start, home_id = self._stamp(), self._home()
+            token = self._enter_call(stage, start, home_id)
+            result, returned = None, False
+            try:
+                result = original(*args, **kwargs)
+                returned = True
+                return result
+            finally:
+                end = self._stamp()
+                try:
+                    if token is not None:
+                        with self.lock:
+                            self.active_calls.pop(token, None)
+                    fields = details(args, result) if details is not None and returned else {}
+                    fields["returned"] = returned
+                    self.note(stage, start, end, fields, home_id)
+                except Exception:
+                    self.errors += 1
+
+        try:
+            setattr(obj, attr, observed)
+            self.hooks.append((obj, attr, original, observed, own))
+            self.available[stage] = "enabled"
+        except Exception as exc:
+            self.available[stage] = "unavailable: " + type(exc).__name__
+
+    def _enter_call(self, stage, start, home_id):
+        # A query can yield while cancellation unwinds the workflow. Retain its
+        # start even if its wrapper has not returned when collection closes.
+        if stage not in ("sensor_status_query", "driver_batch"):
+            return None
+        try:
+            with self.lock:
+                if self.closed or len(self.active_calls) >= 16:
+                    return None
+                self.next_call += 1
+                self.active_calls[self.next_call] = {"stage": stage, "home_id": home_id,
+                    "entry_host_monotonic_s": start[0], "entry_process_cpu_s": start[1]}
+                return self.next_call
+        except Exception:
+            self.errors += 1
+            return None
+
+    @staticmethod
+    def _query_details(args, result):
+        # Driver response timestamps are from the host serial queue, not MCU halt.
+        return {key: result.get(key) for key in ("#sent_time", "#receive_time", "clock",
+                "query_ticks", "next_sequence", "buffered", "possible_overflows")}
+
+    @staticmethod
+    def _queue_details(args, result):
+        return {"messages": len(result),
+                "first_sequence": result[0].get("sequence") if result else None,
+                "last_sequence": result[-1].get("sequence") if result else None,
+                "oldest_receive_host_monotonic_s": result[0].get("#receive_time") if result else None,
+                "newest_receive_host_monotonic_s": result[-1].get("#receive_time") if result else None}
+
+    def _serial(self, reader):
+        serial = getattr(getattr(reader, "mcu", None), "_serial", None)
+        handlers, lock = getattr(serial, "handlers", None), getattr(serial, "lock", None)
+        key = ("sensor_bulk_data", getattr(reader, "oid", None))
+        queue = getattr(reader, "bulk_queue", None)
+        if not isinstance(handlers, dict) or lock is None or queue is None:
+            self.available["mcu_bulk_handler"] = "unavailable: serial/BulkDataQueue contract"
+            return
+        with lock:
+            original = handlers.get(key)
+            if not callable(original) or getattr(original, "__self__", None) is not queue:
+                self.available["mcu_bulk_handler"] = "unavailable: handler not owned by sensor queue"
+                return
+
+            def observed(params):
+                if self.closed:
+                    return original(params)
+                start, home_id = self._stamp(), self._home()
+                try:
+                    return original(params)
+                finally:
+                    end = self._stamp()
+                    try:
+                        self.note("mcu_bulk_handler", start, end,
+                            {"serial_receive_host_monotonic_s": params.get("#receive_time"),
+                             "serial_sent_host_monotonic_s": params.get("#sent_time"),
+                             "mcu_sequence": params.get("sequence"),
+                             "payload_bytes": len(params.get("data", ()))}, home_id)
+                    except Exception:
+                        self.errors += 1
+            handlers[key] = observed
+            self.serial_hook = (handlers, lock, key, original, observed)
+            self.available["mcu_bulk_handler"] = "enabled"
+
+    def start(self):
+        if self.closed or self.available:
+            return
+        try:
+            owner = self.recorder.workflow.owner
+            backend = getattr(owner, "backend", None)
+            helper = getattr(backend, "helper", None)
+            sensor = getattr(backend, "sensor", None)
+            reader = getattr(sensor, "ffreader", None)
+            # Captures driver entry, including empty batches, before plugin clients.
+            self._wrap(helper, "batch_cb", "driver_batch",
+                lambda args, result: {"reactor_eventtime_s": args[0] if args else None,
+                                     "sample_count": len(result.get("data", ())) if result else 0})
+            self._wrap(reader, "pull_samples", "sensor_pull")
+            self._wrap(getattr(reader, "query_status_cmd", None), "send", "sensor_status_query", self._query_details)
+            self._wrap(getattr(reader, "bulk_queue", None), "pull_queue", "driver_queue_drain", self._queue_details)
+            self._wrap(sensor, "_convert_samples", "driver_decode")
+            self._wrap(owner, "_inspect", "detector_with_observer")
+            self._wrap(backend, "_receive", "adapter_processing")
+            self._wrap(backend, "_troubleshoot_receive", "adapter_observer")
+            self._wrap(self.recorder, "record_batch", "recorder_batch")
+            self._wrap(self.recorder, "record_event", "recorder_event")
+            self._serial(reader)
+            gc.callbacks.append(self.gc_callback)
+            self.available["gc"] = "enabled"
+            if callable(getattr(self.reactor, "unregister_timer", None)):
+                self.expected = self.reactor.monotonic() + TIMING_INTERVAL
+                self.previous_heartbeat = self._stamp()
+                self.timer = self.reactor.register_timer(self._heartbeat, self.expected)
+                self.available["reactor_heartbeat"] = "enabled"
+            else:
+                self.available["reactor_heartbeat"] = "unavailable: unregister_timer not exposed"
+        except Exception as exc:
+            self.available["startup_error"] = type(exc).__name__
+            self.close()  # A partially attached observer must not outlive the run.
+
+    def _heartbeat(self, eventtime):
+        if self.closed:
+            return self.reactor.NEVER
+        start = self._stamp()
+        try:
+            expected = self.expected
+            self.expected = start[0] + TIMING_INTERVAL
+            previous = self.previous_heartbeat
+            self.previous_heartbeat = start
+            self.note("reactor_heartbeat", start, start,
+                      {"scheduled_host_monotonic_s": expected,
+                       "lateness_s": max(0., start[0] - expected), "eventtime_s": eventtime,
+                       "interval_s": start[0] - previous[0],
+                       "interval_process_cpu_s": start[1] - previous[1]})
+            return self.expected
+        except Exception:
+            self.errors += 1
+            return eventtime + TIMING_INTERVAL
+
+    def _gc(self, phase, info):
+        if self.closed:
+            return
+        try:
+            generation = info.get("generation")
+            if phase == "start":
+                self.gc_started[generation] = (self._stamp(), self._home())
+            elif phase == "stop":
+                before = self.gc_started.pop(generation, None)
+                if before is not None:
+                    self.note("gc", before[0], self._stamp(),
+                              {key: info.get(key) for key in ("generation", "collected", "uncollectable")}, before[1])
+        except Exception:
+            self.errors += 1
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.active_at_close = list(self.active_calls.values())
+        if self.timer is not None:
+            try:
+                self.reactor.unregister_timer(self.timer)
+            except Exception:
+                self.errors += 1
+        try:
+            if self.gc_callback in gc.callbacks:
+                gc.callbacks.remove(self.gc_callback)
+        except Exception:
+            self.errors += 1
+        if self.serial_hook is not None:
+            handlers, lock, key, original, wrapper = self.serial_hook
+            try:
+                with lock:
+                    if handlers.get(key) is wrapper:
+                        handlers[key] = original
+            except Exception:
+                self.errors += 1
+        for obj, attr, original, wrapper, own in reversed(self.hooks):
+            try:
+                if getattr(obj, attr, None) is wrapper:
+                    if own:
+                        setattr(obj, attr, original)
+                    else:
+                        delattr(obj, attr)
+            except Exception:
+                self.errors += 1
+
+    def export(self, folder):
+        summaries = {}
+        with gzip.open(folder / "timing.jsonl.gz", "wt", encoding="utf-8") as stream:
+            for home_id, group in sorted(self.groups.items()):
+                retained = {row["sequence"]: row for row in list(group["slow"]) + list(group["rows"])}
+                for _, row in sorted(retained.items()):
+                    stream.write(json.dumps(clean(row), allow_nan=False) + "\n")
+                summaries[str(home_id)] = {"observed": group["observed"], "retained": len(retained),
+                    "omitted": group["observed"] - len(retained),
+                    "slow_observed": group["slow_observed"], "slow_retained": len(group["slow"]),
+                    "stages": clean(group["stages"])}
+        return {"schema": "accel_homing_timing_v1", "file": "timing.jsonl.gz", "hooks": self.available,
+                "in_flight_at_close": clean(self.active_at_close),
+                "errors": self.errors, "max_tail_rows_per_home": MAX_TIMING_ROWS,
+                "max_slow_rows_per_home": MAX_SLOW_TIMING_ROWS, "slow_threshold_s": SLOW_TIMING,
+                "heartbeat_interval_s": TIMING_INTERVAL, "homes": summaries,
+                "clock_domain": "host_monotonic", "cpu_scope": "process including other threads",
+                "interpretation": "Nested durations overlap; do not sum stages. Serial receive is a host transport timestamp, not hardware receipt. Recorder/adapter observer costs exclude timing-hook bookkeeping itself. Hooks add overhead and do not locate delays inside firmware or the kernel."}
+
+
+def adxl_saturation_profile(context):
+    """Diagnostic-only endpoints from the configured ADXL345 driver's axes_map.
+
+    Full-resolution +/-16 g uses signed 13-bit counts. At 1600/3200 Hz the
+    least significant bit is zero (ADXL345 data sheet, Data Formatting).
+    Driver scales are signed mm/s2 per count, already mapped to machine axes.
+    """
+    sensor = context.get("sensor", {})
+    cached = sensor.get("configured_sensor_cached", {})
+    cls = sensor.get("configured_sensor_class", "")
+    rate, mapping = cached.get("data_rate"), cached.get("axes_map")
+    if (not cls.endswith("adxl345.ADXL345") or
+            sensor.get("cached_backend", {}).get("full_scale") != 16.0 or
+            rate not in (25, 50, 100, 200, 400, 800, 1600, 3200) or
+            not isinstance(mapping, (list, tuple)) or len(mapping) != 3):
+        return {"available": False, "reason": "verified ADXL345 range/rate/mapping unavailable"}
+    try:
+        if sorted(pair[0] for pair in mapping) != [0, 1, 2] or not all(
+                finite(pair[1]) and pair[1] != 0 for pair in mapping):
+            raise ValueError()
+        upper = 4094 if rate in (1600, 3200) else 4095
+        return {"available": True, "method": "adxl345_mapped_native_endpoints_v1", "rate_hz": rate,
+                "range_source": "configured full-resolution ADXL345 driver contract; no register query",
+                "native_min_count": -4096, "native_max_count": upper,
+                "count_tolerance": .01, "axes_map": mapping,
+                "axis_endpoints_g": {axis: sorted([-4096 * pair[1] / 9806.65, upper * pair[1] / 9806.65])
+                                     for axis, pair in zip("xyz", mapping)}}
+    except (ValueError, TypeError, IndexError):
+        return {"available": False, "reason": "invalid ADXL345 mapping"}
+
+
+def diagnose_saturation(public, raw, profile, stop_time):
+    """Correct exported evidence only, after motion; never mutate detector/model state."""
+    if not profile.get("available"):
+        public["saturation_diagnostic"] = profile
+        return
+    record, capture = public.get("record") or {}, public.get("capture") or {}
+    arm, onset = record.get("arm_time_s"), record.get("onset_time_s")
+    phases = {key: dict.fromkeys("xyz", 0) for key in
+              ("before_arm", "armed_before_onset", "after_onset_before_stop", "after_stop", "unattributed")}
+    counts, first, last = dict.fromkeys("xyz", 0), None, None
+    for offset in range(0, len(raw), 4):
+        when = raw[offset]
+        phase = ("unattributed" if not finite(when) else
+                 "before_arm" if finite(arm) and when < arm else
+                 "after_stop" if finite(stop_time) and when >= stop_time else
+                 "after_onset_before_stop" if finite(onset) and when >= onset else
+                 "armed_before_onset" if finite(arm) and when >= arm else "unattributed")
+        for index, (axis, mapping) in enumerate(zip("xyz", profile["axes_map"])):
+            value = raw[offset + index + 1]
+            if not finite(value):
+                continue
+            native = value * 9806.65 / mapping[1]
+            if (native <= profile["native_min_count"] + profile["count_tolerance"] or
+                    native >= profile["native_max_count"] - profile["count_tolerance"]):
+                counts[axis] += 1
+                phases[phase][axis] += 1
+                if finite(when):
+                    first, last = (when if first is None else first), when
+    limited = bool(sum(counts.values()))
+    public["saturation_diagnostic"] = {**profile, "scope": "retained_raw_capture",
+        "range_limit_axis_counts": counts, "range_limit_axis_values": sum(counts.values()),
+        "amplitude_limited": limited, "phases": phases, "first_print_time_s": first, "last_print_time_s": last,
+        "complete_capture": bool(raw) and not any(capture.get(key) for key in
+            ("dropped", "raw_rows_omitted", "invalid_rows", "truncation", "unavailable", "retention_error")),
+        "physical_peak_recoverable": False if limited else None}
+    # Retain the original runtime report verbatim. Calibration/acceptance has
+    # already finished; flags here describe the raw capture, including braking.
+    if limited:
+        for key in ("capture", "record"):
+            if not isinstance(public.get(key), dict):
+                continue
+            original = public[key]
+            public[key] = {**original, "runtime_signal_quality": {name: original.get(name) for name in (
+                "amplitude_limited", "excess_amplitude_unknown", "range_limit_axis_values", "range_limit_axis_counts", "peak_semantics", "signal_scope")},
+                "amplitude_limited": True, "excess_amplitude_unknown": True,
+                "range_limit_axis_values": sum(counts.values()), "range_limit_axis_counts": dict(counts),
+                "peak_semantics": "reported_sensor_derived_range_limited",
+                "signal_scope": "retained_raw_capture", "signal_quality_source": profile["method"]}
 
 
 class Recorder:
@@ -157,6 +547,10 @@ class Recorder:
         self.before = snapshot(workflow)
         self.log_start = self._log_position()
         self.folder = None
+        self.timing = TimingTrace(self)
+
+    def start(self):
+        self.timing.start()
 
     def _log_position(self):
         args = self.workflow.chart_start_args
@@ -244,7 +638,10 @@ class Recorder:
 
     def close(self):
         """Freeze evidence after stream/command unwind, before any file writes."""
+        self.timing.close()
         with self.observer_lock:
+            if self.closed:
+                return
             self.closed = True
             self.closed_at = self.workflow.reactor.monotonic()
 
@@ -324,7 +721,7 @@ class Recorder:
         objects += [obj for name, obj in self.workflow.printer.lookup_objects()
                     if name == "mcu" or name.startswith("mcu ") or name == getattr(owner, "sensor_name", None)]
         loaded = {type(obj).__module__ for obj in objects if obj is not None}
-        dependencies = {"klippy", "homing", "bulk_sensor", "mcu", "stepper", "toolhead", "clocksync"}
+        dependencies = {"klippy", "homing", "bulk_sensor", "mcu", "stepper", "toolhead", "clocksync", "serialhdl", "reactor"}
         loaded.update(name for name in list(sys.modules) if name.rsplit(".", 1)[-1] in dependencies)
         module_files = {}
         for name in sorted(loaded):
@@ -383,9 +780,13 @@ class Recorder:
         folder.mkdir()  # Unique UUID; deliberately never overwrite another report.
         self.folder = str(folder)
         homes = []
+        profile = adxl_saturation_profile(self.context)
         for home in self.homes:
             public = {key: value for key, value in home.items() if key not in ("raw", "packet_prefix", "packet_tail")}
             public["stop_timing"] = self._stop_timing(home["home_id"])
+            stop = next((event["fields"].get("request_estimated_print_time_s") for event in self.events
+                         if event["home_id"] == home["home_id"] and event["kind"] == "stop_request"), None)
+            diagnose_saturation(public, home["raw"], profile, stop)
             public["packet_retention"] = {"policy": "first prefix and rolling last tail; omitted middle",
                 "prefix_limit": INITIAL_HOME_BATCHES, "tail_limit": MAX_HOME_BATCHES - INITIAL_HOME_BATCHES,
                 "retained_sequence_ranges": [[rows[0]["home_packet_sequence"], rows[-1]["home_packet_sequence"]]
@@ -414,6 +815,7 @@ class Recorder:
                   "environment": self.context, "installed_identity": self._source_identity(),
                   "before": self.before, "after": snapshot(self.workflow), "homes": homes,
                   "events": self.events, "log": self._export_log(folder),
+                  "timing": self.timing.export(folder),
                   "collector_closed_host_monotonic_s": self.closed_at,
                   "bounds": {"max_raw_rows": MAX_RAW_ROWS, "max_home_rows": MAX_HOME_ROWS,
                              "raw_rows_retained": self.raw_rows, "max_events": MAX_EVENTS,
@@ -422,6 +824,7 @@ class Recorder:
                              "batches_retained": len(self.batches) + sum(home["batches_retained"] for home in self.homes),
                              "batches_omitted": self.batches_omitted, "observer_errors": self.observer_errors},
                   "interpretation": ["Commanded positions and step counts are not measured physical carriage positions.",
+                      "Saturation corrections apply to homes[].record/capture only. runtime_signal_quality, events and ending preserve the runtime report; detector and calibration decisions are unchanged.",
                       "Host stop dispatch does not establish MCU receipt time.",
                       "Clock domains are named in fields; do not subtract host monotonic from print_time.",
                       "callback_duration_s ends before recorder formatting/append and excludes that observer overhead; it is not full callback occupancy or transport latency.",
@@ -436,6 +839,7 @@ class Recorder:
             "Share the entire folder or ZIP. Read manifest.json first.\n"
             "home-*.csv.gz: every retained raw decoded XYZ sample before graph reduction, in g including gravity/bias.\n"
             "packets.jsonl.gz: bounded callback timing, pending/filtered packet context.\n"
+            "timing.jsonl.gz: MCU host receive, driver/query/decode, detector/observer, reactor and GC timing. See manifest timing hook availability and omissions.\n"
             "manifest.json: home/return/next-home linkage, detector/reference/quality metadata, errors, config, installed source SHA256, bounds.\n"
             "Each home records capture/core drops and recorder omissions. Missing is not zero.\n"
             "No physical-position sensor is present; travel is commanded step accounting.\n"
@@ -531,6 +935,69 @@ def render_bundle(folder, renderer, reactor=None, check_running=None):
             process.wait(timeout=2)
 
 
+def _plot_timing(folder, home, report, rows, Figure, FigureCanvasAgg):
+    """Host-clock view of the stop window; never mix in sensor print_time."""
+    stops = [event["fields"].get("request_before_host_monotonic_s") for event in report["events"]
+             if event["home_id"] == home["home_id"] and event["kind"] == "stop_request"]
+    origin = next((stamp for stamp in stops if finite(stamp)), None)
+    has_stop = origin is not None
+    if origin is None:
+        origin = max((row["exit_host_monotonic_s"] for row in rows), default=home["begin_host_monotonic_s"])
+    # The full bounded trace is in timing.jsonl.gz; the picture focuses on the
+    # dispatch window, so the 5 ms normal batches do not conceal an 87 ms pause.
+    selected = [row for row in rows if row["exit_host_monotonic_s"] >= origin - .250
+                and row["entry_host_monotonic_s"] <= origin + .100]
+    figure = Figure(figsize=(12, 10), dpi=110)
+    FigureCanvasAgg(figure)
+    plots = figure.subplots(3, 1, sharex=True)
+    def series(stage, value, plot, label):
+        pairs = [((row["entry_host_monotonic_s"] - origin) * 1000, value(row))
+                 for row in selected if row["stage"] == stage]
+        pairs = [(x, y * 1000) for x, y in pairs if finite(y)]
+        if pairs:
+            plot.plot([x for x, _ in pairs], [y for _, y in pairs], ".-", markersize=3, linewidth=.7, label=label)
+    for stage, label in (("mcu_bulk_handler", "Bulk handler entry gap"),
+                         ("driver_batch", "Driver batch entry gap"),
+                         ("adapter_processing", "Plugin entry gap")):
+        series(stage, lambda row: row["entry_gap_s"], plots[0], label)
+    def serial_lag(row):
+        received = row["details"].get("serial_receive_host_monotonic_s")
+        return row["entry_host_monotonic_s"] - received if finite(received) else None
+    series("mcu_bulk_handler", serial_lag, plots[0], "Host serial receive to handler")
+    series("reactor_heartbeat", lambda row: row["details"].get("lateness_s"), plots[0], "Reactor timer lateness")
+    plots[0].set(title="Delivery gaps and host scheduling (missing stages are unavailable)", ylabel="ms")
+    stages = ("sensor_status_query", "driver_queue_drain", "sensor_pull", "driver_decode",
+              "driver_batch", "adapter_processing", "detector_with_observer", "gc")
+    for index, stage in enumerate(stages):
+        intervals = [((row["entry_host_monotonic_s"] - origin) * 1000,
+                      max(row["duration_s"] * 1000, .05)) for row in selected if row["stage"] == stage]
+        plots[1].broken_barh(intervals, (index - .35, .7), facecolors="C%d" % index)
+    plots[1].set_yticks(range(len(stages)))
+    plots[1].set_yticklabels(stages, fontsize=8)
+    plots[1].invert_yaxis()
+    plots[1].set_title("Existing call occupancy; nested intervals overlap (minimum drawn width 0.05 ms)")
+    for stage in ("recorder_batch", "recorder_event", "adapter_observer"):
+        series(stage, lambda row: row["duration_s"], plots[2], stage + " duration")
+    series("sensor_status_query", lambda row: row["process_cpu_s"], plots[2], "Process CPU during status query")
+    series("reactor_heartbeat", lambda row: row["details"].get("interval_process_cpu_s"), plots[2], "Process CPU since previous timer")
+    plots[2].set(title="Observer cost and process-wide CPU (includes other threads)", ylabel="ms",
+                 xlabel="Host monotonic ms from stop dispatch" if has_stop else "Host monotonic ms from last observation; stop unavailable")
+    for plot in plots:
+        plot.set_xlim(-250, 100)
+        plot.grid(True, alpha=.25)
+        if has_stop:
+            plot.axvline(0, color="purple", linestyle="--", label="Host stop dispatch")
+        if plot.lines:
+            plot.legend(fontsize=7, loc="upper left")
+    retention = report.get("timing", {}).get("homes", {}).get(str(home["home_id"]), {})
+    figure.suptitle("Home %03d %s: host timing; retained %s, omitted %s\n"
+                   "No MCU halt timestamp; timing-hook bookkeeping is not included in observer cost" % (
+                       home["home_id"], home["axis"].upper(), retention.get("retained", 0), retention.get("omitted", 0)))
+    figure.tight_layout(rect=(0, 0, 1, .94))
+    figure.savefig(folder / ("home-%03d-%s-timing.png" % (home["home_id"], home["axis"])))
+    figure.clear()
+
+
 def _worker(folder, dependencies):
     folder = Path(folder)
     if Path(dependencies).is_dir():
@@ -551,6 +1018,14 @@ def _worker(folder, dependencies):
         homes = report["homes"]
         if len(homes) > MAX_HOMES:
             raise ValueError("troubleshoot plotting home limit exceeded")
+        timing = {}
+        if report.get("timing"):
+            with gzip.open(folder / "timing.jsonl.gz", "rt", encoding="utf-8") as stream:
+                for number, line in enumerate(stream):
+                    if number >= (MAX_HOMES + 1) * (MAX_TIMING_ROWS + MAX_SLOW_TIMING_ROWS):
+                        raise ValueError("timing plot input exceeds bound")
+                    row = json.loads(line)
+                    timing.setdefault(row["home_id"], []).append(row)
         figure = Figure(figsize=(12, 14), dpi=110)
         FigureCanvasAgg(figure)
         plots = figure.subplots(4, 1)
@@ -606,6 +1081,10 @@ def _worker(folder, dependencies):
             onset = record.get("onset_time_s")
             if not finite(onset):
                 onset = (capture.get("detector") or {}).get("onset_time_s")
+            dispatch = next((event["fields"].get("request_estimated_print_time_s")
+                for event in report["events"] if event["home_id"] == home["home_id"]
+                and event["kind"] == "stop_request"), None)
+            anchor = onset if finite(onset) else dispatch
             baseline = capture.get("baseline_g")
             has_baseline = isinstance(baseline, list) and len(baseline) == 3 and all(finite(v) for v in baseline)
             baseline = baseline if has_baseline else [0, 0, 0]
@@ -618,7 +1097,8 @@ def _worker(folder, dependencies):
                         sample = [float(row[key]) for key in ("print_time_s", "x_g", "y_g", "z_g")]
                     except ValueError:
                         continue
-                    if not finite(onset) or onset - .025 <= sample[0] <= onset + .100:
+                    before = .025 if finite(onset) else .125
+                    if not finite(anchor) or anchor - before <= sample[0] <= anchor + .100:
                         rows.append(sample)
             # Window retains all samples/outliers. Bound unknown-onset plots by
             # displaying a prefix explicitly; raw files remain unchanged.
@@ -627,11 +1107,24 @@ def _worker(folder, dependencies):
             figure = Figure(figsize=(11, 5), dpi=110)
             FigureCanvasAgg(figure)
             plot = figure.subplots()
-            origin = onset if finite(onset) else rows[0][0] if rows else 0
+            origin = anchor if finite(anchor) else rows[0][0] if rows else 0
             times = [(row[0] - origin) * 1000 for row in rows]
             for index, label in enumerate("XYZ"):
                 plot.plot(times, [row[index + 1] - baseline[index] for row in rows], label=label, linewidth=.8)
             plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="XYZ norm", color="black", linewidth=1)
+            threshold = record.get("threshold_g")
+            if finite(threshold):
+                plot.axhline(threshold, color="#d17b00", linestyle="--", label="Active detector threshold")
+            quality = home.get("saturation_diagnostic", {})
+            if quality.get("available"):
+                for index, axis in enumerate("xyz"):
+                    lower, upper = quality["axis_endpoints_g"][axis]
+                    tolerance = abs(quality["axes_map"][index][1]) / 9806.65 * quality["count_tolerance"]
+                    limited = [(t, row[index + 1] - baseline[index]) for t, row in zip(times, rows)
+                               if row[index + 1] <= lower + tolerance or row[index + 1] >= upper - tolerance]
+                    if limited:
+                        plot.scatter([t for t, _ in limited], [v for _, v in limited], marker="x", s=20,
+                                     label=axis.upper() + " native range limit", zorder=5)
             if finite(onset):
                 plot.axvline(0, color="red", label="retained sensor onset")
             for event in report["events"]:
@@ -643,15 +1136,20 @@ def _worker(folder, dependencies):
                         if finite(stamp):
                             plot.axvline((stamp - origin) * 1000, color="purple", linestyle="--", label="host dispatch, estimated print_time")
                             break
-            plot.set(title="Home %03d %s %s; %s; raw omitted %s; plot omitted %d" % (
-                home["home_id"], home["axis"].upper(), home["phase"], home.get("error") or record.get("result", "partial"), capture.get("raw_rows_omitted", "unknown"), omitted),
-                xlabel="ms from retained onset" if finite(onset) else "ms from first retained sample (onset unavailable)",
+            plot.set(title="Home %03d %s %s; %s\nRaw omitted %s; plot omitted %d; capture range-limited axis values %s" % (
+                home["home_id"], home["axis"].upper(), home["phase"], record.get("result", "partial; see manifest error"),
+                capture.get("raw_rows_omitted", "unknown"), omitted, quality.get("range_limit_axis_values", "unknown")),
+                xlabel=("ms from retained onset" if finite(onset) else
+                        "ms from host dispatch estimate (onset unavailable)" if finite(dispatch) else
+                        "ms from first retained sample (onset/stop unavailable)"),
                 ylabel="g after reference subtraction" if has_baseline else "raw g; reference unavailable (gravity/bias retained)")
             plot.legend(fontsize=7)
             plot.grid(True, alpha=.25)
             figure.tight_layout()
             figure.savefig(folder / ("home-%03d-%s.png" % (home["home_id"], home["axis"])))
             figure.clear()
+            if report.get("timing"):
+                _plot_timing(folder, home, report, timing.get(home["home_id"], []), Figure, FigureCanvasAgg)
 
 
 if __name__ == "__main__":

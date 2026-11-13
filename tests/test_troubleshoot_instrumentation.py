@@ -6,6 +6,7 @@ from unittest import mock
 from harness import arm_axis, batch, counts, make_homing, plugin
 from test_backends import arm, baseline, feed, generic, samples
 from test_trigger import feed_baseline, still, x_sample
+from accel_homing_troubleshoot import TimingTrace
 
 HIT = plugin.mcu.MCU_trsync.REASON_ENDSTOP_HIT
 HOST = plugin.mcu.MCU_trsync.REASON_HOST_REQUEST
@@ -139,6 +140,35 @@ class StopObservationTest(unittest.TestCase):
         self.assertEqual(event["request_after_host_monotonic_s"], .210)
         self.assertIsNone(event["mcu_halt_print_time_s"])
 
+    def test_pipeline_timing_hooks_preserve_real_configured_detector_stop(self):
+        for legacy in (False, True):
+            results = []
+            for enabled in (False, True):
+                obj = generic(legacy=legacy)
+                baseline(obj)
+                attempt, trigger = arm(obj)
+                attempt.vector_mode, attempt.moving = True, True
+                attempt.bases = obj._baseline()
+                attempt.last_samples = list(attempt.bases)
+                recorder = Recorder()
+                recorder.workflow = types.SimpleNamespace(owner=obj, reactor=obj.reactor)
+                recorder.current_home = {"home_id": 1}
+                trace = TimingTrace(recorder)
+                obj.troubleshoot = recorder
+                try:
+                    if enabled:
+                        trace.start()
+                    feed(obj, samples(10.060, size=20, x=12))
+                    result = obj.finish(attempt.endstop, attempt, HIT)
+                    results.append((attempt.reason, attempt.onset_sample, result,
+                                    trigger.messages, attempt.request_time))
+                    if enabled:
+                        self.assertIn("adapter_processing", trace.groups[1]["stages"])
+                        self.assertIn("detector_with_observer", trace.groups[1]["stages"])
+                finally:
+                    trace.close()
+            self.assertEqual(results[0], results[1])
+
     def test_trigger_exception_is_not_replaced_or_swallowed_by_sink(self):
         recorder = Recorder(raising=True)
         obj, attempt, _trigger = self.native(recorder)
@@ -151,6 +181,29 @@ class StopObservationTest(unittest.TestCase):
         self.assertIs(caught.exception, failure)
         self.assertFalse(recorder.event("stop_request")["dispatch_returned"])
         self.assertFalse(obj.lock.locked())
+
+    def test_watchdog_records_deadline_after_dispatch_and_preserves_stop_with_failed_sink(self):
+        results = []
+        for recorder in (None, Recorder(), Recorder(raising=True)):
+            obj, attempt, trigger = self.native(recorder, vector=True)
+            attempt.last_data = obj.reactor.now
+            obj.reactor.now += .087
+            log = recorder.log if recorder else []
+            original = attempt.endstop.trigger
+            attempt.endstop.trigger = lambda code: (log.append("stop"), original(code))
+            wake = obj._watchdog(obj.reactor.now)
+            results.append((attempt.reason, trigger.messages, wake, attempt.request_time))
+            if recorder:
+                fields = recorder.event("watchdog_no_data")
+                self.assertLess(log.index("stop"), log.index("watchdog_no_data"))
+                self.assertAlmostEqual(fields["elapsed_s"], .087)
+                self.assertEqual(fields["timeout_s"], obj.stream_timeout)
+                self.assertEqual(fields["arm_print_time_s"], attempt.arm_time)
+                self.assertEqual(fields["last_data_host_monotonic_s"], .210)
+            self.assertEqual(trigger.messages, [[HOST]])
+            self.assertEqual(wake, obj.reactor.NEVER)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], results[2])
 
     def test_stop_observation_keeps_dispatch_reason_if_final_reason_changes(self):
         recorder = Recorder()

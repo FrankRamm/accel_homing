@@ -22,6 +22,7 @@ class TroubleshootChartTests(unittest.TestCase):
                 arm = float(len(rig.home_calls))
                 observer.record_event("arm", axis=axis, arm_print_time_s=arm)
                 observer.record_event("stop_request", axis=axis, arm_print_time_s=arm,
+                                      request_before_host_monotonic_s=rig.reactor.monotonic(),
                                       request_estimated_print_time_s=arm+.003,
                                       onset_print_time_s=arm+.002,
                                       timestamp_provenance="host_stop_dispatch; local_main_mcu_clocksync_estimate")
@@ -36,14 +37,15 @@ class TroubleshootChartTests(unittest.TestCase):
             self.assertEqual(result["artifacts"]["render"]["result"], "complete")
             folder = Path(result["artifacts"]["folder"])
             pngs = list(folder.glob("*.png"))
-            self.assertEqual(len(pngs), 4)
+            self.assertEqual(len(pngs), 7)
+            self.assertEqual(len(list(folder.glob("*-timing.png"))), 3)
             for path in pngs:
                 self.assertGreater(path.stat().st_size, 10000)
                 width, height = _check_png(path.read_bytes())
                 self.assertGreater(width, 500)
                 self.assertGreater(height, 400)
             manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(manifest["render"]["files"]), 4)
+            self.assertEqual(len(manifest["render"]["files"]), 7)
 
 
 if __name__ == "__main__":
