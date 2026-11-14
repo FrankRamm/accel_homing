@@ -11,7 +11,7 @@ centered or that SAVE_CONFIG succeeded.
 | --- | --- |
 | More than one Klipper instance/sensor found | Use the reported full paths and `--config`, `--service`, `--klippy-socket`, `--klipper-path` and/or `--accel-chip`. Explicit selections must describe the same instance. |
 | Source/origin/branch/upstream rejected | Use the complete clean `~/accel_homing` native clone with canonical HTTPS origin, `main` and `origin/main`. Review local changes; do not force-reset them away. |
-| Legacy MISC ownership found | Preserve thresholds/models/config/backups and successfully uninstall with the old installation's uninstaller before standalone installation. See [migration](INSTALLATION.md#migrate-from-the-misc-plugin). |
+| Old MISC uninstall reports changed Moonraker lines | Run the current standalone installer directly. It migrates the current state without requiring the old uninstall or an intact old updater stanza. Preserve old sources/backups for recovery. See [migration](INSTALLATION.md#migrate-from-the-misc-plugin). |
 | Shared checkout/consumer conflict | Keep the source and every affected instance intact. Do not replace shared links while another instance uses them; use a supported dedicated installation. |
 | Service restart cannot be verified | Review the exact unit, checkout, config and socket. For an unsupported manager use `--no-restart`, then activate the selected processes manually while idle. |
 | Install succeeded but old code seems loaded | A full Klipper host-process restart is needed after source/link changes; console RESTART alone does not reload imported modules. |

@@ -440,30 +440,56 @@ def source_commit(source, api):
     return identity["commit"]
 
 
-def reject_legacy_installation(selected, api):
-    """Reject old updater ownership before attempting native history validation."""
-    def legacy(value):
-        return isinstance(value, dict) and (value.get("origin") == LEGACY_ORIGIN
-                                             or value.get("branch") == LEGACY_BRANCH)
+def legacy_context(value):
+    if not isinstance(value, dict) or value.get("origin") == ORIGIN:
+        return False
+    return (bool(re.fullmatch(r"https://github\.com/(?:FrankRamm|Monolith3D)/MISC(?:\.git)?/?",
+                              str(value.get("origin", "")), re.I))
+            or value.get("branch") == LEGACY_BRANCH)
+
+
+def legacy_installation(selected, api):
+    """Identify MISC without requiring its old registration to remain intact."""
     receipt = selected["config"].parent / RECEIPT
     contexts = []
     if receipt.is_file() and not receipt.is_symlink():
         try:
             contexts.append(json.loads(receipt.read_text()))
         except (OSError, ValueError):
-            pass  # The ordinary receipt validator reports unknown ownership.
+            pass
     _records, active, _receipt = api.load_uninstaller().history(selected["config"], api.uninstall_api())
     contexts.extend(record["manifest"].get("updater") for record in active)
-    if any(legacy(context) for context in contexts):
-        _fail(api, "legacy MISC updater installation detected. Back up custom thresholds and SAVE_CONFIG "
-              "models, then run the previous installation's uninstall.sh successfully before installing "
-              "this standalone clone. Keep its old source and backups until that uninstall succeeds. "
-              "No printer or Moonraker files changed.")
+    if any(legacy_context(context) for context in contexts):
+        return True
+    # Also recognize installations whose receipt/history has been removed.
+    # Never infer MISC from a native standalone journal after migration.
+    if (any(isinstance(context, dict) and context.get("origin") == ORIGIN for context in contexts)
+            or any("migration_history" in record["manifest"] for record in active)):
+        return False
+    for name in api.MODULES:
+        link = selected["repo"] / "klippy/extras" / name
+        if link.is_symlink() and Path(os.readlink(link)).parent.name == "Beacon_Accel_Homing":
+            return True
+    return False
+
+
+def reject_legacy_installation(selected, api):
+    """Restoring an old installation still belongs to its original installer."""
+    if legacy_installation(selected, api):
+        _fail(api, "legacy MISC installation detected for this uninstall request. Run install.sh without "
+              "--uninstall to migrate directly. To restore the original MISC installation instead, "
+              "use the previous installation's uninstall.sh. No printer or Moonraker files changed.")
 
 
 def migration_args(selected, args, api):
-    reject_legacy_installation(selected, api)
     result = copy.copy(args)
+    if legacy_installation(selected, api):
+        result._legacy_migration = True
+        result.replace_existing_links = True
+        paths = [selected["repo"] / "klippy/extras" / name for name in api.MODULES]
+        paths.append(selected["config"].parent / RECEIPT)
+        result._migration_expected = {path: api.snapshot(path) for path in paths}
+        return result
     if args.replace_existing_links:
         return result
     expected = api.load_uninstaller().validate_migration(selected, api.uninstall_api())
@@ -488,8 +514,22 @@ def assert_clone_consumers(source, selected, api):
                   "preserve the other instance before installing" % peer["config"])
 
 
+def remove_registration(data, path, api):
+    """Remove only this updater's active section; retain comments and other sections."""
+    document = api.ConfigDocument(path, data)
+    sections = [section for section in document.sections if section.name.lower() == SECTION]
+    if len(sections) > 1:
+        _fail(api, "duplicate [%s] sections in %s" % (SECTION, path))
+    for section in sections:
+        for index in range(section.start, section.end):
+            line = document.lines[index].strip()
+            if index == section.start or (line and not line.startswith(("#", ";"))):
+                document.replacements[index] = ""
+    return document.rendered()
+
+
 def make_plan(source, selected, args, api):
-    reject_legacy_installation(selected, api)
+    migrating = legacy_installation(selected, api)
     repo = managed_path(selected)
     if source != repo or source.is_symlink():
         _fail(api, "install the standalone Git checkout at %s and run its install.sh; "
@@ -512,7 +552,9 @@ def make_plan(source, selected, args, api):
     if receipt_state["kind"] != "absent":
         if receipt_state["kind"] != "file":
             _fail(api, "refusing unsafe updater receipt")
-        previous = receipt_context(json.loads(base64.b64decode(receipt_state["data"])), selected, api)
+        previous = (None if migrating else
+                    receipt_context(json.loads(base64.b64decode(receipt_state["data"])), selected, api))
+    if previous:
         if any(previous[key] != str(moon[name]) for key, name in
                (("moon_config", "config"), ("moon_data", "data"), ("moon_socket", "socket"))):
             _fail(api, "existing updater receipt belongs to another Moonraker instance")
@@ -520,6 +562,12 @@ def make_plan(source, selected, args, api):
         if owned and original.count(owned) != 1:
             _fail(api, "owned Moonraker main-config registration changed/missing; preserve/reconcile it before updating")
     existing = graph.one(SECTION, False)
+    if migrating and existing:
+        path = existing.document.path
+        changes[path] = dict(kind="file", data=remove_registration(existing.document.original, path, api))
+        if path == moon["config"]:
+            original = changes.pop(path)["data"]
+        existing = None
     direct = True
     if existing:
         if existing.document.path == include and include.read_bytes() == stanza(repo):
@@ -528,8 +576,8 @@ def make_plan(source, selected, args, api):
             _fail(api, "conflicting existing [%s]; preserve/reconcile it instead of overwriting" % SECTION)
     elif previous:
         _fail(api, "owned Moonraker updater registration is missing; preserve/reconcile it before updating")
-    if direct and (include.exists() or include.is_symlink()):
-        _fail(api, "%s exists without the unique managed updater stanza" % include)
+    # An unused old include file does not prevent a direct registration. Keep it
+    # in place; only an active conflicting section matters.
     if previous and (previous.get("layout") == "direct") != direct:
         _fail(api, "existing updater layout changed; preserve its recorded registration instead of migrating it")
     base = graph.one("update_manager", False)
@@ -555,9 +603,14 @@ def make_plan(source, selected, args, api):
     for path, change in changes.items():
         change["expected"] = receipt_state if path == receipt else api.snapshot(path)
     pending = activation_needed(selected, context, api)
-    return dict(moon=moon, repo=repo, source=repo, commit=commit, source_identity=identity, selected=selected,
+    plan = dict(moon=moon, repo=repo, source=repo, commit=commit, source_identity=identity, selected=selected,
                 changes=changes, context=context, source_input=source, published=False,
                 restart_needed=any(path != receipt for path in changes) or pending, receipt=receipt)
+    if migrating:
+        _records, active, _receipt = api.load_uninstaller().history(selected["config"], api.uninstall_api())
+        plan["migration_history"] = [record["ref"] for record in active]
+        plan["moonraker_context"] = {str(path): api.snapshot(path) for path in graph.documents}
+    return plan
 
 
 def git(repo, arguments, api, timeout=120):
@@ -773,6 +826,22 @@ def validate_record(manifest, selected, api, verify_live=True):
     allowed = {main: "moon_main", selected["config"].parent / RECEIPT: "updater_receipt"}
     if not layout["direct"]:
         allowed[include] = "moon_generated"
+    migrating = "migration_history" in manifest
+    migration_states = {}
+    if migrating:
+        helper = api.load_uninstaller()
+        context_states = manifest.get("moonraker_context")
+        if not isinstance(context_states, dict):
+            _fail(api, "missing Moonraker migration baseline")
+        migration_states = {helper._path(name, api): helper._state(state, api)
+                            for name, state in context_states.items()}
+        documents = helper._config_paths(main, migration_states, api)
+        if set(documents) != set(migration_states):
+            _fail(api, "Moonraker migration baseline contains unrelated paths")
+        for path, state in documents.items():
+            original = base64.b64decode(state["data"])
+            if remove_registration(original, path, api) != original:
+                allowed[path] = "moon_main"
     checked = {}
     for entry in manifest["changes"]:
         path = Path(entry["path"])
@@ -781,17 +850,28 @@ def validate_record(manifest, selected, api, verify_live=True):
         before, after = entry["before"], entry["after"]
         if manifest.get("operation") == "uninstall":
             before, after = after, before
-        if path == include:
+        if allowed[path] == "moon_generated":
             if before["kind"] != "absent" or after["kind"] != "file" or base64.b64decode(after["data"]) != stanza(repo):
                 _fail(api, "unowned generated Moonraker updater edit")
-        elif path == main:
-            if not suffix or before["kind"] != "file" or after["kind"] != "file":
+        elif allowed[path] == "moon_main":
+            if (not suffix and not migrating) or before["kind"] != "file" or after["kind"] != "file":
                 _fail(api, "unsafe Moonraker main configuration journal")
             old, new = base64.b64decode(before["data"]), base64.b64decode(after["data"])
+            if migrating:
+                if (manifest.get("operation") != "uninstall"
+                        and migration_states.get(path, {}).get("data") != before["data"]):
+                    _fail(api, "Moonraker migration baseline differs from the backup")
+                old = remove_registration(old, path, api)
+            appended = suffix if path == main else b""
             if manifest.get("operation") == "uninstall":
-                if new.count(suffix) != 1 or new.replace(suffix, b"", 1) != old:
+                restored = new
+                if appended:
+                    if new.count(appended) != 1:
+                        _fail(api, "uninstall contains unowned Moonraker text changes")
+                    restored = new.replace(appended, b"", 1)
+                if restored != old:
                     _fail(api, "uninstall contains unowned Moonraker text changes")
-            elif new != old + suffix:
+            elif new != old + appended:
                 _fail(api, "updater journal changes unrelated Moonraker settings")
         else:
             for state in (before, after):
@@ -799,6 +879,10 @@ def validate_record(manifest, selected, api, verify_live=True):
                     continue
                 if state["kind"] != "file":
                     _fail(api, "unsafe updater receipt journal")
+                if migrating and state is before:
+                    # Preserve the old receipt as data; its MISC ownership and
+                    # stale registration are not requirements for installation.
+                    continue
                 value = json.loads(base64.b64decode(state["data"]))
                 value_context = receipt_context(value, selected, api)
                 if set(value_context) != layout["keys"]:

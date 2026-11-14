@@ -600,7 +600,8 @@ def make_plan(source, selected, args):
     existing = plugins[0] if plugins else None
     generic_names = getattr(args, "generic_names", False)
     if generic_names:
-        load_uninstaller().validate_installation_history(selected, uninstall_api())
+        if not getattr(args, "_legacy_migration", False):
+            load_uninstaller().validate_installation_history(selected, uninstall_api())
         validate_generic_names(graph, existing)
     sensor = choose_sensor(graph, args.accel_chip, existing)
     family = sensor.split()[0].lower()
@@ -1187,6 +1188,11 @@ def apply_plan(changes, config, writer=write_state, selected=None, before_write=
     if updater is not None:
         metadata["updater"] = updater["context"]
         metadata["source_update"] = load_updater().source_metadata(updater)
+        if "migration_history" in updater:
+            if updater["migration_history"] != [record["ref"] for record in active]:
+                raise InstallError("Installation history changed during migration planning; retry.")
+            metadata.update(parent=None, migration_history=updater["migration_history"],
+                            moonraker_context=updater["moonraker_context"])
     return execute_transaction(entries, config, metadata, writer, before_write)
 
 
@@ -1297,6 +1303,9 @@ def apply_uninstall_plan(plan, selected, writer=write_state):
     metadata = dict(operation="uninstall", repo=str(selected["repo"]), history=plan["history"])
     if plan.get("updater") is not None:
         metadata["updater"] = plan["updater"]
+    for key in ("migration_history", "moonraker_context"):
+        if key in plan:
+            metadata[key] = plan[key]
     return execute_transaction(plan["entries"], selected["config"], metadata, writer)
 
 
@@ -1551,9 +1560,9 @@ def main(argv=None):
     print("Checkout: %s\nMain config: %s\nDetection: %s\nService: %s\nExecutable: %s" %
           (selected["repo"], selected["config"], selected["origin"], selected["service"] or "none", selected["executable"] or "stopped host"))
     updater_helper = load_updater()
-    if updater_helper:
-        # Known legacy ownership needs its old uninstaller, including when this
-        # entry point was invoked with --uninstall, --rollback, or an opt-out.
+    if updater_helper and args.uninstall:
+        # New installation can adopt MISC directly. Restoring an unmigrated
+        # installation still needs its original history semantics.
         updater_helper.reject_legacy_installation(selected, uninstall_api())
     if args.uninstall:
         plan = make_uninstall_plan(selected)
@@ -1601,7 +1610,7 @@ def main(argv=None):
     # Validate printer/custom-G28/foreign-link policy before source/cache writes.
     changes, messages, sensor = make_plan(source, selected, planning_args)
     if updater_api:
-        updater = updater_api.make_plan(source, selected, args, uninstall_api())
+        updater = updater_api.make_plan(source, selected, planning_args, uninstall_api())
         assert_uninstall_consumers(selected, {"entries": [
             {"path": str(selected["repo"] / "klippy/extras" / name)} for name in MODULES]})
         for module in MODULES:
@@ -1611,6 +1620,9 @@ def main(argv=None):
                                      link, changes.get(link, {}).get("expected", snapshot(link))))
         changes.update(updater["changes"])
         print("Managed update source: %s\nMoonraker config: %s" % (updater["repo"], updater["moon"]["config"]))
+        if "migration_history" in updater:
+            print("Migrating MISC directly from the current configuration; old sources and backups are retained. "
+                  "Uninstall will restore this pre-migration state.")
     print("Accelerometer: [%s] (physical mounting/orientation not inferred)" % sensor)
     for message in messages:
         print("Note: " + message)

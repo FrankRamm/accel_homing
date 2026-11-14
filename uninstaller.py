@@ -122,6 +122,13 @@ def history(config, api):
                 _fail(api, "Missing/gapped/changed history referenced by uninstall", record["directory"])
             active, receipt = [], record
         else:
+            if "migration_history" in data:
+                if (data["version"] != 2
+                        or data["migration_history"] != [item["ref"] for item in active]):
+                    _fail(api, "Changed history referenced by migration", record["directory"])
+                # The migration preserves the old journals, but adopts today's
+                # configuration as its baseline instead of undoing old edits.
+                active = []
             if data["version"] == 2:
                 expected_parent = active[-1]["ref"] if active else None
                 expected_receipt = receipt["ref"] if receipt else None
@@ -623,8 +630,12 @@ def make_plan(selected, api):
                if not _same(initial[path], virtual[path])]
     if not entries:
         _fail(api, "Installation history has no verifiable activation to restore", first["directory"])
-    return dict(entries=entries, history=[item["ref"] for item in active],
+    plan = dict(entries=entries, history=[item["ref"] for item in active],
                 records=[item["ref"] for item in records], config=config, repo=repo,
                 updater=updater_context,
                 expected={str(path): initial[path] if path in initial else final_documents[path]
                           for path in set(initial) | set(final_documents)})
+    if "migration_history" in first["manifest"]:
+        for key in ("migration_history", "moonraker_context"):
+            plan[key] = first["manifest"][key]
+    return plan

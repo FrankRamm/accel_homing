@@ -20,8 +20,9 @@ updates, and restarts the verified services. It may ask for your
 Linux sudo password. It does not home the printer.
 
 Read the [first calibration instructions](docs/SIMPLE_CALIBRATION.md) before
-moving the printer. Existing MISC installations must follow the
-[migration instructions](docs/INSTALLATION.md#migrate-from-the-misc-plugin) first.
+moving the printer. Existing MISC installations can run this installer directly;
+the old uninstaller is not required. See the
+[migration details](docs/INSTALLATION.md#migrate-from-the-misc-plugin).
 
 For later updates, use **accel_homing → Update** in Mainsail or Fluidd while idle.
 

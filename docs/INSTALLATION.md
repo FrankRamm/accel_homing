@@ -68,8 +68,8 @@ axes are preserved. Default installation preserves configured homing speeds;
 and restore a speed written by an earlier installer.
 
 Existing regular Python files at managed link paths are not overwritten.
-Links to another source require review and `--replace-existing-links`; this
-flag does not adopt an old MISC installation's backup/update ownership.
+Recognized MISC module links are backed up and replaced automatically. Other
+source links require review and `--replace-existing-links`.
 Duplicate sections/options/includes, ambiguous instances and unsupported
 configuration structures fail with a reported conflict.
 
@@ -230,30 +230,29 @@ use a forced reset to conceal an ownership or configuration conflict.
 
 ## Migrate from the MISC plugin
 
-The standalone repository has a different source and update identity. It does
-not automatically take ownership of an installation from
-`FrankRamm/MISC` or `Monolith3D/MISC`.
+Run the normal standalone installer above while idle. Installations from
+`FrankRamm/MISC` or `Monolith3D/MISC` no longer require the old uninstaller or
+`--replace-existing-links`. The deleted MISC repository is not contacted.
+An edited or removed old Moonraker registration does not block installation.
 
-1. Keep the printer idle. Back up manual thresholds and the SAVE_CONFIG models
-   before uninstall: full uninstall restores the recorded baseline and can
-   remove models introduced by that installation. Preserve current configuration,
-   plots and the complete `.accel_homing_backups/` history. Keep the old source
-   checkout/cache available.
-2. Run the **old installation's own uninstaller**, with that installation's
-   instance options. Use the exact existing path rather than a guessed MISC
-   directory. Review its output and require a successful result.
-3. Restart every service it lists while idle. Verify that the previous endstop
-   configuration was restored. An uninstall conflict or incomplete backup is a
-   recovery task; do not continue by deleting links, updater entries or history.
-4. Install this standalone repository using the commands above. Review the new
-   plan and confirm its selected sensor and restored homing settings.
-5. Prepare and supervise new calibration/testing. Historical models and results
-   do not validate the standalone revision or the current mechanics.
+The installer backs up the current files and module links, preserves existing
+thresholds and SAVE_CONFIG models, and points the plugin at `~/accel_homing`.
+It replaces the old `[update_manager accel_homing]` section if present, including
+when that section is in an included file, or creates the new entry if absent.
+Other Moonraker sections and comments are preserved. An unused old
+`accel_homing_update.cfg` is left in place.
 
-Do not use `--replace-existing-links` as a shortcut around legacy ownership.
-If the old source is missing, recover the version associated with its recorded
-backup before attempting restoration. Keep old sources until no restored links
-or retained recovery procedure requires them.
+The current configuration becomes the standalone installation's restore
+baseline. Old transaction backups remain unchanged in `.accel_homing_backups/`;
+their old configuration edits are not replayed or required to match current
+Moonraker text. Structural backup integrity, instance selection, non-symlink
+Python files, concurrent edits, and idle/restart checks still apply.
+
+After migration, standalone uninstall restores the state immediately before
+migration, including the previous plugin links and updater registration. It does
+not go back through the old MISC transactions to factory endstop settings.
+Retain the old source and all backups if that restore path may be needed.
+Installation does not test homing; supervise subsequent physical testing.
 
 ## Uninstall
 
