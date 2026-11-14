@@ -67,7 +67,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Measure repeated commanded-travel variation and save an accuracy PNG; X, Y or XY, 2–50 samples per axis. |
 | `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Record repeated homes, packet/stop/return timing, raw samples and diagnostic plots in a shareable bundle; fixed active settings, no recalibration or save. |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW` | Record raw homes and evaluate a frozen weighted-XYZ profile afterward, with rejection details, delivery timing and a diagnostic ZIP. See [experimental workflow](docs/EXPERIMENT.md) for SHADOW and the existing LIVE mode. |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=10` | Compare 10 alternating normal/shorter-delivery pairs using RAW throughout, plus 11 reference/discovery homes; evaluate a frozen shadow profile with noise margins and export a ZIP. Unsupported transports are labelled unavailable. See [experimental workflow](docs/EXPERIMENT.md); existing SHADOW/LIVE behavior and the LIVE default are unchanged. |
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 

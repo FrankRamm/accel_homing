@@ -36,6 +36,48 @@ MAX_TIMING_ROWS = 1024  # Per home, independently of packet/raw retention.
 MAX_SLOW_TIMING_ROWS = 64
 TIMING_INTERVAL = .020
 SLOW_TIMING = .020
+MAX_QUEUE_BLOCKS = 64  # Scalar provenance only, never sensor payload bytes.
+MAX_ENVIRONMENT_OBJECTS = 32
+
+
+def _compare_mode(session):
+    return (session.get("experiment") or {}).get("mode") == "COMPARE"
+
+
+def _home_environment(workflow, now):
+    """Cached thermal/fan state and local OS counters; no hardware queries."""
+    thermal, observed = {}, 0
+    keys = ("temperature", "target", "power", "speed", "rpm", "measured_min_temp", "measured_max_temp")
+    for name, obj in workflow.printer.lookup_objects():
+        if (name in ("fan", "heater_bed", "extruder") or name.startswith((
+                "fan_generic ", "heater_fan ", "controller_fan ", "temperature_fan ",
+                "temperature_sensor ", "heater_generic ", "extruder"))):
+            observed += 1
+            if len(thermal) >= MAX_ENVIRONMENT_OBJECTS:
+                continue
+            status = _observe(obj, "get_status", now)
+            thermal[name] = {key: status[key] for key in keys if key in status}
+            if not thermal[name]:
+                thermal[name] = {"unavailable": "cached scalar status unavailable"}
+    host = {"process_cpu_s": time.process_time(), "load_average_1_5_15": None,
+            "resource_usage": None, "cpu_scope": "whole process, including other threads"}
+    try:
+        host["load_average_1_5_15"] = list(os.getloadavg())
+    except (AttributeError, OSError):
+        pass
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        host["resource_usage"] = {"user_cpu_s": usage.ru_utime, "system_cpu_s": usage.ru_stime,
+            "max_rss_native_units": usage.ru_maxrss, "minor_faults": usage.ru_minflt,
+            "major_faults": usage.ru_majflt, "voluntary_context_switches": usage.ru_nvcsw,
+            "involuntary_context_switches": usage.ru_nivcsw,
+            "max_rss_units": "KiB on Linux; bytes on macOS; OS-native otherwise"}
+    except (ImportError, AttributeError, OSError):
+        pass
+    return {"cached_thermal_fan": thermal, "objects_observed": observed,
+            "objects_omitted": observed - len(thermal), "object_limit": MAX_ENVIRONMENT_OBJECTS,
+            "host": host, "provenance": "cached get_status accessors and local OS process/load counters"}
 
 
 def finite(value):
@@ -89,7 +131,7 @@ def _snapshot(workflow):
             objects[name] = {"status": _observe(obj, "get_status", now)}
             if name == "mcu" or name.startswith("mcu "):
                 objects[name]["stats"] = _observe(obj, "stats", now)
-    return {"host_monotonic_s": now, "logical_commanded_position_mm": clean(toolhead.get_position()),
+    result = {"host_monotonic_s": now, "logical_commanded_position_mm": clean(toolhead.get_position()),
             "kinematic_limits": clean(getattr(kin, "limits", None)),
             "kinematic_status": _observe(kin, "get_status", now),
             "toolhead_status": _observe(toolhead, "get_status", now),
@@ -101,6 +143,9 @@ def _snapshot(workflow):
                 "operation_generation", "sensor_fault", "scale", "session_scale", "full_scale_g",
                 "sensor_name", "baseline_status", "baseline_time", "baseline_batches",
                 "stream_timeout", "stream_on", "native_stream_generation", "last")})}
+    if _compare_mode(getattr(workflow, "session", None) or {}):
+        result["comparison_environment"] = _home_environment(workflow, now)
+    return result
 
 
 def snapshot(workflow):
@@ -164,6 +209,30 @@ class TimingTrace:
         self.gc_started = {}
         self.gc_callback = self._gc
         self.active_calls, self.active_at_close, self.next_call = {}, [], 0
+        self.context_calls, self.bookkeeping, self.queue_blocks = {}, {}, {}
+        self.context_calls_omitted = 0
+        self.batch_timer_hook = None
+
+    def _armed(self):
+        try:
+            attempt = getattr(self.recorder.workflow.owner, "attempt", None)
+            return attempt is not None and not getattr(attempt, "done", True)
+        except Exception:
+            self.errors += 1
+            return False
+
+    def _overhead(self, home_id, armed, started):
+        """Post-call bookkeeping only; nested original call durations excluded."""
+        duration = time.perf_counter() - started
+        with self.lock:
+            if self.closed or home_id not in self.groups:
+                return
+            counters = self.bookkeeping.setdefault(home_id, {})
+            for scope in ("all_calls", "armed_entry_calls") if armed else ("all_calls",):
+                stat = counters.setdefault(scope, {"count": 0, "total_s": 0., "max_s": 0.})
+                stat["count"] += 1
+                stat["total_s"] += duration
+                stat["max_s"] = max(stat["max_s"], duration)
 
     def _stamp(self):
         try:
@@ -194,7 +263,7 @@ class TimingTrace:
                         return
                     self.groups[home_id] = {"rows": deque(maxlen=MAX_TIMING_ROWS),
                         "slow": deque(maxlen=MAX_SLOW_TIMING_ROWS), "observed": 0,
-                        "slow_observed": 0, "stages": {}}
+                        "slow_observed": 0, "stages": {}, "armed_stages": {}}
                 group = self.groups[home_id]
                 stages = group["stages"]
                 if stage not in stages:
@@ -218,6 +287,18 @@ class TimingTrace:
                        "process_cpu_s": (end[1] - start[1] if finite(start[1]) and finite(end[1]) else None),
                        "details": details or {}}
                 group["rows"].append(row)
+                if (details or {}).get("armed_at_entry"):
+                    armed_stat = group["armed_stages"].setdefault(stage, {"count": 0,
+                        "total_duration_s": 0., "max_duration_s": 0., "max_lateness_s": None,
+                        "max_oldest_block_age_s": None})
+                    armed_stat["count"] += 1
+                    armed_stat["total_duration_s"] += duration
+                    armed_stat["max_duration_s"] = max(armed_stat["max_duration_s"], duration)
+                    for source, target in (("lateness_s", "max_lateness_s"),
+                                           ("oldest_block_age_at_drain_s", "max_oldest_block_age_s")):
+                        value = (details or {}).get(source)
+                        if finite(value):
+                            armed_stat[target] = max(value, armed_stat[target]) if finite(armed_stat[target]) else value
                 slow_gap = ((details or {}).get("lateness_s", 0.) if stage == "reactor_heartbeat" else gap)
                 if duration >= SLOW_TIMING or (finite(slow_gap) and slow_gap >= SLOW_TIMING):
                     group["slow_observed"] += 1
@@ -236,6 +317,7 @@ class TimingTrace:
             if self.closed:
                 return original(*args, **kwargs)
             start, home_id = self._stamp(), self._home()
+            armed = self._armed()
             token = self._enter_call(stage, start, home_id)
             result, returned = None, False
             try:
@@ -244,13 +326,25 @@ class TimingTrace:
                 return result
             finally:
                 end = self._stamp()
+                bookkeeping_started = time.perf_counter()
                 try:
+                    context = {}
                     if token is not None:
                         with self.lock:
                             self.active_calls.pop(token, None)
+                            context = self.context_calls.pop(token, {})
                     fields = details(args, result) if details is not None and returned else {}
-                    fields["returned"] = returned
+                    fields.update(returned=returned, armed_at_entry=armed, call_id=token,
+                                  parent_context_call_id=context.get("parent_context_call_id"),
+                                  context_provenance="unique active same-home same-thread driver/pull call; not an exact greenlet stack")
+                    if stage == "driver_queue_drain" and returned:
+                        received = fields.get("oldest_receive_host_monotonic_s")
+                        fields["oldest_block_age_at_drain_s"] = start[0] - received if finite(received) and finite(start[0]) else None
+                        counts = self.queue_blocks.setdefault(home_id, {"observed": 0, "omitted_per_call_limit": 0})
+                        counts["observed"] += fields.get("messages", 0)
+                        counts["omitted_per_call_limit"] += fields.get("blocks_omitted", 0)
                     self.note(stage, start, end, fields, home_id)
+                    self._overhead(home_id, armed, bookkeeping_started)
                 except Exception:
                     self.errors += 1
 
@@ -264,14 +358,22 @@ class TimingTrace:
     def _enter_call(self, stage, start, home_id):
         # A query can yield while cancellation unwinds the workflow. Retain its
         # start even if its wrapper has not returned when collection closes.
-        if stage not in ("sensor_status_query", "driver_batch"):
-            return None
         try:
             with self.lock:
-                if self.closed or len(self.active_calls) >= 16:
+                if self.closed:
+                    return None
+                if len(self.context_calls) >= 32:
+                    self.context_calls_omitted += 1
                     return None
                 self.next_call += 1
-                self.active_calls[self.next_call] = {"stage": stage, "home_id": home_id,
+                thread_id = threading.get_ident()
+                parents = [key for key, item in self.context_calls.items()
+                    if item["home_id"] == home_id and item["thread_id"] == thread_id
+                    and item["stage"] == ("sensor_pull" if stage in ("sensor_status_query", "driver_queue_drain") else "driver_batch")]
+                self.context_calls[self.next_call] = {"stage": stage, "home_id": home_id,
+                    "thread_id": thread_id, "parent_context_call_id": parents[0] if len(parents) == 1 else None}
+                if stage in ("sensor_status_query", "driver_batch"):
+                    self.active_calls[self.next_call] = {"stage": stage, "home_id": home_id,
                     "entry_host_monotonic_s": start[0], "entry_process_cpu_s": start[1]}
                 return self.next_call
         except Exception:
@@ -286,11 +388,16 @@ class TimingTrace:
 
     @staticmethod
     def _queue_details(args, result):
+        blocks = [{"sequence": row.get("sequence"), "payload_bytes": len(row.get("data", ())),
+                   "receive_host_monotonic_s": row.get("#receive_time")}
+                  for row in result[:MAX_QUEUE_BLOCKS]]
         return {"messages": len(result),
                 "first_sequence": result[0].get("sequence") if result else None,
                 "last_sequence": result[-1].get("sequence") if result else None,
                 "oldest_receive_host_monotonic_s": result[0].get("#receive_time") if result else None,
-                "newest_receive_host_monotonic_s": result[-1].get("#receive_time") if result else None}
+                "newest_receive_host_monotonic_s": result[-1].get("#receive_time") if result else None,
+                "blocks": blocks, "blocks_omitted": max(0, len(result) - len(blocks)),
+                "sample_to_block_mapping": "unavailable; decoded sample membership is not inferred"}
 
     def _serial(self, reader):
         serial = getattr(getattr(reader, "mcu", None), "_serial", None)
@@ -310,21 +417,117 @@ class TimingTrace:
                 if self.closed:
                     return original(params)
                 start, home_id = self._stamp(), self._home()
+                armed = self._armed()
                 try:
                     return original(params)
                 finally:
                     end = self._stamp()
+                    bookkeeping_started = time.perf_counter()
                     try:
                         self.note("mcu_bulk_handler", start, end,
                             {"serial_receive_host_monotonic_s": params.get("#receive_time"),
                              "serial_sent_host_monotonic_s": params.get("#sent_time"),
                              "mcu_sequence": params.get("sequence"),
-                             "payload_bytes": len(params.get("data", ()))}, home_id)
+                             "payload_bytes": len(params.get("data", ())), "armed_at_entry": armed}, home_id)
+                        self._overhead(home_id, armed, bookkeeping_started)
                     except Exception:
                         self.errors += 1
             handlers[key] = observed
             self.serial_hook = (handlers, lock, key, original, observed)
             self.available["mcu_bulk_handler"] = "enabled"
+
+    def _detach_batch_timer(self):
+        hook, self.batch_timer_hook = self.batch_timer_hook, None
+        if hook is not None:
+            timer, original, wrapper, _state = hook
+            if getattr(timer, "callback", None) is wrapper:
+                timer.callback = original
+
+    def _attach_batch_timer(self, backend):
+        """Observe the existing timer, including its returned next deadline.
+
+        Klipper sets waketime=NEVER before calling it, so reading waketime from
+        batch_cb would erase the very deadline needed to measure lateness.
+        """
+        if self.closed:
+            return
+        helper = getattr(backend, "helper", None)
+        timer = getattr(helper, getattr(backend, "timer_attr", "batch_timer"), None)
+        if self.batch_timer_hook is not None and self.batch_timer_hook[0] is timer:
+            return
+        self._detach_batch_timer()
+        original = getattr(timer, "callback", None)
+        if not callable(original) or not hasattr(timer, "timer_is_running"):
+            self.available["driver_timer"] = "unavailable: compatible existing reactor timer not exposed"
+            return
+        state = {"next_deadline_s": getattr(timer, "waketime", None), "source": "existing timer waketime after backend start"}
+        def observed(eventtime):
+            if self.closed:
+                return original(eventtime)
+            start, home_id, armed = self._stamp(), self._home(), self._armed()
+            expected, provenance = state["next_deadline_s"], state["source"]
+            result, returned = None, False
+            try:
+                result = original(eventtime)
+                returned = True
+                return result
+            finally:
+                end = self._stamp()
+                bookkeeping_started = time.perf_counter()
+                try:
+                    if not self.closed:
+                        known = finite(expected) and expected < self.reactor.NEVER
+                        state.update(next_deadline_s=result if returned and finite(result) else None,
+                                     source="original timer callback return" if returned else "callback raised; next deadline unavailable")
+                        self.note("driver_timer", start, end, {
+                            "scheduled_host_monotonic_s": expected if known else None,
+                            "lateness_s": max(0., start[0] - expected) if known and finite(start[0]) else None,
+                            "deadline_provenance": provenance, "reactor_eventtime_s": eventtime,
+                            "next_deadline_s": result if returned and finite(result) and result < self.reactor.NEVER else None,
+                            "next_deadline_status": "scheduled" if returned and finite(result) and result < self.reactor.NEVER else "unavailable_or_never",
+                            "returned": returned, "armed_at_entry": armed}, home_id)
+                        self._overhead(home_id, armed, bookkeeping_started)
+                except Exception:
+                    self.errors += 1
+        timer.callback = observed
+        self.batch_timer_hook = (timer, original, observed, state)
+        self.available["driver_timer"] = "enabled: original existing timer only; no new batch timer"
+
+    def _timer_lifecycle(self, backend):
+        original = getattr(backend, "start", None)
+        if not callable(original) or not callable(getattr(self.reactor, "update_timer", None)):
+            self.available["driver_timer"] = "unavailable: configured backend start not exposed"
+            return
+        own = "start" in getattr(backend, "__dict__", {})
+        def start(*args, **kwargs):
+            result = original(*args, **kwargs)
+            try:
+                self._attach_batch_timer(backend)
+            except Exception:
+                self.errors += 1
+            return result
+        backend.start = start
+        self.hooks.append((backend, "start", original, start, own))
+        update = getattr(self.reactor, "update_timer", None)
+        if callable(update):
+            update_own = "update_timer" in getattr(self.reactor, "__dict__", {})
+            def update_timer(*args, **kwargs):
+                result = update(*args, **kwargs)
+                try:
+                    timer = args[0] if args else kwargs.get("timer_handler")
+                    hook = self.batch_timer_hook
+                    if not self.closed and hook is not None and timer is hook[0] and not timer.timer_is_running:
+                        hook[3].update(next_deadline_s=getattr(timer, "waketime", None),
+                                       source="existing reactor.update_timer observed resulting waketime")
+                except Exception:
+                    self.errors += 1
+                return result
+            self.reactor.update_timer = update_timer
+            self.hooks.append((self.reactor, "update_timer", update, update_timer, update_own))
+        else:
+            self.available["driver_timer"] = "unavailable: update_timer reschedules cannot be observed"
+            return
+        self._attach_batch_timer(backend)
 
     def start(self):
         if self.closed or self.available:
@@ -343,12 +546,13 @@ class TimingTrace:
             self._wrap(getattr(reader, "query_status_cmd", None), "send", "sensor_status_query", self._query_details)
             self._wrap(getattr(reader, "bulk_queue", None), "pull_queue", "driver_queue_drain", self._queue_details)
             self._wrap(sensor, "_convert_samples", "driver_decode")
-            self._wrap(owner, "_inspect", "detector_with_observer")
+            self._wrap(owner, "_inspect_data" if backend is None else "_inspect", "detector_with_observer")
             self._wrap(backend, "_receive", "adapter_processing")
             self._wrap(backend, "_troubleshoot_receive", "adapter_observer")
             self._wrap(self.recorder, "record_batch", "recorder_batch")
             self._wrap(self.recorder, "record_event", "recorder_event")
             self._serial(reader)
+            self._timer_lifecycle(backend)
             gc.callbacks.append(self.gc_callback)
             self.available["gc"] = "enabled"
             if callable(getattr(self.reactor, "unregister_timer", None)):
@@ -375,7 +579,7 @@ class TimingTrace:
                       {"scheduled_host_monotonic_s": expected,
                        "lateness_s": max(0., start[0] - expected), "eventtime_s": eventtime,
                        "interval_s": start[0] - previous[0],
-                       "interval_process_cpu_s": start[1] - previous[1]})
+                       "interval_process_cpu_s": start[1] - previous[1], "armed_at_entry": self._armed()})
             return self.expected
         except Exception:
             self.errors += 1
@@ -407,6 +611,10 @@ class TimingTrace:
                 self.reactor.unregister_timer(self.timer)
             except Exception:
                 self.errors += 1
+        try:
+            self._detach_batch_timer()
+        except Exception:
+            self.errors += 1
         try:
             if self.gc_callback in gc.callbacks:
                 gc.callbacks.remove(self.gc_callback)
@@ -440,14 +648,24 @@ class TimingTrace:
                 summaries[str(home_id)] = {"observed": group["observed"], "retained": len(retained),
                     "omitted": group["observed"] - len(retained),
                     "slow_observed": group["slow_observed"], "slow_retained": len(group["slow"]),
-                    "stages": clean(group["stages"])}
+                    "stages": clean(group["stages"]), "armed_entry_stages": clean(group["armed_stages"]),
+                    "bookkeeping_overhead": clean(self.bookkeeping.get(home_id, {})),
+                    "queue_block_provenance": {**self.queue_blocks.get(home_id, {"observed": 0, "omitted_per_call_limit": 0}),
+                        "retained_exported": sum(len(row["details"].get("blocks", ())) for row in retained.values()),
+                        "omitted_total": self.queue_blocks.get(home_id, {}).get("observed", 0) - sum(
+                            len(row["details"].get("blocks", ())) for row in retained.values()),
+                        "per_call_limit": MAX_QUEUE_BLOCKS}}
         return {"schema": "accel_homing_timing_v1", "file": "timing.jsonl.gz", "hooks": self.available,
                 "in_flight_at_close": clean(self.active_at_close),
                 "errors": self.errors, "max_tail_rows_per_home": MAX_TIMING_ROWS,
+                "max_active_context_calls": 32, "context_calls_omitted": self.context_calls_omitted,
+                "max_owned_batch_timer_wrappers": 1,
                 "max_slow_rows_per_home": MAX_SLOW_TIMING_ROWS, "slow_threshold_s": SLOW_TIMING,
                 "heartbeat_interval_s": TIMING_INTERVAL, "homes": summaries,
                 "clock_domain": "host_monotonic", "cpu_scope": "process including other threads",
-                "interpretation": "Nested durations overlap; do not sum stages. Serial receive is a host transport timestamp, not hardware receipt. Recorder/adapter observer costs exclude timing-hook bookkeeping itself. Hooks add overhead and do not locate delays inside firmware or the kernel."}
+                "armed_scope": "Calls entered while owner.attempt exists and done is false; excludes reference/recenter entries, may include pre-motion arm scheduling. Whole-home stages are separate.",
+                "bookkeeping_scope": "Measured post-call metadata/trace recording only; excludes original calls and measurement-counter update itself; nested original durations must not be summed.",
+                "interpretation": "Nested durations overlap; do not sum stages. Serial receive is a host transport timestamp, not hardware receipt. Timer deadlines are observed existing schedules, not inferred intervals. Block provenance has no payload or exact decoded-sample mapping. Hooks add overhead and do not locate delays inside firmware or the kernel."}
 
 
 def adxl_saturation_profile(context):
@@ -688,6 +906,162 @@ def export_delivery(folder, homes):
             writer.writerow(row)
 
 
+COMPARISON_METRICS = (
+    "onset_to_host_dispatch_estimate_ms", "batch_last_to_adapter_ms",
+    "detector_to_request_ms", "commanded_halt_minus_trigger_mm",
+    "armed_query_max_ms", "armed_timer_lateness_max_ms", "armed_queue_age_max_ms",
+    "armed_bookkeeping_total_ms")
+
+
+def _distribution(values, total):
+    ordered = sorted(value for value in values if finite(value))
+    def quantile(fraction):
+        if not ordered:
+            return None
+        position = (len(ordered) - 1) * fraction
+        low, high = int(math.floor(position)), int(math.ceil(position))
+        return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+    return {"count": len(ordered), "missing": total - len(ordered),
+            "mean": sum(ordered) / len(ordered) if ordered else None,
+            "median": quantile(.5), "p95": quantile(.95),
+            "minimum": ordered[0] if ordered else None, "maximum": ordered[-1] if ordered else None}
+
+
+def comparison_report(report):
+    experiment = report.get("experiment") or {}
+    timing_homes = report.get("timing", {}).get("homes", {})
+    rows = []
+    for home in report["homes"]:
+        delivery, record = home.get("delivery_diagnostic") or {}, home.get("record") or {}
+        timing = timing_homes.get(str(home["home_id"]), {})
+        stages = timing.get("armed_entry_stages", {})
+        millis = lambda value: value * 1000 if finite(value) else None
+        row = {key: home.get(key) for key in ("home_id", "axis", "phase", "quality", "error",
+            "comparison_pair", "comparison_order", "delivery_variant", "delivery_planned_variant",
+            "delivery_control_interval_s", "delivery_requested_interval_s", "delivery_effective_interval_s",
+            "delivery_supported", "delivery_intervention_applied")}
+        row["delivery_observation"] = home.get("delivery_observation")
+        row["onset_to_host_dispatch_estimate_ms"] = millis(home.get("stop_timing", {}).get("onset_to_host_dispatch_estimate_s"))
+        for key in ("batch_last_to_adapter", "detector_to_request"):
+            row[key + "_ms"] = millis(delivery.get("segments", {}).get(key, {}).get("duration_s"))
+        halt, trigger = record.get("halt_travel_mm_signed"), record.get("trigger_travel_mm_signed")
+        row["commanded_halt_minus_trigger_mm"] = abs(halt) - abs(trigger) if finite(halt) and finite(trigger) else None
+        row["armed_query_max_ms"] = millis(stages.get("sensor_status_query", {}).get("max_duration_s"))
+        row["armed_timer_lateness_max_ms"] = millis(stages.get("driver_timer", {}).get("max_lateness_s"))
+        row["armed_queue_age_max_ms"] = millis(stages.get("driver_queue_drain", {}).get("max_oldest_block_age_s"))
+        row["armed_bookkeeping_total_ms"] = millis(timing.get("bookkeeping_overhead", {}).get("armed_entry_calls", {}).get("total_s"))
+        rows.append(row)
+    measured = [row for row in rows if row.get("comparison_pair") is not None]
+    groups = {}
+    for variant in ("control", "fast", "unavailable"):
+        group = [row for row in measured if row.get("delivery_variant") == variant]
+        groups[variant] = {"homes": len(group), "home_ids": [row["home_id"] for row in group],
+            "metrics": {key: _distribution([row.get(key) for row in group], len(group)) for key in COMPARISON_METRICS}}
+    pairs = []
+    for axis, pair in sorted({(row["axis"], row["comparison_pair"]) for row in measured}):
+        group = [row for row in measured if (row["axis"], row["comparison_pair"]) == (axis, pair)]
+        control = [row for row in group if row["delivery_variant"] == "control"]
+        fast = [row for row in group if row["delivery_variant"] == "fast"]
+        reason = None
+        if len(control) != 1 or len(fast) != 1:
+            reason = "one observed control and one observed fast home required; unsupported or incomplete pair"
+        else:
+            for row in control + fast:
+                observed = row.get("delivery_observation") or {}
+                if (row.get("error") or not row.get("delivery_supported") or not observed.get("count")
+                        or observed.get("consistent") is not True or not finite(row.get("delivery_effective_interval_s"))):
+                    reason = "home error or active delivery intervention evidence unavailable/inconsistent"
+            if not fast[0].get("delivery_intervention_applied"):
+                reason = "fast intervention not observed"
+        matched = reason is None
+        deltas = {key: (fast[0][key] - control[0][key] if matched and all(
+            finite(row.get(key)) for row in control + fast) else None) for key in COMPARISON_METRICS}
+        pairs.append({"axis": axis, "pair": pair, "matched": matched, "reason": reason,
+            "home_ids": [row["home_id"] for row in group],
+            "order": [row.get("delivery_planned_variant") for row in sorted(group, key=lambda row: row.get("comparison_order") or 0)],
+            "delta_fast_minus_control": deltas})
+    return {"schema": "accel_homing_delivery_comparison_v1", "mode": "COMPARE",
+        "design": clean(experiment.get("delivery_comparison") or {}),
+        "shadow_validation": clean(experiment.get("shadow_validation") or {}),
+        "noise_margin_policy": clean(experiment.get("noise_margin_policy") or {}),
+        "restoration": clean(experiment.get("runtime_restored") or {}),
+        "groups": groups, "pairs": pairs, "homes": rows,
+        "paired_deltas": {key: _distribution([pair["delta_fast_minus_control"][key] for pair in pairs], len(pairs))
+                          for key in COMPARISON_METRICS},
+        "bounds": {"max_homes": MAX_HOMES, "home_rows": len(rows),
+                   "reference_homes_excluded_from_pairs": len(rows) - len(measured),
+                   "timing_rows_omitted": sum(item.get("omitted", 0) for item in timing_homes.values())},
+        "interpretation": ["All physical homes use fixed raw XYZ detection. Shadow validation never authorizes live use.",
+            "Pair deltas are fast minus control: negative latency values mean earlier host observations, not earlier physical stops.",
+            "Commanded halt minus trigger is step accounting, not physical carriage travel or measured physical overshoot.",
+            "Missing numbers remain null/blank; group distributions retain partial homes and expose per-metric missing counts.",
+            "Discovery and references are retained but excluded from delivery groups and pairs.",
+            "Armed metrics cover calls entered with an active unfinished attempt; whole-home recenter/reference timing is excluded.",
+            "Interleaved pairs reduce order effects; small samples and changing host/thermal state do not establish causality.",
+            "MCU receipt, physical contact/halt and exact decoded-sample-to-message mapping remain unavailable."]}
+
+
+def export_comparison(folder, report):
+    comparison = comparison_report(report)
+    write_json(folder / "comparison.json", comparison)
+    fields = ["row_type", "home_id", "axis", "phase", "quality", "comparison_pair", "comparison_order",
+              "delivery_variant", "delivery_planned_variant", "delivery_supported", "delivery_intervention_applied",
+              "delivery_control_interval_s", "delivery_requested_interval_s", "delivery_effective_interval_s",
+              "matched", "reason"] + list(COMPARISON_METRICS)
+    with (folder / "comparison.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for home in comparison["homes"]:
+            writer.writerow({**home, "row_type": "home"})
+        for pair in comparison["pairs"]:
+            writer.writerow({"row_type": "paired_delta_fast_minus_control", "axis": pair["axis"],
+                "comparison_pair": pair["pair"], "matched": pair["matched"], "reason": pair["reason"],
+                **pair["delta_fast_minus_control"]})
+    design = comparison["design"]
+    lines = ["ACCEL_HOMING_EXPERIMENT MODE=COMPARE", "All physical homes use RAW XYZ; shadow replay never controls motion.",
+        "Delivery support: %s; reason: %s" % (design.get("supported", "unknown"), design.get("reason")),
+        "Observed intervention: %s" % design.get("intervention_observed", "unknown"),
+        "Matched pairs: %d / %d" % (sum(pair["matched"] for pair in comparison["pairs"]), len(comparison["pairs"])),
+        "Shadow validation: " + json.dumps(comparison["shadow_validation"], ensure_ascii=True),
+        "Noise margins: " + json.dumps(comparison["noise_margin_policy"], ensure_ascii=True),
+        "Delivery restoration: " + json.dumps(design.get("restoration"), ensure_ascii=True),
+        "Runtime restoration: " + json.dumps(comparison["restoration"], ensure_ascii=True),
+        "", "Paired deltas are fast minus control; negative latency means lower host-observed delay."]
+    for key in COMPARISON_METRICS:
+        value = comparison["paired_deltas"][key]
+        lines.append("%s: n=%d, missing=%d, median=%s, range=[%s, %s]" % (
+            key, value["count"], value["missing"], value["median"], value["minimum"], value["maximum"]))
+    lines += ["", *comparison["interpretation"], "", "Read comparison.json/.csv, noise-margin.json and per-home cached environment before drawing conclusions."]
+    (folder / "tester-summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return comparison
+
+
+def export_noise_margins(folder, experiment, homes):
+    """Shallow standalone assessment rows prevent manifest depth truncation."""
+    assessments = []
+    def collect(value, source, home_id=None):
+        if not isinstance(value, dict):
+            return
+        for key in ("noise_margin", "noise_margins"):
+            if key in value:
+                assessments.append({"source": source, "home_id": home_id, "assessment": clean(value[key])})
+    fit = experiment.get("fit") or {}
+    collect(fit, "fit")
+    shadow = fit.get("shadow") or {}
+    collect(shadow, "fit.shadow")
+    for phase in ("training", "holdout"):
+        for index, result in enumerate(shadow.get(phase) or []):
+            collect(result, "fit.shadow.%s[%d]" % (phase, index))
+    for home in homes:
+        collect(home.get("shadow"), "home.shadow", home["home_id"])
+    # Bounds apply to assessments, not their already bounded numeric structure.
+    write_json(folder / "noise-margin.json", {"schema": "accel_homing_noise_margin_evidence_v1",
+        "policy": clean(experiment.get("noise_margin_policy") or {}), "assessments": assessments[:MAX_HOMES + 12],
+        "assessments_observed": len(assessments), "assessments_omitted": max(0, len(assessments) - MAX_HOMES - 12),
+        "fit_reason": fit.get("reason"), "shadow_reason": shadow.get("reason"),
+        "live_use_authorized": False})
+
+
 class Recorder:
     def __init__(self, workflow, session):
         self.workflow, self.session = workflow, session
@@ -773,6 +1147,8 @@ class Recorder:
                     return
                 home, attribution = self._home_for("packet", fields)
                 row.update(home_id=home["home_id"] if home else None, attribution=attribution)
+                if home is not None and _compare_mode(self.session):
+                    self._delivery_observation(home)
                 if home is None:
                     if len(self.batches) >= MAX_HOME_BATCHES:
                         self.batches_omitted += 1
@@ -792,6 +1168,31 @@ class Recorder:
                 home["batches_retained"] = len(home["packet_prefix"]) + len(home["packet_tail"])
         except Exception:
             self.observer_errors += 1
+
+    def _delivery_observation(self, home):
+        backend = getattr(self.workflow.owner, "backend", None)
+        helper = getattr(backend, "helper", None)
+        observation = home.setdefault("delivery_observation", {"count": 0, "inactive_count": 0,
+            "backend_interval_s": None, "applied_interval_s": None,
+            "helper_interval_s": None, "consistent": True,
+            "provenance": "cached active backend and helper interval attributes at attributed batch callback"})
+        if not getattr(backend, "active", False):
+            observation["inactive_count"] += 1
+            return
+        requested, applied, actual = (getattr(backend, "interval", None), getattr(backend, "applied_interval", None),
+            getattr(helper, getattr(backend, "interval_attr", "batch_interval"), None))
+        same = all(finite(value) and value > 0 for value in (requested, applied, actual)) and applied == actual
+        if observation["count"]:
+            same = same and (observation["backend_interval_s"], observation["applied_interval_s"],
+                             observation["helper_interval_s"]) == (requested, applied, actual)
+        observation["consistent"] = observation["consistent"] and same
+        observation.update(count=observation["count"] + 1, backend_interval_s=requested,
+                           applied_interval_s=applied, helper_interval_s=actual)
+        effective = actual if observation["consistent"] else None
+        home["delivery_effective_interval_s"] = effective
+        control = home.get("delivery_control_interval_s")
+        home["delivery_intervention_applied"] = bool(home.get("delivery_variant") == "fast"
+            and finite(effective) and finite(control) and effective < control)
 
     def close(self):
         """Freeze evidence after stream/command unwind, before any file writes."""
@@ -998,17 +1399,25 @@ class Recorder:
                       "Charts use impact windows; raw retained CSV rows are not decimated."]}
         if experimental:
             report["experiment"] = clean(experimental)
-            shadow_mode = experimental.get("mode") == "SHADOW"
+            compare_mode = experimental.get("mode") == "COMPARE"
+            shadow_mode = experimental.get("mode") in ("SHADOW", "COMPARE")
             report["interpretation"] += [
                 ("OFFLINE SHADOW: every physical home uses raw XYZ magnitude; frozen profile replay never controls the stop."
                  if shadow_mode else "Training and heldout reference homes use raw XYZ magnitude; candidates use a frozen fitted profile with raw bypass."),
-                ("SAMPLES counts additional raw shadow homes only; discovery plus ten reference homes are additional."
+                ("SAMPLES counts interleaved control/fast pairs; discovery plus ten reference homes are additional."
+                 if compare_mode else "SAMPLES counts additional raw shadow homes only; discovery plus ten reference homes are additional."
                  if shadow_mode else "SAMPLES counts candidate homes only; discovery plus ten reference homes are additional."),
-                "The same requested GC policy applies to every phase; this sequential comparison does not isolate GC causality.",
+                "The same requested GC policy applies to every phase; this comparison does not isolate GC causality.",
                 "Profile fit and commanded repeatability do not prove physical contact or absence of lost steps.",
                 "No automatic model, threshold, speed or configuration persistence. Normal G28 is unchanged.",
                 "Freshness limits and no-data timeouts run on the host reactor and provide no MCU-independent stop deadline."]
             write_json(folder / "experiment.json", report["experiment"])
+            if compare_mode:
+                export_noise_margins(folder, experimental, self.homes)
+                export_comparison(folder, report)
+                report["comparison"] = {"summary": "comparison.json", "csv": "comparison.csv",
+                    "tester_summary": "tester-summary.txt", "noise_margins": "noise-margin.json",
+                    "chart": "comparison.png"}
         write_json(folder / "manifest.json", report)
         (folder / "README.txt").write_text(
             command + " evidence\n\n"
@@ -1017,6 +1426,7 @@ class Recorder:
             "packets.jsonl.gz: bounded callback timing, pending/filtered packet context.\n"
             "timing.jsonl.gz: MCU host receive, driver/query/decode, detector/observer, reactor and GC timing. See manifest timing hook availability and omissions.\n"
             "delivery.json / delivery.csv: per-home source-batch tail, aggregate delivery/driver, adapter/detector and host request timing; clock bases and missing evidence are explicit.\n"
+            "MODE=COMPARE also provides comparison.json/.csv, tester-summary.txt, noise-margin.json and comparison.png: observed intervention, paired deltas, margins, omissions and restoration.\n"
             "manifest.json: home/return/next-home linkage, detector/reference/quality metadata, errors, config, installed source SHA256, bounds.\n"
             "Each home records capture/core drops and recorder omissions. Missing is not zero.\n"
             "No physical-position sensor is present; travel is commanded step accounting.\n"
@@ -1142,6 +1552,7 @@ def _plot_timing(folder, home, report, rows, Figure, FigureCanvasAgg):
         return row["entry_host_monotonic_s"] - received if finite(received) else None
     series("mcu_bulk_handler", serial_lag, plots[0], "Host serial receive to handler")
     series("reactor_heartbeat", lambda row: row["details"].get("lateness_s"), plots[0], "Reactor timer lateness")
+    series("driver_timer", lambda row: row["details"].get("lateness_s"), plots[0], "Existing driver timer lateness")
     plots[0].set(title="Delivery gaps and host scheduling (missing stages are unavailable)", ylabel="ms")
     stages = ("sensor_status_query", "driver_queue_drain", "sensor_pull", "driver_decode",
               "driver_batch", "adapter_processing", "detector_with_observer", "gc")
@@ -1190,7 +1601,7 @@ def _plot_timing(folder, home, report, rows, Figure, FigureCanvasAgg):
     plots[3].grid(True, axis="x", alpha=.25)
     retention = report.get("timing", {}).get("homes", {}).get(str(home["home_id"]), {})
     figure.suptitle("Home %03d %s: host timing; retained %s, omitted %s\n"
-                   "No MCU halt timestamp; timing-hook bookkeeping is not included in observer cost" % (
+                   "No MCU halt timestamp; post-call timing bookkeeping is reported separately in manifest" % (
                        home["home_id"], home["axis"].upper(), retention.get("retained", 0), retention.get("omitted", 0)))
     figure.tight_layout(rect=(0, 0, 1, .94))
     figure.savefig(folder / ("home-%03d-%s-timing.png" % (home["home_id"], home["axis"])))
@@ -1253,6 +1664,61 @@ def _plot_experiment(folder, report, Figure, FigureCanvasAgg):
                        experiment.get("gc_guard_requested", "unknown")), fontsize=11)
     figure.tight_layout(rect=(0, 0, 1, .92))
     figure.savefig(folder / "experiment-phases.png")
+    figure.clear()
+
+
+def _plot_comparison(folder, report, Figure, FigureCanvasAgg):
+    comparison = comparison_report(report)
+    figure = Figure(figsize=(13, 16), dpi=110)
+    FigureCanvasAgg(figure)
+    plots = figure.subplots(4, 2)
+    metrics = (("onset_to_host_dispatch_estimate_ms", "Onset to host dispatch estimate (ms)"),
+               ("batch_last_to_adapter_ms", "Source batch end to adapter estimate (ms)"),
+               ("commanded_halt_minus_trigger_mm", "Commanded halt minus trigger (mm; not physical travel)"),
+               ("armed_timer_lateness_max_ms", "Armed-entry maximum existing-timer lateness (ms)"))
+    for index, (key, label) in enumerate(metrics):
+        group_plot, pair_plot = plots[index]
+        observed = 0
+        for position, variant in enumerate(("control", "fast", "unavailable"), 1):
+            values = [home.get(key) for home in comparison["homes"]
+                      if home.get("comparison_pair") is not None and home.get("delivery_variant") == variant]
+            values = [value for value in values if finite(value)]
+            if values:
+                observed += len(values)
+                group_plot.boxplot([values], positions=[position], widths=.45, manage_ticks=False)
+                group_plot.scatter([position + ((i % 7) - 3) * .018 for i in range(len(values))], values,
+                                   s=16, alpha=.7, color="C%d" % (position - 1))
+            stats = comparison["groups"][variant]["metrics"][key]
+            group_plot.text(position, .98, "n=%d\nmissing=%d" % (stats["count"], stats["missing"]),
+                            transform=group_plot.get_xaxis_transform(), ha="center", va="top", fontsize=8)
+        group_plot.set_xticks([1, 2, 3])
+        group_plot.set_xticklabels(["control", "fast", "unavailable"])
+        group_plot.set_xlim(.5, 3.5)
+        group_plot.margins(y=.25)
+        group_plot.set(title=label + "\nPer-home distributions", ylabel="mm" if key.endswith("_mm") else "ms")
+        if not observed:
+            group_plot.text(.5, .45, "No retained numeric evidence", transform=group_plot.transAxes, ha="center")
+        pairs = [(pair["pair"], pair["delta_fast_minus_control"][key]) for pair in comparison["pairs"]
+                 if finite(pair["delta_fast_minus_control"][key])]
+        pair_plot.axhline(0, color="black", linewidth=.8)
+        if pairs:
+            pair_plot.plot([pair for pair, value in pairs], [value for pair, value in pairs], "o-", linewidth=.8)
+        else:
+            pair_plot.text(.5, .5, "No verified matched-pair values", transform=pair_plot.transAxes, ha="center")
+        stat = comparison["paired_deltas"][key]
+        pair_plot.set(title="Fast minus control by matched pair; n=%d, missing=%d\nNegative = lower observed value" % (stat["count"], stat["missing"]),
+                      xlabel="Pair", ylabel="Delta mm" if key.endswith("_mm") else "Delta ms")
+        for plot in (group_plot, pair_plot):
+            plot.grid(True, alpha=.25)
+    design = comparison["design"]
+    figure.suptitle("RAW delivery comparison: interleaved control/fast and fast/control\n"
+        "Supported: %s; observed intervention: %s; shadow: %s; delivery restored: %s\n"
+        "Missing is not zero. Host dispatch and commanded step counts do not measure physical contact or halt." % (
+            design.get("supported", "unknown"), design.get("intervention_observed", "unknown"),
+            comparison["shadow_validation"].get("status", "unknown"),
+            (design.get("restoration") or {}).get("complete", "unknown")), fontsize=11)
+    figure.tight_layout(rect=(0, 0, 1, .93))
+    figure.savefig(folder / "comparison.png")
     figure.clear()
 
 
@@ -1335,7 +1801,10 @@ def _worker(folder, dependencies):
         figure.savefig(folder / "summary.png")
         figure.clear()
         if report.get("experiment"):
-            _plot_experiment(folder, report, Figure, FigureCanvasAgg)
+            if report["experiment"].get("mode") == "COMPARE":
+                _plot_comparison(folder, report, Figure, FigureCanvasAgg)
+            else:
+                _plot_experiment(folder, report, Figure, FigureCanvasAgg)
         for home in homes:
             record, capture = home.get("record") or {}, home["capture"]
             shadow = home.get("shadow") or {}

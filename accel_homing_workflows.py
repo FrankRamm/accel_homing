@@ -3229,8 +3229,8 @@ class AccelHomingWorkflows:
             if key not in ("AXIS", "SAMPLES", "CENTERED", "SPEED", "GC_GUARD", "MAX_SAMPLE_AGE", "MODE"):
                 raise gcmd.error("%s is not supported by ACCEL_HOMING_EXPERIMENT" % key)
         experiment_mode = str(gcmd.get("MODE", "LIVE")).strip().upper()
-        if experiment_mode not in ("LIVE", "SHADOW"):
-            raise gcmd.error("MODE must be LIVE or SHADOW")
+        if experiment_mode not in ("LIVE", "SHADOW", "COMPARE"):
+            raise gcmd.error("MODE must be LIVE, SHADOW or COMPARE")
         samples = gcmd.get_int("SAMPLES", 10, minval=2, maxval=40)
         guard = bool(gcmd.get_int("GC_GUARD", 1, minval=0, maxval=1))
         max_age = gcmd.get_float("MAX_SAMPLE_AGE", .040, minval=.001, maxval=.5)
@@ -3250,8 +3250,8 @@ class AccelHomingWorkflows:
         try:
             module = _load_experiment_module()
             _load_troubleshoot_module()
-            if experiment_mode == "SHADOW" and not callable(getattr(module, "replay_shadow_capture", None)):
-                raise ImportError("experiment module does not support MODE=SHADOW")
+            if experiment_mode in ("SHADOW", "COMPARE") and not callable(getattr(module, "replay_shadow_capture", None)):
+                raise ImportError("experiment module does not support MODE=%s" % experiment_mode)
         except Exception as exc:
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT modules could not load: %s. "
                              "Update the complete accel_homing checkout and rerun ./install.sh "
@@ -3275,6 +3275,17 @@ class AccelHomingWorkflows:
                        "Weighted fitting and holdout consistency do not establish physical contact or missed steps.",
                        "A rejected or faulted home stops without an automatic return."],
             "fit": None, "phase": "discovery", "candidate_activated": False}
+        if experiment_mode == "COMPARE":
+            experiment.update(
+                comparison_design="paired raw XYZ homes; alternate control/fast then fast/control; frozen shadow replay never controls motion",
+                trial_pairs_requested=samples, trial_samples_requested=samples * 2,
+                gc_policy="same guard for discovery, training, holdout and every control/fast RAW home; stationary collection before each guarded native home",
+                noise_margin_policy={"fraction": .10, "minimum_g": .5,
+                                     "scope": "separate startup and cruise; raw bypass and weighted score"},
+                shadow_validation={"status": "pending", "live_use_authorized": False},
+                limits=experiment["limits"] + [
+                    "An invalid shadow profile does not stop qualified raw delivery-comparison homes.",
+                    "Delivery interval is not sensor sampling rate or proof of less physical impact."])
         self._run_diagnostic(gcmd, [axis], samples, experiment=experiment,
                              fitter=module.fit_experimental_profile,
                              shadow_replayer=getattr(module, "replay_shadow_capture", None))
@@ -3328,6 +3339,154 @@ class AccelHomingWorkflows:
                 "references": observed, "errors": errors,
                 "physical_stop_deadline_guaranteed": False}
 
+    def _experimental_delivery_preflight(self, session, pairs):
+        """Inspect only the existing backend interface; never discover driver APIs by trial."""
+        backend = getattr(self.owner, "backend", None)
+        order = [{"pair": pair + 1, "order": slot + 1, "variant": variant}
+                 for pair in range(pairs)
+                 for slot, variant in enumerate(("control", "fast") if pair % 2 == 0
+                                                else ("fast", "control"))]
+        comparison = {"backend": getattr(backend, "kind", "beacon_raw") if backend is not None else "beacon_raw",
+                      "pairs_requested": pairs, "homes_requested": pairs * 2,
+                      "planned_order": order, "supported": False, "preflight_safe": True,
+                      "reason": "Beacon raw transport has no adjustable delivery interval",
+                      "normal_requested_interval_s": None, "control_interval_s": None,
+                      "fast_requested_interval_s": None, "fast_effective_interval_s": None,
+                      "intervention_requested": False, "intervention_observed": False,
+                      "sensor_sampling_rate_changed": False,
+                      "restoration": {"complete": True, "errors": [], "policy":
+                          "only restore our unchanged override after stream stop; preserve external changes"}}
+        session["experiment"]["delivery_comparison"] = comparison
+        if backend is None:
+            return comparison
+        def reject(reason):
+            comparison.update(reason=reason, preflight_safe=False)
+            return comparison
+        if getattr(backend, "kind", None) != "klipper_batch":
+            return reject("unsupported backend kind; no known delivery-interval interface")
+        helper = getattr(backend, "helper", None)
+        legacy = getattr(backend, "legacy", None)
+        attrs = (getattr(backend, "interval_attr", None), getattr(backend, "timer_attr", None))
+        expected = ("update_interval", "update_timer") if legacy is True else ("batch_interval", "batch_timer")
+        if (type(legacy) is not bool or attrs != expected or helper is None
+                or not callable(getattr(helper, "add_client", None))
+                or (legacy and not isinstance(getattr(helper, "clients", None), dict))
+                or not callable(getattr(backend, "start", None))
+                or not callable(getattr(backend, "stop", None))):
+            return reject("unsupported driver helper shape; no motion requested")
+        normal, helper_interval = getattr(backend, "interval", None), getattr(helper, attrs[0], None)
+        valid = lambda value: type(value) in (float, int) and math.isfinite(value) and value > 0.
+        if not valid(normal) or not valid(helper_interval) or not .001 <= normal <= .020:
+            return reject("invalid backend or helper delivery interval; no motion requested")
+        if (getattr(backend, "active", None) is not False
+                or getattr(self.owner, "stream_on", None) is not False
+                or getattr(backend, "saved_interval", object()) is not None
+                or getattr(backend, "applied_interval", object()) is not None):
+            return reject("delivery stream is active or its interval state is not clean; no motion requested")
+        control, fast = min(normal, helper_interval), min(normal, .002)
+        comparison.update(normal_requested_interval_s=normal, control_interval_s=control,
+                          fast_requested_interval_s=fast, fast_effective_interval_s=min(fast, helper_interval),
+                          original_helper_interval_s=helper_interval)
+        session["delivery_state"] = {"backend": backend, "helper": helper,
+                                     "interval_attr": attrs[0], "timer_attr": attrs[1],
+                                     "normal": normal, "helper_interval": helper_interval,
+                                     "override": None}
+        if normal > .005:
+            comparison["reason"] = "interval above 5 ms also affects startup safety budgets; delivery-only intervention unsupported"
+        elif min(fast, helper_interval) >= control:
+            comparison["reason"] = "effective delivery interval is already at or below 2 ms; no shortening available"
+        else:
+            comparison.update(supported=True, intervention_requested=True,
+                              reason="known Klipper batch helper; existing start/stop applies and restores the reporting interval")
+        return comparison
+
+    def _experimental_delivery_check(self, session, expected_interval):
+        state = session.get("delivery_state")
+        if state is None:
+            return
+        backend, helper = state["backend"], state["helper"]
+        if (getattr(self.owner, "backend", None) is not backend
+                or getattr(backend, "helper", None) is not helper
+                or getattr(backend, "interval_attr", None) != state["interval_attr"]
+                or getattr(backend, "timer_attr", None) != state["timer_attr"]):
+            raise self._error("delivery backend interface changed; no further motion")
+        if (getattr(self.owner, "stream_on", None) is not False
+                or getattr(backend, "active", None) is not False
+                or getattr(backend, "saved_interval", object()) is not None
+                or getattr(backend, "applied_interval", object()) is not None):
+            raise self._error("delivery stream did not stop cleanly; no further motion")
+        if getattr(backend, "interval", None) != expected_interval:
+            raise self._error("delivery interval changed externally; preserving that value, no further motion")
+        if getattr(helper, state["interval_attr"], None) != state["helper_interval"]:
+            raise self._error("driver helper interval changed or was not restored; preserving that value, no further motion")
+
+    def _experimental_delivery_restore(self, session):
+        state = session.get("delivery_state")
+        if state is None:
+            return
+        comparison = session["experiment"]["delivery_comparison"]
+        restoration = comparison["restoration"]
+        backend = state["backend"]
+        expected = state["normal"] if state["override"] is None else state["override"]
+        try:
+            # Check independently before writing: a conflicting helper interval
+            # must not prevent restoring our own backend request while stopped.
+            if (getattr(self.owner, "backend", None) is backend
+                    and getattr(self.owner, "stream_on", None) is False
+                    and getattr(backend, "active", None) is False
+                    and getattr(backend, "saved_interval", object()) is None
+                    and getattr(backend, "applied_interval", object()) is None
+                    and getattr(backend, "interval", None) == expected):
+                backend.interval = state["normal"]
+                state["override"] = None
+            self._experimental_delivery_check(session, state["normal"])
+        except Exception as exc:
+            restoration["complete"] = False
+            if str(exc) not in restoration["errors"]:
+                restoration["errors"].append(str(exc))
+            raise
+        finally:
+            restoration.update(backend_interval_after_s=getattr(backend, "interval", None),
+                               helper_interval_after_s=getattr(state["helper"], state["interval_attr"], None))
+
+    @contextlib.contextmanager
+    def _experimental_delivery_scope(self, session, planned_variant):
+        comparison = session["experiment"]["delivery_comparison"]
+        home = session["troubleshoot_recorder"].current_home
+        supported, state = comparison["supported"], session.get("delivery_state")
+        requested = (comparison["fast_requested_interval_s"] if planned_variant == "fast"
+                     else comparison["normal_requested_interval_s"])
+        home.update(delivery_variant=planned_variant if supported else "unavailable",
+                    delivery_planned_variant=planned_variant, delivery_supported=supported,
+                    delivery_control_interval_s=comparison["control_interval_s"],
+                    delivery_requested_interval_s=requested if supported else comparison["normal_requested_interval_s"],
+                    delivery_effective_interval_s=None, delivery_intervention_applied=False,
+                    delivery_unavailable_reason=None if supported else comparison["reason"],
+                    delivery_interval_restored=None)
+        try:
+            if state is not None:
+                self._experimental_delivery_check(session, state["normal"])
+                if supported:
+                    state["backend"].interval = requested
+                    state["override"] = requested
+            if self.owner.experimental_profile is not None:
+                raise self._error("raw delivery comparison cannot arm an experimental profile")
+            yield
+            if supported:
+                observation = home.get("delivery_observation") or {}
+                effective = min(state["helper_interval"], requested)
+                if (not observation.get("count") or observation.get("consistent") is not True
+                        or home.get("delivery_effective_interval_s") != effective):
+                    raise self._error("delivery interval was not consistently observed at the requested value; no automatic return")
+                comparison["intervention_observed"] |= home["delivery_intervention_applied"]
+        finally:
+            try:
+                self._experimental_delivery_restore(session)
+                home["delivery_interval_restored"] = True
+            except Exception:
+                home["delivery_interval_restored"] = False
+                raise
+
     def _run_diagnostic(self, gcmd, axes, samples, experiment=None, fitter=None, shadow_replayer=None):
         # Same idle/native-home/unhomed/geometry preflight as ACCURACY. PNG
         # dependencies are deliberately optional: evidence must survive failure.
@@ -3335,7 +3494,8 @@ class AccelHomingWorkflows:
         session, recorder = self.session, None
         mode = "experiment" if experiment else "troubleshoot"
         shadow_mode = bool(experiment and experiment.get("mode") == "SHADOW")
-        total_samples = samples + (10 if experiment else 0)
+        compare_mode = bool(experiment and experiment.get("mode") == "COMPARE")
+        total_samples = samples * (2 if compare_mode else 1) + (10 if experiment else 0)
         session.update(state="running", axes=axes, samples_requested=samples,
                        attempt_limit=len(axes) * (total_samples + 1), sample_index=0,
                        configured_speeds={axis: self.owner.rails_by_axis[axis].get_homing_info().speed
@@ -3364,7 +3524,19 @@ class AccelHomingWorkflows:
             recorder.record_event("workflow_start", axes=axes, samples_requested=samples,
                                   thresholds_g=session["saved_thresholds"],
                                   speeds_mm_s=session["configured_speeds"], homing_accel_mm_s2=self.owner.homing_accel)
-            if shadow_mode:
+            if compare_mode:
+                delivery = self._experimental_delivery_preflight(session, samples)
+                recorder.record_event("experimental_delivery_preflight", comparison=delivery)
+                if not delivery["preflight_safe"]:
+                    raise self._error("delivery comparison preflight rejected: " + delivery["reason"])
+                self._info("Experiment COMPARE: one discovery, 6 training and 4 heldout RAW homes, then "
+                           "%d pairs (%d RAW homes), alternating control/fast then fast/control. "
+                           "Original threshold, configured speed and same GC guard; no weighted activation or persistence"
+                           % (samples, samples * 2))
+                if not delivery["supported"]:
+                    self._info("Delivery intervention unavailable: %s. Homes remain RAW and are labelled unavailable; "
+                               "this run cannot demonstrate a delivery speedup" % delivery["reason"])
+            elif shadow_mode:
                 self._info("Experiment SHADOW: one discovery, 6 training and 4 heldout raw homes, then "
                            "%d additional RAW homes if the frozen shadow profile passes its diagnostic checks. "
                            "Weighted decisions are replayed after each home and NEVER control motion; "
@@ -3385,15 +3557,31 @@ class AccelHomingWorkflows:
                     session.update(sample_index=sample, pending_record=None)
                     recorder.begin_home(axis, sample)
                     recorder.current_home["expected_travel_mm"] = self._geometry(axis)[1]
+                    planned_variant = "control"
                     if experiment:
                         phase = ("discovery" if sample == 0 else "training" if sample <= 6
                                  else "holdout" if sample <= 10 else "shadow" if shadow_mode else "candidate")
+                        if compare_mode:
+                            plan = delivery["planned_order"][sample - 11] if sample > 10 else None
+                            planned_variant = plan["variant"] if plan else "control"
+                            recorder.current_home.update(comparison_pair=plan["pair"] if plan else None,
+                                                         comparison_order=plan["order"] if plan else None)
+                            if plan:
+                                phase = "delivery_" + (planned_variant if delivery["supported"] else "unavailable")
+                                self._info("COMPARE pair %d/%d, home %d/2: %s%s; RAW detector"
+                                           % (plan["pair"], samples, plan["order"], planned_variant.upper(),
+                                              "" if delivery["supported"] else " (intervention unavailable)"))
                         session["experiment_phase"] = experiment["phase"] = phase
                         recorder.current_home.update(phase=phase,
                             gc_guard={"requested": experiment["gc_guard_requested"], "restored": None},
-                            profile_frozen=phase in ("candidate", "shadow"))
+                            profile_frozen=(phase in ("candidate", "shadow") or
+                                            (compare_mode and sample > 10 and
+                                             session.get("comparison_shadow_profile") is not None)))
                     try:
-                        record, capture = self._home(axis)
+                        home_scope = (self._experimental_delivery_scope(session, planned_variant)
+                                      if compare_mode else contextlib.nullcontext())
+                        with home_scope:
+                            record, capture = self._home(axis)
                         quality, reason = self._quality(axis, record)
                         recorder.current_home["quality"] = quality
                         if experiment:
@@ -3402,21 +3590,37 @@ class AccelHomingWorkflows:
                             session["axis_results"][axis]["rejected"] = record
                             raise self._error(reason + ("; %s stopped without automatic return "
                                               "or recalibration; manually recenter before another run" % mode))
-                        if shadow_mode and sample > 10:
+                        shadow_profile = session.get("comparison_shadow_profile") if compare_mode else None
+                        if (shadow_mode or (compare_mode and shadow_profile is not None)) and sample > 10:
                             self._check_running(session)
-                            profile = experiment["fit"]["shadow"]["profile"]
-                            outcome = shadow_replayer(profile, capture, record, axis=axis,
-                                                      checkpoint=experiment_checkpoint)
+                            profile = shadow_profile if compare_mode else experiment["fit"]["shadow"]["profile"]
+                            try:
+                                outcome = shadow_replayer(profile, capture, record, axis=axis,
+                                                          checkpoint=experiment_checkpoint)
+                            except Exception as exc:
+                                if not compare_mode:
+                                    raise
+                                self._check_running(session)
+                                outcome = {"error": str(exc), "within_negative_guard": False,
+                                           "no_later_than_reference": False,
+                                           "noise_margin": {"qualified": False, "reason_codes": ["invalid_replay_evidence"]}}
                             recorder.current_home.update(shadow=outcome, shadow_profile=profile)
                             experiment["shadow_results"].append(dict(outcome,
                                 home_id=recorder.current_home.get("home_id")))
                             recorder.record_event("experimental_shadow_replay", outcome=outcome,
                                                   live_use_authorized=False)
                             self._check_running(session)
-                            if not (outcome.get("within_negative_guard") and outcome.get("no_later_than_reference")):
+                            valid_shadow = bool(outcome.get("within_negative_guard") and outcome.get("no_later_than_reference"))
+                            if compare_mode:
+                                valid_shadow &= (outcome.get("noise_margin") or {}).get("qualified") is True
+                                if not valid_shadow:
+                                    experiment["shadow_validation"].update(status="invalid", reason="fresh raw home failed frozen shadow replay or noise margin")
+                                    self._info("Frozen shadow profile failed a replay or noise-margin check. "
+                                               "Qualified RAW delivery comparison continues; live use remains unauthorized")
+                            elif not valid_shadow:
                                 raise self._error("shadow replay detected outside the near-event window; "
                                                   "raw home retained, stopped without automatic return")
-                            record["shadow_capture_verified"] = True
+                            record["shadow_capture_verified"] = valid_shadow
                         if sample == 0:
                             session["axis_results"][axis]["discovery"] = record
                         elif not experiment or sample > 10:
@@ -3439,17 +3643,34 @@ class AccelHomingWorkflows:
                             baseline_captures, experiment["max_sample_age_s"])
                         experiment["freshness_preflight"] = envelope
                         recorder.record_event("experimental_freshness_preflight", envelope=envelope)
-                        if not envelope["accepted"]:
+                        if not envelope["accepted"] and not compare_mode:
                             raise self._error("experimental freshness preflight rejected: %s; "
                                               "no candidate homes or automatic return" % "; ".join(envelope["errors"]))
-                        fit_options = {"shadow": True} if shadow_mode else {}
-                        experiment["fit"] = fitter(baseline_captures, baseline_records,
-                                                    axis=axis, max_age_s=experiment["max_sample_age_s"],
-                                                    checkpoint=experiment_checkpoint, **fit_options)
+                        fit_options = {"shadow": True} if shadow_mode or compare_mode else {}
+                        if compare_mode:
+                            fit_options.update(noise_margin_fraction=.10, noise_margin_g=.5)
+                        if compare_mode and not envelope["accepted"]:
+                            experiment["fit"] = {"accepted": False, "profile": None,
+                                "reason": "reference freshness envelope rejected",
+                                "shadow": {"status": "rejected", "profile": None,
+                                           "reason": "reference freshness envelope rejected", "errors": envelope["errors"]}}
+                        else:
+                            try:
+                                experiment["fit"] = fitter(baseline_captures, baseline_records,
+                                                            axis=axis, max_age_s=experiment["max_sample_age_s"],
+                                                            checkpoint=experiment_checkpoint, **fit_options)
+                            except Exception as exc:
+                                if not compare_mode:
+                                    raise
+                                self._check_running(session)
+                                experiment["fit"] = {"accepted": False, "profile": None,
+                                    "reason": "shadow fitting failed: %s" % exc,
+                                    "shadow": {"status": "rejected", "profile": None,
+                                               "reason": "shadow fitting failed: %s" % exc}}
                         self._check_running(session)
                         baseline_captures.clear()
                         recorder.record_event("experimental_profile_fit", fit=experiment["fit"])
-                        if shadow_mode:
+                        if shadow_mode or compare_mode:
                             shadow = experiment["fit"].get("shadow") or {}
                             profile = shadow.get("profile")
                             if profile:
@@ -3457,24 +3678,38 @@ class AccelHomingWorkflows:
                                     homes = [home for home in recorder.homes if home.get("phase") == phase]
                                     for home, outcome in zip(homes, shadow.get(phase, [])):
                                         home.update(shadow=outcome, shadow_profile=profile)
-                            if shadow.get("status") != "ready" or not profile:
+                            ready = shadow.get("status") == "ready" and bool(profile)
+                            if compare_mode:
+                                experiment["shadow_validation"].update(status="ready" if ready else "rejected",
+                                    reason=shadow.get("reason", experiment["fit"].get("reason")))
+                                session["comparison_shadow_profile"] = (json.loads(json.dumps(profile, allow_nan=False))
+                                                                         if ready else None)
+                            if not ready and not compare_mode:
                                 raise self._error("experimental shadow profile rejected: %s; stopped without automatic return"
                                                   % shadow.get("reason", experiment["fit"].get("reason")))
-                            self._info("Shadow profile frozen for diagnostic replay only; live detector remains raw XYZ. "
-                                       "Near-event anticipation is not verified physical contact")
+                            if ready:
+                                self._info("Shadow profile frozen for diagnostic replay only; live detector remains raw XYZ. "
+                                           "Near-event anticipation is not verified physical contact")
+                            else:
+                                self._info("Shadow profile rejected; qualified RAW delivery comparison continues without replay. "
+                                           "No live profile is authorized")
                         elif not experiment["fit"].get("accepted") or not experiment["fit"].get("profile"):
                             raise self._error("experimental profile rejected: %s; stopped without automatic return"
                                               % experiment["fit"].get("reason", "no accepted profile"))
                         # Freeze a private JSON-only profile; neither subsequent
                         # candidate evidence nor detector instances retrain it.
-                        if not shadow_mode:
+                        if not (shadow_mode or compare_mode):
                             self.owner.experimental_profile = json.loads(json.dumps(
                                 experiment["fit"]["profile"], allow_nan=False))
                             experiment["candidate_activated"] = True
                     del capture
                     if sample < total_samples or axis_index < len(axes) - 1:
+                        if compare_mode and session.get("delivery_state"):
+                            self._experimental_delivery_check(session, session["delivery_state"]["normal"])
                         self._diagnostic_recenter(session, recorder, axis)
             axis, record, _source = session["terminal_home"]
+            if compare_mode and session.get("delivery_state"):
+                self._experimental_delivery_check(session, session["delivery_state"]["normal"])
             recorder.record_event("terminal_release_planned", axis=axis,
                                   back_off_mm=session["saved_back_off"], before=troubleshoot_snapshot(self))
             self._release_terminal_home(axis, record)
@@ -3488,6 +3723,12 @@ class AccelHomingWorkflows:
             # Cancellation may finalize inside native G28. Its capture and core
             # cleanup unwind before this outer export; never write from a hook.
             self.owner.troubleshoot = None
+            delivery_cleanup_error = None
+            if compare_mode:
+                try:
+                    self._experimental_delivery_restore(session)
+                except Exception as exc:
+                    delivery_cleanup_error = str(exc)
             if experiment:
                 self.owner.experimental_profile = session["saved_experimental_profile"]
                 baseline_captures.clear()
@@ -3499,12 +3740,16 @@ class AccelHomingWorkflows:
                           completed_samples={axis: len(item["trials"]) for axis, item in session["axis_results"].items()},
                           statistics={axis: self._accuracy_statistics(item["trials"])
                                       for axis, item in session["axis_results"].items()})
+            if delivery_cleanup_error:
+                result.update(result="aborted", delivery_cleanup_error=delivery_cleanup_error,
+                              reason=result.get("reason") or delivery_cleanup_error)
             if experiment:
                 experiment["statistics"] = {phase: self._accuracy_statistics(
                     [record for record in session["records"] if record.get("workflow_phase") == phase
                      and record.get("capture_valid") and record.get("experiment_quality") == "good"
                      and (phase != "shadow" or record.get("shadow_capture_verified"))])
-                    for phase in (("training", "holdout", "shadow") if shadow_mode else
+                    for phase in (("training", "holdout", "delivery_control", "delivery_fast", "delivery_unavailable")
+                                  if compare_mode else ("training", "holdout", "shadow") if shadow_mode else
                                   ("training", "holdout", "candidate"))}
                 experiment["runtime_restored"] = {
                     "thresholds": self.owner.threshold_g == session["saved_thresholds"],
@@ -3514,6 +3759,10 @@ class AccelHomingWorkflows:
                 experiment["runtime_restored"]["gc"] = (all(
                     home.get("gc_guard", {}).get("restored") is True for home in recorder.homes
                     if home.get("gc_guard", {}).get("stationary_collection")) if recorder else True)
+                if compare_mode:
+                    experiment["runtime_restored"]["interval"] = bool(
+                        experiment.get("delivery_comparison", {}).get("restoration", {}).get("complete", False)
+                        and delivery_cleanup_error is None)
                 result["experiment"] = experiment
             try:
                 if recorder is not None:

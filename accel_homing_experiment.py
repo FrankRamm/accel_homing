@@ -28,7 +28,8 @@ def validate_profile(profile, axis, raw_threshold_g):
     """Return an independent, JSON-safe snapshot or reject before arming."""
     if not isinstance(profile, dict) or profile.get("version") != VERSION:
         raise ValueError("unsupported experimental profile")
-    if profile.get("shadow_only") or profile.get("live_use_authorized") is False:
+    if (profile.get("shadow_only") or profile.get("live_use_authorized") is False
+            or "noise_margin_policy" in profile):
         raise ValueError("shadow-only profile is not authorized for live use")
     weights = profile.get("weights_xyz")
     if (profile.get("axis") != axis or axis not in ("x", "y")
@@ -222,6 +223,130 @@ def _classified(outcome, event):
     return result
 
 
+def _noise_margin_policy(fraction, minimum_g):
+    if (not _number(fraction) or not 0 < fraction < 1
+            or not _number(minimum_g) or minimum_g <= 0):
+        raise ValueError("noise margin needs a finite fraction between zero and one and positive g")
+    return {"version": 1, "fraction": fraction, "minimum_g": minimum_g,
+            "interpretation": "engineering_noise_margin_not_reliability_probability",
+            "raw_bypass_assessed": True}
+
+
+def _profile_margin_policy(profile):
+    if "noise_margin_policy" not in profile:
+        return None
+    policy = profile["noise_margin_policy"]
+    if not isinstance(policy, dict):
+        raise ValueError("invalid noise margin policy")
+    canonical = _noise_margin_policy(policy.get("fraction"), policy.get("minimum_g"))
+    if (type(policy.get("version")) is not int or policy.get("raw_bypass_assessed") is not True
+            or policy != canonical):
+        raise ValueError("invalid noise margin policy")
+    return canonical
+
+
+def _negative_noise(event, weights, confirmation_s, checkpoint, weighted2=None):
+    """Observe all negatives, including those after a hypothetical early stop.
+
+    A pair is the minimum of two adjacent original samples within the actual
+    confirmation interval. Both are negative samples; the decision sample sets
+    its phase, so a startup-to-cruise pair is retained in cruise diagnostics.
+    """
+    phases = {phase: {"sample_count": 0, "pair_count": 0,
+                     "raw_max_g": None, "weighted_isolated_max_g": None,
+                     "weighted_pair_max_g": None, "closest_pair": None,
+                     "raw_closest_sample": None, "weighted_isolated_sample": None}
+              for phase in ("startup", "cruise")}
+    previous = None
+    for number, index in enumerate(event["negative"]):
+        if checkpoint is not None and number % 4096 == 0:
+            checkpoint()
+        when, x, y, z = event["rows"][index]
+        raw = math.sqrt(x * x + y * y + z * z)
+        level2 = (weighted2[index] if weighted2 is not None else
+                  weights[0] * x * x + weights[1] * y * y + weights[2] * z * z)
+        level = math.sqrt(level2)
+        if not math.isfinite(raw) or not math.isfinite(level):
+            raise ValueError("negative-window energy overflow")
+        phase = "startup" if when < event["arm"] + STARTUP_S else "cruise"
+        stats = phases[phase]
+        stats["sample_count"] += 1
+        if stats["raw_max_g"] is None or raw > stats["raw_max_g"]:
+            stats["raw_max_g"] = raw
+            stats["raw_closest_sample"] = {"sample_index": index, "time_s": when}
+        if stats["weighted_isolated_max_g"] is None or level > stats["weighted_isolated_max_g"]:
+            stats["weighted_isolated_max_g"] = level
+            stats["weighted_isolated_sample"] = {"sample_index": index, "time_s": when}
+        if (previous is not None and index == previous[0] + 1
+                and 0 < when - previous[1] <= confirmation_s + 1e-12):
+            pair = min(previous[2], level)
+            stats["pair_count"] += 1
+            if stats["weighted_pair_max_g"] is None or pair > stats["weighted_pair_max_g"]:
+                stats["weighted_pair_max_g"] = pair
+                stats["closest_pair"] = {"evidence_sample_index": previous[0],
+                    "decision_sample_index": index, "evidence_time_s": previous[1],
+                    "decision_time_s": when, "separation_s": when - previous[1],
+                    "evidence_weighted_g": previous[2], "decision_weighted_g": level}
+        previous = index, when, level
+    return phases
+
+
+def _assess_noise_margin(profile, phases, policy):
+    """Apply the frozen engineering policy to weighted and raw bypass routes."""
+    result = {"qualified": False, "reason_codes": [], "policy": dict(policy),
+              "physical_contact_verified": False, "live_use_authorized": False,
+              "negative_guard_s": NEGATIVE_GUARD_S, "confirmation_s": profile["confirmation_s"]}
+    threshold, raw = profile["threshold_g"], profile["raw_threshold_g"]
+    required = max(policy["minimum_g"], policy["fraction"] * threshold)
+    raw_required = max(policy["minimum_g"], policy["fraction"] * raw)
+    for phase in ("startup", "cruise"):
+        stats = result[phase] = dict(phases[phase])
+        peak, raw_peak = stats["weighted_pair_max_g"], stats["raw_max_g"]
+        margin = None if peak is None else threshold - peak
+        raw_margin = None if raw_peak is None else raw - raw_peak
+        weighted_ok = margin is not None and margin + 1e-12 >= required
+        raw_ok = raw_margin is not None and raw_margin + 1e-12 >= raw_required
+        stats.update(weighted_margin_g=margin,
+                     weighted_margin_fraction=None if margin is None else margin / threshold,
+                     required_weighted_margin_g=required, weighted_qualified=weighted_ok,
+                     raw_bypass_margin_g=raw_margin,
+                     raw_bypass_margin_fraction=None if raw_margin is None else raw_margin / raw,
+                     required_raw_bypass_margin_g=raw_required, raw_bypass_qualified=raw_ok,
+                     qualified=weighted_ok and raw_ok)
+        if peak is None:
+            result["reason_codes"].append(phase + "_missing_confirmable_negative_pair")
+        elif not weighted_ok:
+            result["reason_codes"].append(phase + "_insufficient_weighted_margin")
+        if not raw_ok:
+            result["reason_codes"].append(phase + "_insufficient_raw_bypass_margin")
+    result["qualified"] = not result["reason_codes"]
+    return result
+
+
+def _validated_shadow(profile, capture, record, axis, checkpoint):
+    if (not isinstance(profile, dict) or profile.get("shadow_only") is not True
+            or profile.get("live_use_authorized") is not False):
+        raise ValueError("replay requires an explicitly shadow-only profile")
+    policy = _profile_margin_policy(profile)
+    axis = profile.get("axis") if axis is None else axis
+    event = _event(capture, record, axis, checkpoint)
+    parameters = {key: value for key, value in profile.items()
+                  if key not in ("shadow_only", "live_use_authorized", "noise_margin_policy")}
+    return validate_profile(parameters, axis, event["threshold"]), event, policy
+
+
+def assess_shadow_margin(profile, capture, record, *, axis=None, checkpoint=None):
+    """Assess a frozen shadow policy without retuning or permitting live use."""
+    try:
+        validated, event, policy = _validated_shadow(profile, capture, record, axis, checkpoint)
+        if policy is None:
+            raise ValueError("shadow profile has no frozen noise margin policy")
+        phases = _negative_noise(event, validated["weights_xyz"], validated["confirmation_s"], checkpoint)
+        return _assess_noise_margin(validated, phases, policy)
+    except _REFERENCE_ERRORS as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def replay_shadow_capture(profile, capture, record, *, axis=None, checkpoint=None):
     """Validate one captured RAW home, then replay a frozen shadow-only profile.
 
@@ -230,15 +355,12 @@ def replay_shadow_capture(profile, capture, record, *, axis=None, checkpoint=Non
     with within_negative_guard=False. Nothing is armed or installed here.
     """
     try:
-        if (not isinstance(profile, dict) or profile.get("shadow_only") is not True
-                or profile.get("live_use_authorized") is not False):
-            raise ValueError("replay requires an explicitly shadow-only profile")
-        axis = profile.get("axis") if axis is None else axis
-        event = _event(capture, record, axis, checkpoint)
-        parameters = {key: value for key, value in profile.items()
-                      if key not in ("shadow_only", "live_use_authorized")}
-        validated = validate_profile(parameters, axis, event["threshold"])
-        return _classified(replay_profile(validated, event, checkpoint), event)
+        validated, event, policy = _validated_shadow(profile, capture, record, axis, checkpoint)
+        result = _classified(replay_profile(validated, event, checkpoint), event)
+        if policy is not None:
+            phases = _negative_noise(event, validated["weights_xyz"], validated["confirmation_s"], checkpoint)
+            result["noise_margin"] = _assess_noise_margin(validated, phases, policy)
+        return result
     except _REFERENCE_ERRORS as exc:
         raise ValueError(str(exc)) from exc
 
@@ -280,13 +402,16 @@ def _diagnose_candidate(report, profile, outcomes, training):
 
 
 def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
-                             checkpoint=None, shadow=False):
+                             checkpoint=None, shadow=False, noise_margin_fraction=None,
+                             noise_margin_g=None):
     """Fit six references, then assess exactly four untouched references.
 
     Live acceptance retains its strict +/-1ms bound. Optional shadow fitting
     studies decisions within 20ms before the software event; it never authorizes
     live use or verifies physical contact. Both candidates freeze before any
     holdout data is inspected, and a failed holdout never causes a refit.
+    Supplying both noise-margin options selects only a shadow candidate using
+    confirmed negative pairs and also qualifies the single-sample raw bypass.
     """
     report = {"accepted": False, "profile": None, "reason": None, "reason_codes": [],
               "train_count": 6, "holdout_count": 4, "training": [], "holdout": [],
@@ -316,6 +441,16 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
     try:
         if type(shadow) is not bool:
             raise ValueError("shadow must be a boolean")
+        policy = None
+        if noise_margin_fraction is not None or noise_margin_g is not None:
+            stage = "invalid_noise_margin_policy"
+            if not shadow:
+                raise ValueError("noise margin qualification requires shadow-only fitting")
+            policy = _noise_margin_policy(noise_margin_fraction, noise_margin_g)
+            shadow_report["noise_margin_policy"] = policy
+            shadow_report["selection"] += "_with_frozen_engineering_noise_margin"
+            report["diagnostics"]["noise_margin_rejection_counts"] = {}
+        stage = "invalid_training_reference"
         if len(captures) != 10 or len(records) != 10:
             raise ValueError("exactly ten reference homes are required (six train, four holdout)")
         if not isinstance(records[0], dict):
@@ -348,6 +483,20 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
             negative_peak = math.sqrt(max(levels[n] for event, levels in zip(training, weighted)
                                           for n in event["negative"]))
             lower = max(negative_peak * 1.05, .01)
+            noise = None
+            if policy is not None:
+                noise = [_negative_noise(event, weights, CONFIRMATION_S, checkpoint, levels)
+                         for event, levels in zip(training, weighted)]
+                peaks = [phases[phase]["weighted_pair_max_g"] for phases in noise
+                         for phase in ("startup", "cruise")]
+                if any(peak is None for peak in peaks):
+                    counts = report["diagnostics"]["noise_margin_rejection_counts"]
+                    code = "missing_confirmable_negative_pair"
+                    counts[code] = counts.get(code, 0) + 1
+                    continue
+                negative_peak = max(peaks)
+                lower = max(negative_peak + policy["minimum_g"],
+                            negative_peak / (1. - policy["fraction"]), .01)
             # Fixed threshold grid, trained only on the first six homes.
             if lower > raw * .95:
                 report["diagnostics"]["weight_sets_without_threshold_margin"] += 1
@@ -363,15 +512,27 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
                 outcomes = [outcomes[number] for outcomes in by_event]
                 report["candidate_count"] += 1
                 weighted_count, compatible, classified = _diagnose_candidate(report, profile, outcomes, training)
+                margin_ok = True
+                if policy is not None:
+                    margins = [_assess_noise_margin(profile, phases, policy) for phases in noise]
+                    margin_ok = all(margin["qualified"] for margin in margins)
+                    counts = report["diagnostics"]["noise_margin_rejection_counts"]
+                    margin_codes = sorted({code for margin in margins for code in margin["reason_codes"]})
+                    for code in margin_codes:
+                        counts[code] = counts.get(code, 0) + 1
+                    examples = report["diagnostics"]["candidate_examples"]
+                    if examples and examples[-1]["candidate_index"] == report["candidate_count"]:
+                        examples[-1].update(noise_margin_qualified=margin_ok,
+                                            noise_margin_reason_codes=margin_codes)
                 # This live ranking and +/-1ms acceptance are unchanged.
                 rank = (sum(o["reference_delta_ms"] for o in outcomes),
                         -threshold / max(negative_peak, .01), weights, -threshold)
-                if weighted_count >= 3 and compatible and (best is None or rank < best[0]):
+                if policy is None and weighted_count >= 3 and compatible and (best is None or rank < best[0]):
                     best = rank, profile, outcomes
                 # Prefer repeatable weighted coverage before exploratory early
                 # timing. This is not evidence that an earlier signal is contact.
                 shadow_rank = (-weighted_count,) + rank
-                if (shadow and weighted_count >= 3
+                if (shadow and margin_ok and weighted_count >= 3
                         and all(o["within_negative_guard"] and o["no_later_than_reference"] for o in classified)
                         and (best_shadow is None or shadow_rank < best_shadow[0])):
                     best_shadow = shadow_rank, profile, classified
@@ -382,6 +543,9 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
             report["reason_codes"] = [code for code, count in report["diagnostics"]["rejection_counts"].items() if count]
             if not report["candidate_count"]:
                 report["reason_codes"] = ["no_candidates_after_negative_margin"]
+            if policy is not None:
+                report.update(reason="noise-margin fitting is shadow-only; live profile selection disabled",
+                              reason_codes=["noise_margin_shadow_only"])
         else:
             _, profile, report["training"] = best
             report["frozen_candidate"] = profile
@@ -389,9 +553,17 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
             if best_shadow is None:
                 shadow_report.update(reason="no training candidate has three weighted decisions within the 20ms guard",
                                      reason_codes=["no_shadow_training_candidate"])
+                if policy is not None:
+                    shadow_report["reason"] += " and the required weighted/raw noise margin"
+                    shadow_report["reason_codes"].append("no_noise_margin_training_candidate")
             else:
                 _, shadow_profile, shadow_report["training"] = best_shadow
                 shadow_profile = dict(shadow_profile, shadow_only=True, live_use_authorized=False)
+                if policy is not None:
+                    shadow_profile["noise_margin_policy"] = dict(policy)
+                    for event, outcome in zip(training, shadow_report["training"]):
+                        phases = _negative_noise(event, shadow_profile["weights_xyz"], CONFIRMATION_S, checkpoint)
+                        outcome["noise_margin"] = _assess_noise_margin(shadow_profile, phases, policy)
                 shadow_report["profile"] = shadow_profile
         if best is None and best_shadow is None:
             return report
@@ -430,6 +602,11 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
             shadow_outcomes = shadow_report["holdout"] = [
                 _classified(replay_profile(shadow_profile, event, checkpoint), event) if event is not None else None
                 for event in holdout]
+            if policy is not None:
+                for event, outcome in zip(holdout, shadow_outcomes):
+                    if event is not None:
+                        phases = _negative_noise(event, shadow_profile["weights_xyz"], CONFIRMATION_S, checkpoint)
+                        outcome["noise_margin"] = _assess_noise_margin(shadow_profile, phases, policy)
             codes = []
             if errors:
                 shadow_report["holdout_errors"] = errors
@@ -441,6 +618,9 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
                 codes.append("holdout_later_than_raw_reference")
             if not any(o is not None and o["route"] == "weighted_confirmed" for o in shadow_outcomes):
                 codes.append("holdout_no_weighted_decisions")
+            if policy is not None and any(o is not None and not o["noise_margin"]["qualified"]
+                                          for o in shadow_outcomes):
+                codes.append("holdout_insufficient_noise_margin")
             shadow_report.update(status="rejected" if codes else "ready", reason_codes=codes,
                 reason=("frozen shadow candidate rejected: " + ", ".join(codes)) if codes else
                        "frozen shadow candidate passed heldout software-window checks; not authorized for live use")
