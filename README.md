@@ -67,6 +67,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Measure repeated commanded-travel variation and save an accuracy PNG; X, Y or XY, 2–50 samples per axis. |
 | `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Record repeated homes, packet/stop/return timing, raw samples and diagnostic plots in a shareable bundle; fixed active settings, no recalibration or save. |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1` | Compare reference homes with a learned weighted-XYZ detector using temporary settings and a diagnostic ZIP. See [experimental workflow](docs/EXPERIMENT.md). |
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 
@@ -109,6 +110,7 @@ Keep the printed backup paths if you may need to undo the uninstall.
 [Calibration](docs/SIMPLE_CALIBRATION.md) ·
 [Accuracy](docs/ACCURACY.md) ·
 [Per-home diagnostic capture](docs/TROUBLESHOOT_CAPTURE.md) ·
+[Experimental detector comparison](docs/EXPERIMENT.md) ·
 [Plots](docs/PLOTS.md) ·
 [Beta experiment](docs/BETA.md) ·
 [Troubleshooting](docs/TROUBLESHOOTING.md) ·

@@ -406,6 +406,16 @@ class Attempt:
         self.bases = None           # resting reading of all three sensor axes
         self.sums = [0.0, 0.0, 0.0]  # integrated readings since the pass started
         self.vector_mode = False   # XYZ magnitude; no acceleration-derived motion proof
+        self.experimental = None  # runtime-only immutable snapshot for this home
+        self.experimental_weights = None
+        self.experimental_pending_time = self.experimental_evidence_sample = None
+        self.experimental_evidence_time = self.experimental_route = None
+        self.experimental_decision_time = None
+        self.experimental_age_oldest = self.experimental_age_newest = None
+        self.experimental_observe = False
+        self.experimental_envelope = {"eligible_batches": 0, "max_oldest_eligible_age_s": None,
+                                      "max_newest_eligible_age_s": None, "future_sample_seen": False,
+                                      "first_eligible_sample": None, "first_eligible_after_arm_s": None}
         self.signal_quality = None
         self.signal_packet = None
         self.reference_signal_quality = None
@@ -580,6 +590,7 @@ class BeaconAccelHoming:
         # Set only by the opt-in troubleshooting workflow. Callbacks retain
         # bounded observations in memory; export stays outside the move.
         self.troubleshoot = None
+        self.experimental_profile = None  # only ACCEL_HOMING_EXPERIMENT sets this
         self.scale = self.session_scale = None
         self.clip_values = (CLIPPED, -CLIPPED - 1)
         self.native_decode_previous = (0, 0, 0)
@@ -1282,7 +1293,37 @@ class BeaconAccelHoming:
                                           % (message, detail))
 
     def _uses_vector_detector(self, axis):
-        return self.workflows.simple_detection(axis)
+        profile = getattr(self, "experimental_profile", None)
+        return (isinstance(profile, dict) and profile.get("axis") == axis
+                or self.workflows.simple_detection(axis))
+
+    def _configure_experimental(self, attempt):
+        profile = getattr(self, "experimental_profile", None)
+        observing = getattr(self.workflows, "_experimental_home", None)
+        attempt.experimental_observe = (profile is not None or
+            bool(observing is not None and observing(attempt.axis)))
+        if profile is None or attempt.experimental is not None:
+            return
+        # Ordinary boot/homing never imports the experimental module.
+        if __package__:
+            from .accel_homing_experiment import validate_profile
+        else:
+            from accel_homing_experiment import validate_profile
+        try:
+            frozen = validate_profile(profile, attempt.axis,
+                                      attempt.limit_raw * attempt.count_g)
+        except (ValueError, TypeError) as exc:
+            raise self.printer.command_error("accel_homing: %s" % exc)
+        mapping = (self.helper.config.axes_map if self.backend is None
+                   else ((0, 1), (1, 1), (2, 1)))
+        sensor_weights = [0., 0., 0.]
+        for machine_axis, (sensor_axis, _sign) in enumerate(mapping):
+            sensor_weights[sensor_axis] = frozen["weights_xyz"][machine_axis]
+        attempt.experimental = frozen
+        attempt.experimental_weights = tuple(sensor_weights)
+        attempt.experimental_limit2 = (frozen["threshold_g"] / attempt.count_g) ** 2
+        attempt.experimental_raw_limit2 = attempt.limit_raw * attempt.limit_raw
+        attempt.vector_mode = True
 
     def _reference_noise_limit(self, axis):
         original = BASELINE_NOISE_RATIO * self.threshold_g[axis]
@@ -1541,9 +1582,11 @@ class BeaconAccelHoming:
                 except Exception:
                     pass
             attempt.expected_travel = abs(attempt.start_position - info.position_endstop)
+        self._configure_experimental(attempt)
         return attempt
 
     def arm(self, attempt):
+        self._configure_experimental(attempt)
         attempt.last_data = self.last_activity = self.reactor.monotonic()
         with self.lock:
             self.tail = None
@@ -2247,9 +2290,10 @@ class BeaconAccelHoming:
         if count < 2:
             return
         now = params.get("#receive_time") or self.reactor.monotonic()
-        if self.backend is None:
-            self.last_batch = now
         attempt = self.attempt
+        experimental = attempt is not None and attempt.experimental is not None
+        if self.backend is None and not experimental:
+            self.last_batch = now
         if trace is not None:
             trace["stage"] = "unarmed" if attempt is None else "armed"
         if attempt is None:
@@ -2266,7 +2310,7 @@ class BeaconAccelHoming:
                     self.last_batch = now
                 self.recent.append(data)
             return
-        if self.backend is None:
+        if self.backend is None and not experimental:
             attempt.last_data = now
         if attempt.done:
             if trace is not None:
@@ -2286,7 +2330,7 @@ class BeaconAccelHoming:
         # The configured adapter validates full-precision source rows first.
         # Direct detector replays still validate before refreshing liveness.
         direct_generic = self.backend is not None and "_sample_start_time_s" not in params
-        strict = strict_native or direct_generic
+        strict = strict_native or direct_generic or experimental
         width = 3 if isinstance(data, tuple) else 6
         if ((strict and (not math.isfinite(interval) or interval <= 0.0))
                 or (direct_generic and len(data) % width)):
@@ -2314,6 +2358,26 @@ class BeaconAccelHoming:
         if trace is not None:
             trace["filtered"] = params
             trace["stage"] = "eligible_after_arm"
+        if attempt.experimental_observe:
+            # Reference homes record the same envelope without changing their
+            # ordinary age policy. Candidate homes enforce the profile below.
+            observed_start, observed_interval = self._batch_timing(source_params, source_count)
+            observed_start += source_skip * observed_interval
+            observed_end = observed_start + (count - 1) * observed_interval
+            observed_now = self.main_mcu.estimated_print_time(self.reactor.monotonic())
+            envelope = attempt.experimental_envelope
+            if envelope["first_eligible_sample"] is None:
+                envelope["first_eligible_sample"] = (source_params["start_clock"],
+                    source_params["delta_clock"], source_skip, source_count)
+                envelope["first_eligible_after_arm_s"] = observed_start - attempt.arm_time
+            oldest_age, newest_age = observed_now - observed_start, observed_now - observed_end
+            if all(math.isfinite(v) for v in (oldest_age, newest_age)):
+                envelope["eligible_batches"] += 1
+                for key, age in (("max_oldest_eligible_age_s", oldest_age),
+                                 ("max_newest_eligible_age_s", newest_age)):
+                    if envelope[key] is None or age > envelope[key]:
+                        envelope[key] = age
+                envelope["future_sample_seen"] |= newest_age < -.005
         if strict:
             if self.backend is None:
                 start_time = self.clock_to_time(start_clock)
@@ -2321,11 +2385,21 @@ class BeaconAccelHoming:
             else:
                 start_time, sample_interval = self._batch_timing(params, count)
                 end_time = start_time + (count - 1) * sample_interval
-            sensor_now = self.main_mcu.estimated_print_time(now)
+            if experimental:
+                start_time, end_time = observed_start, observed_end
+            # Driver receipt time can predate detector dispatch. Only this
+            # opt-in path checks age at the actual current host observation.
+            sensor_now = self.main_mcu.estimated_print_time(
+                self.reactor.monotonic() if experimental else now)
             if not all(math.isfinite(value) for value in (start_time, end_time, sensor_now)):
                 self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
                 return
-            if ((self.backend is None and sensor_now - start_time > self.stream_timeout)
+            if experimental:
+                attempt.experimental_age_oldest = sensor_now - start_time
+                attempt.experimental_age_newest = sensor_now - end_time
+            age_limit = (attempt.experimental["max_age_s"] if experimental else
+                         self.stream_timeout if self.backend is None else None)
+            if ((age_limit is not None and sensor_now - start_time > age_limit)
                     or end_time - sensor_now > 0.005):
                 self._fire(attempt, "stale_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
                 return
@@ -2372,7 +2446,7 @@ class BeaconAccelHoming:
             raw = decoded[source_skip * 3:source_skip * 3 + count * 3]
             if source_skip:
                 params["_native_decode_previous"] = tuple(decoded[source_skip * 3 - 3:source_skip * 3])
-        if self.backend is not None:
+        if self.backend is not None or experimental:
             attempt.last_data = self.last_batch = now
         if trace is not None:
             trace["stage"] = "validated_detector_input"
@@ -2380,7 +2454,10 @@ class BeaconAccelHoming:
             if attempt.gap:
                 self._fire(attempt, "sample_gap", mcu.MCU_trsync.REASON_HOST_REQUEST)
                 return
-            self._inspect_vector(attempt, params, raw, count, source_params, source_skip)
+            if experimental:
+                self._inspect_experimental(attempt, params, raw, count, source_params, source_skip)
+            else:
+                self._inspect_vector(attempt, params, raw, count, source_params, source_skip)
             return
         values = raw[attempt.index::3]
         top, bottom = max(values), min(values)
@@ -2449,6 +2526,84 @@ class BeaconAccelHoming:
             self._observe_response(attempt, params, original, count)
             return
         self._onset(attempt, params, values, count, source_params, source_skip)
+
+    def _inspect_experimental(self, attempt, params, raw, count, source_params, source_skip):
+        """Scalar XYZ loop: no per-sample tuples, slices, generators or sqrt.
+
+        A raw strong impact dispatches on its first sample. The lower weighted
+        route needs two consecutive qualifying samples at most 1ms apart; its
+        trigger position is the second sample, never the earlier evidence.
+        """
+        bx, by, bz = attempt.bases
+        wx, wy, wz = attempt.experimental_weights
+        limit2, raw_limit2 = attempt.experimental_limit2, attempt.experimental_raw_limit2
+        start, interval = self._batch_timing(source_params, sample_count(source_params["data"]))
+        start += source_skip * interval
+        pending = attempt.experimental_pending_time
+        window = attempt.experimental["confirmation_s"]
+        previous_x, previous_y, previous_z = attempt.last_samples
+        peak2 = 0.
+        for position in range(count):
+            offset = position * 3
+            x, y, z = raw[offset], raw[offset + 1], raw[offset + 2]
+            when = start + position * interval
+            changed = x != previous_x or y != previous_y or z != previous_z
+            if changed or attempt.vector_unchanged_since is None:
+                attempt.vector_unchanged_since = when
+                attempt.varied = attempt.varied or changed
+            previous_x, previous_y, previous_z = x, y, z
+            dx, dy, dz = x - bx, y - by, z - bz
+            x2, y2, z2 = dx * dx, dy * dy, dz * dz
+            raw2 = x2 + y2 + z2
+            if not math.isfinite(raw2):
+                self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+                return
+            route = None
+            if raw2 >= raw_limit2:
+                route = "raw_bypass"
+            elif wx * x2 + wy * y2 + wz * z2 >= limit2:
+                if pending is not None and 0 < when - pending <= window + 1e-12:
+                    route = "weighted_confirmed"
+                else:
+                    pending = when
+                    attempt.experimental_evidence_time = when
+                    attempt.experimental_evidence_sample = (
+                        source_params["start_clock"], source_params["delta_clock"],
+                        position + source_skip, sample_count(source_params["data"]))
+            else:
+                pending = None
+                attempt.experimental_evidence_time = None
+                attempt.experimental_evidence_sample = None
+            if route is not None:
+                attempt.onset_batch = (params["start_clock"], params["delta_clock"], position, count)
+                attempt.onset_sample = (source_params["start_clock"], source_params["delta_clock"],
+                                       position + source_skip, sample_count(source_params["data"]))
+                attempt.onset_raw = math.sqrt(raw2)
+                attempt.experimental_route = route
+                attempt.experimental_decision_time = when
+                if route == "raw_bypass":
+                    attempt.experimental_evidence_time = when
+                    attempt.experimental_evidence_sample = attempt.onset_sample
+                onset_clock = params["start_clock"] + int(round(position * params["delta_clock"] / max(count - 1, 1)))
+                attempt.impact_until = (onset_clock + self.impact_window) & 0xFFFFFFFF
+                self._fire(attempt, "impact", mcu.MCU_trsync.REASON_ENDSTOP_HIT)
+                if getattr(self, "troubleshoot", None) is not None:
+                    self._troubleshoot_onset(attempt, params, source_params)
+                self._track_impact(attempt, params, raw, count)
+                return
+            if raw2 > peak2:
+                peak2 = raw2
+        attempt.experimental_pending_time = pending
+        peak = math.sqrt(peak2)
+        attempt.noise_checked = max(attempt.noise_checked, peak)
+        attempt.noise_pos = max(attempt.noise_pos, peak)
+        attempt.last_end_clock = params["start_clock"] + params["delta_clock"]
+        attempt.proof_sample_time = start + (count - 1) * interval
+        attempt.last_samples = [previous_x, previous_y, previous_z]
+        original = params["data"]
+        original = (original if isinstance(original, tuple) else
+                    tuple(v for row in SAMPLE.iter_unpack(original) for v in row))
+        self._observe_response(attempt, params, original, count)
 
     def _inspect_vector(self, attempt, params, raw, count, source_params, source_skip):
         """XYZ acceleration magnitude about a fixed resting offset, in raw units."""
@@ -2561,6 +2716,8 @@ class BeaconAccelHoming:
         return tuple(t / c for t, c in zip(totals, counts))
 
     def onset_time(self, attempt):
+        if getattr(attempt, "experimental", None) is not None and attempt.experimental_decision_time is not None:
+            return attempt.experimental_decision_time
         start_clock, delta_clock, position, count = attempt.onset_batch
         start = self.clock_to_time(start_clock)
         end = self.clock_to_time(start_clock + delta_clock)
@@ -3321,19 +3478,58 @@ class BeaconAccelHoming:
                                        (self.session_scale or self.scale)["scale"] / 1000.0,
                                        contexts[0][1] if self.backend is None and contexts
                                        and contexts[0] is not None else None)
+        if detector is not None and attempt.experimental is not None:
+            detector["experimental"] = self._experimental_status(attempt)
+        prefix_quality = None
+        prefix_count, prefix_first, prefix_last, prefix_done = 0, None, None, False
+        prefix_started = False
+        eligibility_sample, eligibility_matches, eligibility_index = None, 0, None
+        if detector is not None and attempt.experimental_observe:
+            detector["experimental_envelope"] = dict(attempt.experimental_envelope)
+            eligibility_sample = attempt.experimental_envelope["first_eligible_sample"]
+            prefix_quality = self._signal_quality("armed_prefix_through_reference_decision",
+                                                  quality.count_g, quality.clips)
         onset_matches, onset_index = 0, None
+        evidence_matches, evidence_index = 0, None
+        evidence_sample = (None if attempt is None or attempt.experimental is None
+                           else attempt.experimental_evidence_sample)
         for batch_index, (start_clock, delta_clock, data, count_g) in enumerate(batches):
             count = sample_count(data)
             if valid_onset_sample and (start_clock, delta_clock, count) == (
                     onset_sample[0], onset_sample[1], onset_sample[3]):
                 onset_matches += 1
                 onset_index = len(samples) + onset_sample[2]
+            if evidence_sample is not None and (start_clock, delta_clock, count) == (
+                    evidence_sample[0], evidence_sample[1], evidence_sample[3]):
+                evidence_matches += 1
+                evidence_index = len(samples) + evidence_sample[2]
+            if eligibility_sample is not None and (start_clock, delta_clock, count) == (
+                    eligibility_sample[0], eligibility_sample[1], eligibility_sample[3]):
+                eligibility_matches += 1
+                eligibility_index = len(samples) + eligibility_sample[2]
             raw = (list(data) if isinstance(data, tuple)
                    else [v for row in SAMPLE.iter_unpack(sample_slice(data, count)) for v in row])
+            if self.backend is not None and batch_index < len(contexts) and contexts[batch_index] is not None:
+                start, end = contexts[batch_index]
+            else:
+                start, end = self.clock_to_time(start_clock), self.clock_to_time(start_clock + delta_clock)
+            dt = (end - start) / (count - 1)
             quality.count_g = count_g
             for number in range(count):
                 quality.observe(raw[number * 3:number * 3 + 3],
                                 (start_clock, delta_clock, number, count))
+                if prefix_quality is not None and not prefix_done:
+                    identity = (start_clock, delta_clock, number, count)
+                    if identity == eligibility_sample:
+                        prefix_started = True
+                    if prefix_started:
+                        prefix_quality.count_g = count_g
+                        prefix_quality.observe(raw[number * 3:number * 3 + 3], identity)
+                        prefix_first = len(samples) + number if prefix_first is None else prefix_first
+                        prefix_last = len(samples) + number
+                        prefix_count += 1
+                    if valid_onset_sample and identity == tuple(onset_sample):
+                        prefix_done = True
             if self.backend is None:
                 context = contexts[batch_index] if batch_index < len(contexts) else (previous, self.clip_values)
                 limits = None if context is None or context[1] is None else native_clip_limits(context[1])
@@ -3341,11 +3537,6 @@ class BeaconAccelHoming:
                     raise self.printer.command_error("accel_homing: native capture decoder context changed")
                 raw = decode_native_values(raw, *context)
             previous = raw[-3:]
-            if self.backend is not None and batch_index < len(contexts) and contexts[batch_index] is not None:
-                start, end = contexts[batch_index]
-            else:
-                start, end = self.clock_to_time(start_clock), self.clock_to_time(start_clock + delta_clock)
-            dt = (end - start) / (count - 1)
             for number in range(count):
                 xyz = raw[number * 3:number * 3 + 3]
                 samples.append((start + number * dt,) + tuple(
@@ -3357,6 +3548,25 @@ class BeaconAccelHoming:
                 # Use the actual exported row, avoiding both later MCU clock
                 # adjustments and a different floating-point interpolation order.
                 detector["onset_time_s"] = samples[onset_index][0]
+            if prefix_quality is not None:
+                detector.update(first_eligible_sample=eligibility_sample,
+                    first_eligible_sample_matches=eligibility_matches,
+                    first_eligible_sample_index=eligibility_index if eligibility_matches == 1 else None,
+                    capture_arm_time_s=(samples[eligibility_index][0]
+                        - attempt.experimental_envelope["first_eligible_after_arm_s"]
+                        if eligibility_matches == 1 else None))
+                detector["reference_prefix_quality"] = dict(prefix_quality.summary(),
+                    version=1, available=prefix_done and onset_matches == 1 and eligibility_matches == 1,
+                    source="original_sensor_values_before_native_clip_decoding",
+                    sample_count=prefix_count, first_sample_index=prefix_first,
+                    last_sample_index=prefix_last, onset_sample=onset_sample)
+            if "experimental" in detector:
+                detector["experimental"].update(
+                    capture_decision_time_s=detector["onset_time_s"],
+                    capture_decision_sample_index=detector["onset_sample_index"],
+                    capture_evidence_sample_matches=evidence_matches,
+                    capture_evidence_sample_index=evidence_index if evidence_matches == 1 else None,
+                    capture_evidence_time_s=samples[evidence_index][0] if evidence_matches == 1 else None)
         if baseline is None and samples:
             resting = samples[:min(50, len(samples))]
             baseline = tuple(sum(row[i] for row in resting) / len(resting) for i in (1, 2, 3))
@@ -3457,6 +3667,22 @@ class BeaconAccelHoming:
                                    "threshold_g": threshold},
                 "onset_window": impact, "post_stop_response": response}
 
+    def _experimental_status(self, attempt):
+        result = dict(attempt.experimental)
+        # Do not share mutable profile data with a capture/status consumer.
+        result["weights_xyz"] = list(result["weights_xyz"])
+        result.update(route=attempt.experimental_route,
+                      evidence_time_s=attempt.experimental_evidence_time,
+                      evidence_sample=attempt.experimental_evidence_sample,
+                      decision_time_s=attempt.experimental_decision_time,
+                      decision_sample=attempt.onset_sample,
+                      decision_time_domain="main_mcu_print_time_at_detection",
+                      sample_age_oldest_s=attempt.experimental_age_oldest,
+                      sample_age_newest_s=attempt.experimental_age_newest,
+                      decision_is_contact_measurement=False,
+                      raw_bypass_instantaneous=True)
+        return result
+
     def _record(self, attempt):
         to_g = attempt.count_g
         if attempt.reason != "impact":
@@ -3495,6 +3721,10 @@ class BeaconAccelHoming:
         }
         if attempt.signal_quality is not None:
             result.update(attempt.signal_quality.summary())
+        if attempt.experimental is not None:
+            result["experimental"] = self._experimental_status(attempt)
+        if attempt.experimental_observe:
+            result["experimental_envelope"] = dict(attempt.experimental_envelope)
         if attempt.reference_signal_quality and attempt.reference_signal_quality["amplitude_limited"]:
             result.update(amplitude_limited=True, excess_amplitude_unknown=True)
         if attempt.motion_deadline is not None or self.backend is not None:

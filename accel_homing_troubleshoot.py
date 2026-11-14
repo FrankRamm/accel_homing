@@ -774,7 +774,9 @@ class Recorder:
     def export(self, ending):
         """After motion/cleanup only. Raw JSON/CSV survive any plotting failure."""
         self.close()
-        root = Path(self.workflow.charts_directory) / "troubleshoot"
+        experimental = self.session.get("experiment")
+        command = "ACCEL_HOMING_EXPERIMENT" if experimental else "ACCEL_HOMING_TROUBLESHOOT"
+        root = Path(self.workflow.charts_directory) / ("experiment" if experimental else "troubleshoot")
         root.mkdir(parents=True, exist_ok=True)
         folder = root / self.session["run_id"]
         folder.mkdir()  # Unique UUID; deliberately never overwrite another report.
@@ -807,7 +809,8 @@ class Recorder:
             for group in [self.batches] + [rows for home in self.homes for rows in (home["packet_prefix"], home["packet_tail"])]:
                 for row in group:
                     stream.write(json.dumps(row, allow_nan=False) + "\n")
-        report = {"schema": SCHEMA, "run_id": self.session["run_id"], "created_utc": self.started_utc,
+        report = {"schema": SCHEMA, "command": command,
+                  "run_id": self.session["run_id"], "created_utc": self.started_utc,
                   "ending": clean(ending), "axes": self.session["axes"],
                   "samples_requested": self.session["samples_requested"],
                   "fixed_thresholds_g": clean(self.session["saved_thresholds"]),
@@ -833,9 +836,19 @@ class Recorder:
                       "Rejected/partial homes are retained; no automatic recalibration or threshold change.",
                       "Empty CSV cells represent invalid/missing numbers; see capture invalid_rows.",
                       "Charts use impact windows; raw retained CSV rows are not decimated."]}
+        if experimental:
+            report["experiment"] = clean(experimental)
+            report["interpretation"] += [
+                "Training and heldout reference homes use raw XYZ magnitude; candidates use a frozen fitted profile with raw bypass.",
+                "SAMPLES counts candidate homes only; discovery plus ten reference homes are additional.",
+                "The same requested GC policy applies to every phase; this sequential comparison does not isolate GC causality.",
+                "Profile fit and commanded repeatability do not prove physical contact or absence of lost steps.",
+                "No automatic model, threshold, speed or configuration persistence. Normal G28 is unchanged.",
+                "Freshness limits and no-data timeouts run on the host reactor and provide no MCU-independent stop deadline."]
+            write_json(folder / "experiment.json", report["experiment"])
         write_json(folder / "manifest.json", report)
         (folder / "README.txt").write_text(
-            "ACCEL_HOMING_TROUBLESHOOT evidence\n\n"
+            command + " evidence\n\n"
             "Share the entire folder or ZIP. Read manifest.json first.\n"
             "home-*.csv.gz: every retained raw decoded XYZ sample before graph reduction, in g including gravity/bias.\n"
             "packets.jsonl.gz: bounded callback timing, pending/filtered packet context.\n"
@@ -998,6 +1011,56 @@ def _plot_timing(folder, home, report, rows, Figure, FigureCanvasAgg):
     figure.clear()
 
 
+def _plot_experiment(folder, report, Figure, FigureCanvasAgg):
+    """Separate sequential phases; never label commanded travel as accuracy."""
+    figure = Figure(figsize=(12, 12), dpi=110)
+    FigureCanvasAgg(figure)
+    plots = figure.subplots(3, 1)
+    for phase, marker in (("discovery", "x"), ("training", "o"),
+                          ("holdout", "s"), ("candidate", "^")):
+        group = [home for home in report["homes"] if home["phase"] == phase]
+        ids = [home["home_id"] for home in group]
+        records = [home.get("record") or {} for home in group]
+        numeric = lambda values: [value if finite(value) else math.nan for value in values]
+        travel = [record.get("travel_mm_exact", record.get("travel_mm")) for record in records]
+        overshoot = [abs(record["halt_travel_mm_signed"]) - abs(record["trigger_travel_mm_signed"])
+                     if all(finite(record.get(key)) for key in ("halt_travel_mm_signed", "trigger_travel_mm_signed"))
+                     else None for record in records]
+        delay = [home.get("stop_timing", {}).get("onset_to_host_dispatch_estimate_s") for home in group]
+        for plot, values in zip(plots, (travel, overshoot,
+                [value * 1000 if finite(value) else None for value in delay])):
+            plot.plot(ids, numeric(values), marker + "-", label=phase)
+    plots[0].set(title="Commanded travel by sequential phase (not measured physical position)", ylabel="mm")
+    plots[1].set(title="Commanded halt minus trigger distance", ylabel="mm")
+    plots[2].set(title="Sensor onset to host dispatch estimate (MCU receipt unknown)", ylabel="ms", xlabel="Home ID")
+    home_ids = [home["home_id"] for home in report["homes"]]
+    for plot in plots:
+        plot.grid(True, alpha=.25)
+        plot.legend(fontsize=8)
+        if home_ids:
+            plot.set_xlim(min(home_ids) - .5, max(home_ids) + .5)
+    if not any(finite(home.get("stop_timing", {}).get("onset_to_host_dispatch_estimate_s"))
+               for home in report["homes"]):
+        plots[2].text(.5, .5, "Timing unavailable: stop dispatch clock mapping not established",
+                      transform=plots[2].transAxes, ha="center", va="center", fontsize=10)
+    experiment = report["experiment"]
+    fit = experiment.get("fit") or {}
+    profile = fit.get("profile") or {}
+    weights = profile.get("weights_xyz")
+    weight_text = (", ".join("%.3g" % value for value in weights)
+                   if isinstance(weights, (tuple, list)) and all(finite(value) for value in weights)
+                   else "unavailable")
+    threshold_text = "%.3g" % profile["threshold_g"] if finite(profile.get("threshold_g")) else "unavailable"
+    figure.suptitle("ACCEL_HOMING_EXPERIMENT: frozen profile comparison\n"
+                   "Weights XYZ: %s; weighted threshold: %s g; GC guard all phases: %s\n"
+                   "Sequential comparison; no independent GC or physical-contact inference" % (
+                       weight_text, threshold_text,
+                       experiment.get("gc_guard_requested", "unknown")), fontsize=11)
+    figure.tight_layout(rect=(0, 0, 1, .92))
+    figure.savefig(folder / "experiment-phases.png")
+    figure.clear()
+
+
 def _worker(folder, dependencies):
     folder = Path(folder)
     if Path(dependencies).is_dir():
@@ -1072,10 +1135,12 @@ def _worker(folder, dependencies):
                 plot.legend(fontsize=6, loc="upper left" if plot is plots[3] else "upper right")
         for plot in plots:
             plot.grid(True, alpha=.25)
-        figure.suptitle("ACCEL_HOMING_TROUBLESHOOT: " + report["ending"].get("result", "unknown"))
+        figure.suptitle(report.get("command", "ACCEL_HOMING_TROUBLESHOOT") + ": " + report["ending"].get("result", "unknown"))
         figure.tight_layout(rect=(0, 0, 1, .97))
         figure.savefig(folder / "summary.png")
         figure.clear()
+        if report.get("experiment"):
+            _plot_experiment(folder, report, Figure, FigureCanvasAgg)
         for home in homes:
             record, capture = home.get("record") or {}, home["capture"]
             onset = record.get("onset_time_s")
@@ -1112,9 +1177,24 @@ def _worker(folder, dependencies):
             for index, label in enumerate("XYZ"):
                 plot.plot(times, [row[index + 1] - baseline[index] for row in rows], label=label, linewidth=.8)
             plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="XYZ norm", color="black", linewidth=1)
+            experimental = (capture.get("detector") or {}).get("experimental") or {}
+            profile = ((report.get("experiment") or {}).get("fit") or {}).get("profile") or {}
+            weights = profile.get("weights_xyz")
+            if home["phase"] == "candidate" and isinstance(weights, list) and len(weights) == 3:
+                plot.plot(times, [math.sqrt(sum(weights[index] * (row[index + 1] - baseline[index]) ** 2
+                                                 for index in range(3))) for row in rows],
+                          label="Frozen weighted XYZ score", color="#007b83", linewidth=1)
+                if finite(profile.get("threshold_g")):
+                    plot.axhline(profile["threshold_g"], color="#007b83", linestyle="--",
+                                 label="Frozen weighted threshold")
+                for key, label in (("capture_evidence_time_s", "weighted first evidence, retained row"),
+                                   ("capture_decision_time_s", "experimental decision, retained row")):
+                    if finite(experimental.get(key)):
+                        plot.axvline((experimental[key] - origin) * 1000, linestyle=":", label=label)
             threshold = record.get("threshold_g")
             if finite(threshold):
-                plot.axhline(threshold, color="#d17b00", linestyle="--", label="Active detector threshold")
+                plot.axhline(threshold, color="#d17b00", linestyle="--",
+                             label="Raw bypass threshold" if home["phase"] == "candidate" else "Active detector threshold")
             quality = home.get("saturation_diagnostic", {})
             if quality.get("available"):
                 for index, axis in enumerate("xyz"):

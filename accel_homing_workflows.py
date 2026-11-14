@@ -8,7 +8,9 @@ or slip. Qualified homes return to the configured midpoint.
 """
 import datetime
 import configparser
+import contextlib
 from decimal import Decimal
+import gc
 import html
 import importlib
 import importlib.util
@@ -73,6 +75,44 @@ NOISE_DURATION = 1.0
 
 
 _TROUBLESHOOT_MODULE = None
+_EXPERIMENT_MODULE = None
+
+
+def _load_experiment_module():
+    """Load the opt-in experiment without adding a boot-time dependency."""
+    global _EXPERIMENT_MODULE
+    if _EXPERIMENT_MODULE is not None:
+        return _EXPERIMENT_MODULE
+    name = ((__package__ + ".") if __package__ else "") + "accel_homing_experiment"
+    inserted = False
+    try:
+        module = importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        missing_parent = bool(__package__ and exc.name == __package__ and __package__ not in sys.modules)
+        if exc.name != name and not missing_parent:
+            raise
+        workflow_source = Path(__file__).resolve(strict=True)
+        source = workflow_source.with_name("accel_homing_experiment.py").resolve(strict=True)
+        if source.parent != workflow_source.parent:
+            raise ImportError("experiment source must be beside the installed workflow source") from exc
+        spec = importlib.util.spec_from_file_location(name, str(source))
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load experiment source: %s" % source)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        inserted = True
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(name) is module:
+                del sys.modules[name]
+            raise
+    if not callable(getattr(module, "fit_experimental_profile", None)):
+        if inserted and sys.modules.get(name) is module:
+            del sys.modules[name]
+        raise ImportError("accel_homing_experiment must provide fit_experimental_profile")
+    _EXPERIMENT_MODULE = module
+    return module
 
 
 def _load_troubleshoot_module():
@@ -319,6 +359,8 @@ class AccelHomingWorkflows:
                  "Cancel the current accelerometer homing workflow"),
                 ("ACCEL_HOMING_TEST", self.cmd_TEST,
                  "Test X then Y from an explicitly confirmed center"),
+                ("ACCEL_HOMING_EXPERIMENT", self.cmd_EXPERIMENT,
+                 "Opt-in single-axis frozen detector experiment with full diagnostic evidence"),
                 ("ACCEL_HOMING_CHARTS_GENERATE", self.cmd_CHARTS,
                  "Export acceleration PNG charts; optional AXIS=X or AXIS=Y, default both"),
                 ("ACCEL_HOMING_ACCURACY", self.cmd_ACCURACY,
@@ -646,6 +688,8 @@ class AccelHomingWorkflows:
         finally:
             self.owner.threshold_g.update(session["saved_thresholds"])
             self.owner.back_off_dist = session["saved_back_off"]
+            if "saved_experimental_profile" in session:
+                self.owner.experimental_profile = session["saved_experimental_profile"]
             self.in_home, self.home_axis = False, None
 
     def _finish(self, result, release=False):
@@ -864,6 +908,8 @@ class AccelHomingWorkflows:
                     and session.get("axis") == axis and self.in_home is True and self.home_axis == axis)
 
     def simple_detection(self, axis):
+        if self._experimental_home(axis):
+            return True
         if (self.calibration_reference(axis)
                 and self.session.get("algorithm") == SIMPLE_CALIBRATION):
             return True
@@ -871,6 +917,61 @@ class AccelHomingWorkflows:
         return bool(model is not None and axis not in self.manual_axes and not self._temporary_manual_threshold(axis)
                     and axis in model.thresholds
                     and model.metadata[axis].get("impact_metric") == "xyz_magnitude")
+
+    def _experimental_home(self, axis):
+        session = self.session
+        return bool(session and session.get("experiment") and self.in_home
+                    and self.home_axis == axis and session.get("axis") == axis)
+
+    def _experimental_gc_preflight(self):
+        # Kalico/Klipper's explicit idle collection is independent of
+        # gc.isenabled(). Only accept the known boolean gate interface.
+        if (type(getattr(self.reactor, "_check_gc", None)) is not bool
+                or not callable(getattr(self.reactor, "_check_timers", None))
+                or not callable(getattr(self.reactor, "get_gc_stats", None))):
+            raise self._error("GC_GUARD=1 requires the supported reactor _check_gc boolean "
+                              "interface; no motion requested. GC_GUARD=0 runs without suppression")
+
+    @contextlib.contextmanager
+    def _experimental_gc_scope(self, session):
+        experiment = session.get("experiment")
+        if not experiment or not experiment["gc_guard_requested"]:
+            yield
+            return
+        self._experimental_gc_preflight()
+        # Collect before native homing, while stationary; never collect during
+        # a failed home or on scope exit when motion state may be uncertain.
+        self.owner.toolhead.wait_moves()
+        self._check_running(session)
+        queued, estimated, empty = self.owner.toolhead.check_busy(self.reactor.monotonic())
+        if not empty or queued > estimated + .1:
+            raise self._error("GC preparation requires a stationary toolhead")
+        enabled, check_gc = gc.isenabled(), self.reactor._check_gc
+        recorder = session.get("troubleshoot_recorder")
+        evidence = {"requested": True, "scope": "native selected-axis home and wait_moves",
+                    "python_enabled_before": enabled, "reactor_check_gc_before": check_gc,
+                    "stationary_collection": False, "restored": False,
+                    "guarantee": "Python automatic and known reactor GC only; other explicit collection is not intercepted"}
+        if recorder is not None and recorder.current_home is not None:
+            recorder.current_home["gc_guard"] = evidence
+        try:
+            gc.collect()
+            evidence["stationary_collection"] = True
+            self._check_running(session)
+            gc.disable()
+            self.reactor._check_gc = False
+            evidence.update(python_enabled_during=gc.isenabled(),
+                            reactor_check_gc_during=self.reactor._check_gc)
+            yield
+        finally:
+            self.reactor._check_gc = check_gc
+            if enabled:
+                gc.enable()
+            else:
+                gc.disable()
+            evidence.update(python_enabled_after=gc.isenabled(),
+                            reactor_check_gc_after=self.reactor._check_gc,
+                            restored=(gc.isenabled() == enabled and self.reactor._check_gc == check_gc))
 
     def _calibration_grid(self, gcmd, session=None):
         defaults = session or {"start_threshold_g": self.start_threshold,
@@ -1393,8 +1494,9 @@ class AccelHomingWorkflows:
                 # X/Y here, retaining public handlers and normal homing events.
                 # Recheck after capture setup and command creation can yield.
                 self._check_running(session)
-                self._native_g28()(gcmd)
-                self.owner.toolhead.wait_moves()
+                with self._experimental_gc_scope(session):
+                    self._native_g28()(gcmd)
+                    self.owner.toolhead.wait_moves()
                 if session.get("beta"):
                     self.owner.finish_beta_home_capture(lambda: self._check_running(session))
             finally:
@@ -1512,8 +1614,8 @@ class AccelHomingWorkflows:
             record = dict(source)
         record.update(run_id=session["run_id"], workflow_attempt=session["attempts"],
                       workflow_threshold_g=session["saved_thresholds"][axis],
-                      workflow_phase=("discovery" if session["sample_index"] == 0
-                                      else "measurement"),
+                      workflow_phase=(session.get("experiment_phase") or
+                                      ("discovery" if session["sample_index"] == 0 else "measurement")),
                       accuracy_sample=session["sample_index"], capture_valid=False)
         invalid = [key for key, value in record.items()
                    if isinstance(value, float) and not math.isfinite(value)]
@@ -1612,6 +1714,9 @@ class AccelHomingWorkflows:
             record["onset_time_s"] = captured_onset
             record["capture_onset_sample_index"] = index
             record["capture_clock_shift_s"] = captured_onset - onset
+            if session.get("experiment_phase") == "candidate":
+                self._validate_experimental_receipt(session, source_record, detector, capture)
+                record["experimental_capture_verified"] = True
         record["threshold_g"] = detector["threshold_g"]
         record["onset_g"] = detector.get("onset_g")
         record["impact_peak_g"] = detector.get("impact_peak_g")
@@ -1620,6 +1725,60 @@ class AccelHomingWorkflows:
         record["homing_speed_mm_s"] = detector.get("homing_speed_mm_s")
         record["homing_accel_mm_s2"] = detector.get("homing_accel_mm_s2")
         session["last_arm_time"] = arm
+
+    def _validate_experimental_receipt(self, session, source_record, detector, capture):
+        """Bind a candidate's frozen profile and support to this exact capture."""
+        expected = (session["experiment"].get("fit") or {}).get("profile")
+        meta, original = detector.get("experimental"), source_record.get("experimental")
+        def reject(reason):
+            raise self._error("experimental capture receipt invalid: " + reason)
+        if not all(isinstance(value, dict) for value in (expected, meta, original)):
+            reject("missing frozen profile or detector metadata")
+        for key in ("version", "axis", "weights_xyz", "threshold_g", "raw_threshold_g", "confirmation_s", "max_age_s"):
+            if meta.get(key) != expected.get(key) or original.get(key) != expected.get(key):
+                reject("frozen profile changed (%s)" % key)
+        route = meta.get("route")
+        if route not in ("raw_bypass", "weighted_confirmed") or original.get("route") != route:
+            reject("unknown or changed decision route")
+        samples, decision = capture["samples"], detector["onset_sample_index"]
+        evidence = meta.get("capture_evidence_sample_index")
+        finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+        if (type(evidence) is not int or not 0 <= evidence <= decision
+                or type(meta.get("capture_evidence_sample_matches")) is not int
+                or meta["capture_evidence_sample_matches"] != 1
+                or meta.get("capture_decision_sample_index") != decision
+                or meta.get("capture_decision_time_s") != samples[decision][0]
+                or meta.get("capture_evidence_time_s") != samples[evidence][0]):
+            reject("support or decision was not retained exactly once at the stated row")
+        for key in ("evidence_sample", "decision_sample"):
+            value, source = meta.get(key), original.get(key)
+            if (not isinstance(value, (tuple, list)) or len(value) != 4
+                    or not isinstance(source, (tuple, list)) or tuple(value) != tuple(source)):
+                reject("changed original sample identity (%s)" % key)
+        if tuple(meta["decision_sample"]) != tuple(source_record["onset_sample"]):
+            reject("decision differs from the bound onset sample")
+        for key in ("evidence_time_s", "decision_time_s"):
+            if not finite(meta.get(key)) or meta[key] != original.get(key):
+                reject("changed original sample time (%s)" % key)
+        if meta["decision_time_s"] != source_record["onset_time_s"]:
+            reject("original decision time differs from onset")
+        baseline = capture["baseline_g"]
+        energy = lambda index, weights: sum(weights[n] * (samples[index][n + 1] - baseline[n]) ** 2
+                                             for n in range(3))
+        # Conversion from raw counts to exported g can round at a boundary.
+        at_least = lambda value, threshold: value + max(1e-10, abs(threshold) * 1e-9) >= threshold
+        if route == "raw_bypass":
+            if (evidence != decision or tuple(meta["evidence_sample"]) != tuple(meta["decision_sample"])
+                    or meta["evidence_time_s"] != meta["decision_time_s"]
+                    or not at_least(energy(decision, (1., 1., 1.)), expected["raw_threshold_g"] ** 2)):
+                reject("raw bypass lacks its instantaneous raw crossing")
+        else:
+            interval = meta["decision_time_s"] - meta["evidence_time_s"]
+            if (evidence + 1 != decision or not 0 < interval <= expected["confirmation_s"] + 1e-9
+                    or not samples[evidence][0] < samples[decision][0]
+                    or any(not at_least(energy(index, expected["weights_xyz"]), expected["threshold_g"] ** 2)
+                           for index in (evidence, decision))):
+                reject("weighted support is not adjacent, within its original-time window, or above threshold")
 
     def _quality(self, axis, record):
         result = record.get("result")
@@ -3060,13 +3219,115 @@ class AccelHomingWorkflows:
             raise gcmd.error("ACCEL_HOMING_TROUBLESHOOT diagnostics could not load: %s. "
                              "Update the complete accel_homing checkout and rerun ./install.sh "
                              "for this Klipper instance before retrying; no motion was requested" % exc) from exc
+        self._run_diagnostic(gcmd, list(requested), samples)
+
+    def cmd_EXPERIMENT(self, gcmd):
+        axis = str(gcmd.get("AXIS", "")).strip().lower()
+        if axis not in AXES:
+            raise gcmd.error("ACCEL_HOMING_EXPERIMENT requires AXIS=X or AXIS=Y")
+        for key in gcmd.get_command_parameters():
+            if key not in ("AXIS", "SAMPLES", "CENTERED", "SPEED", "GC_GUARD", "MAX_SAMPLE_AGE"):
+                raise gcmd.error("%s is not supported by ACCEL_HOMING_EXPERIMENT" % key)
+        samples = gcmd.get_int("SAMPLES", 10, minval=2, maxval=40)
+        guard = bool(gcmd.get_int("GC_GUARD", 1, minval=0, maxval=1))
+        max_age = gcmd.get_float("MAX_SAMPLE_AGE", .040, minval=.001, maxval=.5)
+        if not math.isfinite(max_age):
+            raise gcmd.error("MAX_SAMPLE_AGE must be finite")
+        self._require_centered(gcmd)
+        self._preflight([axis])
+        self._require_unhomed_xy()
+        configured_speed = self.owner.rails_by_axis[axis].get_homing_info().speed
+        speed = gcmd.get_float("SPEED", configured_speed, minval=0.0, maxval=configured_speed)
+        if not math.isfinite(speed) or speed != configured_speed:
+            raise gcmd.error("SPEED must equal the configured, qualified homing speed (%.6g mm/s); "
+                             "a saved threshold is not qualified at a different speed. No motion requested"
+                             % configured_speed)
+        if guard:
+            self._experimental_gc_preflight()
+        try:
+            module = _load_experiment_module()
+            _load_troubleshoot_module()
+        except Exception as exc:
+            raise gcmd.error("ACCEL_HOMING_EXPERIMENT modules could not load: %s. "
+                             "Update the complete accel_homing checkout and rerun ./install.sh "
+                             "for this Klipper instance before retrying; no motion was requested" % exc) from exc
+        experiment = {
+            "schema": "accel_homing_experiment_workflow_v1", "axis": axis,
+            "baseline_samples": 10, "training_samples": 6, "heldout_samples": 4,
+            "trial_samples_requested": samples, "gc_guard_requested": guard,
+            "max_sample_age_s": max_age,
+            "freshness_semantics": "oldest eligible sample at detector processing, after arm/duplicate boundary trimming; reactor-dependent",
+            "gc_policy": "same guard for discovery, training, holdout and candidate homes; stationary collection before each guarded native home",
+            "speed_mm_s": configured_speed, "speed_policy": "fixed configured speed; no automatic speed search",
+            "raw_threshold_g": self.owner.threshold_g[axis],
+            "comparison_design": "sequential raw XYZ reference homes versus frozen weighted candidate; not randomized or physical ground truth; no independent GC causal estimate",
+            "center_declaration": "CENTERED=1 is an operator declaration, not measured position or pressed-stop detection",
+            "limits": ["Host freshness checks and watchdogs are reactor-dependent; no MCU-independent stop-time guarantee.",
+                       "No automatic notch selection, speed search, firmware change or persistence.",
+                       "Weighted fitting and holdout consistency do not establish physical contact or missed steps.",
+                       "A rejected or faulted home stops without an automatic return."],
+            "fit": None, "phase": "discovery", "candidate_activated": False}
+        self._run_diagnostic(gcmd, [axis], samples, experiment=experiment,
+                             fitter=module.fit_experimental_profile)
+
+    def _diagnostic_recenter(self, session, recorder, axis):
+        before = troubleshoot_snapshot(self)
+        start = self.owner.toolhead.get_position()[AXES[axis]]
+        center = self._geometry(axis)[0]
+        speed = min(self.reposition_speed, session["configured_speeds"][axis])
+        recorder.record_event("return_planned", axis=axis,
+                              commanded_delta_mm_signed=center - start,
+                              target_mm=center, speed_mm_s=speed,
+                              restored_velocity_and_acceleration=before.get("max_velocity_and_acceleration"), before=before)
+        recorder.current_home["return_planned"] = {
+            "commanded_delta_mm_signed": center - start, "target_mm": center, "speed_mm_s": speed,
+            "restored_velocity_and_acceleration": before.get("max_velocity_and_acceleration"),
+            "settle_time_s": self.calibration_settle_time}
+        self._recenter(axis)
+        after = troubleshoot_snapshot(self)
+        recorder.current_home.update(return_completed=True, return_after=after,
+            return_commanded_delta_mm_signed=self.owner.toolhead.get_position()[AXES[axis]] - start)
+        recorder.record_event("return_completed", after=after,
+                              commanded_delta_mm_signed=self.owner.toolhead.get_position()[AXES[axis]] - start)
+
+    @staticmethod
+    def _experimental_reference_envelope(captures, maximum):
+        observed, errors = [], []
+        for number, capture in enumerate(captures, 1):
+            value = (capture.get("detector") or {}).get("experimental_envelope")
+            envelope = dict(value) if isinstance(value, dict) else {}
+            oldest, newest = envelope.get("max_oldest_eligible_age_s"), envelope.get("max_newest_eligible_age_s")
+            count = envelope.get("eligible_batches")
+            valid = (type(oldest) in (int, float) and math.isfinite(oldest)
+                     and type(newest) in (int, float) and math.isfinite(newest)
+                     and type(count) is int and count > 0
+                     and type(envelope.get("future_sample_seen")) is bool)
+            if not valid:
+                errors.append("reference %d lacks complete detector-processing age evidence" % number)
+            elif envelope["future_sample_seen"]:
+                errors.append("reference %d contains future sample timing" % number)
+            elif oldest > maximum:
+                errors.append("reference %d oldest eligible sample age %.6g s exceeds MAX_SAMPLE_AGE=%.6g s"
+                              % (number, oldest, maximum))
+            elif newest > oldest + 1e-9:
+                errors.append("reference %d has inconsistent detector-processing ages" % number)
+            observed.append(dict(envelope, reference_sample=number))
+        if len(captures) != 10:
+            errors.append("exactly ten reference age envelopes are required")
+        return {"accepted": not errors, "max_sample_age_s": maximum,
+                "semantics": "maximum oldest eligible post-trim sample age at detector processing; not freshest sample or transport-only latency",
+                "references": observed, "errors": errors,
+                "physical_stop_deadline_guaranteed": False}
+
+    def _run_diagnostic(self, gcmd, axes, samples, experiment=None, fitter=None):
         # Same idle/native-home/unhomed/geometry preflight as ACCURACY. PNG
         # dependencies are deliberately optional: evidence must survive failure.
-        axes = list(requested)
         self._begin(gcmd, "troubleshoot", axes=axes)
         session, recorder = self.session, None
+        mode = "experiment" if experiment else "troubleshoot"
+        total_samples = samples + (10 if experiment else 0)
         session.update(state="running", axes=axes, samples_requested=samples,
-                       attempt_limit=len(axes) * (samples + 1), sample_index=0,
+                       attempt_limit=len(axes) * (total_samples + 1), sample_index=0,
                        configured_speeds={axis: self.owner.rails_by_axis[axis].get_homing_info().speed
                                           for axis in axes},
                        pending_record=None, last_arm_time=None,
@@ -3075,7 +3336,13 @@ class AccelHomingWorkflows:
                        accuracy_center_reference=None,
                        axis_results={axis: {"trials": [], "discovery": None, "rejected": None}
                                      for axis in axes})
+        baseline_captures, baseline_records = [], []
+        if experiment:
+            session.update(experiment=experiment, experiment_phase="discovery",
+                           saved_experimental_profile=getattr(self.owner, "experimental_profile", None))
         try:
+            if experiment:
+                self.owner.experimental_profile = None
             recorder = TroubleshootRecorder(self, session)
             session["troubleshoot_recorder"] = recorder
             self.owner.troubleshoot = recorder
@@ -3083,30 +3350,48 @@ class AccelHomingWorkflows:
             recorder.record_event("workflow_start", axes=axes, samples_requested=samples,
                                   thresholds_g=session["saved_thresholds"],
                                   speeds_mm_s=session["configured_speeds"], homing_accel_mm_s2=self.owner.homing_accel)
-            self._info("Troubleshoot keeps active speeds, acceleration and thresholds fixed; "
-                       "%d measured homes per axis plus one excluded discovery. "
-                       "Bad homes stop without automatic return or recalibration" % samples)
+            if experiment:
+                self._info("Experiment: one discovery, 6 training and 4 heldout reference homes, then "
+                           "%d frozen-profile candidate homes if fitting passes. Fixed configured speed, "
+                           "same GC guard in all phases; no persistence or physical-contact claim" % samples)
+            else:
+                self._info("Troubleshoot keeps active speeds, acceleration and thresholds fixed; "
+                           "%d measured homes per axis plus one excluded discovery. "
+                           "Bad homes stop without automatic return or recalibration" % samples)
             session["accuracy_center_reference"] = self._accuracy_position_reference()
             for axis_index, axis in enumerate(axes):
                 session["axis"] = axis
-                for sample in range(samples + 1):
+                for sample in range(total_samples + 1):
                     self._check_running(session)
                     session.update(sample_index=sample, pending_record=None)
                     recorder.begin_home(axis, sample)
                     recorder.current_home["expected_travel_mm"] = self._geometry(axis)[1]
+                    if experiment:
+                        phase = ("discovery" if sample == 0 else "training" if sample <= 6
+                                 else "holdout" if sample <= 10 else "candidate")
+                        session["experiment_phase"] = experiment["phase"] = phase
+                        recorder.current_home.update(phase=phase,
+                            gc_guard={"requested": experiment["gc_guard_requested"], "restored": None},
+                            profile_frozen=phase == "candidate")
                     try:
                         record, capture = self._home(axis)
-                        del capture  # Recorder already retained compact raw rows before validation.
                         quality, reason = self._quality(axis, record)
                         recorder.current_home["quality"] = quality
+                        if experiment:
+                            record["experiment_quality"] = quality
                         if quality != "good":
                             session["axis_results"][axis]["rejected"] = record
-                            raise self._error(reason + "; troubleshoot stopped without automatic return "
-                                              "or recalibration; manually recenter before another run")
+                            raise self._error(reason + ("; %s stopped without automatic return "
+                                              "or recalibration; manually recenter before another run" % mode))
                         if sample == 0:
                             session["axis_results"][axis]["discovery"] = record
-                        else:
+                        elif not experiment or sample > 10:
                             session["axis_results"][axis]["trials"].append(record)
+                        if experiment and 1 <= sample <= 10:
+                            baseline_captures.append(capture)
+                            baseline_records.append(record)
+                            if sum(len(item["samples"]) for item in baseline_captures) > 1000000:
+                                raise self._error("reference capture memory limit reached; experiment stopped without automatic return")
                         recorder.finish_home(record)
                     except Exception as exc:
                         pending = session.get("pending_record")
@@ -3114,57 +3399,84 @@ class AccelHomingWorkflows:
                         # Do not substitute a previous home's record.
                         recorder.finish_home(pending, exc)
                         raise
-                    if sample < samples or axis_index < len(axes) - 1:
-                        before = troubleshoot_snapshot(self)
-                        start = self.owner.toolhead.get_position()[AXES[axis]]
-                        center = self._geometry(axis)[0]
-                        speed = min(self.reposition_speed, session["configured_speeds"][axis])
-                        recorder.record_event("return_planned", axis=axis,
-                                              commanded_delta_mm_signed=center - start,
-                                              target_mm=center, speed_mm_s=speed,
-                                              restored_velocity_and_acceleration=before.get("max_velocity_and_acceleration"), before=before)
-                        recorder.current_home["return_planned"] = {
-                            "commanded_delta_mm_signed": center - start,
-                            "target_mm": center, "speed_mm_s": speed,
-                            "restored_velocity_and_acceleration": before.get("max_velocity_and_acceleration"),
-                            "settle_time_s": self.calibration_settle_time}
-                        self._recenter(axis)
-                        after = troubleshoot_snapshot(self)
-                        recorder.current_home.update(return_completed=True, return_after=after,
-                            return_commanded_delta_mm_signed=self.owner.toolhead.get_position()[AXES[axis]] - start)
-                        recorder.record_event("return_completed", after=after,
-                                              commanded_delta_mm_signed=self.owner.toolhead.get_position()[AXES[axis]] - start)
+                    if experiment and sample == 10:
+                        self._check_running(session)
+                        envelope = self._experimental_reference_envelope(
+                            baseline_captures, experiment["max_sample_age_s"])
+                        experiment["freshness_preflight"] = envelope
+                        recorder.record_event("experimental_freshness_preflight", envelope=envelope)
+                        if not envelope["accepted"]:
+                            raise self._error("experimental freshness preflight rejected: %s; "
+                                              "no candidate homes or automatic return" % "; ".join(envelope["errors"]))
+                        def fit_checkpoint():
+                            self._check_running(session)
+                            self.reactor.pause(self.reactor.monotonic())
+                            self._check_running(session)
+                        experiment["fit"] = fitter(baseline_captures, baseline_records,
+                                                    axis=axis, max_age_s=experiment["max_sample_age_s"],
+                                                    checkpoint=fit_checkpoint)
+                        self._check_running(session)
+                        baseline_captures.clear()
+                        recorder.record_event("experimental_profile_fit", fit=experiment["fit"])
+                        if not experiment["fit"].get("accepted") or not experiment["fit"].get("profile"):
+                            raise self._error("experimental profile rejected: %s; stopped without automatic return"
+                                              % experiment["fit"].get("reason", "no accepted profile"))
+                        # Freeze a private JSON-only profile; neither subsequent
+                        # candidate evidence nor detector instances retrain it.
+                        self.owner.experimental_profile = json.loads(json.dumps(
+                            experiment["fit"]["profile"], allow_nan=False))
+                        experiment["candidate_activated"] = True
+                    del capture
+                    if sample < total_samples or axis_index < len(axes) - 1:
+                        self._diagnostic_recenter(session, recorder, axis)
             axis, record, _source = session["terminal_home"]
             recorder.record_event("terminal_release_planned", axis=axis,
                                   back_off_mm=session["saved_back_off"], before=troubleshoot_snapshot(self))
             self._release_terminal_home(axis, record)
             recorder.record_event("terminal_release_completed", after=troubleshoot_snapshot(self))
-            self._finish({"result": "complete", "mode": "troubleshoot"})
+            self._finish({"result": "complete", "mode": mode})
         except Exception as exc:
             if self.session is session and not session.get("finishing"):
-                self._finish({"result": "aborted", "mode": "troubleshoot", "reason": str(exc)}, release=True)
+                self._finish({"result": "aborted", "mode": mode, "reason": str(exc)}, release=True)
             raise
         finally:
             # Cancellation may finalize inside native G28. Its capture and core
             # cleanup unwind before this outer export; never write from a hook.
             self.owner.troubleshoot = None
+            if experiment:
+                self.owner.experimental_profile = session["saved_experimental_profile"]
+                baseline_captures.clear()
             if recorder is not None:
                 recorder.timing.close()
-            result = dict(self.last_result or {"result": "aborted"}, mode="troubleshoot",
+            result = dict(self.last_result or {"result": "aborted"}, mode=mode,
                           run_id=session["run_id"], axes=axes, samples_requested=samples,
                           attempts=session["attempts"],
                           completed_samples={axis: len(item["trials"]) for axis, item in session["axis_results"].items()},
                           statistics={axis: self._accuracy_statistics(item["trials"])
                                       for axis, item in session["axis_results"].items()})
+            if experiment:
+                experiment["statistics"] = {phase: self._accuracy_statistics(
+                    [record for record in session["records"] if record.get("workflow_phase") == phase
+                     and record.get("capture_valid") and record.get("experiment_quality") == "good"])
+                    for phase in ("training", "holdout", "candidate")}
+                experiment["runtime_restored"] = {
+                    "thresholds": self.owner.threshold_g == session["saved_thresholds"],
+                    "speeds": all(self.owner.rails_by_axis[axis].get_homing_info().speed == speed
+                                  for axis, speed in session["configured_speeds"].items()),
+                    "profile": self.owner.experimental_profile is session["saved_experimental_profile"]}
+                experiment["runtime_restored"]["gc"] = (all(
+                    home.get("gc_guard", {}).get("restored") is True for home in recorder.homes
+                    if home.get("gc_guard", {}).get("stationary_collection")) if recorder else True)
+                result["experiment"] = experiment
             try:
                 if recorder is not None:
                     recorder.record_event("workflow_cleanup_observed", result=result["result"],
                                           cleanup_complete=session.get("troubleshoot_cleanup_complete", False))
                     recorder.close()  # Detach hooks even if export cannot start.
                     result["artifacts"] = recorder.export(result)
-                    self._info("Troubleshoot evidence folder: %s" % result["artifacts"]["folder"])
+                    self._info("%s evidence folder: %s" % (mode.capitalize(), result["artifacts"]["folder"]))
                     if result["artifacts"].get("archive"):
-                        self._info("Troubleshoot shareable ZIP: %s" % result["artifacts"]["archive"])
+                        self._info("%s shareable ZIP: %s" % (mode.capitalize(), result["artifacts"]["archive"]))
                     if result["artifacts"]["render"]["result"] != "complete":
                         self._info("Troubleshoot PNG export failed; raw CSV and manifest remain available")
             except Exception as exc:
@@ -3417,6 +3729,11 @@ class AccelHomingWorkflows:
                                                        "samples_requested", "sample_index")}
             active["completed_samples"] = {axis: len(item["trials"])
                                             for axis, item in session["axis_results"].items()}
+            if session.get("experiment"):
+                active.update(mode="experiment", phase=session.get("experiment_phase"),
+                              baseline_samples=10, training_samples=6, heldout_samples=4,
+                              max_sample_age_s=session["experiment"]["max_sample_age_s"],
+                              gc_guard_requested=session["experiment"]["gc_guard_requested"])
         elif session is not None and session["mode"] == "accuracy":
             active = {key: session.get(key) for key in ("mode", "state", "axis", "attempts", "run_id")}
             active.update(axes=list(session["axes"]),

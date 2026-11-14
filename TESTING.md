@@ -73,6 +73,15 @@ TROUBLESHOOT adds fixed-setting motion equivalence, passive stop ordering,
 partial evidence retention, bounded collection and post-cleanup export checks.
 A source test file's presence is not proof that it executed successfully.
 
+EXPERIMENT checks must additionally cover frozen training/holdout separation,
+startup negatives, raw bypass and two-sample weighted decisions, native-axis
+mapping, stale input, exact sample provenance, cleanup after faults/cancellation,
+GC restoration and unchanged ordinary homing. Run the actual symlink-upgrade
+tests on Linux when Windows cannot create links. Render the phase comparison and
+per-home weighted overlays with the plotting dependencies installed. Offline
+replay establishes compatibility with recorded software trigger events; it does
+not establish physical contact timing, force, stopping distance or missed steps.
+
 For a reproducible report, retain the exact commit, command/working directory,
 Python/platform/dependency versions, exit status, full test output and any
 failures/skips. Grammar parsing, compilation, imports, real PNG rendering and a
