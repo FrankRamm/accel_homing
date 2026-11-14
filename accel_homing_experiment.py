@@ -13,6 +13,11 @@ CONFIRMATION_S = .001
 COMPATIBILITY_S = .001
 NEGATIVE_GUARD_S = .020
 STARTUP_S = .100
+MAX_CANDIDATE_DIAGNOSTICS = 12
+_CANDIDATE_CATEGORIES = (
+    "compatible_enough_weighted", "compatible_insufficient_weighted",
+    "incompatible_enough_weighted", "incompatible_insufficient_weighted")
+_REFERENCE_ERRORS = (ValueError, TypeError, KeyError, IndexError, OverflowError)
 
 
 def _number(value):
@@ -23,6 +28,8 @@ def validate_profile(profile, axis, raw_threshold_g):
     """Return an independent, JSON-safe snapshot or reject before arming."""
     if not isinstance(profile, dict) or profile.get("version") != VERSION:
         raise ValueError("unsupported experimental profile")
+    if profile.get("shadow_only") or profile.get("live_use_authorized") is False:
+        raise ValueError("shadow-only profile is not authorized for live use")
     weights = profile.get("weights_xyz")
     if (profile.get("axis") != axis or axis not in ("x", "y")
             or not isinstance(weights, (tuple, list)) or len(weights) != 3
@@ -92,6 +99,7 @@ def _event(capture, record, axis, checkpoint=None):
         first = detector["first_eligible_sample_index"]
         envelope = detector.get("experimental_envelope", {})
         if (type(first) is not int or not 0 <= first <= index
+                or not isinstance(envelope, dict)
                 or detector.get("first_eligible_sample_matches") != 1
                 or not isinstance(detector.get("first_eligible_sample"), (tuple, list))
                 or tuple(detector["first_eligible_sample"]) != tuple(envelope.get("first_eligible_sample") or ())):
@@ -196,31 +204,133 @@ def _replay_thresholds(event, levels, thresholds, checkpoint):
     return results
 
 
-def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040, checkpoint=None):
-    """Fit six references, then validate exactly four untouched references.
+def _classified(outcome, event):
+    """Classify software decisions without claiming that they measure contact."""
+    if outcome is None:
+        return None
+    result = dict(outcome)
+    when = result["decision_time_s"]
+    before_guard = when < event["onset"] - NEGATIVE_GUARD_S - 1e-12
+    if before_guard:
+        phase = "startup" if when < event["arm"] + STARTUP_S else "cruise"
+    else:
+        phase = "reference" if result["sample_index"] == event["onset_index"] else "near_event"
+    result.update(phase=phase, compatible=_compatible(result),
+                  within_negative_guard=not before_guard,
+                  no_later_than_reference=when <= event["onset"] + 1e-12,
+                  physical_contact_verified=False, live_use_authorized=False)
+    return result
 
-    Negatives end 20ms before the software event to avoid labelling the rising
-    impact as motion noise. Replay still examines EVERY post-arm sample, with
-    a strict +/-1ms software-event compatibility bound on training and holdout.
+
+def replay_shadow_capture(profile, capture, record, *, axis=None, checkpoint=None):
+    """Validate one captured RAW home, then replay a frozen shadow-only profile.
+
+    The caller must finish capture before calling this helper. Invalid data
+    raises ValueError; an early negative-window decision is returned as evidence
+    with within_negative_guard=False. Nothing is armed or installed here.
     """
-    report = {"accepted": False, "profile": None, "reason": None,
+    try:
+        if (not isinstance(profile, dict) or profile.get("shadow_only") is not True
+                or profile.get("live_use_authorized") is not False):
+            raise ValueError("replay requires an explicitly shadow-only profile")
+        axis = profile.get("axis") if axis is None else axis
+        event = _event(capture, record, axis, checkpoint)
+        parameters = {key: value for key, value in profile.items()
+                      if key not in ("shadow_only", "live_use_authorized")}
+        validated = validate_profile(parameters, axis, event["threshold"])
+        return _classified(replay_profile(validated, event, checkpoint), event)
+    except _REFERENCE_ERRORS as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _diagnose_candidate(report, profile, outcomes, training):
+    """Count every candidate; retain at most three examples per category."""
+    classified = [_classified(o, e) for o, e in zip(outcomes, training)]
+    weighted = sum(o is not None and o["route"] == "weighted_confirmed" for o in outcomes)
+    compatible = all(_compatible(o) for o in outcomes)
+    category = (("compatible" if compatible else "incompatible")
+                + ("_enough_weighted" if weighted >= 3 else "_insufficient_weighted"))
+    codes = []
+    if weighted < 3:
+        codes.append("insufficient_weighted_decisions")
+    if not compatible:
+        codes.append("outside_live_compatibility")
+    for phase in ("startup", "cruise"):
+        if any(o is not None and o["phase"] == phase for o in classified):
+            codes.append(phase + "_trigger")
+    if any(o is not None and o["phase"] == "near_event" and not o["compatible"]
+           for o in classified):
+        codes.append("near_event_early")
+    diagnostics = report["diagnostics"]
+    diagnostics["candidate_counts"][category] += 1
+    for code in codes:
+        diagnostics["rejection_counts"][code] += 1
+    for outcome in classified:
+        if outcome is not None:
+            diagnostics["decision_phase_counts"][outcome["phase"]] += 1
+    # Each example carries six deltas, not sensor rows or an unbounded trace.
+    examples = diagnostics["candidate_examples"]
+    if sum(e["category"] == category for e in examples) < MAX_CANDIDATE_DIAGNOSTICS // 4:
+        examples.append({"candidate_index": report["candidate_count"], "category": category,
+                         "weights_xyz": list(profile["weights_xyz"]),
+                         "threshold_g": profile["threshold_g"], "weighted_decisions": weighted,
+                         "reason_codes": codes, "phases": [o["phase"] for o in classified],
+                         "reference_delta_ms": [o["reference_delta_ms"] for o in outcomes]})
+    return weighted, compatible, classified
+
+
+def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040,
+                             checkpoint=None, shadow=False):
+    """Fit six references, then assess exactly four untouched references.
+
+    Live acceptance retains its strict +/-1ms bound. Optional shadow fitting
+    studies decisions within 20ms before the software event; it never authorizes
+    live use or verifies physical contact. Both candidates freeze before any
+    holdout data is inspected, and a failed holdout never causes a refit.
+    """
+    report = {"accepted": False, "profile": None, "reason": None, "reason_codes": [],
               "train_count": 6, "holdout_count": 4, "training": [], "holdout": [],
               "reference_kind": "software_raw_xyz_first_crossing",
               "physical_contact_verified": False, "negative_guard_s": NEGATIVE_GUARD_S,
-              "compatibility_tolerance_s": COMPATIBILITY_S, "candidate_count": 0}
+              "compatibility_tolerance_s": COMPATIBILITY_S, "candidate_count": 0,
+              "diagnostics": {
+                  "count_scope": "training_candidates_only",
+                  "candidate_counts": dict.fromkeys(_CANDIDATE_CATEGORIES, 0),
+                  "rejection_counts": dict.fromkeys(("insufficient_weighted_decisions",
+                      "outside_live_compatibility", "startup_trigger", "cruise_trigger",
+                      "near_event_early"), 0),
+                  "decision_phase_counts": dict.fromkeys(("startup", "cruise", "near_event", "reference"), 0),
+                  "candidate_examples": [], "candidate_examples_limit": MAX_CANDIDATE_DIAGNOSTICS,
+                  "weight_sets_without_threshold_margin": 0}}
+    shadow_report = None
+    if shadow:
+        shadow_report = report["shadow"] = {
+            "status": "rejected", "profile": None, "training": [], "holdout": [],
+            "reason": None, "reason_codes": [], "live_use_authorized": False,
+            "physical_contact_verified": False, "negative_guard_s": NEGATIVE_GUARD_S,
+            "train_count": 6, "holdout_count": 4,
+            "selection": "most_weighted_training_homes_then_earliest_sum_then_negative_margin",
+            "interpretation": "Exploratory software-event timing only; not authorized for live use. "
+                              "Earlier selection may trade sensitivity; independent contact truth is required."}
+    stage = "invalid_training_reference"
     try:
+        if type(shadow) is not bool:
+            raise ValueError("shadow must be a boolean")
         if len(captures) != 10 or len(records) != 10:
             raise ValueError("exactly ten reference homes are required (six train, four holdout)")
+        if not isinstance(records[0], dict):
+            raise ValueError("reference record must be an object")
         axis = records[0].get("axis") if axis is None else axis
-        # Do not inspect heldout samples until the complete candidate is frozen.
+        # No heldout sample is accessed during either selection.
         training = [_event(captures[n], records[n], axis, checkpoint) for n in range(6)]
         raw = training[0]["threshold"]
         if any(event["threshold"] != raw for event in training):
             raise ValueError("reference raw thresholds differ")
         report["negative_samples"] = {"startup": sum(len(e["startup"]) for e in training),
                                       "cruise": sum(len(e["cruise"]) for e in training)}
-        best = None
+        best, best_shadow = None, None
         seen = set()
+        stage = "invalid_candidate_parameters"
         for unscaled in itertools.product((.5, 1., 2.), repeat=3):
             weights = tuple(3. * v / sum(unscaled) for v in unscaled)
             if weights in seen:
@@ -240,6 +350,7 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040, ch
             lower = max(negative_peak * 1.05, .01)
             # Fixed threshold grid, trained only on the first six homes.
             if lower > raw * .95:
+                report["diagnostics"]["weight_sets_without_threshold_margin"] += 1
                 continue
             thresholds = [lower + (raw * .95 - lower) * step / 16. for step in range(17)]
             by_event = [_replay_thresholds(event, levels, thresholds, checkpoint)
@@ -251,28 +362,90 @@ def fit_experimental_profile(captures, records, *, axis=None, max_age_s=.040, ch
                     "max_age_s": max_age_s}, axis, raw)
                 outcomes = [outcomes[number] for outcomes in by_event]
                 report["candidate_count"] += 1
-                weighted_count = sum(o is not None and o["route"] == "weighted_confirmed" for o in outcomes)
-                if weighted_count < 3 or len(outcomes) != 6 or not all(_compatible(o) for o in outcomes):
-                    continue
-                # Prefer measured sample-time improvement, then stronger noise
-                # separation, then a fixed lexicographic weight tie breaker.
+                weighted_count, compatible, classified = _diagnose_candidate(report, profile, outcomes, training)
+                # This live ranking and +/-1ms acceptance are unchanged.
                 rank = (sum(o["reference_delta_ms"] for o in outcomes),
                         -threshold / max(negative_peak, .01), weights, -threshold)
-                if best is None or rank < best[0]:
+                if weighted_count >= 3 and compatible and (best is None or rank < best[0]):
                     best = rank, profile, outcomes
+                # Prefer repeatable weighted coverage before exploratory early
+                # timing. This is not evidence that an earlier signal is contact.
+                shadow_rank = (-weighted_count,) + rank
+                if (shadow and weighted_count >= 3
+                        and all(o["within_negative_guard"] and o["no_later_than_reference"] for o in classified)
+                        and (best_shadow is None or shadow_rank < best_shadow[0])):
+                    best_shadow = shadow_rank, profile, classified
         if best is None:
-            raise ValueError("training impacts and motion negatives are inseparable within the compatibility bound")
-        _, profile, report["training"] = best
-        report["frozen_candidate"] = profile
-        holdout = [_event(captures[n], records[n], axis, checkpoint) for n in range(6, 10)]
-        if any(e["threshold"] != raw for e in holdout):
-            raise ValueError("heldout raw threshold differs from frozen candidate")
-        report["holdout"] = [replay_profile(profile, event, checkpoint) for event in holdout]
-        if not all(_compatible(o) for o in report["holdout"]):
-            raise ValueError("frozen candidate failed heldout +/-1ms compatibility")
-        if not any(o["route"] == "weighted_confirmed" for o in report["holdout"]):
-            raise ValueError("frozen candidate has no heldout weighted detections")
-        report.update(accepted=True, profile=profile, reason="frozen candidate passed software-event compatibility")
-    except (ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
-        report["reason"] = str(exc)
+            counts = report["diagnostics"]["candidate_counts"]
+            report["reason"] = ("no training candidate meets both live +/-1ms compatibility and minimum "
+                "weighted coverage: " + ", ".join("%s=%d" % (key, counts[key]) for key in _CANDIDATE_CATEGORIES))
+            report["reason_codes"] = [code for code, count in report["diagnostics"]["rejection_counts"].items() if count]
+            if not report["candidate_count"]:
+                report["reason_codes"] = ["no_candidates_after_negative_margin"]
+        else:
+            _, profile, report["training"] = best
+            report["frozen_candidate"] = profile
+        if shadow:
+            if best_shadow is None:
+                shadow_report.update(reason="no training candidate has three weighted decisions within the 20ms guard",
+                                     reason_codes=["no_shadow_training_candidate"])
+            else:
+                _, shadow_profile, shadow_report["training"] = best_shadow
+                shadow_profile = dict(shadow_profile, shadow_only=True, live_use_authorized=False)
+                shadow_report["profile"] = shadow_profile
+        if best is None and best_shadow is None:
+            return report
+
+        # Freeze both choices above before validating all four holdouts. Retain
+        # valid siblings even if one reference is malformed, without refitting.
+        stage = "invalid_holdout_reference"
+        holdout, errors = [], []
+        for n in range(6, 10):
+            try:
+                event = _event(captures[n], records[n], axis, checkpoint)
+                if event["threshold"] != raw:
+                    raise ValueError("heldout raw threshold differs from frozen candidate")
+                holdout.append(event)
+            except _REFERENCE_ERRORS as exc:
+                holdout.append(None)
+                errors.append({"reference_index": n, "reason": str(exc), "reason_code": stage})
+        if errors:
+            report["holdout_errors"] = errors
+        if best is not None:
+            profile = best[1]
+            report["holdout"] = [replay_profile(profile, event, checkpoint) if event is not None else None
+                                  for event in holdout]
+            if errors:
+                report.update(reason="invalid heldout reference", reason_codes=[stage])
+            elif not all(_compatible(o) for o in report["holdout"]):
+                report.update(reason="frozen candidate failed heldout +/-1ms compatibility",
+                              reason_codes=["holdout_outside_live_compatibility"])
+            elif not any(o["route"] == "weighted_confirmed" for o in report["holdout"]):
+                report.update(reason="frozen candidate has no heldout weighted detections",
+                              reason_codes=["holdout_no_weighted_decisions"])
+            else:
+                report.update(accepted=True, profile=profile, reason_codes=[],
+                              reason="frozen candidate passed software-event compatibility")
+        if best_shadow is not None:
+            shadow_outcomes = shadow_report["holdout"] = [
+                _classified(replay_profile(shadow_profile, event, checkpoint), event) if event is not None else None
+                for event in holdout]
+            codes = []
+            if errors:
+                shadow_report["holdout_errors"] = errors
+                codes.append("invalid_holdout_reference")
+            for phase in ("startup", "cruise"):
+                if any(o is not None and o["phase"] == phase for o in shadow_outcomes):
+                    codes.append("holdout_" + phase + "_trigger")
+            if any(o is not None and not o["no_later_than_reference"] for o in shadow_outcomes):
+                codes.append("holdout_later_than_raw_reference")
+            if not any(o is not None and o["route"] == "weighted_confirmed" for o in shadow_outcomes):
+                codes.append("holdout_no_weighted_decisions")
+            shadow_report.update(status="rejected" if codes else "ready", reason_codes=codes,
+                reason=("frozen shadow candidate rejected: " + ", ".join(codes)) if codes else
+                       "frozen shadow candidate passed heldout software-window checks; not authorized for live use")
+    except _REFERENCE_ERRORS as exc:
+        report.update(reason=str(exc), reason_codes=[stage])
+        if shadow_report is not None:
+            shadow_report.update(status="rejected", reason=str(exc), reason_codes=[stage])
     return report

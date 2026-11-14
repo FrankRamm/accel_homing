@@ -1,8 +1,11 @@
 # Experimental homing comparison
 
 `ACCEL_HOMING_EXPERIMENT` compares the active raw XYZ detector with a learned
-weighted-XYZ detector on the printer, collecting evidence for every attempted
-home. It is an opt-in experiment on `main`; ordinary G28, CALIBRATE, the legacy
+weighted-XYZ detector, collecting evidence for every attempted home. `MODE=SHADOW`
+keeps every home on the raw detector and evaluates the frozen weighted profile
+after each home. `MODE=LIVE` retains the original experiment's stricter checks
+before allowing the weighted profile to control candidate homes.
+It is an opt-in experiment on `main`; ordinary G28, CALIBRATE, the legacy
 TEST command and TROUBLESHOOT retain their policies outside this command.
 
 ## Run
@@ -19,7 +22,7 @@ nozzle, appropriate motor state and operator supervision. `CENTERED=1` confirms
 that preparation; it does not measure position or automatically center the head.
 
 ```gcode
-ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1
+ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW
 ```
 
 Use `AXIS=Y` in a separately prepared run for Y. The command requires one axis
@@ -28,7 +31,8 @@ at a time. Share the complete ZIP reported in the console and status.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `AXIS` | Required | `X` or `Y`; no combined XY run. |
-| `SAMPLES` | `10` | Fresh candidate homes, from 2 to 40; the ten reference homes and discovery are additional. |
+| `MODE` | `LIVE` | `SHADOW` records raw homes and simulates the frozen profile afterward. `LIVE` preserves the previous live candidate workflow and its +/-1 ms compatibility requirement. Specify `SHADOW` for the current diagnostic retest. |
+| `SAMPLES` | `10` | Fresh shadow or live candidate homes, from 2 to 40; the ten reference homes and discovery are additional. |
 | `CENTERED` | Required `1` | Operator confirms the preparation above. |
 | `GC_GUARD` | `1` | Suppress automatic and supported reactor GC during each native home. `0` leaves the existing collection policy unchanged. Unsupported guarded reactors reject before movement. |
 | `MAX_SAMPLE_AGE` | `0.040` | Candidate age limit in seconds for the oldest eligible sample in a delivered batch. Valid range: 0.001 to 0.5 seconds. |
@@ -38,14 +42,20 @@ The sequence is:
 1. One discovery home, retained but excluded from fitting and statistics.
 2. Ten reference homes at the active threshold and configured speed. Six train
    the candidate; four independently check the frozen candidate.
-3. If the candidate passes replay checks, `SAMPLES` fresh experimental homes.
+3. If the candidate passes its mode's replay checks, `SAMPLES` fresh homes.
+   In SHADOW these still use the original raw detector; the frozen profile is
+   evaluated only after the complete capture. In LIVE the profile controls the
+   fresh homes with the original raw crossing retained as a stop path.
    The default is ten, for 21 homes total on a fully accepted run.
 4. Restore temporary state and export the result, captures and plots.
 
 Successful homes return to the configured midpoint between attempts. A failed
 home ends the run without recovery calibration or a blind automatic return.
 An unsuccessful fit prevents experimental homes; the reference evidence and
-rejection reasons remain available. `ACCEL_HOMING_CANCEL` requests cancellation
+rejection reasons remain available. A shadow replay outside its diagnostic
+window stops further attempts without an automatic return, even though that
+home itself was controlled by the raw detector.
+`ACCEL_HOMING_CANCEL` requests cancellation
 when the host can handle it; it is not an emergency stop.
 
 ## What changes during this command
@@ -61,9 +71,37 @@ threshold. This comparison does not claim to eliminate every false trigger.
 
 Reference captures include startup and moving vibration. The recorded raw
 trigger is a software reference, not independently measured physical contact.
-Agreement with those timestamps is necessary for this experiment, but is not
-proof of better physical accuracy. All candidate decisions must pass the full
-prefix replay checks, including checks for significantly earlier triggers.
+In LIVE, agreement within +/-1 ms remains necessary and is not proof of better
+physical accuracy. SHADOW separately studies earlier signals within the final
+20 ms before the raw crossing; this window is a diagnostic region, not a claim
+that contact occurred there. Neither mode ignores startup or cruise samples.
+
+## Shadow selection and rejection diagnostics
+
+Six training captures select one profile. Selection requires at least three
+weighted detections and no decisions before the final 20 ms region. Within
+that constraint it prefers more weighted detections, then earlier summed
+sample-time decisions and stronger separation from training motion noise.
+The four heldout captures can only accept or reject that frozen profile; they
+never change its weights or threshold. At least one heldout weighted detection
+and no detections outside the diagnostic region are required for fresh shadow
+homes. Full capture validation, sample provenance and cadence checks still apply.
+
+Shadow profiles are explicitly marked as diagnostic-only and the live profile
+validator rejects them. A ready shadow profile does not make a rejected live
+fit acceptable. The original +/-1 ms live acceptance limit is unchanged.
+
+The fit report distinguishes insufficient weighted detections, incompatible
+software-reference timing, startup/cruise decisions and invalid evidence. It
+includes candidate counts and bounded examples rather than attributing every
+rejection to inseparable noise. Early near-event signals may be contact onset
+or preceding vibration; an independent contact/position measurement is needed
+to decide. Replay timestamps do not predict actual future stop dispatch or
+physical halt, since delivery and scheduling can differ.
+
+The shadow experiment does not reduce the current homing force or speed. It
+collects evidence for a later change without using an unverified early signal
+to set the home coordinate.
 
 The scoped memory-collection guard suppresses automatic collection and the
 supported reactor's explicit collection check during each native home. Original
@@ -76,7 +114,10 @@ Experimental sample-age checking rejects stale data rather than declaring a
 successful home. This is a host-side check, not a guarantee on stopping time.
 The 40 ms default is a conservative experiment envelope, not a universal sensor
 transport guarantee. Reference packet ages are checked before activating the
-candidate; an incompatible envelope prevents candidate movement. The command
+candidate; an incompatible envelope prevents either mode's additional homes.
+The live candidate enforces its age limit during detection. SHADOW uses raw
+detection throughout and reports the observed timing; it does not install a
+different live freshness policy. The command
 does not increase the limit automatically. Increasing it manually permits older
 data and does not reduce transport delay. The diagnostic itself still adds work
 and memory usage.
@@ -98,6 +139,15 @@ experimental phases, GC guard state and partial failures. See
 bounded retention, plots and export limitations.
 Results are written below `charts_directory/experiment/<run_id>/`, including
 `experiment.json`, the manifest and plots. The console reports the ZIP path.
+
+For SHADOW, each replayed home's plot compares raw XYZ and the frozen weighted
+score, with separate original and simulated decision markers. Raw CSV and
+per-home replay records retain the exact samples behind those markers.
+`delivery.json` and `delivery.csv` separate onset-to-batch-end, batch-end-to-adapter,
+adapter-to-detector and detector-to-stop-request timing. The per-home timing
+plot shows the same decomposition. Missing or ambiguous evidence stays unknown;
+sample-to-host terms use clock estimates, and the delivery/driver term is not
+pure transport latency. No MCU receipt or physical halt time is inferred.
 
 Travel and post-trigger travel describe commanded steps. They do not measure
 actual carriage displacement, motor rotation, contact force or missed steps.

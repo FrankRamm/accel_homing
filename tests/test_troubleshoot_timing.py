@@ -1,6 +1,7 @@
 """Offline regression evidence for range limits and the host delivery pipeline."""
 from array import array
 import copy
+import csv
 import gc
 import gzip
 import json
@@ -88,6 +89,118 @@ class SaturationDiagnosticsTests(unittest.TestCase):
             self.assertEqual(quality["phases"]["unattributed"]["x"], 1)
             self.assertIsNone(quality["first_print_time_s"])
             json.dumps(public, allow_nan=False)
+
+
+class DeliveryDiagnosticsTests(unittest.TestCase):
+    def fixture(self):
+        home = {"home_id": 2, "axis": "y", "phase": "holdout", "batches_omitted": 7,
+                "stop_timing": {"onset_print_time_s": 10., "host_dispatch_estimated_print_time_s": 10.01061,
+                                "onset_to_host_dispatch_estimate_s": .01061}}
+        events = [{"home_id": 2, "kind": "stop_request", "fields": {
+            "request_before_host_monotonic_s": 20.0106, "request_after_host_monotonic_s": 20.0107,
+            "request_estimated_print_time_s": 10.01061, "arm_print_time_s": 9.9,
+            "onset_sample": [1234, 240, 4, 10]}}]
+        common = {"arm_print_time_s": 9.9, "sample_time_domain": "main_mcu_print_time",
+                  "original_first_print_time_s": 9.998, "original_last_print_time_s": 10.006,
+                  "original_sample_count": 10}
+        detector = {"home_id": 2, "home_packet_sequence": 8, "source": "klipper_batch_detector", "fields": {
+            **common, "original_start_clock": 1234, "original_delta_clock": 240,
+            "callback_entry_host_monotonic_s": 20.0104, "callback_exit_host_monotonic_s": 20.0108}}
+        adapter = {"home_id": 2, "home_packet_sequence": 9, "source": "klipper_batch", "fields": {
+            **common, "timestamp_provenance": "configured_driver_decoded_batch_callback",
+            "callback_entry_host_monotonic_s": 20.010, "callback_exit_host_monotonic_s": 20.011,
+            "callback_entry_estimated_print_time_s": 10.010}}
+        return home, events, [detector, adapter]
+
+    def test_decomposition_uses_named_clocks_and_preserves_evidence(self):
+        args = self.fixture()
+        before = copy.deepcopy(args)
+        result = diagnostics.delivery_diagnostic(*args)
+        self.assertEqual(args, before)
+        self.assertEqual(result["status"], "complete")
+        for key, seconds in (("onset_to_batch_last", .006), ("batch_last_to_adapter", .004),
+                             ("adapter_to_detector", .0004), ("detector_to_request", .0002)):
+            self.assertAlmostEqual(result["segments"][key]["duration_s"], seconds)
+            self.assertEqual(result["segments"][key]["status"], "available")
+        self.assertAlmostEqual(result["decomposition_residual_s"], .00001)
+        self.assertAlmostEqual(result["stop_call_duration_s"], .0001)
+        self.assertIn("clocksync estimate", result["segments"]["batch_last_to_adapter"]["clock_basis"])
+        self.assertEqual(result["segments"]["detector_to_request"]["clock_basis"], "host_monotonic")
+        self.assertIsNone(result["mcu_halt_time_s"])
+        self.assertIsNone(result["physical_contact_time_s"])
+        self.assertEqual(result["packet_retention_omitted"], 7)
+        json.dumps(result, allow_nan=False)
+
+    def test_pending_source_gap_and_missing_adapter_remain_unknown(self):
+        for pending_gap in (False, True):
+            with self.subTest(pending_gap=pending_gap):
+                home, events, packets = self.fixture()
+                if pending_gap:
+                    packets[1]["fields"].update(original_first_print_time_s=10.001,
+                        pending_before_first_print_time_s=9.998, pending_before_last_print_time_s=10.,
+                        delivered_first_print_time_s=9.998, delivered_last_print_time_s=10.006)
+                else:
+                    packets.pop()
+                result = diagnostics.delivery_diagnostic(home, events, packets)
+                self.assertEqual(result["status"], "partial")
+                self.assertAlmostEqual(result["segments"]["detector_to_request"]["duration_s"], .0002)
+                self.assertIsNone(result["segments"]["batch_last_to_adapter"]["duration_s"])
+                self.assertIsNone(result["decomposition_residual_s"])
+
+    def test_identity_wrong_home_arm_clock_and_ambiguous_callbacks_are_not_guessed(self):
+        mutations = (
+            lambda h, e, p: p[0]["fields"].update(original_start_clock=4321),
+            lambda h, e, p: p[0].update(home_id=3),
+            lambda h, e, p: p[0]["fields"].update(arm_print_time_s=9.8),
+            lambda h, e, p: p[0]["fields"].update(sample_time_domain="sensor_clock"),
+            lambda h, e, p: p.append(copy.deepcopy(p[0])),
+            lambda h, e, p: h.update(stop_timing={"reason": "clock mapping unavailable"}),
+            lambda h, e, p: e[0]["fields"].update(request_before_host_monotonic_s=None))
+        for mutate in mutations:
+            args = self.fixture()
+            mutate(*args)
+            result = diagnostics.delivery_diagnostic(*args)
+            self.assertEqual(result["status"], "unavailable")
+            self.assertTrue(all(item["duration_s"] is None for item in result["segments"].values()))
+        home, events, packets = self.fixture()
+        packets.append(copy.deepcopy(packets[1]))
+        result = diagnostics.delivery_diagnostic(home, events, packets)
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("ambiguous", result["segments"]["adapter_to_detector"]["reason"])
+
+    def test_reversed_or_missing_clocksync_estimate_is_not_zero(self):
+        for estimate, status in ((9.99, "inconsistent"), (None, "unavailable")):
+            home, events, packets = self.fixture()
+            packets[1]["fields"]["callback_entry_estimated_print_time_s"] = estimate
+            result = diagnostics.delivery_diagnostic(home, events, packets)
+            self.assertEqual(result["status"], "partial")
+            segment = result["segments"]["batch_last_to_adapter"]
+            self.assertEqual(segment["status"], status)
+            self.assertIsNone(segment["duration_s"])
+            self.assertIsNone(result["decomposition_residual_s"])
+
+    def test_native_only_reports_observed_detector_span_without_fabricating_adapter(self):
+        home, events, packets = self.fixture()
+        packets[0]["source"] = "beacon_native"
+        result = diagnostics.delivery_diagnostic(home, events, packets[:1])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["evidence"]["detector_source"], "beacon_native")
+        self.assertIsNone(result["segments"]["adapter_to_detector"]["duration_s"])
+
+    def test_portable_exports_keep_unknowns_null_or_blank_and_name_clock_bases(self):
+        home, events, packets = self.fixture()
+        home["delivery_diagnostic"] = diagnostics.delivery_diagnostic(home, events, packets[:1])
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            diagnostics.export_delivery(folder, [home])
+            report = json.loads((folder / "delivery.json").read_text(encoding="utf-8"))
+            with (folder / "delivery.csv").open(newline="", encoding="utf-8") as stream:
+                row = next(csv.DictReader(stream))
+        self.assertIsNone(report["homes"][0]["segments"]["batch_last_to_adapter"]["duration_s"])
+        self.assertEqual(row["batch_last_to_adapter_ms"], "")
+        self.assertEqual(row["mcu_halt_time_s"], "")
+        self.assertAlmostEqual(float(row["detector_to_request_ms"]), .2)
+        self.assertEqual(row["detector_to_request_clock_basis"], "host_monotonic")
 
 
 class Clock:

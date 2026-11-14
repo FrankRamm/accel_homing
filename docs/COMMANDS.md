@@ -30,7 +30,7 @@ for your machine and independent Z support. See the complete
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1` | One-axis experimental comparison: discovery, ten reference homes, then requested frozen-profile trials if offline validation passes. Temporary settings; no save or restart. See [EXPERIMENT](EXPERIMENT.md). |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW` | One-axis diagnostic retest: discovery, ten reference homes, then raw homes with frozen-profile replay after motion. No shadow profile controls a home. Existing `MODE=LIVE` remains available. No save or restart. See [EXPERIMENT](EXPERIMENT.md). |
 | `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. |
 | `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Per-home diagnostic capture. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 50. Keeps active homing settings; no calibration, save or restart. Preserves available evidence on failure. |

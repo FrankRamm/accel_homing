@@ -3226,8 +3226,11 @@ class AccelHomingWorkflows:
         if axis not in AXES:
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT requires AXIS=X or AXIS=Y")
         for key in gcmd.get_command_parameters():
-            if key not in ("AXIS", "SAMPLES", "CENTERED", "SPEED", "GC_GUARD", "MAX_SAMPLE_AGE"):
+            if key not in ("AXIS", "SAMPLES", "CENTERED", "SPEED", "GC_GUARD", "MAX_SAMPLE_AGE", "MODE"):
                 raise gcmd.error("%s is not supported by ACCEL_HOMING_EXPERIMENT" % key)
+        experiment_mode = str(gcmd.get("MODE", "LIVE")).strip().upper()
+        if experiment_mode not in ("LIVE", "SHADOW"):
+            raise gcmd.error("MODE must be LIVE or SHADOW")
         samples = gcmd.get_int("SAMPLES", 10, minval=2, maxval=40)
         guard = bool(gcmd.get_int("GC_GUARD", 1, minval=0, maxval=1))
         max_age = gcmd.get_float("MAX_SAMPLE_AGE", .040, minval=.001, maxval=.5)
@@ -3247,20 +3250,25 @@ class AccelHomingWorkflows:
         try:
             module = _load_experiment_module()
             _load_troubleshoot_module()
+            if experiment_mode == "SHADOW" and not callable(getattr(module, "replay_shadow_capture", None)):
+                raise ImportError("experiment module does not support MODE=SHADOW")
         except Exception as exc:
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT modules could not load: %s. "
                              "Update the complete accel_homing checkout and rerun ./install.sh "
                              "for this Klipper instance before retrying; no motion was requested" % exc) from exc
         experiment = {
-            "schema": "accel_homing_experiment_workflow_v1", "axis": axis,
+            "schema": "accel_homing_experiment_workflow_v2", "axis": axis,
+            "mode": experiment_mode, "shadow_results": [],
             "baseline_samples": 10, "training_samples": 6, "heldout_samples": 4,
             "trial_samples_requested": samples, "gc_guard_requested": guard,
             "max_sample_age_s": max_age,
             "freshness_semantics": "oldest eligible sample at detector processing, after arm/duplicate boundary trimming; reactor-dependent",
-            "gc_policy": "same guard for discovery, training, holdout and candidate homes; stationary collection before each guarded native home",
+            "gc_policy": "same guard for discovery, training, holdout, candidate and shadow homes; stationary collection before each guarded native home",
             "speed_mm_s": configured_speed, "speed_policy": "fixed configured speed; no automatic speed search",
             "raw_threshold_g": self.owner.threshold_g[axis],
-            "comparison_design": "sequential raw XYZ reference homes versus frozen weighted candidate; not randomized or physical ground truth; no independent GC causal estimate",
+            "comparison_design": ("raw XYZ homes with frozen-profile replay after motion; shadow decisions never control a home"
+                                  if experiment_mode == "SHADOW" else
+                                  "sequential raw XYZ reference homes versus frozen weighted candidate; not randomized or physical ground truth; no independent GC causal estimate"),
             "center_declaration": "CENTERED=1 is an operator declaration, not measured position or pressed-stop detection",
             "limits": ["Host freshness checks and watchdogs are reactor-dependent; no MCU-independent stop-time guarantee.",
                        "No automatic notch selection, speed search, firmware change or persistence.",
@@ -3268,7 +3276,8 @@ class AccelHomingWorkflows:
                        "A rejected or faulted home stops without an automatic return."],
             "fit": None, "phase": "discovery", "candidate_activated": False}
         self._run_diagnostic(gcmd, [axis], samples, experiment=experiment,
-                             fitter=module.fit_experimental_profile)
+                             fitter=module.fit_experimental_profile,
+                             shadow_replayer=getattr(module, "replay_shadow_capture", None))
 
     def _diagnostic_recenter(self, session, recorder, axis):
         before = troubleshoot_snapshot(self)
@@ -3319,12 +3328,13 @@ class AccelHomingWorkflows:
                 "references": observed, "errors": errors,
                 "physical_stop_deadline_guaranteed": False}
 
-    def _run_diagnostic(self, gcmd, axes, samples, experiment=None, fitter=None):
+    def _run_diagnostic(self, gcmd, axes, samples, experiment=None, fitter=None, shadow_replayer=None):
         # Same idle/native-home/unhomed/geometry preflight as ACCURACY. PNG
         # dependencies are deliberately optional: evidence must survive failure.
         self._begin(gcmd, "troubleshoot", axes=axes)
         session, recorder = self.session, None
         mode = "experiment" if experiment else "troubleshoot"
+        shadow_mode = bool(experiment and experiment.get("mode") == "SHADOW")
         total_samples = samples + (10 if experiment else 0)
         session.update(state="running", axes=axes, samples_requested=samples,
                        attempt_limit=len(axes) * (total_samples + 1), sample_index=0,
@@ -3337,6 +3347,10 @@ class AccelHomingWorkflows:
                        axis_results={axis: {"trials": [], "discovery": None, "rejected": None}
                                      for axis in axes})
         baseline_captures, baseline_records = [], []
+        def experiment_checkpoint():
+            self._check_running(session)
+            self.reactor.pause(self.reactor.monotonic())
+            self._check_running(session)
         if experiment:
             session.update(experiment=experiment, experiment_phase="discovery",
                            saved_experimental_profile=getattr(self.owner, "experimental_profile", None))
@@ -3350,7 +3364,12 @@ class AccelHomingWorkflows:
             recorder.record_event("workflow_start", axes=axes, samples_requested=samples,
                                   thresholds_g=session["saved_thresholds"],
                                   speeds_mm_s=session["configured_speeds"], homing_accel_mm_s2=self.owner.homing_accel)
-            if experiment:
+            if shadow_mode:
+                self._info("Experiment SHADOW: one discovery, 6 training and 4 heldout raw homes, then "
+                           "%d additional RAW homes if the frozen shadow profile passes its diagnostic checks. "
+                           "Weighted decisions are replayed after each home and NEVER control motion; "
+                           "same configured speed, threshold and GC guard; no persistence" % samples)
+            elif experiment:
                 self._info("Experiment: one discovery, 6 training and 4 heldout reference homes, then "
                            "%d frozen-profile candidate homes if fitting passes. Fixed configured speed, "
                            "same GC guard in all phases; no persistence or physical-contact claim" % samples)
@@ -3368,11 +3387,11 @@ class AccelHomingWorkflows:
                     recorder.current_home["expected_travel_mm"] = self._geometry(axis)[1]
                     if experiment:
                         phase = ("discovery" if sample == 0 else "training" if sample <= 6
-                                 else "holdout" if sample <= 10 else "candidate")
+                                 else "holdout" if sample <= 10 else "shadow" if shadow_mode else "candidate")
                         session["experiment_phase"] = experiment["phase"] = phase
                         recorder.current_home.update(phase=phase,
                             gc_guard={"requested": experiment["gc_guard_requested"], "restored": None},
-                            profile_frozen=phase == "candidate")
+                            profile_frozen=phase in ("candidate", "shadow"))
                     try:
                         record, capture = self._home(axis)
                         quality, reason = self._quality(axis, record)
@@ -3383,6 +3402,21 @@ class AccelHomingWorkflows:
                             session["axis_results"][axis]["rejected"] = record
                             raise self._error(reason + ("; %s stopped without automatic return "
                                               "or recalibration; manually recenter before another run" % mode))
+                        if shadow_mode and sample > 10:
+                            self._check_running(session)
+                            profile = experiment["fit"]["shadow"]["profile"]
+                            outcome = shadow_replayer(profile, capture, record, axis=axis,
+                                                      checkpoint=experiment_checkpoint)
+                            recorder.current_home.update(shadow=outcome, shadow_profile=profile)
+                            experiment["shadow_results"].append(dict(outcome,
+                                home_id=recorder.current_home.get("home_id")))
+                            recorder.record_event("experimental_shadow_replay", outcome=outcome,
+                                                  live_use_authorized=False)
+                            self._check_running(session)
+                            if not (outcome.get("within_negative_guard") and outcome.get("no_later_than_reference")):
+                                raise self._error("shadow replay detected outside the near-event window; "
+                                                  "raw home retained, stopped without automatic return")
+                            record["shadow_capture_verified"] = True
                         if sample == 0:
                             session["axis_results"][axis]["discovery"] = record
                         elif not experiment or sample > 10:
@@ -3408,24 +3442,35 @@ class AccelHomingWorkflows:
                         if not envelope["accepted"]:
                             raise self._error("experimental freshness preflight rejected: %s; "
                                               "no candidate homes or automatic return" % "; ".join(envelope["errors"]))
-                        def fit_checkpoint():
-                            self._check_running(session)
-                            self.reactor.pause(self.reactor.monotonic())
-                            self._check_running(session)
+                        fit_options = {"shadow": True} if shadow_mode else {}
                         experiment["fit"] = fitter(baseline_captures, baseline_records,
                                                     axis=axis, max_age_s=experiment["max_sample_age_s"],
-                                                    checkpoint=fit_checkpoint)
+                                                    checkpoint=experiment_checkpoint, **fit_options)
                         self._check_running(session)
                         baseline_captures.clear()
                         recorder.record_event("experimental_profile_fit", fit=experiment["fit"])
-                        if not experiment["fit"].get("accepted") or not experiment["fit"].get("profile"):
+                        if shadow_mode:
+                            shadow = experiment["fit"].get("shadow") or {}
+                            profile = shadow.get("profile")
+                            if profile:
+                                for phase in ("training", "holdout"):
+                                    homes = [home for home in recorder.homes if home.get("phase") == phase]
+                                    for home, outcome in zip(homes, shadow.get(phase, [])):
+                                        home.update(shadow=outcome, shadow_profile=profile)
+                            if shadow.get("status") != "ready" or not profile:
+                                raise self._error("experimental shadow profile rejected: %s; stopped without automatic return"
+                                                  % shadow.get("reason", experiment["fit"].get("reason")))
+                            self._info("Shadow profile frozen for diagnostic replay only; live detector remains raw XYZ. "
+                                       "Near-event anticipation is not verified physical contact")
+                        elif not experiment["fit"].get("accepted") or not experiment["fit"].get("profile"):
                             raise self._error("experimental profile rejected: %s; stopped without automatic return"
                                               % experiment["fit"].get("reason", "no accepted profile"))
                         # Freeze a private JSON-only profile; neither subsequent
                         # candidate evidence nor detector instances retrain it.
-                        self.owner.experimental_profile = json.loads(json.dumps(
-                            experiment["fit"]["profile"], allow_nan=False))
-                        experiment["candidate_activated"] = True
+                        if not shadow_mode:
+                            self.owner.experimental_profile = json.loads(json.dumps(
+                                experiment["fit"]["profile"], allow_nan=False))
+                            experiment["candidate_activated"] = True
                     del capture
                     if sample < total_samples or axis_index < len(axes) - 1:
                         self._diagnostic_recenter(session, recorder, axis)
@@ -3457,8 +3502,10 @@ class AccelHomingWorkflows:
             if experiment:
                 experiment["statistics"] = {phase: self._accuracy_statistics(
                     [record for record in session["records"] if record.get("workflow_phase") == phase
-                     and record.get("capture_valid") and record.get("experiment_quality") == "good"])
-                    for phase in ("training", "holdout", "candidate")}
+                     and record.get("capture_valid") and record.get("experiment_quality") == "good"
+                     and (phase != "shadow" or record.get("shadow_capture_verified"))])
+                    for phase in (("training", "holdout", "shadow") if shadow_mode else
+                                  ("training", "holdout", "candidate"))}
                 experiment["runtime_restored"] = {
                     "thresholds": self.owner.threshold_g == session["saved_thresholds"],
                     "speeds": all(self.owner.rails_by_axis[axis].get_homing_info().speed == speed

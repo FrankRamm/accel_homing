@@ -7,8 +7,9 @@ from unittest import mock
 from harness import CommandError, arm_axis, batch, counts, make_homing, plugin
 from test_trigger import feed_baseline, still, x_sample
 import test_backends as backends
-from accel_homing_experiment import (_replay_thresholds, fit_experimental_profile,
-                                     replay_profile, validate_profile)
+from accel_homing_experiment import (MAX_CANDIDATE_DIAGNOSTICS, _replay_thresholds,
+                                     fit_experimental_profile, replay_profile,
+                                     replay_shadow_capture, validate_profile)
 
 HIT = plugin.mcu.MCU_trsync.REASON_ENDSTOP_HIT
 HOST = plugin.mcu.MCU_trsync.REASON_HOST_REQUEST
@@ -48,6 +49,16 @@ def reference(axis="x", shift=0., count=420):
 def references(axis="x"):
     pairs = [reference(axis, n * 2.) for n in range(10)]
     return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def early_references():
+    captures, records = references()
+    for capture in captures:
+        rows = capture["samples"]
+        for source in (397, 398, 399):
+            rows[source - 10] = (rows[source - 10][0],) + rows[source][1:]
+            rows[source] = (rows[source][0], .1, 0., .3)
+    return captures, records
 
 
 def prove_clean_prefix(capture):
@@ -334,7 +345,7 @@ class ExperimentalFitTests(unittest.TestCase):
                 rows[target] = (rows[target][0],) + rows[source][1:]
         result = fit_experimental_profile(captures, records)
         self.assertFalse(result["accepted"])
-        self.assertIn("inseparable", result["reason"])
+        self.assertIn("minimum weighted coverage", result["reason"])
 
     def test_clipping_invalid_provenance_and_missing_startup_fail_closed(self):
         for failure in ("clipping", "marker", "identity", "onset", "missing_startup", "missing_cruise", "unordered"):
@@ -402,9 +413,162 @@ class ExperimentalFitTests(unittest.TestCase):
             detector["experimental_envelope"] = {"first_eligible_sample": [0, 1, 0, 2],
                                                    "first_eligible_after_arm_s": 0.}
             prove_clean_prefix(capture)
-        result = fit_experimental_profile(captures, records)
+        result = fit_experimental_profile(captures, records, shadow=True)
         self.assertFalse(result["accepted"])
-        self.assertIn("inseparable", result["reason"])
+        self.assertIn("minimum weighted coverage", result["reason"])
+        self.assertEqual(result["shadow"]["status"], "rejected")
+
+    def test_diagnostics_distinguish_all_four_categories_with_bounded_examples(self):
+        captures, records = references()
+        # Directionally different early and near-reference signals make all
+        # four categories observable with the actual bounded candidate grid.
+        for number, capture in enumerate(captures):
+            rows = capture["samples"]
+            rows[397] = (rows[397][0], 0., 0., .3)
+            for n in (398, 399): rows[n] = (rows[n][0], 0., 3., 0.)
+            if number == 0:
+                for n in (390, 391): rows[n] = (rows[n][0], 3., 0., 0.)
+        result = fit_experimental_profile(captures, records)
+        diagnostic = result["diagnostics"]
+        counts = diagnostic["candidate_counts"]
+        self.assertTrue(all(count > 0 for count in counts.values()))
+        self.assertEqual(sum(counts.values()), result["candidate_count"])
+        self.assertEqual(diagnostic["rejection_counts"]["outside_live_compatibility"],
+                         counts["incompatible_enough_weighted"] + counts["incompatible_insufficient_weighted"])
+        self.assertEqual(diagnostic["rejection_counts"]["insufficient_weighted_decisions"],
+                         counts["compatible_insufficient_weighted"] + counts["incompatible_insufficient_weighted"])
+        self.assertEqual(diagnostic["rejection_counts"]["startup_trigger"], 0)
+        self.assertEqual(diagnostic["rejection_counts"]["cruise_trigger"], 0)
+        self.assertEqual(sum(diagnostic["decision_phase_counts"].values()), result["candidate_count"] * 6)
+        examples = diagnostic["candidate_examples"]
+        self.assertEqual(len(examples), MAX_CANDIDATE_DIAGNOSTICS)
+        self.assertEqual(set(e["category"] for e in examples), set(counts))
+        self.assertTrue(all(len(e["reference_delta_ms"]) == 6 for e in examples))
+
+    def test_early_shadow_is_ready_without_enabling_live_profile(self):
+        captures, records = early_references()
+        result = fit_experimental_profile(captures, records, shadow=True)
+        self.assertEqual(result, fit_experimental_profile(captures, records, shadow=True))
+        self.assertFalse(result["accepted"])
+        self.assertIsNone(result["profile"])
+        self.assertEqual(result["compatibility_tolerance_s"], .001)
+        self.assertIn("outside_live_compatibility", result["reason_codes"])
+        shadow = result["shadow"]
+        self.assertEqual(shadow["status"], "ready", shadow["reason"])
+        self.assertFalse(shadow["live_use_authorized"])
+        self.assertFalse(shadow["physical_contact_verified"])
+        self.assertEqual(len(shadow["training"]), 6)
+        self.assertEqual(len(shadow["holdout"]), 4)
+        self.assertTrue(all(-20. <= o["reference_delta_ms"] < -1. for o in shadow["training"] + shadow["holdout"]))
+        frozen = shadow["profile"]
+        self.assertTrue(frozen["shadow_only"])
+        with self.assertRaisesRegex(ValueError, "not authorized"):
+            validate_profile(frozen, "x", 8.)
+        # The same fail-closed validation is used by actual homing arm.
+        obj = make_homing()
+        feed_baseline(obj)
+        obj.experimental_profile = frozen
+        with self.assertRaises(CommandError):
+            arm_axis(obj, "x", 200, 1000)
+        self.assertIsNone(obj.attempt)
+
+    def test_shadow_holdout_rejects_startup_cruise_invalid_and_raw_only_without_refitting(self):
+        captures, records = early_references()
+        good = fit_experimental_profile(captures, records, shadow=True)
+        for failure, code in (("startup", "holdout_startup_trigger"),
+                              ("cruise", "holdout_cruise_trigger"),
+                              ("invalid", "invalid_holdout_reference"),
+                              ("threshold", "invalid_holdout_reference"),
+                              ("raw_only", "holdout_no_weighted_decisions")):
+            damaged = copy.deepcopy(captures)
+            if failure in ("startup", "cruise"):
+                rows = damaged[6]["samples"]
+                begin = 10 if failure == "startup" else 300
+                for n in (begin, begin + 1): rows[n] = (rows[n][0], 7.9, 0., 0.)
+            if failure == "invalid": damaged[6]["dropped"] = 1
+            if failure == "threshold": damaged[6]["detector"]["threshold_g"] = 9.
+            if failure == "raw_only":
+                for capture in damaged[6:]:
+                    rows = capture["samples"]
+                    for n in (387, 388, 389): rows[n] = (rows[n][0], .1, 0., .3)
+            result = fit_experimental_profile(damaged, records, shadow=True)
+            shadow = result["shadow"]
+            with self.subTest(failure=failure):
+                self.assertEqual(shadow["status"], "rejected")
+                self.assertIn(code, shadow["reason_codes"])
+                self.assertEqual(shadow["profile"], good["shadow"]["profile"])
+                self.assertEqual(shadow["training"], good["shadow"]["training"])
+                self.assertEqual(result["diagnostics"], good["diagnostics"])
+                self.assertEqual(len(shadow["holdout"]), 4)
+                if failure in ("invalid", "threshold"):
+                    self.assertIsNone(shadow["holdout"][0])
+                    self.assertTrue(all(o is not None for o in shadow["holdout"][1:]))
+                self.assertFalse(result["accepted"])
+                self.assertIsNone(result["profile"])
+
+    def test_shadow_does_not_read_holdouts_when_training_has_no_weighted_candidate(self):
+        captures, records = references()
+        for capture in captures[:6]:
+            rows = capture["samples"]
+            for n in (397, 398, 399): rows[n] = (rows[n][0], .1, 0., .3)
+        captures[6:] = [None] * 4
+        records[6:] = [None] * 4
+        result = fit_experimental_profile(captures, records, shadow=True)
+        self.assertEqual(result["shadow"]["reason_codes"], ["no_shadow_training_candidate"])
+        self.assertEqual(result["shadow"]["holdout"], [])
+        self.assertNotIn("holdout_errors", result)
+
+    def test_public_shadow_replay_preserves_raw_fallback_and_phase_boundaries(self):
+        captures, records = early_references()
+        frozen = fit_experimental_profile(captures, records, shadow=True)["shadow"]["profile"]
+        unchanged = copy.deepcopy(frozen)
+        for decision, phase, guarded in ((11, "startup", False), (301, "cruise", False),
+                                          (359, "cruise", False), (360, "near_event", True),
+                                          (389, "near_event", True), (400, "reference", True)):
+            capture = copy.deepcopy(captures[0])
+            rows = capture["samples"]
+            for n in (387, 388, 389): rows[n] = (rows[n][0], .1, 0., .3)
+            if decision != 400:
+                for n in (decision - 1, decision): rows[n] = (rows[n][0], 7.9, 0., 0.)
+            outcome = replay_shadow_capture(frozen, capture, records[0])
+            with self.subTest(decision=decision):
+                self.assertEqual(outcome["sample_index"], decision)
+                self.assertEqual(outcome["phase"], phase)
+                self.assertEqual(outcome["within_negative_guard"], guarded)
+                self.assertTrue(outcome["no_later_than_reference"])
+                self.assertFalse(outcome["physical_contact_verified"])
+                self.assertFalse(outcome["live_use_authorized"])
+                if decision == 400:
+                    self.assertEqual(outcome["route"], "raw_bypass")
+                    self.assertEqual(outcome["reference_delta_ms"], 0.)
+        self.assertEqual(frozen, unchanged)
+
+    def test_public_shadow_replay_rejects_invalid_provenance_bounds_and_services_checkpoints(self):
+        captures, records = early_references()
+        frozen = fit_experimental_profile(captures, records, shadow=True)["shadow"]["profile"]
+        for failure in ("record", "clipping", "dropped", "first", "envelope", "too_many", "experimental"):
+            capture = copy.deepcopy(captures[0])
+            record = copy.deepcopy(records[0])
+            if failure == "record": record["onset_sample"] = [9, 9, 9, 9]
+            if failure == "clipping": capture["amplitude_limited"] = True
+            if failure == "dropped": capture["dropped"] = 1
+            if failure in ("first", "envelope"):
+                capture["detector"].update(first_eligible_sample_index=0, first_eligible_sample_matches=1,
+                    first_eligible_sample=[0, 1, 0, 2], experimental_envelope=[] if failure == "envelope" else {})
+            if failure == "too_many": capture["samples"] = [capture["samples"][0]] * 200001
+            if failure == "experimental": capture["detector"]["experimental"] = {}
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                replay_shadow_capture(frozen, capture, record)
+        for changes in ({"shadow_only": False}, {"live_use_authorized": True},
+                        {"threshold_g": 8.}, {"weights_xyz": [3., 0., 0.]}, {"max_age_s": .6}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replay_shadow_capture(dict(frozen, **changes), captures[0], records[0])
+        check = mock.Mock()
+        replay_shadow_capture(frozen, captures[0], records[0], checkpoint=check)
+        self.assertGreater(check.call_count, 0)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            replay_shadow_capture(frozen, captures[0], records[0],
+                                  checkpoint=mock.Mock(side_effect=RuntimeError("cancelled")))
 
 
 if __name__ == "__main__":

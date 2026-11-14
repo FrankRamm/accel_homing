@@ -531,6 +531,163 @@ def diagnose_saturation(public, raw, profile, stop_time):
                 "signal_scope": "retained_raw_capture", "signal_quality_source": profile["method"]}
 
 
+DELIVERY_SEGMENTS = (
+    ("onset_to_batch_last", "Onset to source batch end", "main_mcu_print_time"),
+    ("batch_last_to_adapter", "Batch end to adapter (delivery / driver)",
+     "main_mcu_print_time; adapter entry is a local clocksync estimate"),
+    ("adapter_to_detector", "Adapter entry to detector entry", "host_monotonic"),
+    ("detector_to_request", "Detector entry to stop request", "host_monotonic"))
+
+
+def delivery_diagnostic(home, events, packets):
+    """Decompose retained timestamps after cleanup; never infer missing stages.
+
+    Match the source batch by its sample bounds AND enclosing callback. A
+    pending/merged sample from an earlier source batch cannot be attributed to
+    the current callback's source batch just because it contains the stop call.
+    """
+    segments = {key: {"duration_s": None, "clock_basis": basis,
+                      "status": "unavailable", "reason": "matching retained evidence unavailable"}
+                for key, _label, basis in DELIVERY_SEGMENTS}
+    timing = home.get("stop_timing") or {}
+    result = {"version": 1, "status": "unavailable", "segments": segments,
+              "onset_to_host_dispatch_estimate_s": timing.get("onset_to_host_dispatch_estimate_s"),
+              "decomposition_residual_s": None,
+              "stop_call_duration_s": None, "stop_call_clock_basis": "host_monotonic",
+              "hardware_receipt_time_s": None, "mcu_halt_time_s": None,
+              "physical_contact_time_s": None,
+              "packet_retention_omitted": home.get("batches_omitted"),
+              "evidence": {},
+              "interpretation": "Delivery / driver is an aggregate sample-age estimate, not pure transport latency. "
+                  "Mixed-clock component sum is approximate; the residual records clocksync differences. "
+                  "No MCU receipt, physical contact or physical halt timestamp is available."}
+    hid = home["home_id"]
+    stops = [event.get("fields", {}) for event in events
+             if event.get("home_id") == hid and event.get("kind") == "stop_request"]
+    onset, dispatch = timing.get("onset_print_time_s"), timing.get("host_dispatch_estimated_print_time_s")
+    stop = next((item for item in reversed(stops)
+                 if finite(dispatch) and item.get("request_estimated_print_time_s") == dispatch), None)
+    if stop is None or not finite(onset):
+        result["reason"] = "matching onset and clocksync-qualified stop request unavailable"
+        return result
+    request = stop.get("request_before_host_monotonic_s")
+    if not finite(request):
+        result["reason"] = "stop request host monotonic timestamp unavailable"
+        return result
+    result["evidence"].update(onset_print_time_s=onset,
+        request_before_host_monotonic_s=request,
+        request_estimated_print_time_s=dispatch,
+        onset_sample=stop.get("onset_sample"))
+    after = stop.get("request_after_host_monotonic_s")
+    if finite(after) and after >= request:
+        result["stop_call_duration_s"] = after - request
+
+    def contains(fields, value, prefix):
+        first, last = fields.get(prefix + "_first_print_time_s"), fields.get(prefix + "_last_print_time_s")
+        return all(finite(v) for v in (first, last, value)) and first - 1e-9 <= value <= last + 1e-9
+
+    def encloses(fields, first, last):
+        entry, exit_time = fields.get("callback_entry_host_monotonic_s"), fields.get("callback_exit_host_monotonic_s")
+        return all(finite(v) for v in (entry, exit_time, first, last)) and entry <= first <= last <= exit_time
+
+    def same_attempt(fields):
+        arm = stop.get("arm_print_time_s")
+        return finite(arm) and fields.get("arm_print_time_s") == arm
+
+    retained = [row for row in packets if row.get("home_id") == hid]
+    detectors = [row for row in retained if row.get("source") in ("klipper_batch_detector", "beacon_native")
+                 and same_attempt(row.get("fields", {}))
+                 and row["fields"].get("sample_time_domain") == "main_mcu_print_time"
+                 and contains(row["fields"], onset, "original")
+                 and encloses(row["fields"], request, request)]
+    identity = stop.get("onset_sample")
+    if isinstance(identity, (tuple, list)) and len(identity) == 4:
+        detectors = [row for row in detectors if
+                     (row["fields"].get("original_start_clock"), row["fields"].get("original_delta_clock"),
+                      row["fields"].get("original_sample_count")) == (identity[0], identity[1], identity[3])]
+    if len(detectors) != 1:
+        result["reason"] = ("ambiguous detector callback attribution" if detectors else
+                            "matching detector callback unavailable; packet omissions or source gaps are possible")
+        return result
+    detector = detectors[0]
+    df = detector["fields"]
+
+    def duration(key, first, last):
+        item = segments[key]
+        if not all(finite(v) for v in (first, last)):
+            item["reason"] = "required timestamp unavailable"
+        elif last < first:
+            item.update(status="inconsistent", reason="reversed timestamps; clock estimate or attribution unresolved",
+                        observed_delta_s=last - first)
+        else:
+            item.update(duration_s=last - first, status="available", reason=None)
+
+    detector_entry = df.get("callback_entry_host_monotonic_s")
+    duration("detector_to_request", detector_entry, request)
+    result["evidence"].update(detector_packet_sequence=detector.get("home_packet_sequence"),
+        detector_source=detector.get("source"), detector_entry_host_monotonic_s=detector_entry)
+    adapters = [row for row in retained
+                if row.get("fields", {}).get("timestamp_provenance") == "configured_driver_decoded_batch_callback"
+                and same_attempt(row["fields"])
+                and row["fields"].get("sample_time_domain") == "main_mcu_print_time"
+                and contains(row["fields"], onset, "original")
+                and encloses(row["fields"], detector_entry, df.get("callback_exit_host_monotonic_s"))]
+    if len(adapters) == 1:
+        adapter = adapters[0]
+        af = adapter["fields"]
+        last, entry = af.get("original_last_print_time_s"), af.get("callback_entry_host_monotonic_s")
+        estimate = af.get("callback_entry_estimated_print_time_s")
+        duration("onset_to_batch_last", onset, last)
+        duration("batch_last_to_adapter", last, estimate)
+        duration("adapter_to_detector", entry, detector_entry)
+        result["evidence"].update(adapter_packet_sequence=adapter.get("home_packet_sequence"),
+            adapter_source=adapter.get("source"), source_batch_last_print_time_s=last,
+            source_batch_first_print_time_s=af.get("original_first_print_time_s"),
+            source_batch_sample_count=af.get("original_sample_count"),
+            adapter_entry_host_monotonic_s=entry, adapter_entry_estimated_print_time_s=estimate)
+    else:
+        reason = ("ambiguous source batch attribution" if adapters else
+                  "source adapter callback unavailable or onset outside current original batch; pending/source gap not inferred")
+        for key in ("onset_to_batch_last", "batch_last_to_adapter", "adapter_to_detector"):
+            segments[key]["reason"] = reason
+    available = sum(item["status"] == "available" for item in segments.values())
+    result["status"] = "complete" if available == len(segments) else "partial" if available else "unavailable"
+    if result["status"] == "complete" and finite(result["onset_to_host_dispatch_estimate_s"]):
+        result["decomposition_residual_s"] = (result["onset_to_host_dispatch_estimate_s"]
+            - sum(item["duration_s"] for item in segments.values()))
+    result["reason"] = None if result["status"] == "complete" else "see unavailable or inconsistent segments"
+    return result
+
+
+def export_delivery(folder, homes):
+    """Portable per-home summary; CSV blanks retain unknown timing values."""
+    write_json(folder / "delivery.json", {"version": 1, "homes": [
+        {"home_id": home["home_id"], "axis": home["axis"], "phase": home["phase"],
+         **home["delivery_diagnostic"]} for home in homes]})
+    keys = [key for key, _label, _basis in DELIVERY_SEGMENTS]
+    fields = ["home_id", "axis", "phase", "status", "onset_to_host_dispatch_estimate_ms"]
+    fields += [key + "_ms" for key in keys]
+    fields += ["decomposition_residual_ms", "stop_call_duration_ms", "packet_retention_omitted"]
+    fields += [key + suffix for key in keys for suffix in ("_status", "_clock_basis", "_reason")]
+    fields += ["mcu_halt_time_s", "physical_contact_time_s"]
+    with (folder / "delivery.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for home in homes:
+            item = home["delivery_diagnostic"]
+            row = {key: home[key] for key in ("home_id", "axis", "phase")}
+            row.update(status=item["status"], packet_retention_omitted=item["packet_retention_omitted"])
+            for key in ("onset_to_host_dispatch_estimate", "decomposition_residual", "stop_call_duration"):
+                value = item.get(key + "_s")
+                row[key + "_ms"] = value * 1000 if finite(value) else None
+            for key in keys:
+                segment = item["segments"][key]
+                value = segment["duration_s"]
+                row[key + "_ms"] = value * 1000 if finite(value) else None
+                row.update({key + suffix: segment[suffix[1:]] for suffix in ("_status", "_clock_basis", "_reason")})
+            writer.writerow(row)
+
+
 class Recorder:
     def __init__(self, workflow, session):
         self.workflow, self.session = workflow, session
@@ -786,6 +943,8 @@ class Recorder:
         for home in self.homes:
             public = {key: value for key, value in home.items() if key not in ("raw", "packet_prefix", "packet_tail")}
             public["stop_timing"] = self._stop_timing(home["home_id"])
+            public["delivery_diagnostic"] = delivery_diagnostic(public, self.events,
+                list(home["packet_prefix"]) + list(home["packet_tail"]))
             stop = next((event["fields"].get("request_estimated_print_time_s") for event in self.events
                          if event["home_id"] == home["home_id"] and event["kind"] == "stop_request"), None)
             diagnose_saturation(public, home["raw"], profile, stop)
@@ -805,6 +964,7 @@ class Recorder:
                         writer.writerow([original_index] + [value if finite(value) else "" for value in raw[offset:offset + 4]])
                         offset += 4
             homes.append(public)
+        export_delivery(folder, homes)
         with gzip.open(folder / "packets.jsonl.gz", "wt", encoding="utf-8") as stream:
             for group in [self.batches] + [rows for home in self.homes for rows in (home["packet_prefix"], home["packet_tail"])]:
                 for row in group:
@@ -838,9 +998,12 @@ class Recorder:
                       "Charts use impact windows; raw retained CSV rows are not decimated."]}
         if experimental:
             report["experiment"] = clean(experimental)
+            shadow_mode = experimental.get("mode") == "SHADOW"
             report["interpretation"] += [
-                "Training and heldout reference homes use raw XYZ magnitude; candidates use a frozen fitted profile with raw bypass.",
-                "SAMPLES counts candidate homes only; discovery plus ten reference homes are additional.",
+                ("OFFLINE SHADOW: every physical home uses raw XYZ magnitude; frozen profile replay never controls the stop."
+                 if shadow_mode else "Training and heldout reference homes use raw XYZ magnitude; candidates use a frozen fitted profile with raw bypass."),
+                ("SAMPLES counts additional raw shadow homes only; discovery plus ten reference homes are additional."
+                 if shadow_mode else "SAMPLES counts candidate homes only; discovery plus ten reference homes are additional."),
                 "The same requested GC policy applies to every phase; this sequential comparison does not isolate GC causality.",
                 "Profile fit and commanded repeatability do not prove physical contact or absence of lost steps.",
                 "No automatic model, threshold, speed or configuration persistence. Normal G28 is unchanged.",
@@ -853,6 +1016,7 @@ class Recorder:
             "home-*.csv.gz: every retained raw decoded XYZ sample before graph reduction, in g including gravity/bias.\n"
             "packets.jsonl.gz: bounded callback timing, pending/filtered packet context.\n"
             "timing.jsonl.gz: MCU host receive, driver/query/decode, detector/observer, reactor and GC timing. See manifest timing hook availability and omissions.\n"
+            "delivery.json / delivery.csv: per-home source-batch tail, aggregate delivery/driver, adapter/detector and host request timing; clock bases and missing evidence are explicit.\n"
             "manifest.json: home/return/next-home linkage, detector/reference/quality metadata, errors, config, installed source SHA256, bounds.\n"
             "Each home records capture/core drops and recorder omissions. Missing is not zero.\n"
             "No physical-position sensor is present; travel is commanded step accounting.\n"
@@ -960,9 +1124,9 @@ def _plot_timing(folder, home, report, rows, Figure, FigureCanvasAgg):
     # dispatch window, so the 5 ms normal batches do not conceal an 87 ms pause.
     selected = [row for row in rows if row["exit_host_monotonic_s"] >= origin - .250
                 and row["entry_host_monotonic_s"] <= origin + .100]
-    figure = Figure(figsize=(12, 10), dpi=110)
+    figure = Figure(figsize=(12, 13), dpi=110)
     FigureCanvasAgg(figure)
-    plots = figure.subplots(3, 1, sharex=True)
+    plots = figure.subplots(4, 1)
     def series(stage, value, plot, label):
         pairs = [((row["entry_host_monotonic_s"] - origin) * 1000, value(row))
                  for row in selected if row["stage"] == stage]
@@ -995,13 +1159,35 @@ def _plot_timing(folder, home, report, rows, Figure, FigureCanvasAgg):
     series("reactor_heartbeat", lambda row: row["details"].get("interval_process_cpu_s"), plots[2], "Process CPU since previous timer")
     plots[2].set(title="Observer cost and process-wide CPU (includes other threads)", ylabel="ms",
                  xlabel="Host monotonic ms from stop dispatch" if has_stop else "Host monotonic ms from last observation; stop unavailable")
-    for plot in plots:
+    for plot in plots[:3]:
         plot.set_xlim(-250, 100)
         plot.grid(True, alpha=.25)
         if has_stop:
             plot.axvline(0, color="purple", linestyle="--", label="Host stop dispatch")
         if plot.lines:
             plot.legend(fontsize=7, loc="upper left")
+    delivery = home.get("delivery_diagnostic") or {}
+    for index, (key, label, _basis) in enumerate(DELIVERY_SEGMENTS):
+        item = delivery.get("segments", {}).get(key, {})
+        duration = item.get("duration_s")
+        if finite(duration):
+            plots[3].barh(index, duration * 1000, color="C%d" % index)
+            plots[3].annotate(" %.3f ms" % (duration * 1000), (duration * 1000, index),
+                              va="center", fontsize=8)
+        else:
+            plots[3].text(.01, index, "unavailable: " + str(item.get("reason") or "no retained evidence"),
+                          transform=plots[3].get_yaxis_transform(), va="center", fontsize=7)
+    plots[3].set_yticks(range(len(DELIVERY_SEGMENTS)))
+    plots[3].set_yticklabels([label for _key, label, _basis in DELIVERY_SEGMENTS], fontsize=8)
+    plots[3].invert_yaxis()
+    plots[3].margins(x=.25)
+    residual = delivery.get("decomposition_residual_s")
+    plots[3].set(title="Per-home decomposition (%s); clock-mapping residual %s\n"
+                      "First two: main-MCU print time / clocksync estimate; last two: host monotonic" % (
+                          delivery.get("status", "unavailable"),
+                          "%.6f ms" % (residual * 1000) if finite(residual) else "unavailable"),
+                 xlabel="Duration (ms); delivery / driver includes sample age, not pure transport latency")
+    plots[3].grid(True, axis="x", alpha=.25)
     retention = report.get("timing", {}).get("homes", {}).get(str(home["home_id"]), {})
     figure.suptitle("Home %03d %s: host timing; retained %s, omitted %s\n"
                    "No MCU halt timestamp; timing-hook bookkeeping is not included in observer cost" % (
@@ -1013,11 +1199,12 @@ def _plot_timing(folder, home, report, rows, Figure, FigureCanvasAgg):
 
 def _plot_experiment(folder, report, Figure, FigureCanvasAgg):
     """Separate sequential phases; never label commanded travel as accuracy."""
-    figure = Figure(figsize=(12, 12), dpi=110)
+    has_shadow = any(home.get("shadow") for home in report["homes"])
+    figure = Figure(figsize=(12, 15 if has_shadow else 12), dpi=110)
     FigureCanvasAgg(figure)
-    plots = figure.subplots(3, 1)
+    plots = figure.subplots(4 if has_shadow else 3, 1)
     for phase, marker in (("discovery", "x"), ("training", "o"),
-                          ("holdout", "s"), ("candidate", "^")):
+                          ("holdout", "s"), ("candidate", "^"), ("shadow", "D")):
         group = [home for home in report["homes"] if home["phase"] == phase]
         ids = [home["home_id"] for home in group]
         records = [home.get("record") or {} for home in group]
@@ -1030,9 +1217,17 @@ def _plot_experiment(folder, report, Figure, FigureCanvasAgg):
         for plot, values in zip(plots, (travel, overshoot,
                 [value * 1000 if finite(value) else None for value in delay])):
             plot.plot(ids, numeric(values), marker + "-", label=phase)
+        if has_shadow:
+            plots[3].plot(ids, numeric([(home.get("shadow") or {}).get("reference_delta_ms") for home in group]),
+                          marker + "-", label=phase)
     plots[0].set(title="Commanded travel by sequential phase (not measured physical position)", ylabel="mm")
     plots[1].set(title="Commanded halt minus trigger distance", ylabel="mm")
     plots[2].set(title="Sensor onset to host dispatch estimate (MCU receipt unknown)", ylabel="ms", xlabel="Home ID")
+    if has_shadow:
+        plots[3].axhline(0, color="black", linewidth=.8)
+        plots[3].set(title="OFFLINE SHADOW decision relative to original raw software reference\n"
+                          "Negative values are earlier software signals; physical contact is unverified",
+                    ylabel="Decision - reference, ms", xlabel="Home ID")
     home_ids = [home["home_id"] for home in report["homes"]]
     for plot in plots:
         plot.grid(True, alpha=.25)
@@ -1045,16 +1240,16 @@ def _plot_experiment(folder, report, Figure, FigureCanvasAgg):
                       transform=plots[2].transAxes, ha="center", va="center", fontsize=10)
     experiment = report["experiment"]
     fit = experiment.get("fit") or {}
-    profile = fit.get("profile") or {}
+    profile = ((fit.get("shadow") or {}).get("profile") if has_shadow else fit.get("profile")) or {}
     weights = profile.get("weights_xyz")
     weight_text = (", ".join("%.3g" % value for value in weights)
                    if isinstance(weights, (tuple, list)) and all(finite(value) for value in weights)
                    else "unavailable")
     threshold_text = "%.3g" % profile["threshold_g"] if finite(profile.get("threshold_g")) else "unavailable"
-    figure.suptitle("ACCEL_HOMING_EXPERIMENT: frozen profile comparison\n"
+    figure.suptitle("ACCEL_HOMING_EXPERIMENT: %sfrozen profile comparison\n"
                    "Weights XYZ: %s; weighted threshold: %s g; GC guard all phases: %s\n"
                    "Sequential comparison; no independent GC or physical-contact inference" % (
-                       weight_text, threshold_text,
+                       "OFFLINE SHADOW / " if has_shadow else "", weight_text, threshold_text,
                        experiment.get("gc_guard_requested", "unknown")), fontsize=11)
     figure.tight_layout(rect=(0, 0, 1, .92))
     figure.savefig(folder / "experiment-phases.png")
@@ -1143,6 +1338,7 @@ def _worker(folder, dependencies):
             _plot_experiment(folder, report, Figure, FigureCanvasAgg)
         for home in homes:
             record, capture = home.get("record") or {}, home["capture"]
+            shadow = home.get("shadow") or {}
             onset = record.get("onset_time_s")
             if not finite(onset):
                 onset = (capture.get("detector") or {}).get("onset_time_s")
@@ -1163,27 +1359,38 @@ def _worker(folder, dependencies):
                     except ValueError:
                         continue
                     before = .025 if finite(onset) else .125
-                    if not finite(anchor) or anchor - before <= sample[0] <= anchor + .100:
+                    first = anchor - before if finite(anchor) else None
+                    evidence = shadow.get("evidence_time_s")
+                    if finite(first) and finite(evidence):
+                        first = min(first, evidence - .005)
+                    if not finite(anchor) or first <= sample[0] <= anchor + .100:
                         rows.append(sample)
             # Window retains all samples/outliers. Bound unknown-onset plots by
             # displaying a prefix explicitly; raw files remain unchanged.
             omitted = max(0, len(rows) - 20000)
-            rows = rows[:20000]
-            figure = Figure(figsize=(11, 5), dpi=110)
+            # Preserve both the early shadow evidence and the original onset
+            # when a wide replay span exceeds the plot-only bound.
+            rows = rows[:10000] + [[math.nan] * 4] + rows[-10000:] if omitted else rows
+            wide_shadow = finite(onset) and finite(shadow.get("evidence_time_s")) and shadow["evidence_time_s"] < onset - .025
+            figure = Figure(figsize=(11, 9 if wide_shadow else 5), dpi=110)
             FigureCanvasAgg(figure)
-            plot = figure.subplots()
+            if wide_shadow:
+                plot, overview = figure.subplots(2, 1)
+            else:
+                plot, overview = figure.subplots(), None
             origin = anchor if finite(anchor) else rows[0][0] if rows else 0
             times = [(row[0] - origin) * 1000 for row in rows]
             for index, label in enumerate("XYZ"):
                 plot.plot(times, [row[index + 1] - baseline[index] for row in rows], label=label, linewidth=.8)
-            plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="XYZ norm", color="black", linewidth=1)
+            plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="Original per-home XYZ reference" if shadow else "XYZ norm", color="black", linewidth=1)
             experimental = (capture.get("detector") or {}).get("experimental") or {}
-            profile = ((report.get("experiment") or {}).get("fit") or {}).get("profile") or {}
+            profile = home.get("shadow_profile") or ((report.get("experiment") or {}).get("fit") or {}).get("profile") or {}
             weights = profile.get("weights_xyz")
-            if home["phase"] == "candidate" and isinstance(weights, list) and len(weights) == 3:
+            if (home["phase"] == "candidate" or shadow) and has_baseline and isinstance(weights, list) and len(weights) == 3 \
+                    and all(finite(value) and value >= 0 for value in weights):
                 plot.plot(times, [math.sqrt(sum(weights[index] * (row[index + 1] - baseline[index]) ** 2
                                                  for index in range(3))) for row in rows],
-                          label="Frozen weighted XYZ score", color="#007b83", linewidth=1)
+                          label="Frozen weighted XYZ score (offline shadow)" if shadow else "Frozen weighted XYZ score", color="#007b83", linewidth=1)
                 if finite(profile.get("threshold_g")):
                     plot.axhline(profile["threshold_g"], color="#007b83", linestyle="--",
                                  label="Frozen weighted threshold")
@@ -1191,6 +1398,10 @@ def _worker(folder, dependencies):
                                    ("capture_decision_time_s", "experimental decision, retained row")):
                     if finite(experimental.get(key)):
                         plot.axvline((experimental[key] - origin) * 1000, linestyle=":", label=label)
+                for key, label in (("evidence_time_s", "Shadow first evidence (offline)"),
+                                   ("decision_time_s", "Shadow decision (offline)")):
+                    if finite(shadow.get(key)):
+                        plot.axvline((shadow[key] - origin) * 1000, linestyle=":", label=label)
             threshold = record.get("threshold_g")
             if finite(threshold):
                 plot.axhline(threshold, color="#d17b00", linestyle="--",
@@ -1216,15 +1427,40 @@ def _worker(folder, dependencies):
                         if finite(stamp):
                             plot.axvline((stamp - origin) * 1000, color="purple", linestyle="--", label="host dispatch, estimated print_time")
                             break
-            plot.set(title="Home %03d %s %s; %s\nRaw omitted %s; plot omitted %d; capture range-limited axis values %s" % (
+            plot.set(title="Home %03d %s %s; %s\nRaw omitted %s; plot omitted %d; capture range-limited axis values %s%s" % (
                 home["home_id"], home["axis"].upper(), home["phase"], record.get("result", "partial; see manifest error"),
-                capture.get("raw_rows_omitted", "unknown"), omitted, quality.get("range_limit_axis_values", "unknown")),
+                capture.get("raw_rows_omitted", "unknown"), omitted, quality.get("range_limit_axis_values", "unknown"),
+                "\nOFFLINE SHADOW: actual stop uses raw XYZ; physical contact unverified" if shadow else ""),
                 xlabel=("ms from retained onset" if finite(onset) else
                         "ms from host dispatch estimate (onset unavailable)" if finite(dispatch) else
                         "ms from first retained sample (onset/stop unavailable)"),
                 ylabel="g after reference subtraction" if has_baseline else "raw g; reference unavailable (gravity/bias retained)")
             plot.legend(fontsize=7)
             plot.grid(True, alpha=.25)
+            if overview is not None:
+                plot.set_xlim(-25, 100)
+                overview.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3)))
+                                     for row in rows], label="Original per-home XYZ reference", color="black", linewidth=.8)
+                if has_baseline and isinstance(weights, list) and len(weights) == 3 \
+                        and all(finite(value) and value >= 0 for value in weights):
+                    overview.plot(times, [math.sqrt(sum(weights[index] * (row[index + 1] - baseline[index]) ** 2
+                                                       for index in range(3))) for row in rows],
+                                  label="Frozen weighted XYZ score (offline shadow)", color="#007b83", linewidth=.8)
+                if finite(profile.get("threshold_g")):
+                    overview.axhline(profile["threshold_g"], color="#007b83", linestyle="--", label="Frozen weighted threshold")
+                if finite(threshold):
+                    overview.axhline(threshold, color="#d17b00", linestyle="--", label="Active raw threshold")
+                for key, label in (("evidence_time_s", "Shadow first evidence (offline)"),
+                                   ("decision_time_s", "Shadow decision (offline)"),
+                                   ("reference_time_s", "Original software reference")):
+                    if finite(shadow.get(key)):
+                        overview.axvline((shadow[key] - origin) * 1000, linestyle=":", label=label)
+                overview.set(title="Earlier OFFLINE SHADOW evidence overview; phase: %s; compatibility: %s\n"
+                                   "Upper panel keeps original-onset detail; software signals do not establish physical contact" % (
+                                       shadow.get("phase", "unknown"), shadow.get("compatible", "unknown")),
+                             xlabel="ms from original retained onset", ylabel=plot.get_ylabel())
+                overview.grid(True, alpha=.25)
+                overview.legend(fontsize=7)
             figure.tight_layout()
             figure.savefig(folder / ("home-%03d-%s.png" % (home["home_id"], home["axis"])))
             figure.clear()
