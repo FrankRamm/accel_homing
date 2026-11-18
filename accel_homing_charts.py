@@ -1,5 +1,5 @@
-# PNG-only accelerometer homing charts. GPLv3.
-"""Render completed PNGs in an isolated process; keep provenance in memory."""
+# Accelerometer homing charts and mapping-failure evidence. GPLv3.
+"""Render PNGs in an isolated process; retain failed mapping evidence on disk."""
 import collections
 import datetime
 import errno
@@ -18,6 +18,7 @@ import tempfile
 import textwrap
 import time
 import zlib
+import zipfile
 
 
 _MAX_PNG_BYTES = 32 * 1024 * 1024
@@ -219,6 +220,92 @@ def preflight_renderer(renderer=None, check_running=None):
     _check_png(data, decode_pixels=False)
     _check_running(check_running)
     return True
+
+
+def write_axis_mapping_failure(directory, axis, passes, diagnostic, renderer=None):
+    """Export completed mapping captures after cleanup, without rerunning inference.
+
+    Source rows are signed configured-stream g, not native ADC counts. JSON
+    retains every sample; plotting failure does not discard the replay input.
+    """
+    if axis not in ("x", "y") or not isinstance(passes, (tuple, list)) or len(passes) != 2:
+        raise ValueError("Mapping failure export requires two X/Y passes")
+    if not isinstance(diagnostic, dict):
+        raise ValueError("Mapping failure export requires diagnostic metadata")
+    for item in passes:
+        if (not isinstance(item, dict) or type(item.get("direction")) is not int
+                or item["direction"] not in (-1, 1)):
+            raise ValueError("Invalid mapping export direction")
+        capture = item.get("capture", {})
+        rows = capture.get("samples", ())
+        if not isinstance(rows, (list, tuple)) or not 2 <= len(rows) <= _MAX_SAMPLES:
+            raise ValueError("Mapping export has missing or oversized samples")
+        if any(not isinstance(row, (list, tuple)) or len(row) != 4
+               or not all(_finite(value) for value in row) for row in rows):
+            raise ValueError("Mapping export contains invalid sample rows")
+    clock = _clock()
+    report = {"schema": "accel_homing_axis_mapping_failure_v1", "axis": axis,
+              "result": "aborted", "coordinate_frame": "configured_sensor_stream",
+              "sample_columns": ["print_time_s", "x_g", "y_g", "z_g"],
+              "sample_semantics": "Signed configured-stream acceleration in g; not native ADC counts",
+              "velocity_semantics": "Integrated accelerometer estimate; not physical position or speed verification",
+              "simulated": diagnostic.get("simulated") is True,
+              "diagnostic": diagnostic, "passes": passes, **clock}
+    encoded = _json(report).encode("utf-8")
+    if len(encoded) > _MAX_INPUT_BYTES:
+        raise ValueError("Mapping failure export exceeds its size limit")
+    report = json.loads(encoded)  # Detach all evidence from mutable workflow state.
+    destination = Path(directory).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="axis_mapping_%s_" % axis.upper(), dir=str(destination)))
+    # This directory remains in place for Moonraker's asynchronous file watches.
+    source = folder / "mapping.json"
+    with source.open("xb") as stream:
+        stream.write(encoded + b"\n")
+    paths = {"axis_mapping_json": str(source)}
+    try:
+        payload = dict(report, kind="axis_mapping_failure")
+        data = (renderer or PNGRenderer()).render(payload)
+        _check_png(data, decode_pixels=False)
+        target = folder / "mapping.png"
+        image_staging = folder / "mapping.png.tmp"
+        with image_staging.open("xb") as stream:
+            stream.write(data)
+        os.replace(str(image_staging), str(target))
+        paths["axis_mapping_png"] = str(target)
+    except Exception as exc:
+        report["chart_error"] = str(exc)[:2000]
+        paths["chart_error"] = report["chart_error"]
+        # Update only our own new report; no existing artifact is overwritten.
+        update = folder / "mapping.json.tmp"
+        try:
+            with update.open("xb") as stream:
+                stream.write(_json(report).encode("utf-8") + b"\n")
+            os.replace(str(update), str(source))
+        except Exception as annotation_error:
+            # Even a full disk must not hide the already completed replay JSON.
+            paths["annotation_error"] = str(annotation_error)[:2000]
+            try:
+                update.unlink()
+            except OSError:
+                pass
+    archive = folder / "mapping.zip"
+    staging = folder / "mapping.zip.tmp"
+    try:
+        with zipfile.ZipFile(staging, "x", zipfile.ZIP_DEFLATED) as zipped:
+            zipped.write(source, "mapping.json")
+            if "axis_mapping_png" in paths:
+                zipped.write(paths["axis_mapping_png"], "mapping.png")
+        os.replace(str(staging), str(archive))
+        paths["axis_mapping_zip"] = str(archive)
+    except Exception as exc:
+        paths["archive_error"] = str(exc)[:2000]
+        # The JSON (and any completed PNG) remain usable even without a ZIP.
+        try:
+            staging.unlink()
+        except OSError:
+            pass
+    return paths
 
 
 def _clock():
@@ -1216,6 +1303,87 @@ def _validate_noise_recommendation(recommendation, iterations):
     json.dumps(recommendation, allow_nan=False)
 
 
+def _mapping_velocity_trace(item):
+    """Reconstruct diagnostic velocity from the exact saved motion interval."""
+    rows, baseline = item["capture"]["samples"], item["capture"]["baseline_g"]
+    motion = sorted((segment for segment in item["segments"] if segment["phase"] != "startup"),
+                    key=lambda segment: segment["start_time_s"])
+    start, end = motion[0]["start_time_s"], motion[-1]["end_time_s"]
+    if rows[0][0] > start or rows[-1][0] < end or end <= start:
+        raise ValueError("Mapping plot lacks full motion coverage")
+    def boundary(time):
+        for left, right in zip(rows, rows[1:]):
+            if left[0] <= time <= right[0]:
+                fraction = (time - left[0]) / (right[0] - left[0])
+                return [time] + [a + (b - a) * fraction for a, b in zip(left[1:], right[1:])]
+        raise ValueError("Mapping plot cannot interpolate motion boundary")
+    points = [boundary(start)] + [row for row in rows if start < row[0] < end] + [boundary(end)]
+    velocity, integrated = [0., 0., 0.], [(start, (0., 0., 0.))]
+    for left, right in zip(points, points[1:]):
+        for channel in range(3):
+            acceleration_sum = left[channel + 1] + right[channel + 1] - 2. * baseline[channel]
+            velocity[channel] += acceleration_sum * 9806.65 * .5 * (right[0] - left[0])
+        integrated.append((right[0], tuple(velocity)))
+    return [(time,) + tuple((value - drift * (time - start) / (end - start)) * item["direction"]
+                           for value, drift in zip(vector, velocity))
+            for time, vector in integrated]
+
+
+def _plot_axis_mapping_failure(figure, payload):
+    """Show every sensor channel with planner windows; never label a guessed map."""
+    figure.set_size_inches(12, 8)
+    axes = figure.subplots(2, 2, squeeze=False)
+    colors = ("tab:red", "tab:green", "tab:blue")
+    for index, item in enumerate(payload["passes"]):
+        raw, velocity_axis = axes[index]
+        capture, segments = item["capture"], item["segments"]
+        rows, baseline = capture["samples"], capture["baseline_g"]
+        start = min(segment["start_time_s"] for segment in segments if segment["phase"] != "startup")
+        # The JSON is complete. Only display traces are reduced to signed extrema.
+        trace = _envelope([(row[0] - start,) + tuple(row[i + 1] - baseline[i] for i in range(3))
+                           for row in rows])
+        integrated = _envelope([(row[0] - start,) + row[1:] for row in _mapping_velocity_trace(item)])
+        for channel, color in enumerate(colors):
+            raw.plot([row[0] for row in trace], [row[channel + 1] for row in trace],
+                     color=color, linewidth=.65, label="Stream " + "XYZ"[channel])
+            velocity_axis.plot([row[0] for row in integrated], [row[channel + 1] for row in integrated],
+                               color=color, linewidth=.8, label="Stream " + "XYZ"[channel])
+        for segment in segments:
+            phase = segment["phase"]
+            if phase == "startup":
+                continue
+            left, right = segment["start_time_s"] - start, segment["end_time_s"] - start
+            if phase == "cruise":
+                trim = .1 * (right - left)
+                for plot in (raw, velocity_axis):
+                    plot.axvspan(left + trim, right - trim, color="tab:green", alpha=.10)
+                speed = segment["start_velocity_mm_s"]
+                for sign in (-1, 1):
+                    velocity_axis.hlines(sign * speed, left, right, color="black", linestyle="--", linewidth=.7)
+            else:
+                for plot in (raw, velocity_axis):
+                    plot.axvspan(left, right, color="grey", alpha=.16)
+        direction = "+" if item["direction"] > 0 else "-"
+        raw.set_title("%s%s stroke: signed acceleration minus stationary baseline" % (direction, payload["axis"].upper()), fontsize=10)
+        velocity_axis.set_title("Integrated estimate: direction-normalized, drift-corrected", fontsize=10)
+        raw.set_ylabel("Configured-stream acceleration (g)")
+        velocity_axis.set_ylabel("Estimated velocity (mm/s)")
+        for plot in (raw, velocity_axis):
+            plot.set_xlabel("Time from commanded motion start (s)")
+            plot.grid(True, alpha=.25)
+            plot.legend(fontsize=8, loc="best")
+    reason = str(payload["diagnostic"].get("reason", "Mapping inference rejected"))
+    title = "Axis mapping %s - REJECTED\n%s\n%s" % (
+        payload["axis"].upper(), payload["timestamp"], textwrap.fill(reason[:320], 105))
+    if payload.get("simulated"):
+        title = "SIMULATED / NOT PRINTER MEASUREMENT\n" + title
+    figure.suptitle(title, fontsize=11)
+    figure.text(.5, .018, "Green: evaluated cruise window. Grey: acceleration/braking. Dashed: commanded speed magnitude.\n"
+                "Velocity is an accelerometer estimate, not verified physical motion. Full samples and rejection metrics are in mapping.json.",
+                ha="center", fontsize=8)
+    figure.tight_layout(rect=(0, .065, 1, .98))
+
+
 def _worker_main(source, target, dependency_directory):
     # This function runs only as a separate selected-Python process. Plotting
     # packages and their font/config cache are never loaded into Klippy.
@@ -1246,6 +1414,8 @@ def _worker_main(source, target, dependency_directory):
             _plot_noise(figure, payload)
         elif kind == "beta":
             _plot_beta(figure, payload)
+        elif kind == "axis_mapping_failure":
+            _plot_axis_mapping_failure(figure, payload)
         else:
             raise ValueError("Unknown PNG chart render kind")
         canvas.print_png(target, metadata={

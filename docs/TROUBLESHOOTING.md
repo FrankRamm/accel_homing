@@ -109,6 +109,28 @@ abort it. There is no automatic retry of a mapping movement. Manually prepare
 and center XY again before retrying; an aborted stroke does not establish that
 the toolhead returned to the center.
 
+If both strokes were captured but inference rejects the mapping, for example
+`Mapping cruise response is unstable`, calibration exports an evidence bundle
+after successful cleanup. The console prints its ZIP path, and STATUS retains
+it under `last_result.axis_mapping_diagnostics.paths`. Share the ZIP from the
+`axis_mapping_X_*` or `axis_mapping_Y_*` folder inside the charts directory.
+No separate diagnostic command or extra movement is needed.
+
+The bundle contains both full signed configured-stream XYZ captures in g,
+stationary baselines, actual planner segments, sensor context and available
+inference metrics in `mapping.json`, plus `mapping.png`. These are processed
+sensor-stream samples, not native ADC counts. The plot shows acceleration and
+an integrated velocity estimate; it does not verify physical speed or position.
+JSON and the ZIP remain available if plotting fails; a ZIP failure leaves the
+JSON path available. A cleanup failure skips export and reports that failure.
+
+The cruise gate measures total vector variation, which includes both magnitude
+and direction changes. Diagnostic metrics separate parallel and perpendicular
+variation, record the measured value and rejection limit, and identify the
+rejected pass. Evaluation still stops at the first rejection, so a later pass
+may be present in the raw evidence without evaluated metrics. These reports do
+not change the mapping acceptance criteria, homing thresholds or motion.
+
 The requirement that both X and Y be unhomed still applies. Running `G28`
 before calibration homes those axes and therefore causes that separate
 precondition error. The mapping routine only moves the selected X or Y axis.

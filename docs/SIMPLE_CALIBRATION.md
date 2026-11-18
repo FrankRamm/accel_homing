@@ -58,7 +58,10 @@ gaps and fresh-data/acquisition timeouts permit only the bounded complete-window
 
 The noise summary stays in memory until the calibration qualifies. Rendering
 must succeed before the model is staged/saved, and the PNG is published only
-after required cleanup and saving succeed. An aborted calibration saves no PNG.
+after required cleanup and saving succeed. An aborted calibration does not
+publish that qualified noise PNG. A mapping inference rejection instead exports
+its own diagnostic JSON/PNG/ZIP after successful cleanup; see
+[mapping failure evidence](TROUBLESHOOTING.md#automatic-mapping-interruption).
 
 Without an explicit `START_THRESHOLD`, fresh noise selects the initial
 candidate using the same baseline-subtracted mapped component as the detector.

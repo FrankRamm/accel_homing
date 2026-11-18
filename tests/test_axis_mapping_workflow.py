@@ -314,6 +314,151 @@ class AxisMappingWorkflowTests(unittest.TestCase):
         self.assertEqual(observed, ["noise", "home"])
         self.assertEqual(rig.events.count("capture"), 2)
 
+    def test_inference_failure_exports_exact_evidence_after_cleanup_with_reserved_session(self):
+        rig = MappingRig()
+        session = rig.begin_mapping()
+        limits, accel = list(rig.toolhead.kin.limits), rig.toolhead.accel
+        current_context = {"configured": {"tmc5160 stepper_x": {"run_current": 1.2, "homing_current": .8}},
+                           "native_helper": "simulated.Homing._set_homing_current",
+                           "matching": "native_homing_current_helper", "physical_current_verified": False}
+        expected_current_context = copy.deepcopy(current_context)
+        current_calls = []
+        current_helper = lambda axes, enabled: current_calls.append((axes, enabled))
+        metrics = {"version": 1, "axis": "x", "passes": [
+            {"direction": 1, "dispersion": {"median_mm_s": 5.25, "limit_mm_s": 4.0},
+             "velocity_mm_s": [-20., 0., 0.]},
+            {"direction": -1, "sample_count": 2000}], "rejected_pass": 0}
+        captured = {}
+        def reject(axis, passes, diagnostics=None):
+            captured["passes"] = copy.deepcopy(passes)
+            if diagnostics is not None:
+                diagnostics.update(copy.deepcopy(metrics))
+            raise ValueError("Mapping cruise response is unstable")
+        paths = {"axis_mapping_json": "mapping.json", "axis_mapping_png": "mapping.png",
+                 "axis_mapping_zip": "mapping.zip"}
+        def export(directory, axis, passes, diagnostic, renderer=None):
+            self.assertEqual(rig.end_sessions, 1)
+            self.assertEqual(rig.toolhead.kin.limits, limits)
+            self.assertEqual(rig.toolhead.accel, accel)
+            self.assertIsNone(rig.owner.beta_motion_capture)
+            self.assertIs(rig.workflow.session, session)
+            self.assertTrue(session["finishing"])
+            self.assertEqual(rig.home_calls, [])
+            self.assertEqual(rig.noise_calls, [])
+            self.assertEqual(rig.configfile.saved, {})
+            self.assertEqual(passes, captured["passes"])
+            self.assertEqual(diagnostic["inference"], metrics)
+            self.assertEqual(diagnostic["sensor_context"], rig.sensor_context())
+            self.assertEqual(diagnostic["plan"]["distance_mm"], 15.)
+            self.assertEqual(diagnostic["plan"]["driver_current_context"], expected_current_context)
+            self.assertIs(diagnostic["plan"]["homing_current_applied"], True)
+            self.assertEqual(diagnostic["plan"]["calibration_settle_time_s"], rig.workflow.calibration_settle_time)
+            self.assertEqual(current_calls, [(["x"], True), (["x"], False)])
+            self.assertIs(renderer, rig.workflow.renderer)
+            with self.assertRaisesRegex(CommandError, "already active"):
+                rig.workflow.cmd_CALIBRATE(GCmd(AXIS="X", CENTERED=1, SAVE_CONFIG=0))
+            return paths
+        with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch.object(rig.workflow, "_beta_current_context", return_value=(current_helper, current_context)), \
+                mock.patch.object(workflow_module, "infer_axis_mapping", side_effect=reject), \
+                mock.patch.object(workflow_module, "write_axis_mapping_failure", side_effect=export, create=True) as writer, \
+                self.assertRaisesRegex(CommandError, "Mapping cruise response is unstable"):
+            rig.workflow._run_calibration()
+        writer.assert_called_once()
+        result = rig.workflow.last_result
+        self.assertEqual(result["result"], "aborted")
+        self.assertEqual(result["attempts"], 0)
+        self.assertEqual(result["axis_mapping_diagnostics"]["inference"], metrics)
+        self.assertEqual(result["axis_mapping_diagnostics"]["paths"], paths)
+        current_context["configured"]["tmc5160 stepper_x"]["homing_current"] = 5.
+        self.assertEqual(result["axis_mapping_diagnostics"]["plan"]["driver_current_context"],
+                         expected_current_context)
+        self.assertTrue(any("mapping.zip" in line for line in rig.output))
+        self.assertIsNone(rig.workflow.session)
+        self.assertEqual(rig.workflow.pending_model_metadata, {})
+        self.assertEqual(len(rig.toolhead.moves), 4)
+        self.assertTrue(all(move[2] is None for move, speed in rig.toolhead.moves))
+
+    def test_inference_failure_export_error_preserves_primary_abort_and_releases_session(self):
+        rig = MappingRig()
+        rig.begin_mapping()
+        with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch.object(workflow_module, "infer_axis_mapping", side_effect=ValueError("original inference rejection")), \
+                mock.patch.object(workflow_module, "write_axis_mapping_failure", side_effect=OSError("archive disk full"), create=True), \
+                self.assertLogs(level="ERROR"), self.assertRaisesRegex(CommandError, "original inference rejection"):
+            rig.workflow._run_calibration()
+        result = rig.workflow.last_result
+        self.assertIn("original inference rejection", result["reason"])
+        self.assertEqual(result["axis_mapping_diagnostics"]["export_error"], "archive disk full")
+        self.assertIsNone(rig.workflow.session)
+        self.assertEqual(rig.configfile.saved, {})
+        self.assertEqual(rig.home_calls, [])
+
+    def test_inference_failure_export_keeps_json_errors_and_abort_during_cancel(self):
+        rig = MappingRig()
+        rig.begin_mapping()
+        paths = {"axis_mapping_json": "mapping.json", "chart_error": "render failed",
+                 "archive_error": "archive failed"}
+        def export(*args, **kwargs):
+            rig.workflow.cmd_CANCEL(GCmd())
+            self.assertIsNotNone(rig.workflow.session)
+            with self.assertRaisesRegex(CommandError, "already active"):
+                rig.workflow.cmd_CALIBRATE(GCmd(AXIS="X", CENTERED=1, SAVE_CONFIG=0))
+            return paths
+        with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch.object(workflow_module, "infer_axis_mapping", side_effect=ValueError("original inference rejection")), \
+                mock.patch.object(workflow_module, "write_axis_mapping_failure", side_effect=export), \
+                self.assertRaisesRegex(CommandError, "original inference rejection"):
+            rig.workflow._run_calibration()
+        result = rig.workflow.last_result
+        self.assertEqual(result["result"], "aborted")
+        self.assertIn("original inference rejection", result["reason"])
+        self.assertEqual(result["axis_mapping_diagnostics"]["paths"], paths)
+        self.assertEqual(result["axis_mapping_diagnostics"]["chart_error"], "render failed")
+        self.assertEqual(result["axis_mapping_diagnostics"]["archive_error"], "archive failed")
+        self.assertTrue(any("mapping.json" in line for line in rig.output))
+        self.assertIsNone(rig.workflow.session)
+        self.assertEqual(rig.end_sessions, 1)
+        self.assertEqual(rig.home_calls, [])
+        self.assertEqual(rig.configfile.saved, {})
+
+    def test_inference_failure_does_not_export_when_mapping_cleanup_fails(self):
+        rig = MappingRig()
+        rig.begin_mapping()
+        original = rig.owner._set_accel
+        def acceleration(value):
+            if value == 50000.:
+                raise CommandError("cannot restore acceleration")
+            original(value)
+        rig.owner._set_accel = acceleration
+        with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch.object(workflow_module, "infer_axis_mapping", side_effect=ValueError("original inference rejection")), \
+                mock.patch.object(workflow_module, "write_axis_mapping_failure", create=True) as writer, \
+                self.assertRaisesRegex(CommandError, "original inference rejection"):
+            rig.workflow._run_calibration()
+        writer.assert_not_called()
+        diagnostic = rig.workflow.last_result["axis_mapping_diagnostics"]
+        self.assertIn("cannot restore acceleration", " ".join(diagnostic["cleanup_errors"]))
+        self.assertIn("cleanup", diagnostic["export_skipped"])
+        self.assertIsNone(rig.workflow.session)
+        self.assertEqual(rig.home_calls, [])
+
+    def test_inference_failure_does_not_export_when_workflow_cleanup_fails(self):
+        rig = MappingRig()
+        rig.begin_mapping()
+        rig.owner._end_session = mock.Mock(side_effect=CommandError("cleanup stopped"))
+        with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch.object(workflow_module, "infer_axis_mapping", side_effect=ValueError("original inference rejection")), \
+                mock.patch.object(workflow_module, "write_axis_mapping_failure", create=True) as writer, \
+                self.assertRaisesRegex(CommandError, "cleanup stopped"):
+            rig.workflow._run_calibration()
+        writer.assert_not_called()
+        result = rig.workflow.last_result
+        self.assertIn("cleanup stopped", result["reason"])
+        self.assertIn("original inference rejection", result["axis_mapping_diagnostics"]["reason"])
+        self.assertIn("cleanup", result["axis_mapping_diagnostics"]["export_skipped"])
+        self.assertIsNone(rig.workflow.session)
+
     def test_failure_never_homes_saves_or_returns_after_uncertain_move(self):
         for stage in ("enable", "reference", "move", "profile", "capture"):
             with self.subTest(stage=stage):
@@ -321,8 +466,11 @@ class AxisMappingWorkflowTests(unittest.TestCase):
                 rig.fail = stage
                 limits = list(rig.toolhead.kin.limits)
                 rig.begin_mapping()
-                with mock.patch.object(rig.workflow, "_chart_preflight"), self.assertRaises(CommandError):
+                with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                        mock.patch.object(workflow_module, "write_axis_mapping_failure") as writer, \
+                        self.assertRaises(CommandError):
                     rig.workflow._run_calibration()
+                writer.assert_not_called()
                 self.assertEqual(rig.home_calls, [])
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertLessEqual(len(rig.toolhead.moves), 1)
@@ -368,8 +516,11 @@ class AxisMappingWorkflowTests(unittest.TestCase):
                     return capture
                 rig.owner.stop_beta_motion_capture = corrupted
                 rig.begin_mapping()
-                with mock.patch.object(rig.workflow, "_chart_preflight"), self.assertRaises((ValueError, CommandError)):
+                with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                        mock.patch.object(workflow_module, "write_axis_mapping_failure", return_value={}) as writer, \
+                        self.assertRaises((ValueError, CommandError)):
                     rig.workflow._run_calibration()
+                self.assertEqual(writer.call_count, int(failure == "ambiguous"))
                 self.assertEqual(rig.noise_calls, [])
                 self.assertEqual(rig.home_calls, [])
                 self.assertEqual(rig.configfile.saved, {})

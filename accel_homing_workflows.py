@@ -34,7 +34,8 @@ if __package__:
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
                                       write_noise_capture, beta_motion_statistics,
                                       compact_beta_home, write_beta_motion, prepare_capture,
-                                      publish_captures, prepare_noise, publish_noise)
+                                      publish_captures, prepare_noise, publish_noise,
+                                      write_axis_mapping_failure)
 else:  # Standalone offline analysis; do not mask package dependency errors.
     from accel_homing_backends import _ah_compat_sibling_module
     from accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
@@ -42,7 +43,8 @@ else:  # Standalone offline analysis; do not mask package dependency errors.
                                      validate_accuracy, write_accuracy, write_capture, write_noise,
                                      write_noise_capture, beta_motion_statistics,
                                      compact_beta_home, write_beta_motion, prepare_capture,
-                                     publish_captures, prepare_noise, publish_noise)
+                                     publish_captures, prepare_noise, publish_noise,
+                                     write_axis_mapping_failure)
 
 _axes_module = _ah_compat_sibling_module("accel_homing_axes", __package__, __file__)
 infer_axis_mapping = _axes_module.infer_axis_mapping
@@ -782,6 +784,7 @@ class AccelHomingWorkflows:
                 if session is None or not (session.get("beta")
                                            or session.get("troubleshoot_recorder")
                                            or session.get("accuracy_recovery_pending")
+                                           or session.get("axis_mapping_export_pending")
                                            or (session.get("chart_pending")
                                                and result.get("result") == "complete")):
                     self.session = None
@@ -2408,12 +2411,54 @@ class AccelHomingWorkflows:
             self._calibrate_trials()
         except Exception as exc:
             if self.session is session:
-                self._finish({"result": "aborted", "reason": str(exc)},
-                             release=(session["mode"] == "calibration"
-                                      and session.get("axis_touched", False)
-                                      and not session.get("early_return_cleanup", False)
-                                      and not session.get("axis_only_cleanup", False)))
+                export_pending = bool(session.get("_axis_mapping_failure_evidence"))
+                if export_pending:
+                    # Keep the aborted, finishing session reserved while the
+                    # renderer yields; no new workflow may start motion.
+                    session["axis_mapping_export_pending"] = True
+                try:
+                    self._finish({"result": "aborted", "reason": str(exc)},
+                                 release=(session["mode"] == "calibration"
+                                          and session.get("axis_touched", False)
+                                          and not session.get("early_return_cleanup", False)
+                                          and not session.get("axis_only_cleanup", False)))
+                    if export_pending:
+                        self._export_axis_mapping_failure(session)
+                finally:
+                    if export_pending:
+                        if session.pop("_axis_mapping_failure_evidence", None) is not None:
+                            self.last_result["axis_mapping_diagnostics"]["export_skipped"] = \
+                                "workflow cleanup did not complete"
+                        session.pop("axis_mapping_export_pending", None)
+                        if self.session is session:
+                            self.session = None
             raise
+
+    def _export_axis_mapping_failure(self, session):
+        """Publish retained inference evidence only after motion cleanup."""
+        evidence = session.pop("_axis_mapping_failure_evidence")
+        diagnostic = self.last_result["axis_mapping_diagnostics"]
+        if session.get("axis_mapping_cleanup_errors"):
+            diagnostic["export_skipped"] = "automatic mapping cleanup did not complete"
+            return
+        if (self._axis_mapping_stream_active() or self.owner.homing_active
+                or self.owner.attempt is not None or getattr(self.owner, "pending_move", None) is not None):
+            diagnostic["export_skipped"] = "capture or motion ownership remained active after cleanup"
+            return
+        try:
+            paths = write_axis_mapping_failure(self.charts_directory, session["axis"],
+                                               evidence["passes"], copy.deepcopy(diagnostic),
+                                               renderer=self.renderer)
+            diagnostic["paths"] = dict(paths)
+            for key in ("chart_error", "archive_error"):
+                if paths.get(key):
+                    diagnostic[key] = str(paths[key])[:384]
+            evidence_path = paths.get("axis_mapping_zip") or paths.get("axis_mapping_json")
+            if evidence_path:
+                self._info("Automatic mapping failure evidence: %s" % evidence_path)
+        except Exception as exc:
+            diagnostic["export_error"] = str(exc)[:384]
+            logging.exception("accel_homing: automatic mapping failure evidence export failed")
 
     def _axis_mapping_stream_active(self):
         owner = self.owner
@@ -2638,7 +2683,26 @@ class AccelHomingWorkflows:
                     toolhead.wait_moves()
                     self._axis_mapping_check(session)
             session["axis_mapping_phase"] = "inference"
-            mapping = validate_axis_mapping(infer_axis_mapping(axis, passes), axis)
+            inference_diagnostics = {}
+            try:
+                mapping = validate_axis_mapping(infer_axis_mapping(
+                    axis, passes, diagnostics=inference_diagnostics), axis)
+            except Exception as exc:
+                # Both subscriptions are closed and both central returns have
+                # completed. Keep exact configured-stream g rows for replay;
+                # only the bounded inference report enters console status.
+                session["_axis_mapping_failure_evidence"] = {"passes": copy.deepcopy(passes)}
+                self._axis_mapping_note_failure(session, str(exc))
+                session["axis_mapping_diagnostics"].update(
+                    inference=copy.deepcopy(inference_diagnostics),
+                    sensor_context=copy.deepcopy(session["axis_mapping_context"]),
+                    plan={**{key: plan[key] for key in (
+                        "axis", "center_mm", "distance_mm", "effective_speed_mm_s",
+                        "effective_accel_mm_s2", "original_accel_mm_s2", "minimum_duration_s")},
+                          "driver_current_context": copy.deepcopy(plan["driver_current_context"]),
+                          "homing_current_applied": bool(current_attempted),
+                          "calibration_settle_time_s": self.calibration_settle_time})
+                raise
             other = "y" if axis == "x" else "x"
             metadata = self._staged_or_saved_metadata(other)
             previous = self._staged_or_saved_metadata(axis)
@@ -2689,6 +2753,8 @@ class AccelHomingWorkflows:
                 kin.limits[index] = original_limit
             if cleanup_errors:
                 session["axis_mapping_cleanup_errors"] = cleanup_errors
+                if session.get("axis_mapping_diagnostics") is not None:
+                    session["axis_mapping_diagnostics"]["cleanup_errors"] = list(cleanup_errors)
                 if failure is None:
                     session["axis_mapping_phase"] = "cleanup"
                     raise self._axis_mapping_error(session, "automatic axis mapping cleanup failed: " + "; ".join(cleanup_errors))
