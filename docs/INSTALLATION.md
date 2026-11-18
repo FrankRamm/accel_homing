@@ -51,9 +51,11 @@ A dry run reports missing plotting dependencies but does not install them.
 
 ## What installation changes
 
-The transaction records original file bytes, modes and link targets under
-`.accel_homing_backups/` beside the selected main `printer.cfg` before applying
-changes. Preserve the complete backup history, not just the latest directory.
+Installation uses the current configuration and does not create or read
+installation backups. Existing `.accel_homing_backups/` directories are left
+untouched, even if their contents are incomplete or no longer match your files.
+Current user edits are preserved outside the settings the installation needs
+to change.
 
 Installation links the plugin modules into the selected `klippy/extras`, adds
 one plugin section/include when needed, and sets the requested X/Y endstop pins
@@ -68,7 +70,7 @@ axes are preserved. Default installation preserves configured homing speeds;
 and restore a speed written by an earlier installer.
 
 Existing regular Python files at managed link paths are not overwritten.
-Recognized MISC module links are backed up and replaced automatically. Other
+Recognized MISC module links are replaced automatically. Other
 source links require review and `--replace-existing-links`.
 Duplicate sections/options/includes, ambiguous instances and unsupported
 configuration structures fail with a reported conflict.
@@ -109,12 +111,13 @@ For a process manager the installer cannot verify, or to defer activation:
 
 Then restart the selected host processes manually while idle using the printed
 commands. `--no-restart` also opts out of automatic Moonraker activation.
-Uninstall and explicit rollback always leave service restarts to the operator.
+Uninstall leaves service restarts to the operator, after physical endstop
+configuration has been restored manually.
 
 Console `RESTART`/`FIRMWARE_RESTART` rebuild printer objects inside the same
 Python process; they do not reload already imported modules after code/link
 changes. Use a full host process restart for code installation, updates,
-uninstall and module-link rollback. Configuration-only edits and calibration's
+and uninstall. Configuration-only edits and calibration's
 `SAVE_CONFIG` use the normal console restart behavior.
 
 Restarting also discards unsaved configuration/model changes. Preserve any
@@ -142,10 +145,10 @@ pending work before installing or updating.
 | `--max-startup-travel N` | Opt into the generic startup policy, finite 0.1–5.0 mm. |
 | `--no-update-manager` | Skip managed source/Moonraker registration for offline or development use. |
 | `--no-restart` | Defer service activation to the operator. |
-| `--replace-existing-links` | Back up and replace reviewed links from another source. |
+| `--replace-existing-links` | Replace reviewed links from another source. |
 | `--acknowledge-homing-override` | Acknowledge reviewed `gcode_macro G28` behavior for installation only. |
 | `--dry-run` | Validate and print a plan without writes. |
-| `--rollback BACKUP_DIRECTORY` | Restore one unchanged transaction. |
+| `--rollback BACKUP_DIRECTORY` | Deprecated; exits without writes. Historical restoration is no longer supported. |
 | `--uninstall` or `-u` | Perform full managed uninstallation. |
 
 `KLIPPER_PATH`, `PRINTER_CONFIG`, `KLIPPER_SERVICE` and `KLIPPY_SOCKET` supply
@@ -235,24 +238,20 @@ Run the normal standalone installer above while idle. Installations from
 `--replace-existing-links`. The deleted MISC repository is not contacted.
 An edited or removed old Moonraker registration does not block installation.
 
-The installer backs up the current files and module links, preserves existing
-thresholds and SAVE_CONFIG models, and points the plugin at `~/accel_homing`.
-It replaces the old `[update_manager accel_homing]` section if present, including
-when that section is in an included file, or creates the new entry if absent.
-Other Moonraker sections and comments are preserved. An unused old
-`accel_homing_update.cfg` is left in place.
+The installer preserves current thresholds and SAVE_CONFIG models and points
+recognized plugin links at `~/accel_homing`. It replaces an identified MISC
+`[update_manager accel_homing]` section, including one in an included file, or
+creates the standalone entry if absent. Other Moonraker sections and comments
+are preserved. An unused old `accel_homing_update.cfg` is left in place.
 
-The current configuration becomes the standalone installation's restore
-baseline. Old transaction backups remain unchanged in `.accel_homing_backups/`;
-their old configuration edits are not replayed or required to match current
-Moonraker text. Structural backup integrity, instance selection, non-symlink
-Python files, concurrent edits, and idle/restart checks still apply.
+No backup history or original configuration is required. Existing backup
+folders are not read, changed or deleted. Old source directories are left in
+place. Current instance selection, source ownership, non-symlink Python files,
+concurrent edits, and idle/restart checks still apply.
 
-After migration, standalone uninstall restores the state immediately before
-migration, including the previous plugin links and updater registration. It does
-not go back through the old MISC transactions to factory endstop settings.
-Retain the old source and all backups if that restore path may be needed.
-Installation does not test homing; supervise subsequent physical testing.
+Uninstall removes the current plugin setup; it does not restore the previous
+MISC installation or its original physical endstop settings. Installation does
+not test homing; supervise subsequent physical testing.
 
 ## Uninstall
 
@@ -264,66 +263,45 @@ Preview or perform the operation from the complete checkout:
 ```
 
 Selection options such as `--config` and `--service` work here too.
-`uninstall.sh` performs full uninstall and rejects `--rollback`; use
-`install.sh --rollback` for a single transaction.
+Uninstall uses the current configuration and recognized plugin module links.
+It removes the plugin sections, saved plugin models, plugin virtual endstop
+options and matching Moonraker updater registration. Other settings, comments,
+includes, files and unrelated SAVE_CONFIG models remain in place. An empty
+plugin include file may remain so existing include directives stay valid.
 
-Full uninstall follows the active installation/upgrade history back to its
-recorded baseline. It restores original endstops, retract/speed settings,
-sensorless options and plugin links; removes owned includes/configuration,
-installer-created updater registration and newly introduced plugin models;
-and restores any pre-existing plugin state. Unrelated edits and other SAVE_CONFIG
-data, such as Beacon/bed-mesh models, are preserved when ownership is clear.
+Original endstop pins, speeds, retract distances and sensorless settings are
+not restored. **Configure the physical X/Y endstops and review their homing
+settings before restarting Klipper.** Existing commented-out values can be
+reviewed manually; they are never automatically re-enabled.
 
-An intact history and recognizable managed edits are required. Changed links or
-settings, unrelated additions to an installer-created file, missing original
-targets, shared consumers or incomplete backups cause a conflict before writes.
-There is no force-uninstall option that overwrites later edits.
+Uninstall checks current ownership and refuses ambiguous or foreign module
+links, regular Python files at module paths, shared consumers and concurrent
+changes. It does not compare your files with old installation snapshots.
 
-Successful uninstall prints a current-state backup and an **Undo this uninstall**
-command. Save both. Then manually restart the selected Klipper and any listed
-Moonraker service while idle. Uninstall does not restart services or move the
-printer. The old Python module and updater may remain loaded until those
-processes restart.
+Uninstall does not restart services or move the printer. Once the configuration
+is ready, manually restart the selected Klipper and any listed Moonraker
+service while idle. The old Python module and updater may remain loaded until
+those processes restart.
 
-Charts and transaction backups remain on disk. The checkout and its
-`.plot-deps/` cache also remain until you remove them yourself. **Only after
-uninstallation succeeds and the listed services have restarted**, check that
-no restored or shared plugin links or pre-existing manual updater entries
-still need this checkout. Remove/reconcile any manual updater entry separately;
-the uninstaller preserves pre-existing registration it does not own. Then, if desired:
+Charts, old backups, source checkouts and the `.plot-deps/` cache remain on disk.
+No new backup or undo command is created. Only remove the source after uninstall
+succeeds, the configuration is ready, services have restarted and no remaining
+links or updater entries reference that checkout. Do not delete the checkout
+to work around a failed uninstall.
 
-```bash
-rm -rf ~/accel_homing
-```
+## Backup deprecation and interrupted installation
 
-Do not run that deletion after a failed uninstall. Deleting the checkout also
-deletes its local undo entrypoint and plotting cache. To use a retained
-transaction backup later, recover or re-clone a compatible source at the path
-required by its recorded links, then use the saved rollback command. Retain
-the source instead if you want the printed undo command to remain immediately
-usable.
+Persistent installation backups and historical rollback are deprecated.
+`install.sh --rollback` exits without changing files. Installation, migration,
+updates, activation and uninstall ignore `.accel_homing_backups/`; no old
+manifest can block a new installation.
 
-## Transaction rollback and conflicts
+The installer retains the current operation's before-state only in memory
+while applying changes. If a write fails, it attempts to restore changes from
+that operation without overwriting a later concurrent edit. These temporary
+states are not saved as a backup elsewhere. Activation receipts contain service
+and source metadata, not copies of configuration contents.
 
-`--rollback` restores one selected transaction, only if the affected files and
-links still match that transaction's recorded result. Use the **actual path
-printed by the installer**, for example:
-
-```bash
-~/accel_homing/install.sh --rollback \
-  "$HOME/printer_data/config/.accel_homing_backups/ACTUAL-BACKUP-DIRECTORY"
-```
-
-You can add `--dry-run` first. This restores the recorded configuration and
-module-link states, not the caller-owned Git checkout revision. It does not
-undo a Git pull or Moonraker code update, and it does not perform full uninstall.
-Recover the intended compatible source revision separately when required.
-Restart the printed host services manually afterward.
-
-On a conflict, preserve current files and all history. Inspect the reported
-`manifest.json` and compare its `before`/`after` states with the current file or
-link. Reconcile managed edits without replacing a whole current `printer.cfg`
-with an old copy. A missing baseline or removed original source cannot be
-reconstructed by the uninstaller. Ordinary write failures are rolled back;
-power loss or a terminated process with a `prepared` manifest can require manual
-recovery. See [troubleshooting](TROUBLESHOOTING.md).
+A terminated process or power loss has no persistent automatic restore point.
+Inspect the current files and rerun the installer after resolving any partial
+write or current ownership conflict. See [troubleshooting](TROUBLESHOOTING.md).

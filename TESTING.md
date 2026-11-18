@@ -66,7 +66,8 @@ python3 -B -m unittest discover -s tests -p 'test_warmup_timing.py' -v
 python3 -B -m unittest discover -s tests -p 'test_troubleshoot*.py' -v
 ```
 
-The tests cover installation/ownership/rollback, adapter contracts and faults,
+The tests cover installation/ownership, current-edit preservation, backup-free
+operation and recovery from write failures, adapter contracts and faults,
 fresh references, legacy/vector detector behavior, single-pass homing/release,
 noise selection, calibration geometry/early returns/repeatability, accuracy
 capture/recovery/statistics, PNG rendering and the isolated Beta experiment.

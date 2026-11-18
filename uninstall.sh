@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restore owned installation transactions from the complete local checkout.
+# Remove current plugin configuration and links from the selected instance.
 set -euo pipefail
 source_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if ! command -v python3 >/dev/null 2>&1; then

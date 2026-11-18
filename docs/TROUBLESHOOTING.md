@@ -11,7 +11,7 @@ centered or that SAVE_CONFIG succeeded.
 | --- | --- |
 | More than one Klipper instance/sensor found | Use the reported full paths and `--config`, `--service`, `--klippy-socket`, `--klipper-path` and/or `--accel-chip`. Explicit selections must describe the same instance. |
 | Source/origin/branch/upstream rejected | Use the complete clean `~/accel_homing` native clone with canonical HTTPS origin, `main` and `origin/main`. Review local changes; do not force-reset them away. |
-| Old MISC uninstall reports changed Moonraker lines | Run the current standalone installer directly. It migrates the current state without requiring the old uninstall or an intact old updater stanza. Preserve old sources/backups for recovery. See [migration](INSTALLATION.md#migrate-from-the-misc-plugin). |
+| Old backup section changes or changed Moonraker lines block installation | Update to the current standalone installer and run it directly. Installation backups are deprecated and ignored; existing backup folders remain untouched. The old MISC uninstaller is not required. See [migration](INSTALLATION.md#migrate-from-the-misc-plugin). |
 | Shared checkout/consumer conflict | Keep the source and every affected instance intact. Do not replace shared links while another instance uses them; use a supported dedicated installation. |
 | Service restart cannot be verified | Review the exact unit, checkout, config and socket. For an unsupported manager use `--no-restart`, then activate the selected processes manually while idle. |
 | Install succeeded but old code seems loaded | A full Klipper host-process restart is needed after source/link changes; console RESTART alone does not reload imported modules. |
@@ -19,9 +19,9 @@ centered or that SAVE_CONFIG succeeded.
 | Update controls disabled or version unknown | Inspect Moonraker logs and its repository/tag/version status. See [official Git-repo configuration](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration). Do not point it at the historical MISC subtree. |
 | Plot dependency/render preflight failed | Rerun the installer with the exact selected Klipper interpreter if needed. Check connectivity, supported binary wheels and output permissions; global package pins are not a repair shortcut. |
 
-Do not delete `~/accel_homing` while extras, restored/shared links or a retained
-manual Moonraker updater entry still reference it. The uninstaller removes
-installer-created registration, not a pre-existing manual entry it does not own.
+Do not delete `~/accel_homing` while extras links or a Moonraker updater entry
+still reference it. Uninstall removes the matching current plugin registration
+and preserves unrelated updater sections.
 
 ### Import failure after the first troubleshooting update
 
@@ -170,17 +170,21 @@ emergency stop for unexpected active movement. A shutdown/homing fault can
 disable motors, including Z. Re-establish support and clearance before any
 later operation.
 
-## Uninstall or rollback conflict
+## Uninstall or installation conflict
 
-Keep current configuration, old/new sources and the complete
-`.accel_homing_backups/` history. The reported manifest identifies original
-and installed states. Reconcile only the managed conflict while retaining
-unrelated later edits and other saved models.
+Installation and uninstall use current files, not backup history. There is no
+need to repair or delete `.accel_homing_backups/` to proceed. Update the checkout
+if an older installer still reports an installation-backup validation error.
+Historical `--rollback` is no longer supported and exits without writes.
 
-Missing original targets, ambiguous shared links or incomplete old baselines
-cannot be reconstructed safely from a guessed directory. Recover the original
-source/baseline before retrying. Do not delete links/history to silence an
-ownership error. See [uninstall and recovery](INSTALLATION.md#uninstall).
+A current conflict can still indicate an ambiguous instance, a foreign module
+link or file, a shared consumer, or a file edited while the operation was being
+prepared. Inspect the specific path and resolve that current conflict before
+retrying. Do not delete source checkouts to silence a link-ownership error.
+
+Uninstall removes plugin virtual endstop options without restoring original
+pins or homing settings. Configure physical X/Y endstops and review their
+settings before restarting Klipper. See [uninstall](INSTALLATION.md#uninstall).
 
 ## Reporting a problem
 

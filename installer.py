@@ -270,15 +270,14 @@ class Section:
         line = "%s: %s%s" % (name, value, self.document.newline)
         if entries:
             index, match = entries[0]
-            old = self.document.lines[index].lstrip().rstrip("\r\n")
-            self.document.replacements[index] = "# accel_homing previous: " + old + self.document.newline + match.group(1) + line
+            self.document.replacements[index] = match.group(1) + line
         else:
             self.document.insertions.setdefault(self.end, []).append(line)
 
     def disable(self, name):
         if self.get(name) is not None:
             index = self.options[name.lower()][0][0]
-            self.document.replacements[index] = "# accel_homing previous: " + self.document.lines[index].lstrip()
+            self.document.replacements[index] = "# " + self.document.lines[index].lstrip()
 
     def generic_name(self):
         if self.name.lower() != "beacon_accel_homing":
@@ -573,6 +572,13 @@ def assert_migration_state(args):
             raise InstallError("%s changed after migration ownership validation. No printer transaction files changed; retry." % path)
 
 
+class PlannedChanges(dict):
+    """File changes plus the current-state inputs on which planning depended."""
+    def __init__(self):
+        super().__init__()
+        self.expected = {}
+
+
 def make_plan(source, selected, args):
     assert_migration_state(args)
     source = canonical(source)
@@ -600,8 +606,6 @@ def make_plan(source, selected, args):
     existing = plugins[0] if plugins else None
     generic_names = getattr(args, "generic_names", False)
     if generic_names:
-        if not getattr(args, "_legacy_migration", False):
-            load_uninstaller().validate_installation_history(selected, uninstall_api())
         validate_generic_names(graph, existing)
     sensor = choose_sensor(graph, args.accel_chip, existing)
     family = sensor.split()[0].lower()
@@ -611,7 +615,12 @@ def make_plan(source, selected, args):
         raise InstallError("Configured [%s] has no installed driver in klippy/extras or klippy/plugins. "
                            "Install its normal driver first." % sensor)
     speeds = validate_homing_speeds(graph, args, family, existing)
-    changes, messages = {}, []
+    changes, messages = PlannedChanges(), []
+    for path, document in graph.documents.items():
+        changes.expected[path] = dict(snapshot(path), data=base64.b64encode(document.original).decode("ascii"))
+    for module in MODULES:
+        path = selected["repo"] / "klippy/extras" / module
+        changes.expected[path] = snapshot(path)
     if safe_z_home is not None:
         messages.append("Preserved [safe_z_home]. Supervised X/Y workflows use native selected-axis "
                         "homing and omit the wrapper's z_hop; ordinary G28 remains unchanged.")
@@ -647,15 +656,20 @@ def make_plan(source, selected, args):
             existing.replace(name, value)
     else:
         managed = selected["config"].parent / MANAGED
-        if managed.exists() or managed.is_symlink():
+        included_managed = graph.documents.get(canonical(managed))
+        if (managed.exists() or managed.is_symlink()) and included_managed is None:
             raise InstallError("%s exists but is not included; review/include or rename it. It will not be overwritten." % managed)
         content = ("# Managed by the accelerometer homing installer. Edit this file normally.\n"
                    "# Independent overrides; leave commented to use SAVE_CONFIG calibration models.\n"
                    "[accel_homing]\naccel_chip: " + sensor + "\n"
                     "#x_threshold: 8.0\n#y_threshold: 8.0\n#model: default\n"
                     + "".join("%s: %s\n" % item for item in overrides.items()))
-        changes[managed] = {"kind": "file", "data": content.encode("utf-8")}
-        if not any(managed.match(pattern) for pattern in graph.include_patterns):
+        if included_managed is not None:
+            included_managed.insertions.setdefault(included_managed.active_end, []).append(
+                included_managed.newline + content.replace("\n", included_managed.newline))
+        else:
+            changes[managed] = {"kind": "file", "data": content.encode("utf-8")}
+        if included_managed is None and not any(managed.match(pattern) for pattern in graph.include_patterns):
             main = graph.documents[selected["config"]]
             main.insertions.setdefault(main.active_end, []).append(main.newline + "[include " + MANAGED + "]" + main.newline + main.newline)
     for axis, (rail, speed, actual_speed) in speeds.items():
@@ -684,7 +698,7 @@ def make_plan(source, selected, args):
             if canonical(link) == canonical(wanted):
                 continue
             if not args.replace_existing_links:
-                raise InstallError("%s links to %s. Review it, then --replace-existing-links to back up/replace." % (link, os.readlink(link)))
+                raise InstallError("%s links to %s. Review it, then --replace-existing-links to replace it." % (link, os.readlink(link)))
         elif link.exists():
             raise InstallError("Refusing to overwrite non-symlink plugin %s. Resolve manually." % link)
         changes[link] = {"kind": "symlink", "target": wanted}
@@ -705,6 +719,7 @@ def make_plan(source, selected, args):
         change.setdefault("expected", snapshot(path))
         if path in graph.documents:
             change["expected"]["data"] = base64.b64encode(graph.documents[path].original).decode("ascii")
+        changes.expected.setdefault(path, change["expected"])
     return changes, messages, sensor
 
 
@@ -1058,12 +1073,7 @@ def assert_restart_safe(selected, plan):
 
 
 def activation_path(selected, backup=None):
-    if backup is None:
-        _, active, _ = load_uninstaller().history(selected["config"], uninstall_api())
-        if active:
-            backup = active[-1]["directory"]
-    return (backup / "activation.json" if backup else
-            selected["config"].parent / ".accel_homing_activation.json")
+    return selected["config"].parent / ".accel_homing_activation.json"
 
 
 def save_activation(path, selected, status, attempted=False, **details):
@@ -1114,9 +1124,9 @@ def activate_install(selected, plan, backup=None):
         except (InstallError, OSError, ValueError) as receipt_error:
             print("Activation receipt could not be saved: %s" % receipt_error, file=sys.stderr)
         raise InstallError("Files are installed; automatic host-service activation %s. "
-                           "Installed changes and backups were retained; no automatic rollback was attempted. "
-                           "The service may have changed state. Backup: %s; activation receipt: %s. Cause: %s" %
-                           ("failed" if attempted else "was blocked", backup or "existing installation", receipt, exc))
+                           "Installed changes were retained; no automatic undo was attempted. "
+                           "The service may have changed state. Activation receipt: %s. Cause: %s" %
+                           ("failed" if attempted else "was blocked", receipt, exc))
     print("Host service %s restarted; a new matching process was verified (PID %s)." % (selected["service"], after["pid"]))
     print("Klipper Ready/module behavior and physical homing/calibration have not been verified. Activation receipt: %s" % receipt)
 
@@ -1160,12 +1170,13 @@ def write_state(path, state):
             temporary.unlink()
 
 
-def save_manifest(directory, manifest):
-    data = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    write_state(directory / "manifest.json", {"kind": "file", "mode": 0o600, "data": base64.b64encode(data).decode("ascii")})
-
-
 def apply_plan(changes, config, writer=write_state, selected=None, before_write=None, updater=None):
+    expected_inputs = {str(path): state for path, state in getattr(changes, "expected", {}).items()}
+    if updater:
+        expected_inputs.update({str(path): state for path, state in updater.get("expected", {}).items()})
+    for path, expected in expected_inputs.items():
+        if not state_matches(path, expected):
+            raise InstallError("%s changed after planning. No files changed; retry after editor/SAVE_CONFIG finishes." % path)
     if not changes:
         return None
     entries = []
@@ -1179,24 +1190,17 @@ def apply_plan(changes, config, writer=write_state, selected=None, before_write=
         if after["kind"] == "file":
             after["data"], after["mode"] = base64.b64encode(after["data"]).decode("ascii"), before.get("mode", 0o600)
         entries.append(dict(path=str(path), before=before, after=after))
-    uninstaller = load_uninstaller()
-    _, active, receipt = uninstaller.history(config, uninstall_api())
-    context = {str(path): snapshot(path) for path in ConfigGraph(config).documents}
-    metadata = dict(operation="install", repo=str(selected["repo"]) if selected else None,
-                    parent=active[-1]["ref"] if active else None,
-                    previous_uninstall=receipt["ref"] if receipt else None, context=context)
-    if updater is not None:
-        metadata["updater"] = updater["context"]
-        metadata["source_update"] = load_updater().source_metadata(updater)
-        if "migration_history" in updater:
-            if updater["migration_history"] != [record["ref"] for record in active]:
-                raise InstallError("Installation history changed during migration planning; retry.")
-            metadata.update(parent=None, migration_history=updater["migration_history"],
-                            moonraker_context=updater["moonraker_context"])
+    metadata = dict(operation="install", expected=expected_inputs)
     return execute_transaction(entries, config, metadata, writer, before_write)
 
 
 def execute_transaction(entries, config, metadata, writer=write_state, before_write=None):
+    expected_inputs = {str(path): state for path, state in metadata.get("expected", {}).items()}
+    def verify_inputs():
+        for path, expected in expected_inputs.items():
+            if not state_matches(Path(path), expected):
+                raise InstallError("%s changed after planning; retry after editor/SAVE_CONFIG finishes." % path)
+    verify_inputs()
     for entry in entries:
         path = Path(entry["path"])
         if not state_matches(path, entry["before"]):
@@ -1206,26 +1210,18 @@ def execute_transaction(entries, config, metadata, writer=write_state, before_wr
             raise InstallError("No write access to %s. Run as Klipper service user; files are never written with sudo." % path.parent)
     if before_write:
         before_write()
-    parent = config.parent / ".accel_homing_backups"
-    if parent.is_symlink():
-        raise InstallError("Refusing symlink backup directory: %s" % parent)
-    parent.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(parent, 0o700)
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    backup = parent / (stamp + "-" + uuid.uuid4().hex[:8])
-    backup.mkdir(mode=0o700)
-    manifest = dict(version=2, config=str(config), status="prepared", created_utc=stamp, changes=entries, **metadata)
-    save_manifest(backup, manifest)
+    verify_inputs()
     applied = []
     try:
         for entry in entries:
+            verify_inputs()
             path = Path(entry["path"])
             if not state_matches(path, entry["before"]):
                 raise InstallError("%s changed during installation. Retry after editor/SAVE_CONFIG finishes." % path)
             applied.append(entry)
             writer(path, entry["after"])
-        manifest["status"] = "installed"
-        save_manifest(backup, manifest)
+            expected_inputs[str(path)] = entry["after"]
+        verify_inputs()
     except Exception as exc:
         errors = []
         for entry in reversed(applied):
@@ -1237,21 +1233,17 @@ def execute_transaction(entries, config, metadata, writer=write_state, before_wr
                 write_state(Path(entry["path"]), entry["before"])
             except Exception as undo:
                 errors.append("%s: %s" % (entry["path"], undo))
-        manifest.update(status="rollback_incomplete" if errors else "rolled_back_after_failure", failure=str(exc), rollback_errors=errors)
-        save_manifest(backup, manifest)
-        raise InstallError("%s failed; %s. Backup %s. Cause: %s%s" %
+        raise InstallError("%s failed; %s. No persistent backup was created. Cause: %s%s" %
                            ("Uninstall" if metadata.get("operation") == "uninstall" else "Installation",
-                            "rollback needs repair" if errors else "applied changes restored", backup, exc, "; ".join(errors)))
-    return backup
+                            "recovery needs manual repair" if errors else "applied changes restored", exc,
+                            ("; " + "; ".join(errors)) if errors else ""))
+    return None
 
 
 def make_uninstall_plan(selected):
-    try:
-        plan = load_uninstaller().make_plan(selected, uninstall_api())
-        assert_uninstall_consumers(selected, plan)
-        return plan
-    except InstallError as error:
-        raise InstallError("%s History/backups: %s" % (error, selected["config"].parent / ".accel_homing_backups"))
+    plan = load_uninstaller().make_plan(selected, uninstall_api())
+    assert_uninstall_consumers(selected, plan)
+    return plan
 
 
 def assert_uninstall_consumers(selected, plan, processes=None, services=None):
@@ -1291,71 +1283,19 @@ def assert_uninstall_consumers(selected, plan, processes=None, services=None):
 def apply_uninstall_plan(plan, selected, writer=write_state):
     if plan["config"] != selected["config"] or plan["repo"] != selected["repo"]:
         raise InstallError("Uninstall plan belongs to a different instance. No files changed.")
-    records, _, _ = load_uninstaller().history(selected["config"], uninstall_api())
-    if [item["ref"] for item in records] != plan["records"]:
-        raise InstallError("Installation history changed after uninstall planning. No files changed; retry.")
     for path, expected in plan.get("expected", {}).items():
         if not state_matches(Path(path), expected):
             raise InstallError("%s changed after planning. No files changed; retry after editor/SAVE_CONFIG finishes." % path)
     if not plan["entries"]:
         return None
     assert_uninstall_consumers(selected, plan)
-    metadata = dict(operation="uninstall", repo=str(selected["repo"]), history=plan["history"])
-    if plan.get("updater") is not None:
-        metadata["updater"] = plan["updater"]
-    for key in ("migration_history", "moonraker_context"):
-        if key in plan:
-            metadata[key] = plan[key]
+    metadata = dict(operation="uninstall", expected=plan.get("expected", {}))
     return execute_transaction(plan["entries"], selected["config"], metadata, writer)
 
 
 def rollback(backup, dry_run=False, selected=None):
-    backup = canonical(backup)
-    if backup.is_file():
-        backup = backup.parent
-    manifest = json.loads((backup / "manifest.json").read_text())
-    if manifest.get("version") not in (1, 2) or manifest.get("status") != "installed":
-        raise InstallError("Not an installed transaction: %s" % backup)
-    if selected and canonical(manifest["config"]) != selected["config"]:
-        raise InstallError("Backup belongs to a different config: %s" % manifest["config"])
-    if selected and manifest.get("repo") and canonical(manifest["repo"]) != selected["repo"]:
-        raise InstallError("Backup belongs to a different checkout: %s" % manifest["repo"])
-    if manifest.get("updater") is not None:
-        if selected is None:
-            raise InstallError("Updater rollback requires the exact selected instance.")
-        load_updater().validate_record(manifest, selected, uninstall_api())
-    source_restore = load_updater().validate_source_rollback(manifest, selected, uninstall_api()) if manifest.get("source_update") else None
-    for entry in manifest["changes"]:
-        if not state_matches(Path(entry["path"]), entry["after"]):
-            raise InstallError("%s changed after installation. Refusing to overwrite later edits; restore selected "
-                               "before states from %s manually." % (entry["path"], backup / "manifest.json"))
-    if dry_run:
-        return
-    done = []
-    try:
-        for entry in reversed(manifest["changes"]):
-            if not state_matches(Path(entry["path"]), entry["after"]):
-                raise InstallError("%s changed during rollback; preserving current contents" % entry["path"])
-            write_state(Path(entry["path"]), entry["before"])
-            done.append(entry)
-        if source_restore:
-            load_updater().restore_publication(source_restore, uninstall_api())
-    except Exception as exc:
-        errors = []
-        for entry in reversed(done):
-            try:
-                if not state_matches(Path(entry["path"]), entry["before"]):
-                    raise InstallError("changed concurrently; preserving current contents")
-                write_state(Path(entry["path"]), entry["after"])
-            except Exception as repair:
-                errors.append("%s: %s" % (entry["path"], repair))
-        intact = all(state_matches(Path(e["path"]), e["after"]) for e in manifest["changes"])
-        manifest.update(status="installed" if intact else "rollback_incomplete", failure=str(exc), rollback_errors=errors)
-        save_manifest(backup, manifest)
-        raise InstallError("Rollback failed; concurrent changes were preserved. Inspect backup %s. Cause: %s%s" %
-                           (backup, exc, "; ".join(errors)))
-    manifest["status"] = "rolled_back"
-    save_manifest(backup, manifest)
+    raise InstallError("--rollback is deprecated and unsupported. This installer uses the current "
+                       "configuration and creates no persistent backups. No files changed.")
 
 
 def arguments(argv=None):
@@ -1380,11 +1320,11 @@ def arguments(argv=None):
     parser.add_argument("--acknowledge-homing-override", action="store_true",
                         help="acknowledge installation after reviewing gcode_macro G28 behavior during ordinary homing; "
                         "not needed for built-in homing_override/safe_z_home; workflows bypass public G28")
-    parser.add_argument("--replace-existing-links", action="store_true", help="back up/replace plugin links from another source")
+    parser.add_argument("--replace-existing-links", action="store_true", help="replace reviewed plugin links from another source")
     parser.add_argument("--no-restart", action="store_true", help="install/update without automatic host-service restart; activate manually")
     parser.add_argument("--dry-run", action="store_true", help="validate/print plan, no writes")
-    parser.add_argument("--rollback", metavar="BACKUP_DIRECTORY", help="restore one unchanged installation transaction")
-    parser.add_argument("-u", "--uninstall", action="store_true", help="restore the state before the first active managed installation, including upgrades")
+    parser.add_argument("--rollback", metavar="BACKUP_DIRECTORY", help="deprecated and unsupported; no files are changed")
+    parser.add_argument("-u", "--uninstall", action="store_true", help="remove recognized current plugin state; configure physical endstops manually before restarting")
     args = parser.parse_args(argv)
     args.axes = [axis.strip().lower() for axis in args.axes.split(",")]
     if not args.axes or len(set(args.axes)) != len(args.axes) or any(axis not in ("x", "y") for axis in args.axes):
@@ -1554,49 +1494,32 @@ def prepare_plotting(selected, args, before_write=None, source=None):
 
 def main(argv=None):
     args = arguments(argv)
+    if args.rollback:
+        rollback(args.rollback)
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         raise InstallError("Run as the Klipper service user, not root. Only the detected host-service restart uses sudo.")
     selected = discover_target(args)
     print("Checkout: %s\nMain config: %s\nDetection: %s\nService: %s\nExecutable: %s" %
           (selected["repo"], selected["config"], selected["origin"], selected["service"] or "none", selected["executable"] or "stopped host"))
-    updater_helper = load_updater()
-    if updater_helper and args.uninstall:
-        # New installation can adopt MISC directly. Restoring an unmigrated
-        # installation still needs its original history semantics.
-        updater_helper.reject_legacy_installation(selected, uninstall_api())
     if args.uninstall:
         plan = make_uninstall_plan(selected)
         for entry in plan["entries"]:
-            print("Restore %s (%s -> %s)" % (entry["path"], entry["before"]["kind"], entry["after"]["kind"]))
+            print("Remove plugin state from %s (%s -> %s)" % (entry["path"], entry["before"]["kind"], entry["after"]["kind"]))
         if args.dry_run:
-            print("Uninstall dry run: %d installation transaction(s); no writes, restart, or movement." % len(plan["history"]))
+            print("Uninstall dry run: %d current file change(s); no writes, restart, or movement." % len(plan["entries"]))
             return 0
         if not plan["entries"]:
             print("Already uninstalled; no changes, restart, or movement.")
             return 0
         print(assert_idle(selected))
-        backup = apply_uninstall_plan(plan, selected)
-        print("Uninstalled. Current-state backup: %s" % backup)
-        print("Restored the pre-install activation/config state across %d installation transaction(s). "
-              "Source caches, charts and original backups were retained." % len(plan["history"]))
-        print("Review the restored config.")
-        print_restart_advice(selected)
+        apply_uninstall_plan(plan, selected)
+        print("Uninstalled the recognized current plugin configuration, module links and updater registration. "
+              "No persistent backups were created; historical settings were not restored.")
+        print("Before restarting Klipper, configure valid physical/sensorless endstops and review homing settings "
+              "and any macros that called the plugin. Existing comments are reference only, not restored settings.")
+        print("Source checkout, caches, charts, configuration files and existing backup directories were retained.")
         if plan.get("updater") is not None:
             load_updater().print_activation_advice(plan["updater"], selected, uninstall_api())
-        print("Undo this uninstall (only while its restored files remain unchanged): bash %s --config %s --klipper-path %s --rollback %s" %
-              tuple(shlex.quote(str(v)) for v in (Path(__file__).resolve().parent / "install.sh", selected["config"], selected["repo"], backup)))
-        return 0
-    if args.rollback:
-        rollback(args.rollback, True, selected)
-        if not args.dry_run:
-            print(assert_idle(selected))
-            rollback(args.rollback, False, selected)
-        print(("Would restore: " if args.dry_run else "Restored: ") + args.rollback)
-        if not args.dry_run:
-            print_restart_advice(selected)
-            manifest = json.loads((canonical(args.rollback) / "manifest.json").read_text())
-            if manifest.get("updater") is not None:
-                load_updater().print_activation_advice(manifest["updater"], selected, uninstall_api())
         return 0
     source = Path(__file__).resolve().parent
     updater_receipt = selected["config"].parent / ".accel_homing_updater.json"
@@ -1620,9 +1543,8 @@ def main(argv=None):
                                      link, changes.get(link, {}).get("expected", snapshot(link))))
         changes.update(updater["changes"])
         print("Managed update source: %s\nMoonraker config: %s" % (updater["repo"], updater["moon"]["config"]))
-        if "migration_history" in updater:
-            print("Migrating MISC directly from the current configuration; old sources and backups are retained. "
-                  "Uninstall will restore this pre-migration state.")
+        if updater.get("legacy_migration"):
+            print("Migrating MISC directly from the current configuration; old sources and existing backup directories are untouched.")
     print("Accelerometer: [%s] (physical mounting/orientation not inferred)" % sensor)
     for message in messages:
         print("Note: " + message)
@@ -1632,10 +1554,17 @@ def main(argv=None):
         prepare_plotting(selected, args)
         print("Dry run: no writes, restart, or movement.")
         return 0
+    expected_inputs = dict(getattr(changes, "expected", {}))
+    expected_inputs.update({path: change["expected"] for path, change in changes.items() if "expected" in change})
+    if updater:
+        expected_inputs.update(updater.get("expected", {}))
     restart = None if args.no_restart else prepare_restart(selected)
     moon_restart = (updater_api.prepare_restart(updater["moon"], selected, uninstall_api())
                     if updater and updater["restart_needed"] and not args.no_restart else None)
     def before_write():
+        for path, expected in expected_inputs.items():
+            if not state_matches(Path(path), expected):
+                raise InstallError("%s changed after planning. No printer transaction files changed; retry." % path)
         assert_migration_state(planning_args)
         executable = selected.get("executable") or args.klipper_python
         if executable:
@@ -1664,45 +1593,41 @@ def main(argv=None):
             else:
                 changes[path] = desired
         changes.update(updater["changes"])
-    backup = None
     try:
         if updater:
             updater_api.publish_source(updater, uninstall_api(), before_write)
         if changes:
             options = {"updater": updater} if updater else {}
-            backup = apply_plan(changes, selected["config"], selected=selected, before_write=before_write, **options)
+            apply_plan(changes, selected["config"], selected=selected, before_write=before_write, **options)
     except Exception as exc:
         if updater:
             try:
                 updater_api.restore_publication(updater, uninstall_api())
             except Exception as recovery:
-                raise InstallError("Installer file transaction failed and prior source restoration also failed. "
-                                   "Retained source backup: %s. Original cause: %s. Recovery: %s" %
-                                   (updater.get("source_backup"), exc, recovery))
+                raise InstallError("Installer file transaction failed and source verification also failed. "
+                                   "Original cause: %s. Recovery: %s" % (exc, recovery))
         raise
     if changes:
-        print("Installed. Backup: %s" % backup)
+        print("Installed using the current configuration. No persistent backups were created.")
         print("Review the config and sensor mounting/orientation.")
-        print("Restore: bash %s --config %s --klipper-path %s --rollback %s" %
-              tuple(shlex.quote(str(v)) for v in (Path(__file__).resolve().parent / "install.sh", selected["config"], selected["repo"], backup)))
     else:
         print("Already installed; no installation files changed.")
     if updater and updater["restart_needed"]:
         if moon_restart:
-            updater_api.activate(updater, selected, moon_restart, uninstall_api(), backup)
+            updater_api.activate(updater, selected, moon_restart, uninstall_api(), None)
         else:
-            updater_api.record_activation(updater, selected, uninstall_api(), backup, "skipped", reason="--no-restart")
+            updater_api.record_activation(updater, selected, uninstall_api(), None, "skipped", reason="--no-restart")
             print("Moonraker updater entry is written but not loaded (--no-restart). Restart the matching "
                   "Moonraker service once from its UI/service manager; refreshing the browser alone does not load it.")
             updater_api.print_activation_advice(updater["context"], selected, uninstall_api())
     if restart:
-        activate_install(selected, restart, backup)
+        activate_install(selected, restart)
     else:
-        receipt = activation_path(selected, backup)
+        receipt = activation_path(selected)
         save_activation(receipt, selected, "skipped", reason="--no-restart")
         print("Automatic activation skipped by --no-restart. Activation receipt: %s" % receipt)
         print_restart_advice(selected)
-    print("Full uninstall (including upgrades): bash %s --config %s --klipper-path %s" %
+    print("Remove current plugin configuration and links: bash %s --config %s --klipper-path %s" %
           tuple(shlex.quote(str(v)) for v in (Path(__file__).resolve().parent / "uninstall.sh", selected["config"], selected["repo"])))
     return 0
 

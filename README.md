@@ -15,9 +15,10 @@ git clone https://github.com/FrankRamm/accel_homing.git
 ~/accel_homing/install.sh
 ```
 
-The installer backs up its changes, configures X/Y homing and Moonraker
-updates, and restarts the verified services. It may ask for your
-Linux sudo password. It does not home the printer.
+The installer configures X/Y homing and Moonraker updates using the current
+configuration, without creating or checking installation backups. It restarts
+the verified services and may ask for your Linux sudo password. It does not
+home the printer.
 
 Read the [first calibration instructions](docs/SIMPLE_CALIBRATION.md) before
 moving the printer. Existing MISC installations can run this installer directly;
@@ -44,8 +45,8 @@ managed_services: klipper
 
 Add the base `[update_manager]` section once if absent. After manual edits,
 restart the matching Moonraker service while idle. `~` is Moonraker's service
-user's home; use the printed absolute path if needed. A pre-existing manual
-entry survives uninstall.
+user's home; use the printed absolute path if needed. Uninstall removes the
+matching plugin entry while preserving unrelated updater configuration.
 [Update details](docs/INSTALLATION.md#moonraker-updates) ·
 [Moonraker reference](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
 
@@ -97,7 +98,9 @@ Run while idle:
 ~/accel_homing/uninstall.sh
 ```
 
-After uninstallation succeeds, restart the services listed in its output.
+After uninstallation succeeds, configure the physical X/Y endstops and review
+their homing settings before restarting the services listed in its output.
+Previous settings are not restored from backups.
 Only after those restarts, and after checking that no remaining plugin links
 or manual updater entries need this checkout, remove the source if desired:
 
@@ -105,7 +108,6 @@ or manual updater entries need this checkout, remove the source if desired:
 rm -rf ~/accel_homing
 ```
 
-Keep the printed backup paths if you may need to undo the uninstall.
 [Uninstall and recovery details](docs/INSTALLATION.md#uninstall).
 
 ## Documentation
