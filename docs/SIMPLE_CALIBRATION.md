@@ -10,12 +10,22 @@ ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
 Use one axis per invocation. `AXIS` selects the printer direction to move,
 not an accelerometer channel. Physically center XY, leave both axes unhomed,
 keep Z supported/clear, and supervise with an accessible emergency stop.
-`CENTERED=1` authorizes the mapping strokes as well as subsequent homing.
+`CENTERED=1` authorizes automatic mapping strokes when needed, as well as
+subsequent homing.
 
 ## Automatic physical-axis mapping
 
-Every new per-axis calibration first makes gentle, short central strokes in
-both directions on the selected machine axis. It uses the signed motion
+Calibration first checks the **selected sensor's loaded configuration**,
+including included files and named sensor sections. An explicit Beacon
+`accel_axes_map` or other accelerometer's `axes_map` skips automatic mapping.
+The configured stream's X channel is then used for physical X and Y for
+physical Y. An explicit `x,y,z` counts as configured; the driver's identity
+default when the option is omitted does not. The declared map must be a valid
+signed permutation and agree with the map applied by the driver. This path
+trusts the user's orientation setting; it does not measure or verify mounting.
+
+When the selected sensor has no explicit map, calibration makes gentle, short
+central strokes in both directions on the selected machine axis. It uses the signed motion
 response to identify one configured-stream sensor channel and its sign.
 Each outward stroke is at most 15 mm, with a commanded return to the manual
 center between directions; speed is at most 20 mm/s and acceleration at most
@@ -25,11 +35,14 @@ or inconsistent response aborts before noise-based threshold selection or homing
 there is no fallback to whichever channel has the largest impact peak.
 
 The mapping acts on the sensor stream **after** the sensor's configured
-`axes_map`; the plugin does not rewrite that configuration or apply it twice.
+`accel_axes_map` or `axes_map`; the plugin does not rewrite that configuration
+or apply it twice.
 The result is stored with the selected axis model and its sensor context.
 Repeat calibration after changing the sensor, orientation, axes map or other
-reported context. Mapping proves a consistent measured response to commanded
-motion; it does not independently verify physical position or clearance.
+reported context. Automatic mapping checks a consistent measured response to
+commanded motion; it does not independently verify physical position or clearance.
+Neither mapping path moves machine Z. Fresh noise measurement and threshold
+qualification still run when an explicit configuration skips the mapping strokes.
 
 Recalibrate both axes after remounting the sensor. If a successful calibration
 detects that the previous orientation changed or conflicts with the other
@@ -87,11 +100,11 @@ Each move acquires a fresh resting XYZ offset (normally 100 ms, at least
 50 contiguous samples), separate from the initial three noise windows.
 It does not test stationary peak-to-peak quietness. For each sample it evaluates
 `abs(sign * (a[source_axis] - baseline[source_axis]))` in g, with the
-learned channel/sign and the resting offset fixed for the move. X homing uses
+selected channel/sign and the resting offset fixed for the move. X homing uses
 only physical X; Y homing uses only physical Y. Other stream channels remain
 available for diagnostics and do not contribute to the ordinary impact metric.
 The first sample at or above the candidate threshold requests an immediate
-stop. The later recorded impact peak does not delay stopping. The learned sign
+stop. The later recorded impact peak does not delay stopping. The selected sign
 preserves physical-axis orientation; taking the absolute value makes the
 trigger independent of polarity. Ordinary motion can also cross the
 threshold: it is not an independent classifier of mechanical contact.
@@ -285,8 +298,12 @@ continue to describe their measurement and initial-value hints.
 
 New models record `impact_metric: mapped_axis` and `axis_mapping` with version,
 machine axis, source channel, sign, `coordinate_frame: configured_sensor_stream`,
-method `bidirectional_velocity_v1`, confidence and diagnostics. After reload,
-ordinary G28, TEST, CHARTS, ACCURACY and TROUBLESHOOT use that axis's mapped
+and its selection method. `bidirectional_velocity_v1` records measured confidence
+and diagnostics; `configured_axes_map_v1` instead records the explicit sensor
+section, option and normalized map, without claiming measured confidence.
+Configured-map models require the same explicit declaration after reload.
+Previously inferred models remain valid when their sensor context is unchanged.
+After reload, ordinary G28, TEST, CHARTS, ACCURACY and TROUBLESHOOT use that axis's mapped
 component and offset-only reference. Charts identify the physical axis and
 keep the other configured-stream channels visible as diagnostics.
 Older XYZ-magnitude qualifications require fresh calibration and cannot supply

@@ -49,6 +49,7 @@ else:  # Standalone offline analysis; do not mask package dependency errors.
 _axes_module = _ah_compat_sibling_module("accel_homing_axes", __package__, __file__)
 infer_axis_mapping = _axes_module.infer_axis_mapping
 validate_axis_mapping = _axes_module.validate_axis_mapping
+CONFIGURED_MAPPING_METHOD = _axes_module.CONFIGURED_METHOD
 
 try:
     from .homing import PrinterHoming as _PrinterHoming
@@ -951,7 +952,7 @@ class AccelHomingWorkflows:
                     and model.metadata[axis].get("impact_metric") == "mapped_axis")
 
     def detection_axis_mapping(self, axis):
-        """Return a learned channel in the configured sensor stream frame."""
+        """Return the qualified channel in the configured sensor stream frame."""
         session = self.session
         if self._experimental_home(axis) or (session and session.get("beta")):
             return None
@@ -974,11 +975,20 @@ class AccelHomingWorkflows:
             self._check_pending_mapping(axis)
             return None
         try:
-            mapping = validate_axis_mapping(mapping, axis)
+            mapping = self._validate_current_axis_mapping(mapping, axis)
         except (TypeError, ValueError) as exc:
-            raise self._error("invalid saved automatic axis mapping: %s; recalibrate %s" % (exc, axis.upper()))
+            raise self._error("invalid saved axis mapping: %s; recalibrate %s" % (exc, axis.upper()))
         if context != self.owner.noise_sensor_context():
-            raise self._error("automatic axis mapping sensor context changed; recalibrate %s" % axis.upper())
+            raise self._error("axis mapping sensor context changed; recalibrate %s" % axis.upper())
+        return mapping
+
+    def _validate_current_axis_mapping(self, mapping, axis):
+        mapping = validate_axis_mapping(mapping, axis)
+        if mapping["method"] == CONFIGURED_MAPPING_METHOD:
+            configured = getattr(self.owner, "configured_axis_mapping", None)
+            current = configured(axis) if callable(configured) else None
+            if current is None or validate_axis_mapping(current, axis) != mapping:
+                raise ValueError("configured sensor axis map changed or was removed; recalibrate %s" % axis.upper())
         return mapping
 
     def _staged_or_saved_metadata(self, axis):
@@ -1443,7 +1453,10 @@ class AccelHomingWorkflows:
         self._preflight([session["axis"]], continuation=continuation)
         self._require_unhomed_xy()
         self._check_stopped_noise_context(session)
-        mapping = validate_axis_mapping(session["axis_mapping"], session["axis"])
+        try:
+            mapping = self._validate_current_axis_mapping(session["axis_mapping"], session["axis"])
+        except (TypeError, ValueError) as exc:
+            raise self._error("axis mapping changed during stationary noise measurement: %s" % exc) from exc
         source_axis = "xyz"[mapping["source_axis"]]
         peaks = [item["record"]["noise_peak_g"].get(source_axis) for item in session["iterations"]]
         if (len(peaks) != NOISE_ITERATIONS or any(
@@ -1757,7 +1770,7 @@ class AccelHomingWorkflows:
             raise self._error("homing capture does not belong to the current detector/reference")
         if record.get("impact_metric") == "mapped_axis":
             try:
-                expected_mapping = (validate_axis_mapping(session.get("axis_mapping"), axis)
+                expected_mapping = (self._validate_current_axis_mapping(session.get("axis_mapping"), axis)
                     if session.get("mode") == "calibration" else self.detection_axis_mapping(axis))
                 if (expected_mapping is None
                         or any(validate_axis_mapping(item.get("axis_mapping"), axis) != expected_mapping
@@ -1912,7 +1925,7 @@ class AccelHomingWorkflows:
                 return "fatal", "calibration requires the current %s detector" % self._calibration_metric(session)
             if not session.get("beta"):
                 try:
-                    mapping = validate_axis_mapping(session.get("axis_mapping"), axis)
+                    mapping = self._validate_current_axis_mapping(session.get("axis_mapping"), axis)
                     if (validate_axis_mapping(record.get("axis_mapping"), axis) != mapping
                             or session.get("axis_mapping_context") != self.owner.noise_sensor_context()):
                         raise ValueError("mapping or sensor context changed")
@@ -2227,7 +2240,7 @@ class AccelHomingWorkflows:
             # sensor headroom, not just the lower threshold used by the trials.
             threshold = self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
-                    "axis_mapping": validate_axis_mapping(session["axis_mapping"], axis),
+                    "axis_mapping": self._validate_current_axis_mapping(session["axis_mapping"], axis),
                     "axis_mapping_context": session["axis_mapping_context"],
                     "polarity_policy": POLARITY_POLICY,
                     "signal_quality": [self._signal_metadata(record) for record in qualified],
@@ -2594,17 +2607,32 @@ class AccelHomingWorkflows:
                 "driver_current_context": current_context}
 
     def _calibration_axis_mapping(self, session):
-        """Learn one signed channel from two independently captured free strokes."""
+        """Use an explicit sensor declaration or learn a signed channel."""
         axis, toolhead = session["axis"], self.owner.toolhead
         continuation = bool(session.get("accuracy_recovery"))
         self._preflight([axis], continuation=continuation)
         self._require_unhomed_xy()
-        plan = self._axis_mapping_plan(axis)
         session.update(state="mapping", axis_mapping_generation=self.owner.operation_generation,
                        axis_mapping_context=self.owner.noise_sensor_context(), axis_mapping_phase="preflight",
                        axis_mapping_capture_started=False)
         self._axis_mapping_reset_closed_fault(session)
         self._axis_mapping_check(session)
+        configured = getattr(self.owner, "configured_axis_mapping", None)
+        mapping = configured(axis) if callable(configured) else None
+        if mapping is not None:
+            try:
+                mapping = self._validate_current_axis_mapping(mapping, axis)
+            except (TypeError, ValueError) as exc:
+                raise self._axis_mapping_error(session, str(exc)) from exc
+            self._axis_mapping_peer_conflict(session, mapping)
+            self._axis_mapping_check(session)
+            session.update(axis_mapping=mapping, axis_mapping_phase="qualified", state="starting")
+            declaration = mapping["configuration"]
+            self._info("%s uses explicitly configured [%s] %s: %s; automatic mapping strokes skipped" % (
+                axis.upper(), declaration["sensor_section"], declaration["option"],
+                ", ".join(declaration["axes_map"])))
+            return
+        plan = self._axis_mapping_plan(axis)
         index, kin = AXES[axis], toolhead.get_kinematics()
         original_position, original_limit = toolhead.get_position()[index], kin.limits[index]
         current_attempted = completed = False
@@ -2703,21 +2731,7 @@ class AccelHomingWorkflows:
                           "homing_current_applied": bool(current_attempted),
                           "calibration_settle_time_s": self.calibration_settle_time})
                 raise
-            other = "y" if axis == "x" else "x"
-            metadata = self._staged_or_saved_metadata(other)
-            previous = self._staged_or_saved_metadata(axis)
-            orientation_changed = False
-            if (previous is not None and previous.get("impact_metric") == "mapped_axis"
-                    and not previous.get("axis_mapping_invalidated")
-                    and previous.get("axis_mapping_context") == session["axis_mapping_context"]):
-                old_map = validate_axis_mapping(previous.get("axis_mapping"), axis)
-                orientation_changed = any(old_map[key] != mapping[key] for key in ("source_axis", "sign"))
-            if (metadata is not None and metadata.get("impact_metric") == "mapped_axis"
-                    and not metadata.get("axis_mapping_invalidated")
-                    and metadata.get("axis_mapping_context") == session["axis_mapping_context"]
-                    and (orientation_changed or
-                         validate_axis_mapping(metadata.get("axis_mapping"), other)["source_axis"] == mapping["source_axis"])):
-                session["axis_mapping_peer_conflict"] = {"axis": other, "metadata": copy.deepcopy(metadata)}
+            self._axis_mapping_peer_conflict(session, mapping)
             self._axis_mapping_check(session)
             completed = True
         except Exception as exc:
@@ -2762,6 +2776,24 @@ class AccelHomingWorkflows:
         session.update(axis_mapping=mapping, axis_mapping_phase="qualified", state="starting")
         self._info("%s mapped to configured sensor %s%s; bidirectional free-motion evidence qualified" % (
             axis.upper(), "+" if mapping["sign"] > 0 else "-", "XYZ"[mapping["source_axis"]]))
+
+    def _axis_mapping_peer_conflict(self, session, mapping):
+        axis = session["axis"]
+        other = "y" if axis == "x" else "x"
+        metadata = self._staged_or_saved_metadata(other)
+        previous = self._staged_or_saved_metadata(axis)
+        orientation_changed = False
+        if (previous is not None and previous.get("impact_metric") == "mapped_axis"
+                and not previous.get("axis_mapping_invalidated")
+                and previous.get("axis_mapping_context") == session["axis_mapping_context"]):
+            old_map = validate_axis_mapping(previous.get("axis_mapping"), axis)
+            orientation_changed = any(old_map[key] != mapping[key] for key in ("source_axis", "sign"))
+        if (metadata is not None and metadata.get("impact_metric") == "mapped_axis"
+                and not metadata.get("axis_mapping_invalidated")
+                and metadata.get("axis_mapping_context") == session["axis_mapping_context"]
+                and (orientation_changed or
+                     validate_axis_mapping(metadata.get("axis_mapping"), other)["source_axis"] == mapping["source_axis"])):
+            session["axis_mapping_peer_conflict"] = {"axis": other, "metadata": copy.deepcopy(metadata)}
 
     def _beta_extractor(self):
         report = self.printer.lookup_object("motion_report", None)

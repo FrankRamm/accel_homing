@@ -33,8 +33,10 @@ else:  # Standalone offline replay harness; preserve package import failures.
                                        motion_startup_timeout, select_sensor,
                                        _ah_compat_sibling_module)
 
-validate_axis_mapping = _ah_compat_sibling_module(
-    "accel_homing_axes", __package__, __file__).validate_axis_mapping
+_axes_module = _ah_compat_sibling_module("accel_homing_axes", __package__, __file__)
+validate_axis_mapping = _axes_module.validate_axis_mapping
+normalize_configured_axes_map = _axes_module.normalize_configured_axes_map
+CONFIGURED_METHOD = _axes_module.CONFIGURED_METHOD
 
 SAMPLE = struct.Struct("<hhh")
 CLIPPED = 0x7FFF
@@ -578,6 +580,9 @@ class BeaconAccelHoming:
                 raise config.error("accel_homing: %s must be finite" % option)
         # Load the sensor first so its MCU is configured before our connect handler.
         self.sensor = self.printer.load_object(config, self.sensor_name)
+        # This wrapper represents the merged loaded section, including includes.
+        # Driver runtime maps cannot distinguish an explicit identity from defaults.
+        self.sensor_config = config.getsection(self.sensor_name)
         self.backend = None if self.is_beacon else ConfiguredAccelBackend(self, config, self.sensor)
         if self.backend is not None and config.get("threshold", None) is None:
             default_threshold = min(8.0, self.backend.full_scale * 0.5)
@@ -880,6 +885,41 @@ class BeaconAccelHoming:
             raise self.printer.command_error("accel_homing: invalid accelerometer axes map")
         return tuple(tuple(pair) for pair in mapping)
 
+    def configured_axis_mapping(self, axis):
+        """Trust only an explicit selected-sensor map, applied by its driver once."""
+        if axis not in AXES:
+            raise self.printer.command_error("accel_homing: configured mapping requires X or Y")
+        option = "accel_axes_map" if self.is_beacon else "axes_map"
+        # note_valid=False preserves the driver's typed access-tracking entry.
+        declared = self.sensor_config.get(option, None, note_valid=False)
+        if declared is None:
+            return None
+        try:
+            tokens = normalize_configured_axes_map(declared)
+            mapping = validate_axis_mapping({
+                "version": 1, "axis": axis, "source_axis": AXES[axis], "sign": 1,
+                "coordinate_frame": _axes_module.FRAME, "method": CONFIGURED_METHOD,
+                "configuration": {"sensor_section": self.sensor_name,
+                                  "option": option, "axes_map": tokens}}, axis)
+            runtime = (self._capture_axes_mapping() if self.backend is None
+                       else getattr(self.backend.sensor, "axes_map", None))
+            if (not isinstance(runtime, (list, tuple)) or len(runtime) != 3
+                    or any(not isinstance(pair, (list, tuple)) or len(pair) != 2
+                           or type(pair[0]) is not int or pair[0] not in (0, 1, 2)
+                           or type(pair[1]) not in (int, float)
+                           or not math.isfinite(pair[1]) or pair[1] == 0
+                           for pair in runtime)):
+                raise ValueError("driver does not expose a valid axes map")
+            expected = [("xyz".index(token[-1]), -1 if token.startswith("-") else 1)
+                        for token in tokens]
+            observed = [(index, -1 if scale < 0 else 1) for index, scale in runtime]
+            if observed != expected:
+                raise ValueError("explicit axes map disagrees with the active driver map")
+            return mapping
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise self.printer.command_error("accel_homing: invalid explicit [%s] %s: %s" % (
+                self.sensor_name, option, exc)) from exc
+
     @staticmethod
     def _impact_metric(attempt):
         if attempt.axis_mapping is not None:
@@ -898,7 +938,7 @@ class BeaconAccelHoming:
         session = self.workflows.session
         if (isinstance(session, dict) and session.get("mode") == "calibration"
                 and not session.get("beta") and not session.get("experiment")):
-            raise self.printer.command_error("accel_homing: calibration requires a qualified automatic axis mapping")
+            raise self.printer.command_error("accel_homing: calibration requires a qualified axis mapping")
         return None
 
     def _native_decode_context(self, params):

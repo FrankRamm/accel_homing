@@ -138,6 +138,215 @@ class MappingRig(Rig):
 
 
 class AxisMappingWorkflowTests(unittest.TestCase):
+    def use_configured_mapping(self, rig, tokens=("x", "y", "z")):
+        rig.owner.sensor_name = "adxl345 toolhead"
+        declaration = {"sensor_section": rig.owner.sensor_name, "option": "axes_map", "axes_map": list(tokens)}
+        rig.axis_declaration = declaration
+        def configured(axis):
+            if rig.axis_declaration is None:
+                return None
+            return {"version": 1, "axis": axis, "source_axis": "xy".index(axis), "sign": 1,
+                    "coordinate_frame": "configured_sensor_stream", "method": "configured_axes_map_v1",
+                    "configuration": copy.deepcopy(rig.axis_declaration)}
+        rig.owner.configured_axis_mapping = configured
+        return declaration
+
+    def test_explicit_identity_permutation_and_sign_skip_only_mapping_motion(self):
+        for axis in "xy":
+            for tokens in (("x", "y", "z"), ("z", "x", "y"), ("-y", "x", "-z")):
+                with self.subTest(axis=axis, declaration=tokens):
+                    rig = MappingRig(axis)
+                    declaration = self.use_configured_mapping(rig, tokens)
+                    initial, limits, accel = rig.toolhead.get_position(), list(rig.toolhead.kin.limits), rig.toolhead.accel
+                    session = rig.begin_mapping()
+                    del rig.objects["motion_report"]
+                    del rig.owner.start_beta_motion_capture
+                    del rig.owner.stop_beta_motion_capture
+                    with mock.patch.object(rig.workflow, "_axis_mapping_plan", side_effect=AssertionError("mapping plan requested")):
+                        rig.workflow._calibration_axis_mapping(session)
+                    mapping = session["axis_mapping"]
+                    self.assertEqual((mapping["source_axis"], mapping["sign"]), ("xy".index(axis), 1))
+                    self.assertEqual(mapping["configuration"], declaration)
+                    self.assertEqual(mapping["method"], "configured_axes_map_v1")
+                    self.assertNotIn("confidence", mapping)
+                    self.assertNotIn("passes", mapping)
+                    self.assertEqual(rig.toolhead.position, initial)
+                    self.assertEqual(rig.toolhead.kin.limits, limits)
+                    self.assertEqual(rig.toolhead.accel, accel)
+                    self.assertEqual(rig.toolhead.moves, [])
+                    self.assertEqual(rig.events, [])
+                    self.assertEqual(rig.home_calls, [])
+                    self.assertEqual(session["axis_mapping_phase"], "qualified")
+                    self.assertTrue(any("explicitly configured" in line for line in rig.output))
+                    self.assertFalse(any("bidirectional free-motion evidence qualified" in line for line in rig.output))
+
+    def test_absent_explicit_declaration_keeps_bidirectional_mapping(self):
+        rig = MappingRig()
+        rig.owner.configured_axis_mapping = mock.Mock(return_value=None)
+        session = rig.begin_mapping()
+        rig.workflow._calibration_axis_mapping(session)
+        self.assertEqual(session["axis_mapping"]["method"], "bidirectional_velocity_v1")
+        self.assertEqual(rig.events.count("reference"), 2)
+        self.assertEqual(rig.events.count("capture"), 2)
+        self.assertEqual(len(rig.toolhead.moves), 4)
+
+    def test_configured_mapping_still_measures_fresh_noise_calibrates_and_persists(self):
+        for axis in "xy":
+            with self.subTest(axis=axis):
+                rig = MappingRig(axis)
+                declaration = self.use_configured_mapping(rig, ("-y", "x", "-z"))
+                initial, limits = rig.toolhead.get_position(), list(rig.toolhead.kin.limits)
+                rig.amplitudes = (.6, 7., 5.) if axis == "x" else (7., .6, 5.)
+                original_noise = rig.workflow._calibration_noise_preflight
+                def noise(session):
+                    self.assertEqual(rig.events, [])
+                    self.assertEqual(rig.toolhead.moves, [])
+                    self.assertEqual(rig.toolhead.position, initial)
+                    self.assertEqual(rig.toolhead.kin.limits, limits)
+                    original_noise(session)
+                with mock.patch.object(rig.workflow, "_calibration_noise_preflight", side_effect=noise), \
+                        mock.patch.object(workflow_module, "publish_noise", return_value={"png": "noise.png"}):
+                    rig.calibrate(axis.upper(), save=0)
+                self.addCleanup(rig.calibration_charts.cleanup)
+                self.assertEqual(rig.noise_window_count, 3)
+                self.assertEqual(len(rig.home_calls), 11)
+                self.assertTrue(all(home["axis"] == axis for home in rig.home_calls))
+                self.assertEqual(rig.home_calls[0]["threshold"], 1.)
+                self.assertEqual(rig.events.count("reference"), 0)
+                self.assertEqual(rig.events.count("capture"), 0)
+                self.assertEqual(rig.events.count("profile"), 0)
+                self.assertEqual(rig.toolhead.position[2:], initial[2:])
+                self.assertTrue(all(move[2] is None for move, speed in rig.toolhead.moves))
+                metadata = json.loads(rig.configfile.saved[("accel_homing_model default", axis + "_metadata")])
+                self.assertEqual(metadata["axis_mapping"]["configuration"], declaration)
+                self.assertEqual(metadata["axis_mapping"]["source_axis"], "xy".index(axis))
+                self.assertEqual(metadata["impact_metric"], "mapped_axis")
+                self.assertAlmostEqual(metadata["stationary_noise_measurement"]["noise_axis_peak_g"], .6)
+                AccelHomingModel(Config(None, {axis + "_threshold": rig.workflow.last_result["threshold_g"],
+                                             axis + "_successes": 10, axis + "_metadata": json.dumps(metadata)},
+                                       "accel_homing_model configured"))
+
+    def test_configured_shortcut_preserves_center_unhomed_busy_and_fault_guards(self):
+        for fault in ("center", "homed", "busy", "sensor"):
+            with self.subTest(fault=fault):
+                rig = MappingRig()
+                self.use_configured_mapping(rig)
+                if fault == "homed": rig.toolhead.kin.limits[0] = (0., 300.)
+                elif fault == "busy": rig.idle_state = "Printing"
+                elif fault == "sensor": rig.owner.sensor_fault = "sample_gap"
+                initial, limits = rig.toolhead.get_position(), list(rig.toolhead.kin.limits)
+                with mock.patch.object(rig.workflow, "_chart_preflight"), self.assertRaises(CommandError):
+                    rig.workflow.cmd_CALIBRATE(GCmd(AXIS="X", CENTERED=0 if fault == "center" else 1, SAVE_CONFIG=0))
+                self.assertEqual(rig.events, [])
+                self.assertEqual(rig.toolhead.moves, [])
+                self.assertEqual(rig.toolhead.position, initial)
+                self.assertEqual(rig.toolhead.kin.limits, limits)
+                self.assertEqual(rig.noise_calls, [])
+                self.assertEqual(rig.configfile.saved, {})
+
+    def test_configured_provenance_is_rechecked_after_noise_receipts_and_final_release(self):
+        for boundary in ("noise", "receipt", "save"):
+            with self.subTest(boundary=boundary):
+                rig = MappingRig()
+                self.use_configured_mapping(rig)
+                if boundary == "noise":
+                    rig.on_noise = lambda iteration: setattr(rig, "axis_declaration", None)
+                elif boundary == "receipt":
+                    original_capture = rig.owner.stop_capture
+                    def capture():
+                        result = original_capture()
+                        rig.axis_declaration = None
+                        return result
+                    rig.owner.stop_capture = capture
+                else:
+                    original_release = rig.workflow._release_terminal_home
+                    def release(axis, record):
+                        original_release(axis, record)
+                        rig.axis_declaration = None
+                    rig.workflow._release_terminal_home = release
+                with self.assertRaises((CommandError, ValueError)):
+                    rig.calibrate(save=0)
+                self.addCleanup(rig.calibration_charts.cleanup)
+                self.assertEqual(rig.configfile.saved, {})
+                self.assertEqual(rig.workflow.pending_model_metadata, {})
+                self.assertEqual(len(rig.home_calls), {"noise": 0, "receipt": 1, "save": 11}[boundary])
+                self.assertEqual(rig.toolhead.position[2:], [40., 6.])
+
+    def test_configured_model_requires_same_declaration_but_inferred_model_does_not(self):
+        rig = MappingRig()
+        self.use_configured_mapping(rig)
+        mapping = rig.owner.configured_axis_mapping("x")
+        metadata = {"impact_metric": "mapped_axis", "axis_mapping": mapping,
+                    "axis_mapping_context": rig.sensor_context()}
+        rig.workflow.model = types.SimpleNamespace(thresholds={"x": 4.}, metadata={"x": metadata})
+        self.assertEqual(rig.workflow.detection_axis_mapping("x"), mapping)
+        rig.owner.sensor_name = "different"
+        with self.assertRaisesRegex(CommandError, "context changed"):
+            rig.workflow.detection_axis_mapping("x")
+        rig.owner.sensor_name = mapping["configuration"]["sensor_section"]
+        for declaration in (None, {**mapping["configuration"], "axes_map": ["y", "x", "z"]}):
+            rig.axis_declaration = declaration
+            with self.assertRaisesRegex(CommandError, "changed|removed"):
+                rig.workflow.detection_axis_mapping("x")
+        inferred = {"axis": "x"}
+        rig.qualify_axis_mapping(inferred)
+        metadata.update(inferred)
+        self.assertEqual(rig.workflow.detection_axis_mapping("x")["method"], "bidirectional_velocity_v1")
+        rig.owner.sensor_name = "different"
+        with self.assertRaisesRegex(CommandError, "context changed"):
+            rig.workflow.detection_axis_mapping("x")
+
+    def test_invalid_explicit_mapping_never_falls_back_to_motion_identification(self):
+        rig = MappingRig()
+        self.use_configured_mapping(rig)
+        mapping = rig.owner.configured_axis_mapping("x")
+        mapping["source_axis"] = 2
+        rig.owner.configured_axis_mapping = lambda axis: mapping
+        rig.begin_mapping()
+        with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch.object(rig.workflow, "_axis_mapping_plan", side_effect=AssertionError("fallback motion")), \
+                self.assertRaises(CommandError):
+            rig.workflow._run_calibration()
+        self.assertEqual(rig.events, [])
+        self.assertEqual(rig.toolhead.moves, [])
+        self.assertEqual(rig.noise_calls, [])
+        self.assertEqual(rig.home_calls, [])
+        self.assertEqual(rig.configfile.saved, {})
+
+    def test_inferred_to_configured_orientation_change_stages_peer_invalidation_atomically(self):
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                rig = MappingRig()
+                self.use_configured_mapping(rig)
+                self.saved_pair(rig)
+                rig.workflow.model.metadata["x"]["axis_mapping"]["source_axis"] = 2
+                original = copy.deepcopy(rig.workflow.model.metadata)
+                if failure:
+                    rig.home_results.append(CommandError("synthetic home failure"))
+                    with self.assertRaises(CommandError):
+                        rig.calibrate(save=0)
+                    self.addCleanup(rig.calibration_charts.cleanup)
+                    self.assertEqual(rig.configfile.saved, {})
+                    self.assertEqual(rig.workflow.pending_model_metadata, {})
+                else:
+                    with mock.patch.object(workflow_module, "publish_noise", return_value={"png": "noise.png"}):
+                        rig.calibrate("X", save=0)
+                        self.addCleanup(rig.calibration_charts.cleanup)
+                        first_x = copy.deepcopy(rig.workflow.pending_model_metadata["x"])
+                        self.assertTrue(rig.workflow.pending_model_metadata["y"]["axis_mapping_invalidated"])
+                        with self.assertRaisesRegex(CommandError, "invalidated"):
+                            rig.workflow.check_home_axes(["y"])
+                        rig.toolhead.kin.limits[:2] = [(1., -1.)] * 2
+                        rig.idle_state = "Ready"
+                        rig.calibrate("Y", save=0)
+                    self.assertEqual(rig.workflow.pending_model_metadata["x"], first_x)
+                    self.assertNotIn("axis_mapping_invalidated", rig.workflow.pending_model_metadata["y"])
+                    self.assertTrue(all(item["axis_mapping"]["method"] == "configured_axes_map_v1"
+                                        for item in rig.workflow.pending_model_metadata.values()))
+                self.assertEqual(rig.workflow.model.metadata, original)
+                self.assertEqual(rig.events.count("reference"), 0)
+                self.assertEqual(rig.toolhead.position[2:], [40., 6.])
+
     def test_manual_retry_after_closed_stream_fault_reaches_real_fresh_reference(self):
         for decoded in (False, True):
             with self.subTest(decoded=decoded):

@@ -14,6 +14,7 @@ import statistics
 
 FRAME = "configured_sensor_stream"
 METHOD = "bidirectional_velocity_v1"
+CONFIGURED_METHOD = "configured_axes_map_v1"
 GRAVITY_MM_S2 = 9806.65
 MIN_ALIGNMENT = 0.85
 MIN_DIRECTION_AGREEMENT = 0.95
@@ -35,6 +36,20 @@ def _finite_tree(value):
     return value is None or isinstance(value, (str, bool, int))
 
 
+def normalize_configured_axes_map(value):
+    """Normalize an explicit driver option, never substitute a default map."""
+    if isinstance(value, str):
+        value = value.split(",")
+    if (not isinstance(value, (list, tuple)) or len(value) != 3
+            or any(not isinstance(token, str) for token in value)):
+        raise ValueError("Configured axes map must contain three signed axes")
+    tokens = [token.strip() for token in value]
+    if (any(token not in ("x", "y", "z", "-x", "-y", "-z") for token in tokens)
+            or len({token[-1] for token in tokens}) != 3):
+        raise ValueError("Configured axes map must be a signed permutation of x, y, z")
+    return tokens
+
+
 def validate_axis_mapping(mapping, axis=None):
     """Validate persisted coordinate semantics; return an independent copy."""
     if not isinstance(mapping, dict) or not _finite_tree(mapping):
@@ -49,8 +64,26 @@ def validate_axis_mapping(mapping, axis=None):
         raise ValueError("Axis mapping source_axis must be 0, 1 or 2")
     if type(mapping.get("sign")) is not int or mapping["sign"] not in (-1, 1):
         raise ValueError("Axis mapping sign must be +1 or -1")
-    if mapping.get("coordinate_frame") != FRAME or mapping.get("method") != METHOD:
+    if (mapping.get("coordinate_frame") != FRAME
+            or mapping.get("method") not in (METHOD, CONFIGURED_METHOD)):
         raise ValueError("Unsupported axis mapping coordinate frame or method")
+    if mapping["method"] == CONFIGURED_METHOD:
+        if mapping["source_axis"] != "xy".index(mapping["axis"]) or mapping["sign"] != 1:
+            raise ValueError("Configured mapping must select the machine axis in the configured sensor stream")
+        if any(key in mapping for key in ("confidence", "passes", "direction_agreement")):
+            raise ValueError("Configured mapping cannot claim measured inference evidence")
+        declaration = mapping.get("configuration")
+        if not isinstance(declaration, dict):
+            raise ValueError("Configured mapping requires its explicit sensor configuration")
+        section = declaration.get("sensor_section")
+        if not isinstance(section, str) or not section or section != section.strip():
+            raise ValueError("Configured mapping requires the selected sensor section")
+        option = "accel_axes_map" if section.split()[0] == "beacon" else "axes_map"
+        if declaration.get("option") != option:
+            raise ValueError("Configured mapping has the wrong axes-map option for its sensor")
+        tokens = declaration.get("axes_map")
+        if not isinstance(tokens, list) or normalize_configured_axes_map(tokens) != tokens:
+            raise ValueError("Configured mapping requires a normalized signed axes-map permutation")
     if "confidence" in mapping and (not _number(mapping["confidence"])
                                     or not MIN_ALIGNMENT <= mapping["confidence"] <= 1):
         raise ValueError("Axis mapping is ambiguous or has invalid confidence")

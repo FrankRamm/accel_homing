@@ -136,6 +136,16 @@ class FakeConfig:
     def has_section(self, name):
         return name in self.sections
 
+    def getsection(self, name):
+        if name == "printer" and not self.has_section(name):
+            # Older minimal fixtures supplied no global printer options; their
+            # workflows previously retained an unspecified kinematics value.
+            return FakeConfig(self.printer, {}, self.sections, name)
+        if not self.has_section(name):
+            raise ConfigError("Missing section " + name)
+        options = self.sections[name] if isinstance(self.sections, dict) else {}
+        return FakeConfig(self.printer, options, self.sections, name)
+
     def get_prefix_sections(self, prefix):
         return [types.SimpleNamespace(get_name=lambda name=name: name)
                 for name in self.sections if name == prefix or name.startswith(prefix + " ")]
@@ -143,7 +153,7 @@ class FakeConfig:
     def deprecate(self, option):
         self.deprecated.append(option)
 
-    def get(self, name, default=None):
+    def get(self, name, default=None, note_valid=True):
         return self.options.get(name, default)
 
     def _number(self, kind, name, default, minval=None, maxval=None):

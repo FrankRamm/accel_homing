@@ -71,7 +71,7 @@ an 8 g MPU9250 sensor.
 To use calibration, comment out both axis overrides **and** the shared
 `threshold`, then issue console `RESTART` while idle. An explicit manual
 threshold changes the numeric threshold. When a valid mapped-axis model exists,
-its learned orientation and mapped detector remain active with that manual
+its configured or learned orientation and mapped detector remain active with that manual
 value. Without a mapped model, manual thresholds retain the legacy configured
 channel behavior. RAW detection subtracts its fresh signed reference before
 the absolute value; homing direction controls commanded travel, not polarity.
@@ -87,10 +87,15 @@ choose an explicit manual threshold; the plugin does not rewrite old models.
 SAVE_CONFIG block. Leave the generated **DO NOT EDIT** block alone. Models keep
 each axis independently, ten-success qualification and sensor/geometry metadata.
 New calibration stores `impact_metric: mapped_axis` and a versioned
-`axis_mapping` with machine axis, source channel, sign, confidence and diagnostic
-evidence. Its coordinate frame is the configured sensor stream, after the
-driver's `axes_map`. The plugin does not edit that driver setting. X/Y homing
-uses only its own learned physical component; raw XYZ remain available for
+`axis_mapping` with machine axis, source channel, sign and selection method.
+An explicit `accel_axes_map` in the selected Beacon section, or `axes_map` in
+the selected other sensor section, uses method `configured_axes_map_v1` and
+records that declaration. Included settings and explicit `x,y,z` are recognized;
+omitted identity defaults are not. Without an explicit declaration, automatic
+mapping uses `bidirectional_velocity_v1` with measured confidence and diagnostics.
+Its coordinate frame is the configured sensor stream, after the driver's map.
+The plugin does not edit or apply that setting twice. X/Y homing
+uses only its own selected physical component; raw XYZ remain available for
 diagnosis. A changed sensor/orientation/axes map requires recalibration.
 Changed context can prevent a model from being accepted; recalibrate after
 reviewing the reported mismatch rather than editing generated metadata.

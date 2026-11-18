@@ -7,7 +7,9 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from accel_homing_axes import GRAVITY_MM_S2, infer_axis_mapping, validate_axis_mapping
+from accel_homing_axes import (CONFIGURED_METHOD, FRAME, GRAVITY_MM_S2,
+                               infer_axis_mapping, normalize_configured_axes_map,
+                               validate_axis_mapping)
 
 
 def motion_pass(direction, vector=(1., 0., 0.), noise=0., rate=1000., offset=(.1, -.2, 1.)):
@@ -331,6 +333,56 @@ class AxisMappingValidationTests(unittest.TestCase):
         result = validate_axis_mapping(self.mapping, "x")
         self.mapping["passes"][0]["velocity_mm_s"][0] = 999.
         self.assertNotEqual(self.mapping, result)
+
+
+class ConfiguredAxisMappingValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.mapping = {"version": 1, "axis": "x", "source_axis": 0, "sign": 1,
+                        "coordinate_frame": FRAME, "method": CONFIGURED_METHOD,
+                        "configuration": {"sensor_section": "beacon toolhead",
+                                          "option": "accel_axes_map", "axes_map": ["y", "-x", "z"]}}
+
+    def test_accepts_declared_identity_without_fabricated_inference_evidence(self):
+        for axis in "xy":
+            self.mapping.update(axis=axis, source_axis="xy".index(axis))
+            result = validate_axis_mapping(self.mapping, axis)
+            self.assertEqual(result, self.mapping)
+            for field in ("confidence", "passes", "direction_agreement"):
+                self.assertNotIn(field, result)
+            json.dumps(result, allow_nan=False)
+
+    def test_rejects_raw_axis_transform_or_measured_evidence_in_configured_frame(self):
+        for key, value in (("source_axis", 1), ("sign", -1),
+                           ("confidence", 1.), ("passes", []), ("direction_agreement", 1.)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_axis_mapping(dict(self.mapping, **{key: value}), "x")
+
+    def test_requires_sensor_option_and_normalized_permutation_provenance(self):
+        for key, value in (("sensor_section", ""), ("sensor_section", " beacon"),
+                           ("option", "axes_map"), ("axes_map", "y,-x,z"),
+                           ("axes_map", ["y", "y", "z"]), ("axes_map", [" y", "-x", "z"]),
+                           ("axes_map", ["y", "x", "+z"]), ("axes_map", ["y", "-x"]),
+                           ("axes_map", ["y", None, "z"])):
+            candidate = copy.deepcopy(self.mapping)
+            candidate["configuration"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                validate_axis_mapping(candidate, "x")
+        candidate = dict(self.mapping)
+        candidate.pop("configuration")
+        with self.assertRaises(ValueError):
+            validate_axis_mapping(candidate, "x")
+
+    def test_generic_sensor_uses_axes_map_option_and_returns_detached_provenance(self):
+        self.mapping["configuration"].update(sensor_section="adxl345 toolhead", option="axes_map")
+        result = validate_axis_mapping(self.mapping, "x")
+        self.mapping["configuration"]["axes_map"][0] = "z"
+        self.assertEqual(result["configuration"]["axes_map"], ["y", "-x", "z"])
+
+    def test_raw_option_normalization_never_supplies_an_implicit_map(self):
+        self.assertEqual(normalize_configured_axes_map(" y, -x,\n z "), ["y", "-x", "z"])
+        for invalid in (None, "", "x,y", "x,y,z,x", "x,-x,z", "X,y,z", "x,+y,z", 0):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize_configured_axes_map(invalid)
 
 
 if __name__ == "__main__":

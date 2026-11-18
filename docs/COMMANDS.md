@@ -65,9 +65,11 @@ The saved threshold is the candidate that passed ten checks **plus 0.5 g**,
 applied once after qualification. Those checks test the candidate; they do not
 test the higher saved value. The other axis is unchanged.
 
-Both commands first identify the selected physical axis with gentle
-bidirectional strokes around the manual center, then measure fresh stationary
-noise on the learned component. Ambiguous mapping aborts before homing. The default start grid is
+Both commands use an explicit `accel_axes_map` (Beacon) or `axes_map` from the
+selected sensor's configuration. Without that setting, they identify the
+selected physical axis with gentle bidirectional strokes around the manual
+center. Both paths then measure fresh stationary noise on the selected component
+and qualify its threshold. Ambiguous automatic mapping aborts before homing. The default start grid is
 1 g with 0.25 g steps. `START_THRESHOLD` explicitly chooses the first candidate
 but still performs the measurement; `STEP` alone changes grid spacing while
 retaining noise-based selection. Starts are finite and at least 0.5 g; step is

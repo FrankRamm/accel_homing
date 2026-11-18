@@ -31,10 +31,13 @@ section name, preserving suffix case. Saved/model sections or ambiguous sensor
 inventory can require an explicit selection instead of auto.
 
 Generic input is timestamped configured-stream acceleration in mm/s², converted
-to g after the driver's configured `axes_map`. Simple calibration learns the
-selected physical machine-axis channel and sign from gentle bidirectional motion.
-It does not change the sensor configuration. Weak, ambiguous or inconsistent
-responses cannot qualify a mapping. Recalibrate after sensor-context changes;
+to g after the driver's configured `axes_map`. Simple calibration uses an
+explicit map from the selected sensor's configuration (`accel_axes_map` for
+Beacon, `axes_map` for other sensors), with X using configured-stream X and Y
+using Y. If omitted, it learns the channel and sign from gentle bidirectional
+motion. It does not change the sensor configuration or apply its map twice.
+Weak, ambiguous or inconsistent measured responses cannot qualify an automatic mapping.
+Recalibrate after sensor-context changes;
 `axes_map` remains relevant to other features and the legacy manual detector.
 
 ## Host contracts and evidence
@@ -96,11 +99,11 @@ configuration.
 ## Detection and transport limits
 
 Simple calibration and its newly saved mapped-axis models use a fresh resting offset
-and only the learned physical-axis component. They do not use a quietness gate or an
+and only the selected physical-axis component. They do not use a quietness gate or an
 acceleration-derived startup-motion proof. Ordinary motion or an obstruction
 can cross the same threshold as an intended endstop.
 
-Manual thresholds with a valid mapped model retain its learned orientation and
+Manual thresholds with a valid mapped model retain its selected orientation and
 mapped reference policy. Unmapped manual thresholds and accepted legacy
 selected-axis models use absolute deviation on the configured channel, retaining
 legacy preparation/motion rules. Generic legacy homing rejects

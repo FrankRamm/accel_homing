@@ -14,16 +14,16 @@ or a hard real-time endstop.
 
 | Context | Metric and preparation |
 | --- | --- |
-| New simple calibration | Gentle bidirectional central mapping; fresh XYZ resting offset; absolute learned physical-axis component at each sample; no quiet-range gate or integrated homing-motion proof. |
+| New simple calibration | Explicit sensor map, or gentle bidirectional central mapping if absent; fresh XYZ resting offset; absolute selected physical-axis component at each sample; no quiet-range gate or integrated homing-motion proof. |
 | New saved model with `impact_metric: mapped_axis` | Same mapped detector during ordinary homing, TEST, CHARTS, ACCURACY and TROUBLESHOOT after reload; persisted mapping is tied to sensor context. |
 | Older saved `xyz_magnitude` qualification | Requires fresh per-axis calibration; cannot be silently reused as mapped-axis qualification. |
-| Manual threshold with a valid mapped model | Manual scalar threshold with the learned physical-axis orientation and mapped reference policy. |
+| Manual threshold with a valid mapped model | Manual scalar threshold with the selected physical-axis orientation and mapped reference policy. |
 | Unmapped manual thresholds / accepted legacy selected-axis models | Absolute configured-channel deviation about a fresh quiet reference, with legacy motion/pressed policies. |
 | Beta calibration | Isolated moving-noise experiment and proposal; does not replace or save the ordinary model. |
 
 The mapped detector evaluates
 `abs(sign * (a[source_axis] - baseline[source_axis]))` in g about a fixed fresh
-reference. The learned source channel is in the already configured sensor
+reference. The selected source channel is in the already configured sensor
 stream, after driver `axes_map`; raw XYZ capture rows are not reordered.
 The first sample reaching the threshold requests stopping; a later peak does
 not delay that request. Other channels do not contribute to this metric.
@@ -159,8 +159,9 @@ and finite derived raw trigger limits/deadlines are required.
 
 ## Calibration qualification and saving
 
-Current simple calibration first learns a physical-axis channel/sign from
-gentle central bidirectional motion and rejects ambiguous results. It then uses
+Current simple calibration uses the selected sensor's explicit map, or learns
+a physical-axis channel/sign from gentle central bidirectional motion when
+the option is absent, rejecting ambiguous measured results. It then uses
 fresh three-window stationary noise on that mapped component to select
 an initial candidate, then requires an impact beyond 20 mm inside the
 midpoint-to-endstop travel band. It excludes discovery and requires ten fresh

@@ -43,7 +43,7 @@ Standard chart acceleration curves show `abs(ax-bx)`, `abs(ay-by)` and
 `abs(az-bz)` in g.
 The fresh signed resting reference is subtracted **before** taking absolute
 values. Acceleration axes, threshold lines and peak markers are nonnegative.
-Mapped-axis captures label the learned physical X or Y and its signed source
+Mapped-axis captures label the selected physical X or Y and its signed source
 channel, for example `Physical X (= -stream Y)`. Their peak marker and threshold
 use only that selected component. The remaining stream channels are diagnostic;
 their letters do not assert a physical machine-axis mapping. ACCURACY places
@@ -112,14 +112,15 @@ grid. Unknown physical range or a result above known sensor headroom makes
 an automatic hint unavailable. A displayed hint is not a calibrated impact
 threshold or a measured minimum.
 
-Each new CALIBRATE first learns its physical-axis mapping with gentle central
-bidirectional strokes, then measures fresh **mapped-axis** stationary noise.
+Each new CALIBRATE uses the selected sensor's explicit map, or learns its
+physical-axis mapping with gentle central bidirectional strokes if the option
+is absent. Both paths then measure fresh **mapped-axis** stationary noise.
 A previous standalone NOISE result is not reused. Fresh acquisition is required
 even when START_THRESHOLD is explicit. Its summary is rendered only after the
 calibration qualifies and published after required cleanup and saving succeed.
 Stationary measurement does not cover motor enabling, first-step
 transients, acceleration or moving vibration. Calibration noise plots label
-the learned physical component and its peak; any retained XYZ-magnitude peak
+the selected physical component and its peak; any retained XYZ-magnitude peak
 is explicitly diagnostic. See [calibration](SIMPLE_CALIBRATION.md).
 
 ## Opening plots in Mainsail or Fluidd

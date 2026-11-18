@@ -93,6 +93,13 @@ Commanded return completion is not physical arrival feedback.
 
 ### Automatic mapping interruption
 
+Automatic mapping runs only when the selected sensor has no explicit
+`accel_axes_map` (Beacon) or `axes_map` (other accelerometers). With an explicit
+setting, calibration uses the already mapped X/Y channels and skips these
+strokes. Fresh noise and threshold qualification still run and can report their
+own acquisition faults. Only configure a map that matches the sensor's mounting;
+the configured path trusts that orientation rather than measuring it.
+
 The earlier message `automatic axis mapping was interrupted or its sensor
 context changed` also covered sensor acquisition faults; it did not establish
 that the configured axes map had changed. A retained fault from that failed,
@@ -138,9 +145,10 @@ precondition error. The mapping routine only moves the selected X or Y axis.
 ### Noise on another accelerometer axis
 
 A Y move can excite several configured sensor channels through the toolhead
-and mount. New calibration learns physical Y from gentle motion in both
-directions; it does not select the largest endstop-impact peak. Subsequent Y
-homing compares only that mapped component with its threshold. X does the same
+and mount. New calibration uses an explicit sensor map or, if absent, learns
+physical Y from gentle motion in both directions. It does not select the largest
+endstop-impact peak. Subsequent Y homing compares only that mapped component
+with its threshold. X does the same
 with its own mapping. Other channels remain in diagnostics but cannot trigger
 the mapped-axis detector. A large channel labelled X in a raw stream does not,
 by itself, establish a physical X response or an `axes_map` error.
