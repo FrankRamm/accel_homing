@@ -278,9 +278,16 @@ the queued move does not measure physical arrival.
 ## Saving and ordinary homing
 
 A clean cycle has one discovery impact plus ten endstop checks. `SAVE_CONFIG=1` is still
-the default: successful calibration stages the selected axis model, saves it,
-and restarts Klipper. `SAVE_CONFIG=0` only stages it until an explicit save.
-The other axis's saved model is not changed.
+the default: successful calibration stages the selected axis model and its
+`x_threshold` or `y_threshold`, saves both, and restarts Klipper. Existing
+selected-axis threshold lines are commented at save time, including those in
+included files, and the new setting goes in the generated SAVE_CONFIG block.
+The shared `threshold` is preserved for the other axis; the new per-axis value
+overrides it for the calibrated axis. The other axis's threshold and saved
+model are not changed, except for the documented orientation-conflict invalidation.
+`SAVE_CONFIG=0` only stages the values in memory until an explicit save; it does
+not comment or write configuration files early. Sequential X/Y calibrations
+retain both pending results. Failed qualification stages no replacement.
 
 After the ten checks pass, add **0.5 g once** to the qualified candidate and
 stage that value as the selected axis's threshold. For example, ten checks at
@@ -307,8 +314,10 @@ After reload, ordinary G28, TEST, CHARTS, ACCURACY and TROUBLESHOOT use that axi
 component and offset-only reference. Charts identify the physical axis and
 keep the other configured-stream channels visible as diagnostics.
 Older XYZ-magnitude qualifications require fresh calibration and cannot supply
-a mapped threshold. Leave manual overrides commented out to use the saved
-threshold; thresholds qualified for different metrics are not interchangeable.
+a mapped threshold. Successful calibration replaces the selected axis's previous
+manual threshold. A later user-written override still takes precedence;
+thresholds qualified for different metrics are not interchangeable. The paired
+generated setting retains the qualified model's context checks after reload.
 
 New calibration metadata also records `travel_plausibility_required: true`,
 `recenter_acceleration_policy: restored_normal_limit` and the configured

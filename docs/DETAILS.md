@@ -48,6 +48,8 @@ headroom or establish a physical impact peak.
 
 Changing a threshold through temporary SET does not save a new detector/model.
 Persistent manual overrides take precedence over saved model values on reload.
+Successful calibration replaces its selected-axis override through SAVE_CONFIG;
+the generated paired threshold retains the qualified model's context checks.
 See [threshold precedence](CONFIGURATION.md#thresholds-and-saved-models).
 
 ## Fresh reference and legacy quiet policies

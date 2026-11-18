@@ -81,9 +81,11 @@ To defer saving:
 ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 SAVE_CONFIG=0
 ```
 
-This stages a model without writing or restarting; it does not activate it for
-ordinary homing. Issue `SAVE_CONFIG` to persist/reload it. Explicit config
-thresholds take precedence over ordinary saved models. Read the
+This stages the model and selected-axis runtime threshold without writing or
+restarting; it does not activate them for ordinary homing. Issue `SAVE_CONFIG`
+to persist/reload both and comment the replaced selected-axis setting. The
+other axis and any shared fallback remain unchanged. Later manual overrides
+still take precedence. Read the
 [complete calibration sequence](SIMPLE_CALIBRATION.md), including early-hit
 automatic returns and the ten-home, at-most-2-mm spread rule.
 

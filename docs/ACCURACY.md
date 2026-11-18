@@ -92,9 +92,10 @@ The 0.5 g calibration minimum, known sensor-range headroom and finite-number
 requirements still apply to both candidate and saved threshold. Either value
 outside those limits aborts without clamping or saving a replacement.
 
-If a manual shared or axis setting would override the new model after reload,
-recovery also stages the failing axis's replacement threshold through native
-SAVE_CONFIG. The other axis/shared setting is preserved. Include/save conflicts
+As with ordinary calibration, recovery stages the failing axis's replacement
+threshold together with its model through native SAVE_CONFIG. Old selected-axis
+thresholds in the main or included configuration are commented at save time.
+The other axis/shared setting is preserved. Save conflicts
 are reported as `save_failed`; a passed calibration does not imply persistence
 or restart succeeded when SAVE_CONFIG reports an error.
 

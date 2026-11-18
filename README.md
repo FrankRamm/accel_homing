@@ -75,9 +75,10 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 **CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
 0.5 g once to the candidate after ten checks pass; those homes test the candidate,
 not the higher saved value. The other axis is unchanged. Prepare
-XY again after restart before calibrating the other axis. Explicit X/Y/shared
-manual thresholds override ordinary saved models; comment them out and issue
-`RESTART` while idle to use calibration. See
+XY again after restart before calibrating the other axis. Successful calibration
+saves the selected axis's runtime threshold together with its model through
+`SAVE_CONFIG`, replacing its previous manual value. A shared threshold remains
+available to the other axis. Later manual overrides still take precedence. See
 [configuration](docs/CONFIGURATION.md#thresholds-and-saved-models).
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.

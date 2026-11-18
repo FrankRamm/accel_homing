@@ -1778,6 +1778,9 @@ class BootstrapFixture(unittest.TestCase):
         self.assertIn("accel_homing_axes.py", installer.MODULES)
         self.assertEqual((self.source / "accel_homing_axes.py").read_bytes(),
                          (DIRECTORY / "accel_homing_axes.py").read_bytes())
+        self.assertIn("accel_homing_config.py", installer.MODULES)
+        self.assertEqual((self.source / "accel_homing_config.py").read_bytes(),
+                         (DIRECTORY / "accel_homing_config.py").read_bytes())
         for name in ("LICENSE", "NOTICE"):
             self.assertEqual((self.source / name).read_bytes(), (DIRECTORY / name).read_bytes())
 

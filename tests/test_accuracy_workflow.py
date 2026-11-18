@@ -18,8 +18,8 @@ from test_workflows import GCmd, Rig, workflow_module
 class AccuracyRig(Rig):
     """Reuse the stock-handler fixture with current per-trial sensor evidence."""
 
-    def __init__(self, options=None):
-        super().__init__(options)
+    def __init__(self, options=None, sections=None):
+        super().__init__(options, sections=sections)
         self.sensor_time = 0.0
         self.capture_mutator = None
         self.capture_directories = []

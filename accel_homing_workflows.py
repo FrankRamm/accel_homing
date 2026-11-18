@@ -50,6 +50,8 @@ _axes_module = _ah_compat_sibling_module("accel_homing_axes", __package__, __fil
 infer_axis_mapping = _axes_module.infer_axis_mapping
 validate_axis_mapping = _axes_module.validate_axis_mapping
 CONFIGURED_MAPPING_METHOD = _axes_module.CONFIGURED_METHOD
+CalibrationConfigSave = _ah_compat_sibling_module(
+    "accel_homing_config", __package__, __file__).CalibrationConfigSave
 
 try:
     from .homing import PrinterHoming as _PrinterHoming
@@ -301,11 +303,14 @@ class AccelHomingWorkflows:
         if config.get("threshold", None) is not None:
             self.manual_axes.update(AXES)
         self.temporary_manual_thresholds = {}
+        self.calibration_config_save = None
         self.model = None
         self.pending_model_metadata = {}
         if config.has_section(self.model_section):
             self.model = self.printer.load_object(config, self.model_section)
             for axis, threshold in self.model.thresholds.items():
+                if self._is_generated_threshold_pair(axis):
+                    self.manual_axes.discard(axis)
                 if axis not in self.manual_axes:
                     owner.threshold_g[axis] = threshold
         self.start_threshold = config.getfloat("calibration_start_threshold", 1.0,
@@ -660,6 +665,39 @@ class AccelHomingWorkflows:
                 "homing_speed_mm_s": info.speed,
                 "homing_accel_mm_s2": self.owner.homing_accel,
                 "impact_sign": self.owner.impact_sign[axis]}
+
+    def _is_generated_threshold_pair(self, axis):
+        """Recognize a surviving native SAVE_CONFIG threshold/model pair."""
+        metadata = self.model.metadata[axis]
+        binding = metadata.get("runtime_threshold_setting")
+        threshold = self.model.thresholds[axis]
+        section, option = self.config.get_name(), axis + "_threshold"
+        if (not isinstance(binding, dict) or type(binding.get("version")) is not int
+                or binding["version"] != 1 or binding.get("section") != section
+                or binding.get("option") != option
+                or type(binding.get("threshold_g")) not in (int, float)
+                or not math.isfinite(binding["threshold_g"]) or binding["threshold_g"] != threshold
+                or not isinstance(binding.get("run_id"), str) or not binding["run_id"]
+                or binding["run_id"] != metadata.get("run_id")
+                or metadata.get("saved_threshold_g") != threshold
+                or metadata.get("calibration_algorithm") != SIMPLE_CALIBRATION
+                or metadata.get("impact_metric") != "mapped_axis"):
+            return False
+        configfile = self.printer.lookup_object("configfile", None)
+        parser = getattr(getattr(configfile, "autosave", None), "fileconfig", None)
+        if not isinstance(parser, configparser.RawConfigParser):
+            return False
+        try:
+            # Native loading removes generated options shadowed by a regular
+            # or included declaration, even when its number is unchanged.
+            # Require both surviving origins, not merely equal numeric values.
+            return (float(self.config.get(option, None)) == threshold
+                    and parser.getfloat(section, option) == threshold
+                    and parser.getfloat(self.model_section, option) == threshold
+                    and parser.getint(self.model_section, axis + "_successes") == REQUIRED_SUCCESSES
+                    and json.loads(parser.get(self.model_section, axis + "_metadata", raw=True)) == metadata)
+        except (TypeError, ValueError, configparser.Error):
+            return False
 
     def _validate_model_connection(self):
         if self.model is None:
@@ -2268,6 +2306,9 @@ class AccelHomingWorkflows:
                     "calibration_settle_time_s": session["calibration_settle_time_s"],
                     "recovery": self._calibration_recovery_status(session),
                     "physical_position_verified": False}
+        metadata["runtime_threshold_setting"] = {
+            "version": 1, "section": self.config.get_name(), "option": axis + "_threshold",
+            "threshold_g": threshold, "run_id": session["run_id"]}
         if session.get("noise_seed") is not None:
             metadata["stationary_noise_seed"] = dict(session["noise_seed"])
         if session.get("stationary_noise") is not None:
@@ -2293,8 +2334,7 @@ class AccelHomingWorkflows:
             staged_metadata[other] = invalidated
             entries.append((self.model_section, other + "_metadata",
                             json.dumps(invalidated, separators=(",", ":"), allow_nan=False)))
-        if recovery is not None and axis in self.manual_axes:
-            entries.append((self.config.get_name(), axis + "_threshold", encoded_threshold))
+        entries.append((self.config.get_name(), axis + "_threshold", encoded_threshold))
         result = {"result": "calibrated", "axis": axis, "threshold_g": threshold,
                   "impact_metric": "mapped_axis", "axis_mapping": metadata["axis_mapping"],
                   "tested_threshold_g": tested_threshold, "saved_threshold_g": threshold,
@@ -2311,9 +2351,15 @@ class AccelHomingWorkflows:
         self._finish(result)
         # Complete stream/motion cleanup before staging threshold and mapping as
         # one qualified pair. A failed cleanup must not replace a pending model.
+        rollback_target = None
         try:
+            if self.calibration_config_save is None:
+                self.calibration_config_save = CalibrationConfigSave(self.printer, self.config.get_name())
+            rollback_target = self.calibration_config_save.register_threshold(axis, encoded_threshold)
             self._stage_model_settings(configfile, entries)
         except Exception as exc:
+            if rollback_target is not None:
+                rollback_target()
             self.last_result.update(result="aborted", save_config=False,
                                     reason="calibration model staging failed: %s" % exc)
             raise
@@ -2327,9 +2373,7 @@ class AccelHomingWorkflows:
                    "(tested threshold + %.1f g). The saved threshold was not tested by those homes. %s" % (
             axis.upper(), self.model_name, tested_threshold, spread, CALIBRATION_REPEATABILITY_MM,
             threshold, CALIBRATION_THRESHOLD_MARGIN_G,
-            "The selected manual override is staged with this model." if recovery is not None and axis in self.manual_axes
-            else "Explicit manual threshold overrides remain active." if axis in self.manual_axes
-            else "The saved model supplies this axis threshold after restart."))
+            "The calibrated %s_threshold and model become active after SAVE_CONFIG and restart." % axis))
         if save:
             if recovery is not None:
                 self._info("After SAVE_CONFIG succeeds and Klipper restarts, release and manually center XY, "
@@ -2346,7 +2390,7 @@ class AccelHomingWorkflows:
                                "were not confirmed. Resolve the reported save error before rerunning accuracy")
                 raise
         else:
-            self._info("Model staged only. Run SAVE_CONFIG to write printer.cfg and restart")
+            self._info("Threshold and model staged only. Run SAVE_CONFIG to write printer.cfg and restart")
         if noise_png is not None:
             try:
                 # Qualification, motion cleanup and any required SAVE_CONFIG
@@ -2366,15 +2410,19 @@ class AccelHomingWorkflows:
         parser = getattr(autosave, "fileconfig", None)
         snapshot = None
         if isinstance(parser, configparser.RawConfigParser):
-            snapshot = (copy.deepcopy(parser), copy.deepcopy(configfile.status_save_pending),
-                        configfile.save_config_pending)
+            # Modern Klipper owns these fields on ConfigAutoSave; Kalico and
+            # older Klipper own them on PrinterConfig itself.
+            state = (autosave if hasattr(autosave, "status_save_pending")
+                     and hasattr(autosave, "save_config_pending") else configfile)
+            snapshot = (copy.deepcopy(parser), copy.deepcopy(state.status_save_pending),
+                        state.save_config_pending)
         try:
             # Native configfile.set does not yield to the reactor.
             for section, option, value in entries:
                 configfile.set(section, option, value)
         except Exception:
             if snapshot is not None:
-                autosave.fileconfig, configfile.status_save_pending, configfile.save_config_pending = snapshot
+                autosave.fileconfig, state.status_save_pending, state.save_config_pending = snapshot
             raise
 
     def _calibration_saved_threshold(self, tested_threshold):

@@ -420,6 +420,7 @@ class Rig:
         self.gcode.gcode_handlers = self.gcode.ready_gcode_handlers
         homing = StockHoming(self)
         self.gcode.ready_gcode_handlers["G28"] = homing.cmd_G28
+        self.gcode.ready_gcode_handlers["SAVE_CONFIG"] = lambda gcmd: self.run_script("SAVE_CONFIG")
         self.objects = {
             "gcode": self.gcode, "toolhead": self.toolhead,
             "homing": homing, "configfile": self.configfile,
@@ -484,6 +485,8 @@ class Rig:
         return self.shutdown
 
     def register_command(self, name, callback, desc=None):
+        if callback is None:
+            return self.gcode.ready_gcode_handlers.pop(name, None)
         if name in self.gcode.ready_gcode_handlers:
             raise ConfigError("duplicate command: " + name)
         self.gcode.ready_gcode_handlers[name] = callback
@@ -754,6 +757,10 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     self.assertIs(rig.objects["safe_z_home"], safe)
                     self.assertIs(rig.gcode.ready_gcode_handlers, registries[0])
                     self.assertIs(rig.gcode.gcode_handlers, registries[1])
+                    if mode.startswith("calibrate"):
+                        saver = rig.workflow.calibration_config_save
+                        self.assertIs(saver._original, registered["SAVE_CONFIG"])
+                        registered["SAVE_CONFIG"] = saver.cmd_SAVE_CONFIG
                     self.assertEqual(rig.gcode.ready_gcode_handlers, registered)
                     self.assertIsNone(rig.workflow.session)
 
@@ -945,6 +952,9 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                                     for coords, _speed in rig.toolhead.moves))
                 self.assertIs(rig.gcode.ready_gcode_handlers, registries[0])
                 self.assertIs(rig.gcode.gcode_handlers, registries[1])
+                saver = rig.workflow.calibration_config_save
+                self.assertIs(saver._original, registered["SAVE_CONFIG"])
+                registered["SAVE_CONFIG"] = saver.cmd_SAVE_CONFIG
                 self.assertEqual(rig.gcode.ready_gcode_handlers, registered)
                 self.assertIs(rig.objects["gcode_macro g28"], macro)
                 rig.run_script("G28 X")
@@ -1115,6 +1125,10 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     self.assertIs(rig.objects["homing_override"], override)
                     self.assertIs(rig.gcode.ready_gcode_handlers, registries[0])
                     self.assertIs(rig.gcode.gcode_handlers, registries[1])
+                    if mode.startswith("calibrate"):
+                        saver = rig.workflow.calibration_config_save
+                        self.assertIs(saver._original, registered["SAVE_CONFIG"])
+                        registered["SAVE_CONFIG"] = saver.cmd_SAVE_CONFIG
                     self.assertEqual(rig.gcode.ready_gcode_handlers, registered)
                     self.assertIsNone(rig.workflow.session)
                     self.assertFalse(rig.capture_active)
@@ -1409,7 +1423,9 @@ class CalibrationTests(unittest.TestCase):
             values = rig.configfile.saved
             self.assertEqual(values[("accel_homing_model default", axis.lower() + "_successes")], "10")
             self.assertNotIn(("accel_homing_model default", "XY"[1 - index].lower() + "_threshold"), values)
-            self.assertNotIn(("accel_homing", "x_threshold"), values)
+            self.assertEqual(values[("accel_homing", axis.lower() + "_threshold")],
+                             values[("accel_homing_model default", axis.lower() + "_threshold")])
+            self.assertNotIn(("accel_homing", "XY"[1 - index].lower() + "_threshold"), values)
             self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
             self.assertEqual(rig.owner.back_off_dist, 5.0)
             self.assertEqual(rig.toolhead.position[2:], [40.0, 6.0])

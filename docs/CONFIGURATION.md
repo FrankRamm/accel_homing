@@ -68,9 +68,17 @@ with unknown excess amplitude; they do not relax threshold headroom or other
 data-fault checks. Do not paste an 8 g threshold for
 an 8 g MPU9250 sensor.
 
-To use calibration, comment out both axis overrides **and** the shared
-`threshold`, then issue console `RESTART` while idle. An explicit manual
-threshold changes the numeric threshold. When a valid mapped-axis model exists,
+Successful calibration replaces the selected axis's old manual value by saving
+`x_threshold` or `y_threshold` alongside its qualified model. You do not need to
+comment out those overrides before calibrating. Existing selected-axis entries
+are commented when `SAVE_CONFIG` writes the new setting, including entries in
+included configuration files. The shared `threshold` is retained for the other
+axis; the new per-axis value takes precedence for the calibrated axis.
+In the main `printer.cfg`, keep section headers and threshold option names
+unindented so the native SAVE_CONFIG serializer can comment replaced entries.
+An unsupported main-file layout is reported before included files are modified.
+
+A later explicit manual threshold changes the numeric threshold. When a valid mapped-axis model exists,
 its configured or learned orientation and mapped detector remain active with that manual
 value. Without a mapped model, manual thresholds retain the legacy configured
 channel behavior. RAW detection subtracts its fresh signed reference before
@@ -101,12 +109,16 @@ Changed context can prevent a model from being accepted; recalibrate after
 reviewing the reported mismatch rather than editing generated metadata.
 
 Successful normal calibration defaults to `SAVE_CONFIG=1`: it writes the
-selected axis model and restarts Klipper. `SAVE_CONFIG=0` stages the model only.
+selected axis model and runtime threshold, then restarts Klipper.
+`SAVE_CONFIG=0` stages both in memory, without changing configuration files.
 Its threshold is the qualified candidate plus a fixed 0.5 g final margin; the
 ten qualification homes test the candidate before that addition. Both values
 must satisfy known-range headroom. Saving or reloading never adds the margin again.
+The generated threshold is tied to its qualified model and keeps the model's
+sensor, geometry and speed checks. A later user-written override remains a
+manual override, even when its numeric value matches the calibration.
 The former active thresholds are restored when that workflow ends; saving and
-reloading are still required to activate the staged model. An ordinary restart
+reloading are still required to activate the staged values. An ordinary restart
 discards unsaved staged values. See [calibration](SIMPLE_CALIBRATION.md).
 
 ## Common plugin options
