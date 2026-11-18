@@ -91,6 +91,28 @@ bounds. Above-band travel, missing impact, a sensor fault or failed return
 aborts; inspect the machine and manually prepare XY before a new command.
 Commanded return completion is not physical arrival feedback.
 
+### Automatic mapping interruption
+
+The earlier message `automatic axis mapping was interrupted or its sensor
+context changed` also covered sensor acquisition faults; it did not establish
+that the configured axes map had changed. A retained fault from that failed,
+closed stream could also reject the next calibration before fresh acquisition
+started.
+
+Mapping now reports the phase and specific interruption or sensor cause.
+After an abort, collect the console output and `ACCEL_HOMING_STATUS` before
+starting another command. Its `last_result.axis_mapping_diagnostics` retains
+the first failure, including available sample-timing and window-fault details
+before capture cleanup. A new calibration may start a fresh capture after a
+closed-stream fault, but faults in its own reference or moving capture still
+abort it. There is no automatic retry of a mapping movement. Manually prepare
+and center XY again before retrying; an aborted stroke does not establish that
+the toolhead returned to the center.
+
+The requirement that both X and Y be unhomed still applies. Running `G28`
+before calibration homes those axes and therefore causes that separate
+precondition error. The mapping routine only moves the selected X or Y axis.
+
 ### Noise on another accelerometer axis
 
 A Y move can excite several configured sensor channels through the toolhead

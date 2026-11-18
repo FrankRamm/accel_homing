@@ -728,6 +728,10 @@ class AccelHomingWorkflows:
                                   repeatability_spread_mm=session.get("repeatability_spread_mm"))
                 if session.get("stationary_noise") is not None:
                     result["stationary_noise"] = dict(session["stationary_noise"])
+                if session.get("state") == "mapping" and result.get("result") != "calibrated":
+                    self._axis_mapping_note_failure(session, result.get("reason", result.get("result")))
+                if session.get("axis_mapping_diagnostics") is not None:
+                    result["axis_mapping_diagnostics"] = copy.deepcopy(session["axis_mapping_diagnostics"])
             session["finishing"] = True
             session["finish_result"] = result.get("result")
         try:
@@ -2411,13 +2415,108 @@ class AccelHomingWorkflows:
                                       and not session.get("axis_only_cleanup", False)))
             raise
 
-    def _axis_mapping_check(self, session):
+    def _axis_mapping_stream_active(self):
+        owner = self.owner
+        return bool(getattr(owner, "stream_on", False)
+                    or getattr(getattr(owner, "backend", None), "active", False)
+                    or any(getattr(owner, name, None) is not None for name in (
+                        "noise_session", "noise_window", "beta_motion_capture", "beta_capture", "capture_batches")))
+
+    def _axis_mapping_reset_closed_fault(self, session):
+        """Retire one inactive latch before setup; later faults are always fatal."""
+        owner = self.owner
+        if getattr(owner, "sensor_fault", None) is None:
+            return
+        lock = getattr(owner, "sensor_fault_lock", None)
+        if lock is None:
+            return  # Without the fault lock, preserve the latch and fail closed.
         self._check_running(session)
-        if (session.get("finishing")
-                or self.owner.operation_generation != session["axis_mapping_generation"]
-                or getattr(self.owner, "sensor_fault", None) is not None
-                or self.owner.noise_sensor_context() != session["axis_mapping_context"]):
-            raise self._error("automatic axis mapping was interrupted or its sensor context changed")
+        with lock:
+            if (self._axis_mapping_stream_active() or owner.homing_active
+                    or any(getattr(owner, name, None) is not None for name in (
+                        "attempt", "pending_move", "capture_attempt"))):
+                return
+            shared = getattr(owner, "_noise_shared_client", None)
+            if (not callable(shared) or shared()
+                    or getattr(getattr(owner, "helper", None), "_stream_en", False)):
+                return
+            fault = owner.sensor_fault
+            if fault is not None:
+                session["axis_mapping_previous_fault"] = fault
+                session["_axis_mapping_previous_timing_fault"] = getattr(owner, "sample_timing_fault", None)
+                session["axis_mapping_previous_fault_cleared"] = True
+                owner.sensor_fault = None
+
+    def _axis_mapping_note_failure(self, session, reason):
+        """Freeze the first fault while window evidence still exists."""
+        if session.get("axis_mapping_diagnostics") is not None:
+            return
+        owner, backend = self.owner, getattr(self.owner, "backend", None)
+        window = getattr(owner, "noise_window", None)
+        timing = getattr(owner, "sample_timing_fault", None)
+        previous_timing = session.get("_axis_mapping_previous_timing_fault")
+        diagnostic = {"version": 1, "axis": session.get("axis"),
+                      "phase": session.get("axis_mapping_phase", "preflight"), "reason": reason,
+                      "sensor_fault": getattr(owner, "sensor_fault", None),
+                      "backend_fault": getattr(backend, "fault", None),
+                      "previous_closed_stream_fault": session.get("axis_mapping_previous_fault"),
+                      "previous_fault_cleared": session.get("axis_mapping_previous_fault_cleared", False),
+                      "capture_started": session.get("axis_mapping_capture_started", False),
+                      "stream_active": self._axis_mapping_stream_active(),
+                      "noise_session_active": getattr(owner, "noise_session", None) is not None,
+                      "moving_capture_active": getattr(owner, "beta_motion_capture", None) is not None,
+                      "operation_generation": owner.operation_generation,
+                      "expected_operation_generation": session.get("axis_mapping_generation"),
+                      "last_sample_age_s": getattr(backend, "last_age", None),
+                      "observed_rate_hz": getattr(backend, "observed_rate", None),
+                      "sample_timing_fault": timing if timing is not previous_timing else None,
+                      "previous_closed_stream_timing_fault": previous_timing,
+                      "window_fault_details": window.get("fault_details") if isinstance(window, dict) else None}
+        budget = [96]
+        def bounded(value, depth=0):
+            budget[0] -= 1
+            if budget[0] < 0 or depth > 4:
+                return "truncated"
+            if value is None or type(value) in (bool, int):
+                return value
+            if isinstance(value, float):
+                return value if math.isfinite(value) else None
+            if isinstance(value, str):
+                return value[:384]
+            if isinstance(value, dict):
+                return {str(key)[:64]: bounded(item, depth + 1)
+                        for key, item in list(value.items())[:24]}
+            if isinstance(value, (tuple, list)):
+                return [bounded(item, depth + 1) for item in value[:8]]
+            return type(value).__name__
+        session["axis_mapping_diagnostics"] = bounded(diagnostic)
+
+    def _axis_mapping_error(self, session, reason):
+        self._axis_mapping_note_failure(session, reason)
+        return self._error("automatic axis mapping failed during %s: %s" % (
+            session.get("axis_mapping_phase", "preflight"), reason))
+
+    def _axis_mapping_check(self, session):
+        try:
+            self._check_running(session)
+        except Exception as exc:
+            raise self._axis_mapping_error(session, str(exc)) from exc
+        if session.get("finishing"):
+            raise self._axis_mapping_error(session, session.get("finish_interrupted", "workflow is finishing"))
+        if self.owner.operation_generation != session["axis_mapping_generation"]:
+            raise self._axis_mapping_error(session, "operation generation changed (motors released or workflow interrupted)")
+        try:
+            changed = self.owner.noise_sensor_context() != session["axis_mapping_context"]
+        except Exception as exc:
+            raise self._axis_mapping_error(session, "sensor context unavailable: %s" % exc) from exc
+        if changed:
+            raise self._axis_mapping_error(session, "sensor context changed")
+        active = self._axis_mapping_stream_active()
+        if active:
+            session["axis_mapping_capture_started"] = True
+        fault = getattr(self.owner, "sensor_fault", None)
+        if fault is not None:
+            raise self._axis_mapping_error(session, "accelerometer fault: %s" % fault)
 
     def _axis_mapping_plan(self, axis):
         """A bounded central stroke; it does not change configured homing speed."""
@@ -2457,7 +2556,9 @@ class AccelHomingWorkflows:
         self._require_unhomed_xy()
         plan = self._axis_mapping_plan(axis)
         session.update(state="mapping", axis_mapping_generation=self.owner.operation_generation,
-                       axis_mapping_context=self.owner.noise_sensor_context(), axis_mapping_phase="preflight")
+                       axis_mapping_context=self.owner.noise_sensor_context(), axis_mapping_phase="preflight",
+                       axis_mapping_capture_started=False)
+        self._axis_mapping_reset_closed_fault(session)
         self._axis_mapping_check(session)
         index, kin = AXES[axis], toolhead.get_kinematics()
         original_position, original_limit = toolhead.get_position()[index], kin.limits[index]
@@ -2468,24 +2569,32 @@ class AccelHomingWorkflows:
                        axis.upper(), plan["distance_mm"], plan["distance_mm"],
                        plan["effective_speed_mm_s"], plan["effective_accel_mm_s2"]))
         try:
+            session["axis_mapping_phase"] = "center_frame"
             position = toolhead.get_position()
             position[index] = plan["center_mm"]
             toolhead.set_position(position)
             self._axis_mapping_check(session)
             kin.limits[index] = self.owner.rails_by_axis[axis].get_range()
+            session["axis_mapping_phase"] = "mapping_acceleration"
             self.owner._set_accel(plan["effective_accel_mm_s2"])
             self._axis_mapping_check(session)
+            session["axis_mapping_phase"] = "motor_enable"
             self.owner._enable_motors(axis)
             self._axis_mapping_check(session)
             if plan["current_helper"] is not None:
+                session["axis_mapping_phase"] = "homing_current"
                 current_attempted = True
                 plan["current_helper"]([axis], True)
                 self._axis_mapping_check(session)
+            session["axis_mapping_phase"] = "motor_settle"
             toolhead.wait_moves()
             self._axis_mapping_check(session)
             for direction in (1, -1):
                 session["axis_mapping_phase"] = "reference_positive" if direction > 0 else "reference_negative"
                 token = self.owner.start_beta_motion_capture(lambda: self._axis_mapping_check(session))
+                # A completed start owns fresh evidence even when an adapter
+                # does not expose its live stream state to this workflow.
+                session["axis_mapping_capture_started"] = True
                 self._axis_mapping_check(session)
                 rate = token.get("sample_rate_hz")
                 duration = plan["minimum_duration_s"] + 1. + 2. * self.owner.stream_timeout
@@ -2506,6 +2615,7 @@ class AccelHomingWorkflows:
                 segments = self._beta_profile(dict(plan, target_mm=target[index]), start, end,
                                                token["capture_cutoff_time_s"])
                 closing, token = token, None
+                session["axis_mapping_phase"] = "capture_positive" if direction > 0 else "capture_negative"
                 capture = self.owner.stop_beta_motion_capture(closing, lambda: self._axis_mapping_check(session))
                 self._axis_mapping_check(session)
                 rows = capture.get("samples", ())
@@ -2527,6 +2637,7 @@ class AccelHomingWorkflows:
                     self._axis_mapping_check(session)
                     toolhead.wait_moves()
                     self._axis_mapping_check(session)
+            session["axis_mapping_phase"] = "inference"
             mapping = validate_axis_mapping(infer_axis_mapping(axis, passes), axis)
             other = "y" if axis == "x" else "x"
             metadata = self._staged_or_saved_metadata(other)
@@ -2547,8 +2658,12 @@ class AccelHomingWorkflows:
             completed = True
         except Exception as exc:
             failure = exc
-            raise
+            self._axis_mapping_note_failure(session, str(exc))
+            if "automatic axis mapping failed during " in str(exc):
+                raise
+            raise self._axis_mapping_error(session, str(exc)) from exc
         finally:
+            session["axis_mapping_phase"] = "cleanup"
             cleanup_errors = []
             if token is not None:
                 try:
@@ -2575,7 +2690,8 @@ class AccelHomingWorkflows:
             if cleanup_errors:
                 session["axis_mapping_cleanup_errors"] = cleanup_errors
                 if failure is None:
-                    raise self._error("automatic axis mapping cleanup failed: " + "; ".join(cleanup_errors))
+                    session["axis_mapping_phase"] = "cleanup"
+                    raise self._axis_mapping_error(session, "automatic axis mapping cleanup failed: " + "; ".join(cleanup_errors))
         self._axis_mapping_check(session)
         session.update(axis_mapping=mapping, axis_mapping_phase="qualified", state="starting")
         self._info("%s mapped to configured sensor %s%s; bidirectional free-motion evidence qualified" % (

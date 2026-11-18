@@ -11,6 +11,52 @@ from test_workflows import AccelHomingWorkflows, Config, GCmd, Rig, workflow_mod
 from accel_homing_model import AccelHomingModel
 
 
+class RealCaptureOwner:
+    """Use actual acquisition/stream state with a simulated motion controller."""
+    sensor_fields = {"sensor_fault", "sample_timing_fault", "stream_on", "backend", "noise_session",
+                     "noise_window", "beta_motion_capture", "beta_capture", "capture_batches",
+                     "sensor_name", "noise_sensor_context", "sensor_fault_lock", "_noise_shared_client", "helper",
+                     "pending_move", "capture_attempt"}
+
+    def __init__(self, owner, sensor):
+        object.__setattr__(self, "owner", owner)
+        object.__setattr__(self, "sensor", sensor)
+
+    def __getattr__(self, name):
+        return getattr(self.sensor if name in self.sensor_fields else self.owner, name)
+
+    def __setattr__(self, name, value):
+        setattr(self.sensor if name in self.sensor_fields else self.owner, name, value)
+
+
+def real_reference_rig(decoded):
+    from test_noise_recovery import sensor
+    from test_retract_noise import noise_flow
+    rig, obj = MappingRig(), sensor(decoded)
+    obj.reactor = rig.reactor
+    obj.reactor.now = 10.
+    base = rig.owner
+    rig.owner = RealCaptureOwner(base, obj)
+    rig.workflow.owner = rig.owner
+    rig.fresh_references = []
+
+    def reference(check):
+        try:
+            token = obj.start_beta_motion_capture(check)
+            rig.fresh_references.append(token)
+            raise CommandError("stop after real fresh reference")
+        finally:
+            # This fixture deliberately stops before any stroke. Stream setup,
+            # reference acquisition and its fault reset above remain real.
+            obj.beta_motion_capture = None
+            obj.stop_noise_measurement()
+
+    base.start_beta_motion_capture = reference
+    base.stop_beta_motion_capture = obj.stop_beta_motion_capture
+    noise_flow(obj)
+    return rig, obj
+
+
 class MappingRig(Rig):
     def __init__(self, axis="x", source=2, sign=-1):
         super().__init__()
@@ -92,6 +138,143 @@ class MappingRig(Rig):
 
 
 class AxisMappingWorkflowTests(unittest.TestCase):
+    def test_manual_retry_after_closed_stream_fault_reaches_real_fresh_reference(self):
+        for decoded in (False, True):
+            with self.subTest(decoded=decoded):
+                rig, obj = real_reference_rig(decoded)
+                obj.sensor_fault = "sample_gap"
+                self.assertFalse(obj.stream_on)
+                self.assertIsNone(obj.noise_session)
+                rig.begin_mapping()
+                with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                        self.assertRaisesRegex(CommandError, "stop after real fresh reference"):
+                    rig.workflow._run_calibration()
+                self.assertEqual(len(rig.fresh_references), 1)
+                self.assertIsNone(obj.sensor_fault)
+                self.assertEqual(rig.toolhead.moves, [])
+                self.assertEqual(rig.home_calls, [])
+                self.assertEqual(rig.configfile.saved, {})
+
+    def test_real_reference_gap_is_fatal_and_preserved_before_manual_retry(self):
+        from test_noise_recovery import gap_flow
+        from test_retract_noise import noise_flow
+        for decoded in (False, True):
+            with self.subTest(decoded=decoded):
+                rig, obj = real_reference_rig(decoded)
+                gap_flow(obj, {1})
+                rig.begin_mapping()
+                with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                        self.assertRaisesRegex(CommandError, "reference_positive.*sample_gap"):
+                    rig.workflow._run_calibration()
+                diagnostic = rig.workflow.last_result["axis_mapping_diagnostics"]
+                self.assertEqual(diagnostic["phase"], "reference_positive")
+                self.assertEqual(diagnostic["sensor_fault"], "sample_gap")
+                self.assertTrue(diagnostic["capture_started"])
+                if not decoded:
+                    self.assertGreater(diagnostic["window_fault_details"]["gap_s"], .04)
+                else:
+                    self.assertEqual(diagnostic["backend_fault"], "sample_gap")
+                self.assertIsNone(obj.noise_window)
+                self.assertIsNone(obj.noise_session)
+                self.assertFalse(obj.stream_on)
+                self.assertEqual(rig.fresh_references, [])
+                self.assertEqual(rig.toolhead.moves, [])
+                saved = copy.deepcopy(diagnostic)
+                # This is a second explicit operator invocation, not a retry
+                # performed by either the workflow or acquisition loop.
+                rig.idle_state = "Ready"
+                noise_flow(obj)
+                rig.begin_mapping()
+                with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                        self.assertRaisesRegex(CommandError, "stop after real fresh reference"):
+                    rig.workflow._run_calibration()
+                self.assertEqual(len(rig.fresh_references), 1)
+                self.assertEqual(diagnostic, saved)
+                retry = rig.workflow.last_result["axis_mapping_diagnostics"]
+                self.assertEqual(retry["previous_closed_stream_fault"], "sample_gap")
+                self.assertTrue(retry["previous_fault_cleared"])
+                self.assertIsNone(obj.sensor_fault)
+                self.assertEqual(rig.toolhead.moves, [])
+
+    def test_new_same_code_native_fault_during_motor_enable_is_not_historical(self):
+        rig, obj = real_reference_rig(False)
+        obj.sensor_fault = "invalid_data"
+        def malformed(stage):
+            if stage == "enable":
+                self.assertIsNone(obj.sensor_fault)
+                obj._batch_hook({})
+        rig.interrupt = malformed
+        rig.begin_mapping()
+        with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch("logging.exception"), \
+                self.assertRaisesRegex(CommandError, "motor_enable.*invalid_data"):
+            rig.workflow._run_calibration()
+        diagnostic = rig.workflow.last_result["axis_mapping_diagnostics"]
+        self.assertEqual(diagnostic["sensor_fault"], "invalid_data")
+        self.assertEqual(diagnostic["previous_closed_stream_fault"], "invalid_data")
+        self.assertTrue(diagnostic["previous_fault_cleared"])
+        self.assertEqual(obj.sensor_fault, "invalid_data")
+        self.assertEqual(rig.fresh_references, [])
+        self.assertEqual(rig.toolhead.moves, [])
+        self.assertEqual(rig.toolhead.position[2:], [40., 6.])
+
+    def test_existing_active_or_shared_sensor_ownership_never_clears_fault(self):
+        for ownership in ("stream_on", "noise_session", "beta_motion_capture", "capture_batches",
+                          "pending_move", "capture_attempt", "shared"):
+            with self.subTest(ownership=ownership):
+                rig, obj = real_reference_rig(False)
+                obj.sensor_fault = "invalid_data"
+                if ownership == "shared":
+                    obj.helper._stream_en = True
+                else:
+                    setattr(obj, ownership, True if ownership == "stream_on" else object())
+                rig.begin_mapping()
+                with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                        self.assertRaisesRegex(CommandError, "preflight.*invalid_data"):
+                    rig.workflow._run_calibration()
+                self.assertEqual(obj.sensor_fault, "invalid_data")
+                self.assertFalse(rig.workflow.last_result["axis_mapping_diagnostics"]["previous_fault_cleared"])
+                self.assertEqual(rig.fresh_references, [])
+                self.assertEqual(rig.toolhead.moves, [])
+
+    def test_new_faults_stop_each_stroke_return_and_capture_without_continuation(self):
+        for stage, occurrence in (("reference", 1), ("move", 1), ("move", 2),
+                                  ("move", 3), ("move", 4), ("capture", 1), ("capture", 2)):
+            with self.subTest(stage=stage, occurrence=occurrence):
+                rig = MappingRig()
+                def fail(current):
+                    if current == stage and rig.events.count(stage) == occurrence:
+                        rig.owner.sensor_fault = "stale_data"
+                rig.interrupt = fail
+                rig.begin_mapping()
+                with mock.patch.object(rig.workflow, "_chart_preflight"), \
+                        self.assertRaisesRegex(CommandError, "accelerometer fault: stale_data"):
+                    rig.workflow._run_calibration()
+                self.assertEqual(rig.workflow.last_result["axis_mapping_diagnostics"]["sensor_fault"], "stale_data")
+                self.assertEqual(rig.events.count(stage), occurrence)
+                self.assertEqual(rig.home_calls, [])
+                self.assertEqual(rig.configfile.saved, {})
+                self.assertEqual(rig.toolhead.kin.limits[:2], [(1., -1.)] * 2)
+                self.assertEqual(rig.toolhead.position[2:], [40., 6.])
+
+    def test_mapping_fault_diagnostics_are_frozen_bounded_finite_json(self):
+        rig = MappingRig()
+        details = {str(index): {"rows": ["x" * 10000] * 30, "not_finite": float("inf")}
+                   for index in range(100)}
+        def fail(stage):
+            if stage == "reference":
+                rig.owner.sample_timing_fault = details
+                rig.owner.sensor_fault = "sample_gap"
+        rig.interrupt = fail
+        rig.begin_mapping()
+        with mock.patch.object(rig.workflow, "_chart_preflight"), self.assertRaises(CommandError):
+            rig.workflow._run_calibration()
+        diagnostic = rig.workflow.last_result["axis_mapping_diagnostics"]
+        encoded = json.dumps(diagnostic, allow_nan=False)
+        self.assertLess(len(encoded), 45000)
+        details.clear()
+        self.assertEqual(json.dumps(diagnostic, allow_nan=False), encoded)
+
     def test_both_axes_all_channels_both_polarities_preserve_other_coordinates_and_normal_limits(self):
         for axis in "xy":
             for source in range(3):
