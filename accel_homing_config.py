@@ -18,6 +18,7 @@ import types
 MAX_CONFIG_FILES = 256
 MAX_CONFIG_BYTES = 16 * 1024 * 1024
 MAX_INCLUDE_DEPTH = 32
+_AUTOSAVE_MARKER = "#*# <---------------------- SAVE_CONFIG ---------------------->"
 _COMMENT = re.compile(r"[#;].*$")
 _OPTION = re.compile(r"(?P<option>.*?)\s*(?:=|:)\s*.*$")
 
@@ -148,6 +149,21 @@ class _NativeReader:
         # Kalico enables recursive '**'; retained Klipper does not.
         return self.reader._resolve_include(filename, specification, _parser(), set())
 
+    def checked_root_data(self, data):
+        """Reject an unreadable existing envelope before any save-side edits."""
+        text = data.decode("utf-8").replace("\r\n", "\n")
+        regular, generated = self.find_autosave(text)
+        lines = text.split("\n")
+        # Native rejection returns an empty suffix. Both retained hosts return
+        # newline-only data for valid empty/no blocks; also allow compatible
+        # readers to return empty for ordinary files with no reserved lines.
+        # Kalico may accept contiguous repeated headers, unlike Klipper.
+        if (lines.count(_AUTOSAVE_MARKER) > 1
+                or (generated == "" and any(line.startswith("#*# ") for line in lines))):
+            raise ValueError("existing malformed SAVE_CONFIG block; no files were changed; "
+                             "repair or restore the existing autosave block before retrying")
+        return regular
+
     def check_root_targets(self, data, targets):
         """Native serialization must actually remove selected root literals.
 
@@ -238,6 +254,7 @@ class CalibrationConfigSave:
 
     def _configuration(self, reader, filename):
         root = _snapshot(filename)
+        regular_root = reader.checked_root_data(root["data"])
         files, edges, total = {root["path"]: root}, [], [len(root["data"])]
         visited, parsed = set(), set()
 
@@ -250,7 +267,7 @@ class CalibrationConfigSave:
             visited.add(logical)
             data = snapshot["data"].decode("utf-8")
             if depth == 0:
-                data, _saved = reader.find_autosave(data.replace("\r\n", "\n"))
+                data = regular_root
             for line in data.split("\n"):
                 line = line.split("#", 1)[0]
                 match = configparser.RawConfigParser.SECTCRE.match(line)

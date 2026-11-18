@@ -1,5 +1,6 @@
 """Disposable configuration trees and public SAVE_CONFIG chaining only."""
 import configparser
+import copy
 import glob
 import io
 import os
@@ -16,7 +17,9 @@ import accel_homing_config as persistence
 from accel_homing_config import CalibrationConfigSave
 
 
-HEADER = "\n#*# <---------------------- SAVE_CONFIG ---------------------->\n"
+HEADER = ("\n#*# <---------------------- SAVE_CONFIG ---------------------->\n"
+          "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n"
+          "#*#\n")
 
 
 class SaveError(Exception):
@@ -42,10 +45,22 @@ class NativeShape:
 
     @staticmethod
     def _find_autosave_data(text):
-        if HEADER not in text:
+        # Retained Kalico semantics, including its missing repeated-header
+        # rejection. Empty generated text means corrupt; valid empty/no header
+        # produces newline-only generated data.
+        regular, generated = text, ""
+        if HEADER in text:
+            regular, generated = text.split(HEADER, 1)
+            generated = generated.strip()
+        if "\n#*# " in regular:
             return text, ""
-        regular, generated = text.split(HEADER, 1)
-        return regular, "\n".join(line[4:] for line in generated.split("\n") if line.startswith("#*# "))
+        lines = [""]
+        for line in generated.split("\n"):
+            if generated and (not line.startswith("#*#")
+                              or (len(line) >= 4 and not line.startswith("#*# "))):
+                return text, ""
+            lines.append(line[4:])
+        return regular, "\n".join(lines + [""])
 
     @staticmethod
     def _resolve_include(filename, specification, parser, visited):
@@ -135,6 +150,13 @@ class Rig:
     def save(self):
         return self.gcode.handlers["SAVE_CONFIG"](object())
 
+    def reload(self, modern=False):
+        _regular, generated = self.config._find_autosave_data(self.root.read_text())
+        self.config = NativeShape(self.root, modern)
+        self.config.autosave.fileconfig.read_string(generated)
+        self.gcode = PublicGCode(self.config.save)
+        self.helper = CalibrationConfigSave(self, "accel_homing")
+
 
 class CalibrationConfigTests(unittest.TestCase):
     def setUp(self):
@@ -200,6 +222,107 @@ class CalibrationConfigTests(unittest.TestCase):
         self.rig.save()
         self.assertIn(b"#x_threshold: 8", self.rig.include.read_bytes())
         self.assertIn(b"#y_threshold: 7", self.rig.include.read_bytes())
+
+    def test_repeated_saves_after_reload_keep_one_block_and_both_axis_models(self):
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                rig = Rig(self.directory.name, modern)
+                rig.config.set("beacon model default", "model_coef", "1.0,\n  2.0,\n  3.0")
+                for axis, value in (("x", "2.75"), ("y", "3.25")):
+                    rig.stage(axis, value)
+                    rig.config.set("accel_homing_model default", axis + "_metadata",
+                                   '{"run_id":"%s-run","threshold_g":%s}' % (axis, value))
+                    rig.save()
+                    self.assertEqual(rig.root.read_text().count(HEADER), 1)
+                    self.assertEqual(rig.helper._targets, {})
+                    rig.reload(modern)
+                    parser = rig.config.autosave.fileconfig
+                    self.assertEqual(parser.get("accel_homing", "x_threshold"), "2.75")
+                    self.assertEqual(parser.get("accel_homing_model default", "x_successes"), "10")
+                    self.assertEqual(parser.get("accel_homing_model default", "x_metadata"),
+                                     '{"run_id":"x-run","threshold_g":2.75}')
+                    self.assertEqual(parser.get("beacon model default", "model_coef"), "1.0,\n2.0,\n3.0")
+                self.assertEqual(parser.get("accel_homing", "y_threshold"), "3.25")
+                self.assertEqual(parser.get("accel_homing_model default", "y_successes"), "10")
+                self.assertEqual(parser.get("accel_homing_model default", "y_metadata"),
+                                 '{"run_id":"y-run","threshold_g":3.25}')
+                self.assertIn(b"#x_threshold: 8", rig.include.read_bytes())
+                self.assertIn(b"#y_threshold: 7", rig.include.read_bytes())
+                self.assertIn(b"\r\nthreshold: 8", rig.include.read_bytes())
+
+    def test_malformed_existing_autosave_is_rejected_before_reads_edits_or_native_save(self):
+        valid = HEADER + "#*# [beacon model default]\n#*# model_coef = 1.0\n"
+        malformed = {
+            "four complete blocks": valid * 4,
+            "contiguous repeated headers": valid.rstrip("\n") + valid,
+            "ordinary comment below generated data": valid + "\n# user note\n",
+            "ordinary option below generated data": valid + "\nx_threshold: 8\n",
+            "missing header": "\n#*# [beacon model default]\n#*# model_coef = 1.0\n",
+            "CRLF malformed tail": (valid + "\n# user note\n").replace("\n", "\r\n"),
+        }
+        for modern in (False, True):
+            for name, suffix in malformed.items():
+                with self.subTest(modern=modern, malformed=name):
+                    rig = Rig(self.directory.name, modern)
+                    rig.root.write_text(rig.root.read_text().rstrip() + suffix)
+                    rig.stage("x", "2.75")
+                    root, included = rig.root.read_bytes(), rig.include.read_bytes()
+                    parser = rig.config.autosave.fileconfig
+                    saved = {section: dict(parser.items(section)) for section in parser.sections()}
+                    pending = copy.deepcopy(rig.config.state.status_save_pending)
+                    targets = dict(rig.helper._targets)
+                    with mock.patch.object(persistence._NativeReader, "included") as resolve:
+                        with mock.patch.object(persistence, "_replace") as replace:
+                            with self.assertRaisesRegex(SaveError, "malformed SAVE_CONFIG.*no files were changed"):
+                                rig.save()
+                    resolve.assert_not_called()
+                    replace.assert_not_called()
+                    self.assertEqual(rig.config.calls, 0)
+                    self.assertEqual(rig.root.read_bytes(), root)
+                    self.assertEqual(rig.include.read_bytes(), included)
+                    self.assertEqual(rig.config.state.status_save_pending, pending)
+                    self.assertTrue(rig.config.state.save_config_pending)
+                    self.assertEqual({section: dict(parser.items(section)) for section in parser.sections()}, saved)
+                    self.assertEqual(rig.helper._targets, targets)
+                    self.assertFalse(rig.helper._saving)
+
+    def test_valid_empty_envelope_and_ordinary_comments_are_accepted(self):
+        for newline in ("\n", "\r\n"):
+            for existing in ("", HEADER):
+                with self.subTest(newline=repr(newline), empty_envelope=bool(existing)):
+                    rig = Rig(self.directory.name)
+                    regular = (rig.root.read_text() + "# Mention SAVE_CONFIG in an ordinary comment\n"
+                               "# Example: " + HEADER.splitlines()[1] + "\n#*#\n")
+                    rig.root.write_bytes((regular.rstrip() + existing).replace("\n", newline).encode())
+                    rig.stage()
+                    rig.save()
+                    self.assertEqual(rig.config.calls, 1)
+                    self.assertEqual(rig.root.read_text().count(HEADER), 1)
+                    self.assertIn("# Mention SAVE_CONFIG", rig.root.read_text())
+                    self.assertIn("# Example: #*#", rig.root.read_text())
+
+    def test_compatible_reader_empty_suffix_without_reserved_lines_is_accepted(self):
+        original = NativeShape._find_autosave_data
+        def find(text):
+            return original(text) if HEADER in text else (text, "")
+        self.rig.stage()
+        with mock.patch.object(NativeShape, "_find_autosave_data", side_effect=find):
+            self.rig.save()
+        self.assertEqual(self.rig.config.calls, 1)
+        self.assertEqual(self.rig.root.read_text().count(HEADER), 1)
+
+    def test_empty_registry_does_not_add_envelope_validation_to_unrelated_save(self):
+        original = mock.Mock(return_value="unrelated native result")
+        self.rig.gcode.handlers["SAVE_CONFIG"] = original
+        rollback = self.rig.helper.register_threshold("x", "2.75")
+        rollback()
+        self.rig.root.write_text(self.rig.root.read_text() + HEADER + HEADER)
+        root, included = self.rig.root.read_bytes(), self.rig.include.read_bytes()
+        with mock.patch.object(persistence, "_snapshot", side_effect=AssertionError("unrelated read")):
+            self.assertEqual(self.rig.save(), "unrelated native result")
+        original.assert_called_once()
+        self.assertEqual(self.rig.root.read_bytes(), root)
+        self.assertEqual(self.rig.include.read_bytes(), included)
 
     def test_empty_registry_forwards_unrelated_save_unchanged(self):
         rollback = self.rig.helper.register_threshold("x", "2.75")
