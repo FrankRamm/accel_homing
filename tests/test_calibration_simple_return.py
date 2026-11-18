@@ -52,6 +52,7 @@ class SimpleRecordedReturnTests(unittest.TestCase):
         rig = Rig()
         workflow = rig.workflow
         workflow._begin(GCmd(SAVE_CONFIG=0), "calibration", "x")
+        rig.qualify_axis_mapping(workflow.session)
         session = workflow.session
         session["state"] = "running"
         rig.home_results.append({"travel_mm": 2., "halt_travel_mm_signed": -5.})

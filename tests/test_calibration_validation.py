@@ -58,12 +58,14 @@ class CalibrationTravelPlausibilityTests(unittest.TestCase):
                 rig = machine(axis, positive, options={"calibration_travel_tolerance": tolerance})
                 workflow = rig.workflow
                 workflow._begin(GCmd(SAVE_CONFIG=0), "calibration", axis)
+                rig.qualify_axis_mapping(workflow.session)
                 workflow.session["state"] = "running"
                 expected = workflow._geometry(axis)[1]
                 low, high = expected * (1. - tolerance), expected * (1. + tolerance)
                 for travel, quality in ((low, "good"), (high, "good"),
                                         (low - .0001, "early"), (high + .0001, "implausible")):
-                    record = {"result": "impact", "impact_metric": "xyz_magnitude",
+                    record = {"result": "impact", "impact_metric": "mapped_axis",
+                              "axis_mapping": workflow.session["axis_mapping"],
                               "travel_mm": expected, "travel_mm_exact": travel, "workflow_phase": phase}
                     self.assertEqual(workflow._quality(axis, record)[0], quality)
 
@@ -72,9 +74,11 @@ class CalibrationTravelPlausibilityTests(unittest.TestCase):
         rig.owner.rails_by_axis["x"].bounds = (0., 40.1)
         workflow = rig.workflow
         workflow._begin(GCmd(SAVE_CONFIG=0), "calibration", "x")
+        rig.qualify_axis_mapping(workflow.session)
         workflow.session["state"] = "running"
         for travel, quality in ((20., "early"), (20.0001, "good")):
-            record = {"result": "impact", "impact_metric": "xyz_magnitude",
+            record = {"result": "impact", "impact_metric": "mapped_axis",
+                      "axis_mapping": workflow.session["axis_mapping"],
                       "travel_mm": 20., "travel_mm_exact": travel}
             self.assertEqual(workflow._quality("x", record)[0], quality)
 

@@ -365,7 +365,7 @@ class StatusTest(unittest.TestCase):
         self.assertIn("ordinary homing requires quiet XYZ", policy)
         self.assertIn("post-settle 100.00 ms / 50 sample reference", policy)
         self.assertIn("without a quiet-range limit", policy)
-        self.assertIn("no acceleration-derived motion proof for XYZ magnitude", policy)
+        self.assertIn("no acceleration-derived motion proof for mapped-axis or explicit XYZ detection", policy)
 
     def test_status_is_a_copy(self):
         obj = make_homing()
@@ -574,14 +574,19 @@ class EnablePreparationTest(unittest.TestCase):
                             self.begin(obj, endstop)
                         self.assert_unarmed_cleanup(obj, endstop)
 
-    def test_native_calibration_keeps_noisy_reference_envelope_and_first_raw_contact(self):
+    def test_native_mapped_calibration_keeps_noisy_reference_and_first_raw_contact(self):
         from test_single_touch import RampStepper
+        from test_mapped_detector import mapping
+        from accel_homing_workflows import SIMPLE_CALIBRATION
         for threshold in (1.0, 8.0):
             for axis in range(3):
                 with self.subTest(threshold=threshold, noisy_axis=axis):
                     obj, endstop, _log, _lines = self.session()
                     obj.threshold_g["x"] = threshold
-                    obj.workflows.session = {"mode": "calibration", "state": "running", "axis": "x"}
+                    obj.workflows.session = {"mode": "calibration", "state": "running", "axis": "x",
+                                            "algorithm": SIMPLE_CALIBRATION,
+                                            "axis_mapping": mapping(),
+                                            "axis_mapping_context": obj.noise_sensor_context()}
                     obj.workflows.in_home, obj.workflows.home_axis = True, "x"
                     plain, number = obj.reactor.on_pause, [0]
                     def flow():
@@ -609,7 +614,8 @@ class EnablePreparationTest(unittest.TestCase):
                     endstop.get_steppers = lambda: [RampStepper(when, 5000.0, 100.0)]
                     attempt = obj.prepare(endstop, when)
                     self.assertEqual(attempt.bases, means)
-                    self.assertEqual(attempt.proof_noise, envelope)
+                    self.assertIsNone(attempt.proof_noise)
+                    self.assertTrue(attempt.vector_mode)
                     self.assertAlmostEqual(attempt.limit_raw * attempt.count_g, threshold)
                     self.assertFalse(obj.baseline_status["quiet_range_enforced"])
                     self.assertEqual(endstop._dispatch.started, [])

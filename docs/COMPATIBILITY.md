@@ -30,10 +30,12 @@ requires exactly one recognized configured section; otherwise choose its full
 section name, preserving suffix case. Saved/model sections or ambiguous sensor
 inventory can require an explicit selection instead of auto.
 
-Generic input is timestamped machine-mapped acceleration in mm/s², converted
-to g. The simple calibration/vector model uses three-axis magnitude, which
-does not require a homing-axis channel/sign mapping. Correct `axes_map` remains
-important for other features and the legacy selected-axis detector.
+Generic input is timestamped configured-stream acceleration in mm/s², converted
+to g after the driver's configured `axes_map`. Simple calibration learns the
+selected physical machine-axis channel and sign from gentle bidirectional motion.
+It does not change the sensor configuration. Weak, ambiguous or inconsistent
+responses cannot qualify a mapping. Recalibrate after sensor-context changes;
+`axes_map` remains relevant to other features and the legacy manual detector.
 
 ## Host contracts and evidence
 
@@ -93,18 +95,21 @@ configuration.
 
 ## Detection and transport limits
 
-Simple calibration and its newly saved XYZ models use a fresh resting offset
-and raw three-axis magnitude. They do not use a quietness gate or an
+Simple calibration and its newly saved mapped-axis models use a fresh resting offset
+and only the learned physical-axis component. They do not use a quietness gate or an
 acceleration-derived startup-motion proof. Ordinary motion or an obstruction
 can cross the same threshold as an intended endstop.
 
-Manual config thresholds and older selected-axis models use absolute deviation
-on the selected machine axis, retaining legacy preparation/motion rules. Generic legacy homing rejects
+Manual thresholds with a valid mapped model retain its learned orientation and
+mapped reference policy. Unmapped manual thresholds and accepted legacy
+selected-axis models use absolute deviation on the configured channel, retaining
+legacy preparation/motion rules. Generic legacy homing rejects
 unproved startup with `no_motion`; it does not accept a stationary generic
 sensor as a successful already-pressed stop. Native Beacon retains a separate
 legacy pressed-start path. See [detector details](DETAILS.md#detector-paths).
 
-Compatible saved XYZ-magnitude profiles remain accepted. Selected-axis profiles
+Older saved XYZ-magnitude profiles require fresh per-axis calibration, even
+when a manual threshold is present. Legacy selected-axis profiles
 with legacy/unknown sign-gated qualification need fresh calibration or an
 explicit manual threshold unless their recorded policy already establishes
 sign-independent qualification. Existing profiles are not silently rewritten.

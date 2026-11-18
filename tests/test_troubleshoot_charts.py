@@ -17,6 +17,44 @@ import accel_homing_troubleshoot as diagnostics
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib unavailable")
 class TroubleshootChartTests(unittest.TestCase):
+    def test_mapped_home_keeps_source_xyz_and_plots_signed_physical_component(self):
+        from matplotlib.figure import Figure
+        from test_mapped_axis_charts import mapping
+        learned = mapping("y", 2, -1)
+        home = {"home_id": 1, "axis": "y", "phase": "measurement", "previous_home_id": None,
+                "begin_host_monotonic_s": 20., "stop_timing": {}, "raw_file": "home-001-y.csv.gz",
+                "record": {"onset_time_s": .1, "threshold_g": 2., "result": "impact",
+                           "impact_metric": "mapped_axis", "axis_mapping": learned},
+                "capture": {"baseline_g": [1., 2., 3.], "raw_rows_omitted": 0,
+                            "impact_metric": "mapped_axis", "axis_mapping": learned}}
+        report = {"homes": [home], "axes": ["y"], "ending": {"result": "complete"}, "events": []}
+        snapshots = {}
+        original_save = Figure.savefig
+        def save(figure, path, *args, **kwargs):
+            snapshots[Path(path).name] = {line.get_label(): list(line.get_ydata())
+                                         for line in figure.axes[0].lines}
+            return original_save(figure, path, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            diagnostics.write_json(folder / "manifest.json", report)
+            with gzip.open(folder / "packets.jsonl.gz", "wt", encoding="utf-8"):
+                pass
+            with gzip.open(folder / home["raw_file"], "wt", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(("sample_index", "print_time_s", "x_g", "y_g", "z_g"))
+                writer.writerows(((0, .099, 11., 8., 3.), (1, .1, 12., 9., 1.), (2, .101, 13., 10., 6.)))
+            with mock.patch.object(Figure, "savefig", save), mock.patch.dict(os.environ):
+                diagnostics._worker(folder, "")
+            _check_png((folder / "home-001-y.png").read_bytes())
+        lines = snapshots["home-001-y.png"]
+        self.assertEqual(lines["Stream X"], [10., 11., 12.])
+        self.assertEqual(lines["Stream Y"], [6., 7., 8.])
+        self.assertEqual(lines["Stream Z"], [0., -2., 3.])
+        self.assertEqual(lines["Physical Y (= -stream Z) signed"], [0., 2., -3.])
+        self.assertEqual(lines["Physical Y detector magnitude"], [0., 2., 3.])
+        self.assertEqual(lines["Physical Y trigger"], [2., 2.])
+        self.assertNotIn("XYZ norm", lines)
+
     def test_real_subprocess_creates_nonempty_valid_summary_and_impact_pngs(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = AccuracyRig({"charts_directory": directory})

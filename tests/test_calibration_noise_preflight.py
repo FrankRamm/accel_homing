@@ -23,7 +23,7 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
         self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
         self.assertIsNone(rig.workflow.session)
 
-    def test_noise_precedes_each_axis_motion_and_uses_sample_xyz_magnitude(self):
+    def test_noise_precedes_each_axis_home_and_uses_mapped_component_peak(self):
         for axis in "XY":
             with self.subTest(axis=axis), tempfile.TemporaryDirectory() as temp:
                 rig = NoiseRig({"charts_directory": temp, "calibration_start_threshold": .5},
@@ -46,21 +46,23 @@ class CalibrationNoisePreflightTests(unittest.TestCase):
                     self.assertEqual(rig.noise_calls, ["start", 1, 2, 3, "stop"])
                     identities.append(id(rig.workflow.session))
                     active = rig.workflow.get_status(0)["active"]
-                    self.assertEqual(active["stationary_noise"]["impact_metric"], "xyz_magnitude")
+                    self.assertEqual(active["stationary_noise"]["impact_metric"], "mapped_axis")
 
                 rig.on_noise, rig.on_home = observe_noise, observe_home
                 rig.calibrate(axis, save=0, STEP=.2)
                 self.assertEqual(len(set(identities)), 1)
                 self.assertTrue(all(item["purpose"] == "calibration_preflight" for item in active_status))
                 self.assertTrue(all(item["calibration_axis"] == axis.lower() for item in active_status))
-                self.assertEqual([call["threshold"] for call in rig.home_calls], [1.1] * 11)
+                self.assertEqual([call["threshold"] for call in rig.home_calls], [.9] * 11)
                 result = rig.workflow.last_result
                 measurement = result["stationary_noise"]
                 self.assertAlmostEqual(measurement["noise_magnitude_peak_g"], math.sqrt(.6 ** 2 * 2))
+                self.assertAlmostEqual(measurement["noise_axis_peak_g"], .6)
+                self.assertEqual(measurement["axis_mapping"]["source_axis"], "XY".index(axis))
                 self.assertEqual(measurement["initial_threshold_source"], "stationary_noise")
                 metadata = json.loads(rig.configfile.saved[("accel_homing_model default", axis.lower() + "_metadata")])
                 self.assertEqual(metadata["stationary_noise_seed"]["candidate_step_g"], .2)
-                self.assertEqual(metadata["stationary_noise_seed"]["start_threshold_g"], 1.1)
+                self.assertEqual(metadata["stationary_noise_seed"]["start_threshold_g"], .9)
                 self.assertEqual(metadata["stationary_noise_measurement"], dict(measurement, summary_paths={}))
                 payload = next(item for item in rig.workflow.renderer.calls if item["kind"] == "noise")
                 self.assertAlmostEqual(payload["records"][0]["noise_magnitude_peak_g"],

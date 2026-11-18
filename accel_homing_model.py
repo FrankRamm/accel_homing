@@ -3,6 +3,13 @@
 import json
 import math
 
+if __package__:
+    from .accel_homing_backends import _ah_compat_sibling_module
+else:
+    from accel_homing_backends import _ah_compat_sibling_module
+
+validate_axis_mapping = _ah_compat_sibling_module("accel_homing_axes", __package__, __file__).validate_axis_mapping
+
 
 def _finite_metadata(value):
     if isinstance(value, float):
@@ -33,6 +40,10 @@ class AccelHomingModel:
                     raise ValueError("metadata must be an object")
                 if not _finite_metadata(metadata):
                     raise ValueError("metadata numbers must be finite")
+                if metadata.get("impact_metric") == "mapped_axis":
+                    metadata["axis_mapping"] = validate_axis_mapping(metadata.get("axis_mapping"), axis)
+                    if not isinstance(metadata.get("axis_mapping_context"), dict):
+                        raise ValueError("mapped-axis model requires its sensor context")
             except (ValueError, TypeError) as exc:
                 raise config.error("Invalid %s model metadata: %s" % (axis, exc))
             self.metadata[axis] = metadata
@@ -42,6 +53,12 @@ class AccelHomingModel:
                 if self.successes[axis] != 10:
                     raise config.error("Saved %s homing model needs ten successes" % axis)
                 self.thresholds[axis] = threshold
+        mapped = [self.metadata[axis] for axis in self.thresholds
+                  if self.metadata[axis].get("impact_metric") == "mapped_axis"
+                  and not self.metadata[axis].get("axis_mapping_invalidated")]
+        if (len(mapped) == 2 and mapped[0]["axis_mapping_context"] == mapped[1]["axis_mapping_context"]
+                and mapped[0]["axis_mapping"]["source_axis"] == mapped[1]["axis_mapping"]["source_axis"]):
+            raise config.error("Saved X and Y homing mappings select the same sensor channel")
 
     def get_status(self, eventtime):
         return {"name": self.name, "version": self.version,

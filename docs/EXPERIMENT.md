@@ -11,6 +11,13 @@ the default; specify `COMPARE` for the paired delivery test below.
 It is an opt-in experiment on `main`; ordinary G28, CALIBRATE, the legacy
 TEST command and TROUBLESHOOT retain their policies outside this command.
 
+This historical XYZ experiment rejects a selected axis with a saved or staged
+`mapped_axis` calibration, including manual threshold overrides. Its XYZ
+detector cannot reuse a threshold qualified on one component. After automatic
+axis calibration, use `ACCEL_HOMING_TROUBLESHOOT AXIS=X CENTERED=1` (or Y)
+to collect homing diagnostics with the mapped detector. Beta's separate XYZ
+proposal remains isolated and does not save a general-calibration model.
+
 ## Run
 
 Update the existing `main` installation with the normal Moonraker updater or

@@ -9,7 +9,42 @@ sample rate and error counters before passing a batch to the detector.  This
 does not provide a real-time guarantee for Python, USB/CAN or MCU stopping.
 """
 
+import importlib
+import importlib.util
 import math
+from pathlib import Path
+import sys
+
+
+def _ah_compat_sibling_module(module_name, package, source_file):
+    """Load a new module from the checkout behind an older installed symlink.
+
+    Only an absent requested module permits the exact resolved sibling fallback;
+    dependency failures inside an existing module retain their original error.
+    """
+    name = ((package + ".") if package else "") + module_name
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        missing_parent = bool(package and exc.name == package and package not in sys.modules)
+        if exc.name != name and not missing_parent:
+            raise
+        installed_source = Path(source_file).resolve(strict=True)
+        source = installed_source.with_name(module_name + ".py").resolve(strict=True)
+        if source.parent != installed_source.parent:
+            raise ImportError("accelerometer module must be beside the installed source") from exc
+        spec = importlib.util.spec_from_file_location(name, str(source))
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load accelerometer source: %s" % source) from exc
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(name) is module:
+                del sys.modules[name]
+            raise
+        return module
 
 
 GRAVITY = 9806.65
@@ -118,7 +153,11 @@ def _checked_rows(rows):
 
 
 class ConfiguredAccelBackend:
-    """Machine-mapped mm/s² batches, normalized to 0.001 g detector units."""
+    """Configured-driver XYZ in mm/s², normalized to 0.001 g detector units.
+
+    Drivers already apply their axes_map, including scaling. Learned machine
+    orientation is a separate detector mapping of these delivered channels.
+    """
     kind = "klipper_batch"
     count_g = 0.001
 
@@ -186,6 +225,10 @@ class ConfiguredAccelBackend:
         self.pending = []
         self.fault = None
         self.last_xyz = self.unchanged_since = None
+
+    def axes_map_snapshot(self):
+        mapping = getattr(self.sensor, "axes_map", None)
+        return None if mapping is None else tuple(tuple(pair) for pair in mapping)
 
     def seconds_to_clock(self, seconds):
         return seconds * CLOCK_FREQ
@@ -322,6 +365,10 @@ class ConfiguredAccelBackend:
             pass
 
     def _receive(self, message, trace=None):
+        attempt = self.owner.attempt
+        if (attempt is not None and attempt.axis_mapping is not None
+                and self.axes_map_snapshot() != attempt.driver_axes_map):
+            return self._fail("invalid_data")
         rows = message.get("data", ())
         if not rows:
             if trace is not None:

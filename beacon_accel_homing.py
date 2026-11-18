@@ -6,7 +6,8 @@
 # travels, then only against the travel (or in a configured direction). A
 # legacy Beacon path recognizes pressed starts from commanded versus measured
 # motion. Legacy configured batch sensors require startup motion proof. Simple
-# calibration and its saved models use XYZ magnitude and commanded travel instead.
+# calibration and its saved models use the mapped machine-axis component and
+# commanded travel instead. Explicit Beta/EXPERIMENT modes retain XYZ magnitude.
 #
 # Experimental. The inherited upstream Beacon implementation reports use on
 # three printers; these generic adapters have only been tested synthetically.
@@ -25,10 +26,15 @@ import mcu
 
 if __package__:
     from .accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
-                                        motion_startup_timeout, select_sensor)
+                                        motion_startup_timeout, select_sensor,
+                                        _ah_compat_sibling_module)
 else:  # Standalone offline replay harness; preserve package import failures.
     from accel_homing_backends import (ConfiguredAccelBackend, motion_proof_window,
-                                       motion_startup_timeout, select_sensor)
+                                       motion_startup_timeout, select_sensor,
+                                       _ah_compat_sibling_module)
+
+validate_axis_mapping = _ah_compat_sibling_module(
+    "accel_homing_axes", __package__, __file__).validate_axis_mapping
 
 SAMPLE = struct.Struct("<hhh")
 CLIPPED = 0x7FFF
@@ -405,7 +411,10 @@ class Attempt:
         self.pending_noise = (0.0, 0.0, 0.0)
         self.bases = None           # resting reading of all three sensor axes
         self.sums = [0.0, 0.0, 0.0]  # integrated readings since the pass started
-        self.vector_mode = False   # XYZ magnitude; no acceleration-derived motion proof
+        self.vector_mode = False   # fresh-reference policy; no acceleration motion proof
+        self.axis_mapping = None   # frozen configured-stream -> machine-axis mapping
+        self.capture_axes_map = None  # raw sensor -> configured-stream coordinates
+        self.driver_axes_map = None  # batch driver must not change its delivered frame
         self.experimental = None  # runtime-only immutable snapshot for this home
         self.experimental_weights = None
         self.experimental_pending_time = self.experimental_evidence_sample = None
@@ -858,13 +867,46 @@ class BeaconAccelHoming:
         index, sign = self.helper.config.axes_map[AXES[axis]]
         return index, sign
 
+    def _capture_axes_mapping(self):
+        """Raw detector coordinates to the configured sensor stream, exactly once."""
+        mapping = (((0, 1), (1, 1), (2, 1)) if self.backend is not None
+                   else self.helper.config.axes_map)
+        if (not isinstance(mapping, (tuple, list)) or len(mapping) != 3
+                or any(not isinstance(pair, (tuple, list)) or len(pair) != 2
+                       or type(pair[0]) is not int or pair[0] not in (0, 1, 2)
+                       or type(pair[1]) is not int or pair[1] not in (-1, 1)
+                       for pair in mapping)
+                or len({pair[0] for pair in mapping}) != 3):
+            raise self.printer.command_error("accel_homing: invalid accelerometer axes map")
+        return tuple(tuple(pair) for pair in mapping)
+
+    @staticmethod
+    def _impact_metric(attempt):
+        if attempt.axis_mapping is not None:
+            return "mapped_axis"
+        return "xyz_magnitude" if attempt.vector_mode else "selected_axis"
+
+    def _detection_mapping(self, axis):
+        """Obtain a detached validated profile before an ordinary move can arm."""
+        getter = getattr(self.workflows, "detection_axis_mapping", None)
+        mapping = None if getter is None else getter(axis)
+        if mapping is not None:
+            try:
+                return json.loads(json.dumps(validate_axis_mapping(mapping, axis), allow_nan=False))
+            except (ValueError, TypeError) as exc:
+                raise self.printer.command_error("accel_homing: invalid axis mapping: %s" % exc)
+        session = self.workflows.session
+        if (isinstance(session, dict) and session.get("mode") == "calibration"
+                and not session.get("beta") and not session.get("experiment")):
+            raise self.printer.command_error("accel_homing: calibration requires a qualified automatic axis mapping")
+        return None
+
     def _native_decode_context(self, params):
         return (tuple(params.get("_native_decode_previous", self.native_decode_previous)),
                 params.get("_native_clip_values", getattr(self.helper, "_clip_values", None)))
 
-    def _signal_quality(self, scope, count_g=None, clips=None):
-        mapping = ([(0, 1), (1, 1), (2, 1)] if self.backend is not None
-                   else self.helper.config.axes_map)
+    def _signal_quality(self, scope, count_g=None, clips=None, mapping=None):
+        mapping = self._capture_axes_mapping() if mapping is None else mapping
         if self.backend is None:
             clips = getattr(self.helper, "_clip_values", None) if clips is None else clips
             clips = native_clip_limits(clips) if clips is not None else None
@@ -878,7 +920,8 @@ class BeaconAccelHoming:
             return
         if attempt.signal_quality is None:
             clips = self._native_decode_context(params)[1] if self.backend is None else None
-            attempt.signal_quality = self._signal_quality("armed_response", attempt.count_g, clips)
+            attempt.signal_quality = self._signal_quality("armed_response", attempt.count_g, clips,
+                                                          attempt.capture_axes_map)
         for number in range(count):
             attempt.signal_quality.observe(original[number * 3:number * 3 + 3],
                 (params["start_clock"], params["delta_clock"], number, count))
@@ -1159,7 +1202,7 @@ class BeaconAccelHoming:
             record = attempt.record
             accepted = (attempt.reason == "impact" and
                         (record.get("moving") or record.get("motion_seen")
-                         or record.get("impact_metric") == "xyz_magnitude")) or (
+                         or record.get("impact_metric") in ("xyz_magnitude", "mapped_axis"))) or (
                             attempt.reason == "pressed" and record.get("kept_origin"))
             if accepted and self.last.get(attempt.axis) is record:
                 context["rails"][attempt.axis] = (self.session_axes[attempt.axis], record)
@@ -1304,6 +1347,8 @@ class BeaconAccelHoming:
             bool(observing is not None and observing(attempt.axis)))
         if profile is None or attempt.experimental is not None:
             return
+        if attempt.axis_mapping is not None:
+            raise self.printer.command_error("accel_homing: experimental XYZ profile cannot replace a mapped-axis detector")
         # Ordinary boot/homing never imports the experimental module.
         if __package__:
             from .accel_homing_experiment import validate_profile
@@ -1504,7 +1549,9 @@ class BeaconAccelHoming:
             raise self.printer.command_error("accel_homing: %s_threshold cannot produce a finite"
                                              " positive trigger limit at the active accelerometer scale"
                                              % axis)
-        vector_mode = self._uses_vector_detector(axis)
+        axis_mapping = self._detection_mapping(axis)
+        capture_axes_map = self._capture_axes_mapping()
+        vector_mode = axis_mapping is not None or self._uses_vector_detector(axis)
         if vector_mode:
             limit_squared = limit_raw * limit_raw
             if not math.isfinite(limit_squared) or limit_squared <= 0.0:
@@ -1512,6 +1559,9 @@ class BeaconAccelHoming:
                     "accel_homing: %s_threshold cannot produce a finite positive squared XYZ"
                     " trigger limit at the active accelerometer scale" % axis)
         index, map_sign = self._raw_axis(axis)
+        if axis_mapping is not None:
+            index, map_sign = capture_axes_map[axis_mapping["source_axis"]]
+            map_sign *= axis_mapping["sign"]
         direction = self.impact_sign[axis]
         if self.sensor_fault is not None:
             raise self.printer.command_error("accel_homing: %s" % FAILURES[self.sensor_fault])
@@ -1552,7 +1602,12 @@ class BeaconAccelHoming:
                           deadline, beacon_mcu.print_time_to_clock(deadline) & 0xFFFFFFFF,
                           index, map_sign, direction, limit_raw, count_g)
         attempt.vector_mode = vector_mode
-        reference_quality = self._signal_quality("stationary_reference", count_g)
+        attempt.axis_mapping = axis_mapping
+        attempt.capture_axes_map = capture_axes_map
+        if self.backend is not None:
+            attempt.driver_axes_map = self.backend.axes_map_snapshot()
+        reference_quality = self._signal_quality("stationary_reference", count_g,
+                                                  mapping=capture_axes_map)
         for observation in reference._observations:
             if observation is not None:
                 reference_quality.observe(*observation)
@@ -1586,6 +1641,8 @@ class BeaconAccelHoming:
         return attempt
 
     def arm(self, attempt):
+        if attempt.capture_axes_map is None:
+            attempt.capture_axes_map = self._capture_axes_mapping()
         self._configure_experimental(attempt)
         attempt.last_data = self.last_activity = self.reactor.monotonic()
         with self.lock:
@@ -2606,7 +2663,7 @@ class BeaconAccelHoming:
         self._observe_response(attempt, params, original, count)
 
     def _inspect_vector(self, attempt, params, raw, count, source_params, source_skip):
-        """XYZ acceleration magnitude about a fixed resting offset, in raw units."""
+        """First mapped-component crossing; explicit legacy modes use XYZ magnitude."""
         if not all(math.isfinite(value) for value in raw):
             self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return
@@ -2621,7 +2678,14 @@ class BeaconAccelHoming:
                 attempt.vector_unchanged_since = self.clock_to_time(
                     params["start_clock"] + int(round(position * interval)))
             previous = xyz
-            level2 = sum((value - base) ** 2 for value, base in zip(xyz, attempt.bases))
+            if attempt.axis_mapping is not None:
+                delta = xyz[attempt.index] - attempt.bases[attempt.index]
+                level2 = delta * delta
+            else:
+                level2 = sum((value - base) ** 2 for value, base in zip(xyz, attempt.bases))
+            if not math.isfinite(level2):
+                self._fire(attempt, "invalid_data", mcu.MCU_trsync.REASON_HOST_REQUEST)
+                return
             if level2 >= limit2:
                 attempt.onset_batch = (params["start_clock"], params["delta_clock"], position, count)
                 attempt.onset_sample = (source_params["start_clock"], source_params["delta_clock"],
@@ -2687,8 +2751,12 @@ class BeaconAccelHoming:
         if attempt.vector_mode:
             raw = (data if isinstance(data, (tuple, list, memoryview)) else
                    [v for row in SAMPLE.iter_unpack(sample_slice(data, count)) for v in row])
-            peak = max(math.sqrt(sum((raw[n + axis] - attempt.bases[axis]) ** 2
-                                     for axis in range(3))) for n in range(0, count * 3, 3))
+            if attempt.axis_mapping is not None:
+                peak = max(abs(raw[n + attempt.index] - attempt.bases[attempt.index])
+                           for n in range(0, count * 3, 3))
+            else:
+                peak = max(math.sqrt(sum((raw[n + axis] - attempt.bases[axis]) ** 2
+                                         for axis in range(3))) for n in range(0, count * 3, 3))
             if peak > attempt.impact_peak:
                 attempt.impact_peak = peak
                 if attempt.record is not None:
@@ -2755,6 +2823,7 @@ class BeaconAccelHoming:
                       if self.backend is not None else mapping)
         context = {"sensor": self.sensor_name,
                    "backend": "beacon_raw" if self.backend is None else self.backend.kind,
+                   "coordinate_frame": "configured_sensor_stream",
                    "scale_id": scale.get("id"), "scale_name": scale.get("name"),
                    "count_g": count_g, "full_scale_g": full_scale,
                    "capture_axes_map": mapping, "sensor_axes_map": driver_map,
@@ -3429,7 +3498,7 @@ class BeaconAccelHoming:
                     logging.exception("accel_homing: beta home stream cleanup failed")
 
     def _stop_capture_data(self):
-        """Convert bounded captured batches to machine-axis g off the trigger path.
+        """Convert captured batches to configured-sensor-stream g off the trigger path.
 
         `samples` include gravity and bias; `baseline_g` must be subtracted when
         comparing channels to directional impact thresholds in charts.
@@ -3441,8 +3510,8 @@ class BeaconAccelHoming:
             attempt, self.capture_attempt = self.capture_attempt, None
             attempt_count, self.capture_attempts = self.capture_attempts, 0
             fault = self.sensor_fault
-        mapping = ([(0, 1), (1, 1), (2, 1)] if self.backend is not None
-                   else self.helper.config.axes_map)
+        mapping = (attempt.capture_axes_map if attempt is not None
+                   and attempt.capture_axes_map is not None else self._capture_axes_mapping())
         detector = None
         onset_sample = None if attempt is None else attempt.onset_sample
         valid_onset_sample = (isinstance(onset_sample, (tuple, list)) and len(onset_sample) == 4
@@ -3469,7 +3538,10 @@ class BeaconAccelHoming:
                         "direction": 0,
                         "polarity_policy": POLARITY_POLICY,
                         "reference_signal_quality": attempt.reference_signal_quality,
-                        "impact_metric": "xyz_magnitude" if attempt.vector_mode else "selected_axis",
+                        "impact_metric": self._impact_metric(attempt),
+                        "coordinate_frame": "configured_sensor_stream",
+                        "axis_mapping": (None if attempt.axis_mapping is None else
+                                         json.loads(json.dumps(attempt.axis_mapping))),
                         "homing_speed_mm_s": attempt.effective_speed,
                         "homing_accel_mm_s2": attempt.effective_accel,
                         "attempt_count": attempt_count}
@@ -3477,7 +3549,7 @@ class BeaconAccelHoming:
         quality = self._signal_quality("capture", batches[0][3] if batches else
                                        (self.session_scale or self.scale)["scale"] / 1000.0,
                                        contexts[0][1] if self.backend is None and contexts
-                                       and contexts[0] is not None else None)
+                                       and contexts[0] is not None else None, mapping)
         if detector is not None and attempt.experimental is not None:
             detector["experimental"] = self._experimental_status(attempt)
         prefix_quality = None
@@ -3577,6 +3649,9 @@ class BeaconAccelHoming:
         if detector is not None:
             detector.update(signal)
         return {"samples": samples, "dropped": dropped, "baseline_g": baseline, "fault": fault,
+                "coordinate_frame": "configured_sensor_stream",
+                "axis_mapping": (None if attempt is None or attempt.axis_mapping is None else
+                                 json.loads(json.dumps(attempt.axis_mapping))),
                 **signal, "reference_signal_quality": reference_signal,
                 "detector": detector,
                 # Used only for in-process provenance; workflows remove this
@@ -3697,7 +3772,10 @@ class BeaconAccelHoming:
             "pass": attempt.pass_no,
             "result": attempt.reason or "no_trigger",
             "threshold_g": round(attempt.limit_raw * to_g, 2),
-            "impact_metric": "xyz_magnitude" if attempt.vector_mode else "selected_axis",
+            "impact_metric": self._impact_metric(attempt),
+            "coordinate_frame": "configured_sensor_stream",
+            "axis_mapping": (None if attempt.axis_mapping is None else
+                             json.loads(json.dumps(attempt.axis_mapping))),
             "physical_position_verified": False,
             "direction": 0,
             "polarity_policy": POLARITY_POLICY,
@@ -3820,9 +3898,9 @@ class BeaconAccelHoming:
         gcmd.respond_info("accel_homing: sensor %s, backend %s, X %.12g g, Y %.12g g"
                           % (self.sensor_name, kind, self.threshold_g["x"], self.threshold_g["y"]))
         gcmd.respond_info("accel_homing: baseline policy: legacy ordinary homing requires quiet XYZ;"
-                          " simple calibration and saved XYZ-magnitude models require a post-settle"
+                          " mapped-axis calibration and saved models require a post-settle"
                           " %.2f ms / %d sample reference without a quiet-range limit;"
-                          " no acceleration-derived motion proof for XYZ magnitude"
+                          " no acceleration-derived motion proof for mapped-axis or explicit XYZ detection"
                           % (self.baseline_time * 1000.0, BASELINE_MIN_SAMPLES))
         if self.backend is not None:
             gcmd.respond_info("accel_homing: requested report interval %.4f s, past sample-age limit disabled;"

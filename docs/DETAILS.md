@@ -14,17 +14,22 @@ or a hard real-time endstop.
 
 | Context | Metric and preparation |
 | --- | --- |
-| New simple calibration | Fresh XYZ resting offset; magnitude at each sample; no quiet-range gate or integrated motion proof. |
-| New saved model with `impact_metric: xyz_magnitude` | Same vector detector during ordinary homing, TEST, CHARTS and ACCURACY after reload, unless explicit config thresholds take precedence. |
-| Explicit config thresholds / older selected-axis models | Absolute machine-axis deviation about a fresh quiet reference, with legacy motion/pressed policies. |
+| New simple calibration | Gentle bidirectional central mapping; fresh XYZ resting offset; absolute learned physical-axis component at each sample; no quiet-range gate or integrated homing-motion proof. |
+| New saved model with `impact_metric: mapped_axis` | Same mapped detector during ordinary homing, TEST, CHARTS, ACCURACY and TROUBLESHOOT after reload; persisted mapping is tied to sensor context. |
+| Older saved `xyz_magnitude` qualification | Requires fresh per-axis calibration; cannot be silently reused as mapped-axis qualification. |
+| Manual threshold with a valid mapped model | Manual scalar threshold with the learned physical-axis orientation and mapped reference policy. |
+| Unmapped manual thresholds / accepted legacy selected-axis models | Absolute configured-channel deviation about a fresh quiet reference, with legacy motion/pressed policies. |
 | Beta calibration | Isolated moving-noise experiment and proposal; does not replace or save the ordinary model. |
 
-The vector detector evaluates
-`sqrt((ax-bx)^2 + (ay-by)^2 + (az-bz)^2)` in g about a fixed fresh reference.
+The mapped detector evaluates
+`abs(sign * (a[source_axis] - baseline[source_axis]))` in g about a fixed fresh
+reference. The learned source channel is in the already configured sensor
+stream, after driver `axes_map`; raw XYZ capture rows are not reordered.
 The first sample reaching the threshold requests stopping; a later peak does
-not delay that request. Channel permutations/sign reversals do not change the
-magnitude. Motion, vibration, binding and intended stop contact can all produce
+not delay that request. Other channels do not contribute to this metric.
+Motion, vibration, binding and intended stop contact can all produce
 the same threshold crossing. The full-move deadline and data-fault checks remain.
+Beta, historical captures and explicit XYZ experiments retain vector support.
 
 The selected-axis RAW detector similarly compares `abs(a-b)` with its
 threshold; homing direction does not select an acceleration polarity.
@@ -53,7 +58,7 @@ and acquires a fresh contiguous reference. The default `baseline_time` is
 0.1 s with at least 50 samples. Earlier buffered impacts cannot supply that
 fresh reference. Preparation can time out if no usable window arrives.
 
-Simple vector references estimate only a fresh resting offset; the quiet gates
+Simple mapped-axis references estimate only a fresh resting offset; the quiet gates
 below do not apply to them. They still need valid, fresh, contiguous data.
 
 For the **generic legacy detector**, each sensor axis's stationary peak-to-peak
@@ -145,7 +150,7 @@ The travel expression includes one 3 ms startup watchdog allowance.
 It excludes host stalls, transport/MCU stopping delay and mechanical response.
 A policy refusal describes a numerically planned command, not a measured
 stopping distance. Runtime checks use current live limits, including changes
-made by other macros. Simple vector detection omits the integrated startup
+made by other macros. Simple mapped-axis detection omits the integrated startup
 proof, while applicable generic plan/admission checks remain in place.
 
 Receipt silence, future/invalid/nonmonotonic timestamps, rate/error/range faults and
@@ -154,7 +159,9 @@ and finite derived raw trigger limits/deadlines are required.
 
 ## Calibration qualification and saving
 
-Current simple calibration uses fresh three-window stationary noise to select
+Current simple calibration first learns a physical-axis channel/sign from
+gentle central bidirectional motion and rejects ambiguous results. It then uses
+fresh three-window stationary noise on that mapped component to select
 an initial candidate, then requires an impact beyond 20 mm inside the
 midpoint-to-endstop travel band. It excludes discovery and requires ten fresh
 validation homes at the candidate threshold with travel range at most 2 mm.

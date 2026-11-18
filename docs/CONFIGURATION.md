@@ -70,14 +70,15 @@ an 8 g MPU9250 sensor.
 
 To use calibration, comment out both axis overrides **and** the shared
 `threshold`, then issue console `RESTART` while idle. An explicit manual
-threshold retains the legacy selected-axis detector; a newly calibrated model
-uses XYZ magnitude. Values calibrated for one metric are not interchangeable
-with the other. The detector in use is part of the model/status context.
-Both RAW metrics ignore acceleration polarity after subtracting their fresh
-signed reference; selected-axis detection uses `abs(a-b)`. Homing direction
-still controls commanded travel and does not change the source sensor signs.
-Compatible saved XYZ-magnitude profiles retain their thresholds and
-qualification. A saved selected-axis profile with legacy/unknown sign-gated
+threshold changes the numeric threshold. When a valid mapped-axis model exists,
+its learned orientation and mapped detector remain active with that manual
+value. Without a mapped model, manual thresholds retain the legacy configured
+channel behavior. RAW detection subtracts its fresh signed reference before
+the absolute value; homing direction controls commanded travel, not polarity.
+The detector and mapping in use are part of the model/status context.
+Older XYZ-magnitude profiles require fresh per-axis calibration before ordinary
+homing, including when a manual threshold is present. Their qualification is
+not transferable to the mapped metric. A saved selected-axis profile with legacy/unknown sign-gated
 qualification is refused before homing unless it records the current polarity
 policy (including the recognized native policy). Recalibrate that axis or
 choose an explicit manual threshold; the plugin does not rewrite old models.
@@ -85,6 +86,12 @@ choose an explicit manual threshold; the plugin does not rewrite old models.
 `model: default` selects `[accel_homing_model default]` in the generated
 SAVE_CONFIG block. Leave the generated **DO NOT EDIT** block alone. Models keep
 each axis independently, ten-success qualification and sensor/geometry metadata.
+New calibration stores `impact_metric: mapped_axis` and a versioned
+`axis_mapping` with machine axis, source channel, sign, confidence and diagnostic
+evidence. Its coordinate frame is the configured sensor stream, after the
+driver's `axes_map`. The plugin does not edit that driver setting. X/Y homing
+uses only its own learned physical component; raw XYZ remain available for
+diagnosis. A changed sensor/orientation/axes map requires recalibration.
 Changed context can prevent a model from being accepted; recalibrate after
 reviewing the reported mismatch rather than editing generated metadata.
 
@@ -114,7 +121,7 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |
 | `baseline_time` | `0.1` | Fresh reference duration in seconds; 0.05–1, with at least 50 contiguous samples. |
 | `baseline_batches` | `25` | Retained baseline batch capacity; integer 10–200. |
-| `baseline_noise_floor` | `0.7` | Generic legacy quiet-reference floor in g; 0–0.7. Does not apply to the simple vector detector or change native Beacon's separate policy. |
+| `baseline_noise_floor` | `0.7` | Generic legacy quiet-reference floor in g; 0–0.7. Does not apply to the simple mapped-axis detector or change native Beacon's separate policy. |
 | `stream_timeout` | `0.05` | Independent stream receipt watchdog in seconds (0.01–0.5). Generic data renews it through validated relevant rows. Native Beacon retains its timing policy. |
 | `travel_margin` | `1.1` | Full-move travel/time margin multiplier; 1–2. |
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |

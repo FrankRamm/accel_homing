@@ -43,8 +43,12 @@ Standard chart acceleration curves show `abs(ax-bx)`, `abs(ay-by)` and
 `abs(az-bz)` in g.
 The fresh signed resting reference is subtracted **before** taking absolute
 values. Acceleration axes, threshold lines and peak markers are nonnegative.
-New vector-model captures also label XYZ magnitude; selected-axis captures
-retain their detector context. The measured onset/peak can differ from the
+Mapped-axis captures label the learned physical X or Y and its signed source
+channel, for example `Physical X (= -stream Y)`. Their peak marker and threshold
+use only that selected component. The remaining stream channels are diagnostic;
+their letters do not assert a physical machine-axis mapping. ACCURACY places
+the threshold on the mapped component panel. Historical/explicit XYZ captures
+continue to label XYZ magnitude. The measured onset/peak can differ from the
 threshold used to request stopping. Signed source samples, reference offsets,
 travel statistics and times are retained internally. Relative event times can
 be negative; ACCURACY retains its precise travel scale in mm.
@@ -57,8 +61,10 @@ A diagnostic chart cannot establish that all vector peaks or physical
 transients were preserved, nor measure end-to-end stopping latency. Synthetic
 fixtures are marked **SIMULATED / NOT PRINTER MEASUREMENT**.
 
-TROUBLESHOOT impact plots show signed XYZ components and XYZ magnitude with
-their available reference, plus separate timing and travel diagnostics. Its
+TROUBLESHOOT impact plots keep signed configured-stream XYZ components and,
+for mapped-axis homes, add the signed physical component and its absolute
+detector value with the physical-axis threshold. XYZ-mode captures retain their
+vector display. These use the available reference, plus separate timing and travel diagnostics. Its
 CSV files retain source samples at their original resolution within the stated
 retention limits; inspect the manifest for omitted ranges.
 
@@ -100,18 +106,21 @@ old sensor timestamps. Only validated relevant receipts renew the independent
 stream watchdog. Native Beacon retains its age policy. Homing/Beta do not opt
 into stationary-window retries.
 
-Mapped X/Y hints are diagnostic. The numerical candidate is the measured peak
+Configured-stream X/Y hints are diagnostic. The numerical candidate is the measured peak
 plus the larger of 20% or 0.1 g, rounded upward onto the configured start/step
 grid. Unknown physical range or a result above known sensor headroom makes
 an automatic hint unavailable. A displayed hint is not a calibrated impact
 threshold or a measured minimum.
 
-Each new CALIBRATE measures its own fresh **XYZ-magnitude** noise before movement.
+Each new CALIBRATE first learns its physical-axis mapping with gentle central
+bidirectional strokes, then measures fresh **mapped-axis** stationary noise.
 A previous standalone NOISE result is not reused. Fresh acquisition is required
 even when START_THRESHOLD is explicit. Its summary is rendered only after the
 calibration qualifies and published after required cleanup and saving succeed.
 Stationary measurement does not cover motor enabling, first-step
-transients, acceleration or moving vibration. See [calibration](SIMPLE_CALIBRATION.md).
+transients, acceleration or moving vibration. Calibration noise plots label
+the learned physical component and its peak; any retained XYZ-magnitude peak
+is explicitly diagnostic. See [calibration](SIMPLE_CALIBRATION.md).
 
 ## Opening plots in Mainsail or Fluidd
 

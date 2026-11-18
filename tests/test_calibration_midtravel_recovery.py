@@ -178,6 +178,7 @@ class MidtravelRecoveryTests(unittest.TestCase):
         rig = Rig()
         workflow = rig.workflow
         workflow._begin(GCmd(SAVE_CONFIG=0), "calibration", "x")
+        rig.qualify_axis_mapping(workflow.session)
         workflow.session["state"] = "running"
         rig.home_results.append({"travel_mm": 51.175})
         record, _capture = workflow._home("x", 1.)

@@ -9,6 +9,7 @@ or slip. Qualified homes return to the configured midpoint.
 import datetime
 import configparser
 import contextlib
+import copy
 from decimal import Decimal
 import gc
 import html
@@ -27,6 +28,7 @@ import urllib.parse
 import uuid
 
 if __package__:
+    from .accel_homing_backends import _ah_compat_sibling_module
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
@@ -34,12 +36,17 @@ if __package__:
                                       compact_beta_home, write_beta_motion, prepare_capture,
                                       publish_captures, prepare_noise, publish_noise)
 else:  # Standalone offline analysis; do not mask package dependency errors.
+    from accel_homing_backends import _ah_compat_sibling_module
     from accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                      PNGRenderer, default_dependency_directory, preflight_renderer,
                                      validate_accuracy, write_accuracy, write_capture, write_noise,
                                      write_noise_capture, beta_motion_statistics,
                                      compact_beta_home, write_beta_motion, prepare_capture,
                                      publish_captures, prepare_noise, publish_noise)
+
+_axes_module = _ah_compat_sibling_module("accel_homing_axes", __package__, __file__)
+infer_axis_mapping = _axes_module.infer_axis_mapping
+validate_axis_mapping = _axes_module.validate_axis_mapping
 
 try:
     from .homing import PrinterHoming as _PrinterHoming
@@ -62,7 +69,7 @@ SIGNAL_QUALITY_FIELDS = ("amplitude_limited", "excess_amplitude_unknown", "peak_
 CALIBRATION_MIN_TRAVEL_MM = 20.0
 CALIBRATION_REPEATABILITY_MM = 2.0
 CALIBRATION_THRESHOLD_MARGIN_G = 0.5
-SIMPLE_CALIBRATION = "impact20_vector_v2"
+SIMPLE_CALIBRATION = "impact20_mapped_axis_v1"
 REQUIRED_SUCCESSES = 10
 # Diagnostic captures only: retain the final discovery + ten checks and context.
 # Each of its two display envelopes is <=4096 points; 16 homes leave ample
@@ -292,6 +299,7 @@ class AccelHomingWorkflows:
             self.manual_axes.update(AXES)
         self.temporary_manual_thresholds = {}
         self.model = None
+        self.pending_model_metadata = {}
         if config.has_section(self.model_section):
             self.model = self.printer.load_object(config, self.model_section)
             for axis, threshold in self.model.thresholds.items():
@@ -727,6 +735,8 @@ class AccelHomingWorkflows:
                     and result.get("result") != "calibrated"):
                 self._invalidate_calibration_axis(session)
             self._restore()
+            if session is not None and session.get("finish_interrupted"):
+                raise self._error(session["finish_interrupted"])
             if release:
                 try:
                     self._disable_xy()
@@ -745,6 +755,9 @@ class AccelHomingWorkflows:
                 result = dict(result, result="aborted", save_config=False,
                               operation_reason=result.get("reason"),
                               reason="recovery calibration cleanup failed: %s" % exc)
+            elif session is not None and session["mode"] == "calibration":
+                result = dict(result, result="aborted", save_config=False,
+                              reason="calibration cleanup failed: %s" % exc)
             elif session is not None and session["mode"] in ("accuracy", "troubleshoot", "noise", "charts"):
                 result = {"result": "aborted", "reason": "workflow cleanup failed: %s" % exc}
             raise
@@ -798,10 +811,23 @@ class AccelHomingWorkflows:
                               "command or use CANCEL")
         calibrating = bool(self.session and self.session.get("mode") == "calibration")
         for axis in axes:
-            if (calibrating or axis in self.manual_axes or self._temporary_manual_threshold(axis)
-                    or self.model is None or axis not in self.model.thresholds):
+            if calibrating or self._experimental_home(axis):
+                continue
+            self._check_pending_mapping(axis)
+            if self.model is None or axis not in self.model.thresholds:
                 continue
             metadata = self.model.metadata[axis]
+            if metadata.get("axis_mapping_invalidated"):
+                raise self._error("Saved %s axis mapping was invalidated; recalibrate this axis" % axis.upper())
+            if metadata.get("impact_metric") == "xyz_magnitude":
+                raise self._error("Saved XYZ-magnitude homing model requires automatic axis mapping; "
+                                  "recalibrate with ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1 "
+                                  "before ordinary homing" % axis.upper())
+            if metadata.get("impact_metric") == "mapped_axis":
+                self.detection_axis_mapping(axis)
+                continue
+            if axis in self.manual_axes or self._temporary_manual_threshold(axis):
+                continue
             if (metadata.get("impact_metric") != "xyz_magnitude"
                     and metadata.get("polarity_policy") != POLARITY_POLICY
                     and not (getattr(self.owner, "backend", None) is None
@@ -914,9 +940,61 @@ class AccelHomingWorkflows:
                 and self.session.get("algorithm") == SIMPLE_CALIBRATION):
             return True
         model = self.model
-        return bool(model is not None and axis not in self.manual_axes and not self._temporary_manual_threshold(axis)
-                    and axis in model.thresholds
-                    and model.metadata[axis].get("impact_metric") == "xyz_magnitude")
+        return bool(model is not None and axis in model.thresholds
+                    and model.metadata[axis].get("impact_metric") == "mapped_axis")
+
+    def detection_axis_mapping(self, axis):
+        """Return a learned channel in the configured sensor stream frame."""
+        session = self.session
+        if self._experimental_home(axis) or (session and session.get("beta")):
+            return None
+        if session and session.get("axis") == axis and session.get("mode") == "calibration":
+            if not self.calibration_reference(axis):
+                raise self._error("automatic mapping is available only to the current calibration home")
+            mapping = session.get("axis_mapping")
+            context = session.get("axis_mapping_context")
+            if mapping is None:
+                raise self._error("automatic axis mapping must qualify before calibration homing")
+        elif self.model is not None and axis in self.model.thresholds:
+            self._check_pending_mapping(axis)
+            metadata = self.model.metadata[axis]
+            if metadata.get("axis_mapping_invalidated"):
+                raise self._error("Saved %s axis mapping was invalidated; recalibrate this axis" % axis.upper())
+            if metadata.get("impact_metric") != "mapped_axis":
+                return None
+            mapping, context = metadata.get("axis_mapping"), metadata.get("axis_mapping_context")
+        else:
+            self._check_pending_mapping(axis)
+            return None
+        try:
+            mapping = validate_axis_mapping(mapping, axis)
+        except (TypeError, ValueError) as exc:
+            raise self._error("invalid saved automatic axis mapping: %s; recalibrate %s" % (exc, axis.upper()))
+        if context != self.owner.noise_sensor_context():
+            raise self._error("automatic axis mapping sensor context changed; recalibrate %s" % axis.upper())
+        return mapping
+
+    def _staged_or_saved_metadata(self, axis):
+        if axis in self.pending_model_metadata:
+            return self.pending_model_metadata[axis]
+        if self.model is not None and axis in self.model.thresholds:
+            return self.model.metadata[axis]
+        return None
+
+    def _check_pending_mapping(self, axis):
+        pending = self.pending_model_metadata.get(axis)
+        if pending is None:
+            return
+        if pending.get("axis_mapping_invalidated"):
+            raise self._error("%s axis mapping was invalidated by another calibration; recalibrate this axis" % axis.upper())
+        loaded = (self.model.metadata.get(axis, {}) if self.model is not None else {})
+        if pending.get("axis_mapping") != loaded.get("axis_mapping"):
+            raise self._error("%s automatic axis mapping is staged; run SAVE_CONFIG and restart before ordinary homing"
+                              % axis.upper())
+
+    @staticmethod
+    def _calibration_metric(session):
+        return "xyz_magnitude" if session.get("beta") else "mapped_axis"
 
     def _experimental_home(self, axis):
         session = self.session
@@ -1029,7 +1107,7 @@ class AccelHomingWorkflows:
             self._clear_noise_seeds()
 
     def _announce_calibration(self, session):
-        self._info("%s calibration starts at %.6g g with %.6g g steps; XYZ magnitude; "
+        self._info("%s calibration starts at %.6g g with %.6g g steps; mapped-axis absolute acceleration; "
                    "impact after >20 mm then ten centered endstop checks with spread <= 2 mm; "
                    "no quietness or acceleration-derived motion proof; returns settle for %.3f s; "
                    "early triggers reverse their recorded signed start-to-halt travel; "
@@ -1126,7 +1204,7 @@ class AccelHomingWorkflows:
             self._check_running(session)
         if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
             raise self._error("printer is shut down")
-        continuation = session is not None and bool(session.get("accuracy_recovery"))
+        continuation = session is not None and bool(session.get("accuracy_recovery") or session.get("axis_mapping"))
         if self._printing() or (not continuation
                                and self._status("idle_timeout").get("state") == "Printing"):
             raise self._error("noise measurement requires an idle printer, not printing or paused")
@@ -1207,7 +1285,7 @@ class AccelHomingWorkflows:
                 "noise_peak_to_peak_g": spread, "noise_rms_g": rms,
                 "sensor": context["sensor"], "backend": context["backend"],
                 "full_scale_g": context["full_scale_g"],
-                "axis_context": "machine-mapped XYZ after configured axes_map",
+                "axis_context": "configured sensor-stream XYZ; learned machine-axis mapping is separate",
                 "sensor_context": context,
                 "acquisition_attempts": capture.get("acquisition_attempts", 1),
                 "acquisition_faults": list(capture.get("acquisition_faults", ()))}
@@ -1311,6 +1389,10 @@ class AccelHomingWorkflows:
                                                       on_acquisition_fault=acquisition_fault)
             self._check_noise_running(session)
             record = self._noise_record(session, iteration, capture)
+            if session.get("axis_mapping") is not None:
+                mapping = session["axis_mapping"]
+                record.update(impact_metric="mapped_axis", axis_mapping=dict(mapping),
+                              noise_axis_peak_g=record["noise_peak_g"]["xyz"[mapping["source_axis"]]])
             try:
                 paths = write_noise_capture(self.charts_directory, session["run_id"],
                                             iteration, capture, record, **self._chart_options(session))
@@ -1332,7 +1414,7 @@ class AccelHomingWorkflows:
         self._begin_noise(session)
         session["calibration_preflight"] = True
         self._chart_preflight()
-        continuation = bool(session.get("accuracy_recovery"))
+        continuation = bool(session.get("accuracy_recovery") or session.get("axis_mapping"))
         self._preflight([session["axis"]], continuation=continuation)
         self._require_unhomed_xy()
         self._preflight_noise(session)
@@ -1354,12 +1436,15 @@ class AccelHomingWorkflows:
         self._preflight([session["axis"]], continuation=continuation)
         self._require_unhomed_xy()
         self._check_stopped_noise_context(session)
-        peaks = [item["record"].get("noise_magnitude_peak_g") for item in session["iterations"]]
+        mapping = validate_axis_mapping(session["axis_mapping"], session["axis"])
+        source_axis = "xyz"[mapping["source_axis"]]
+        peaks = [item["record"]["noise_peak_g"].get(source_axis) for item in session["iterations"]]
         if (len(peaks) != NOISE_ITERATIONS or any(
                 not isinstance(peak, (int, float)) or isinstance(peak, bool)
                 or not math.isfinite(peak) or peak < 0.0 for peak in peaks)):
-            raise self._error("calibration requires three measured XYZ-magnitude noise peaks")
+            raise self._error("calibration requires three measured mapped-axis noise peaks")
         peak = max(peaks)
+        magnitude_peak = max(item["record"]["noise_magnitude_peak_g"] for item in session["iterations"])
         start, step = session["start_threshold_g"], session["threshold_step_g"]
         # Decimal avoids an extra grid step from binary roundoff at an exact
         # boundary. A noisy candidate must never be rounded or clamped downward.
@@ -1375,7 +1460,8 @@ class AccelHomingWorkflows:
         explicit = session["explicit_start_threshold"]
         session["stationary_noise"] = {
             "run_id": session["run_id"], "iterations": NOISE_ITERATIONS,
-            "impact_metric": "xyz_magnitude", "noise_magnitude_peak_g": peak,
+            "impact_metric": "mapped_axis", "axis_mapping": dict(mapping),
+            "noise_axis_peak_g": peak, "noise_magnitude_peak_g": magnitude_peak,
             "initial_threshold_source": "explicit_start_threshold" if explicit else "stationary_noise",
             "start_threshold_g": start if explicit else candidate,
             "acquisition_faults": list(noise_result["acquisition_faults"]),
@@ -1383,25 +1469,28 @@ class AccelHomingWorkflows:
         session["deferred_noise_result"] = noise_result
         if not explicit:
             if limit is None:
-                raise self._error("stationary XYZ-magnitude noise cannot select a calibration start "
+                raise self._error("stationary mapped-axis noise cannot select a calibration start "
                                   "without a known sensor range; specify START_THRESHOLD explicitly")
             if not math.isfinite(candidate) or candidate > limit or candidate <= peak:
-                raise self._error("stationary XYZ-magnitude noise requires %.6g g, outside the "
+                raise self._error("stationary mapped-axis noise requires %.6g g, outside the "
                                   "calibration sensor-range headroom ceiling %.6g g "
                                   "(80%% of the known range); calibration aborted" % (
                                       candidate, limit))
             session["noise_seed"] = {
                 "run_id": session["run_id"], "source": "stationary_noise",
-                "impact_metric": "xyz_magnitude", "noise_magnitude_peak_g": peak,
+                "impact_metric": "mapped_axis", "axis_mapping": dict(mapping),
+                "noise_axis_peak_g": peak, "noise_magnitude_peak_g": magnitude_peak,
                 "required_threshold_g": required, "start_threshold_g": candidate,
                 "configured_start_g": start, "candidate_step_g": step, "threshold_limit_g": limit,
                 "margin_factor": 1.2, "margin_g": 0.1}
             session.update(start_threshold_g=candidate, candidate=candidate)
-            self._info("Fresh stationary XYZ-magnitude peak %.6g g selects initial candidate %.6g g; "
+            self._info("Fresh stationary mapped-axis peak %.6g g selects initial candidate %.6g g; "
                        "ten-home qualification remains required" % (peak, candidate))
         else:
-            self._info("Fresh stationary XYZ-magnitude peak %.6g g measured; explicit START_THRESHOLD "
+            self._info("Fresh stationary mapped-axis peak %.6g g measured; explicit START_THRESHOLD "
                        "%.6g g remains the initial candidate" % (peak, start))
+        session["recommendation"].update(calibration_axis=session["axis"], impact_metric="mapped_axis",
+                                         axis_mapping=dict(mapping), noise_axis_peak_g=peak)
         self._announce_calibration(session)
         self._check_running(session)
         self._check_stopped_noise_context(session)
@@ -1558,11 +1647,16 @@ class AccelHomingWorkflows:
                                             record, capture)
             record["capture_valid"] = True
         elif early_calibration:
-            if not isinstance(capture.get("detector"), dict) or capture["detector"].get("impact_metric") != "xyz_magnitude":
-                raise self._error("early return requires the current XYZ-magnitude detector capture")
+            if (not isinstance(capture.get("detector"), dict)
+                    or capture["detector"].get("impact_metric") != self._calibration_metric(session)):
+                raise self._error("early return requires the current calibrated detector capture")
             self._validate_accuracy_capture(session, axis, source_record, detector_record,
                                             record, capture, record["workflow_threshold_g"])
             record["early_capture_valid"] = True
+        elif session["mode"] == "calibration" and not session.get("beta"):
+            self._validate_accuracy_capture(session, axis, source_record, detector_record,
+                                            record, capture, record["workflow_threshold_g"])
+            record["capture_valid"] = True
         if session.get("beta"):
             if not early_calibration:
                 self._validate_accuracy_capture(session, axis, source_record, detector_record,
@@ -1654,6 +1748,18 @@ class AccelHomingWorkflows:
                 or (session.get("last_arm_time") is not None
                     and arm <= session["last_arm_time"])):
             raise self._error("homing capture does not belong to the current detector/reference")
+        if record.get("impact_metric") == "mapped_axis":
+            try:
+                expected_mapping = (validate_axis_mapping(session.get("axis_mapping"), axis)
+                    if session.get("mode") == "calibration" else self.detection_axis_mapping(axis))
+                if (expected_mapping is None
+                        or any(validate_axis_mapping(item.get("axis_mapping"), axis) != expected_mapping
+                               for item in (record, source_record, detector, capture))
+                        or detector.get("impact_metric") != "mapped_axis"
+                        or capture.get("coordinate_frame") != "configured_sensor_stream"):
+                    raise ValueError("mapped-axis receipts differ")
+            except (TypeError, ValueError) as exc:
+                raise self._error("homing capture axis mapping does not belong to the current detector: %s" % exc)
         samples = capture["samples"]
         if not samples[0][0] < arm <= samples[-1][0]:
             raise self._error("homing capture lacks the current pre-arm reference or armed samples")
@@ -1795,8 +1901,16 @@ class AccelHomingWorkflows:
             if (not isinstance(travel, (int, float)) or isinstance(travel, bool)
                     or not math.isfinite(travel) or travel < 0):
                 return "fatal", "missing commanded travel measurement"
-            if record.get("impact_metric") != "xyz_magnitude":
-                return "fatal", "calibration requires the XYZ-magnitude detector"
+            if record.get("impact_metric") != self._calibration_metric(session):
+                return "fatal", "calibration requires the current %s detector" % self._calibration_metric(session)
+            if not session.get("beta"):
+                try:
+                    mapping = validate_axis_mapping(session.get("axis_mapping"), axis)
+                    if (validate_axis_mapping(record.get("axis_mapping"), axis) != mapping
+                            or session.get("axis_mapping_context") != self.owner.noise_sensor_context()):
+                        raise ValueError("mapping or sensor context changed")
+                except (TypeError, ValueError):
+                    return "fatal", "calibration homing result has different automatic axis mapping"
             if result != "impact":
                 return "fatal", "sensor/homing failure (%s)" % result
             if travel <= CALIBRATION_MIN_TRAVEL_MM:
@@ -1823,7 +1937,7 @@ class AccelHomingWorkflows:
         if result == "pressed" or travel <= MIN_TRAVEL:
             return "early", "pressed start or early trigger at %.2f mm (must exceed 10 mm)" % travel
         if not (record.get("moving") or record.get("motion_seen")
-                or record.get("impact_metric") == "xyz_magnitude"):
+                or record.get("impact_metric") in ("xyz_magnitude", "mapped_axis")):
             return "fatal", "accelerometer did not establish motion before impact"
         _center, expected = self._geometry(axis)
         if travel < expected * (1.0 - self.travel_tolerance):
@@ -2078,6 +2192,8 @@ class AccelHomingWorkflows:
         maximum = max(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
         spread = self._repeatability_spread(qualified)
         self._release_terminal_home(axis, qualified[-1])
+        if session["axis_mapping_context"] != self.owner.noise_sensor_context():
+            raise self._error("automatic axis mapping sensor context changed during final release; recalibrate")
         # Final release may yield while its motion completes. Recheck all ten
         # accepted trials before staging any model settings.
         self._qualified_validation_records()
@@ -2104,6 +2220,8 @@ class AccelHomingWorkflows:
             # sensor headroom, not just the lower threshold used by the trials.
             threshold = self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
+                    "axis_mapping": validate_axis_mapping(session["axis_mapping"], axis),
+                    "axis_mapping_context": session["axis_mapping_context"],
                     "polarity_policy": POLARITY_POLICY,
                     "signal_quality": [self._signal_metadata(record) for record in qualified],
                     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -2113,7 +2231,7 @@ class AccelHomingWorkflows:
                     "max_commanded_travel_mm": maximum,
                     "repeatability_spread_mm": spread,
                     "repeatability_limit_mm": CALIBRATION_REPEATABILITY_MM,
-                    "calibration_algorithm": SIMPLE_CALIBRATION, "impact_metric": "xyz_magnitude",
+                    "calibration_algorithm": SIMPLE_CALIBRATION, "impact_metric": "mapped_axis",
                     "minimum_impact_travel_mm": CALIBRATION_MIN_TRAVEL_MM,
                     "discovery_impact_required": True, "recenter_policy": "selected_axis_midpoint",
                     "travel_plausibility_required": True,
@@ -2138,16 +2256,27 @@ class AccelHomingWorkflows:
         configfile = self.printer.lookup_object("configfile")
         recovery = session.get("accuracy_recovery")
         encoded_threshold = "%.17g" % threshold
-        configfile.set(self.model_section, "version", "1")
-        configfile.set(self.model_section, axis + "_threshold", encoded_threshold)
-        configfile.set(self.model_section, axis + "_successes", str(REQUIRED_SUCCESSES))
-        configfile.set(self.model_section, axis + "_metadata", encoded_metadata)
+        staged_metadata = {axis: metadata}
+        entries = [(self.model_section, "version", "1"),
+                   (self.model_section, axis + "_threshold", encoded_threshold),
+                   (self.model_section, axis + "_successes", str(REQUIRED_SUCCESSES)),
+                   (self.model_section, axis + "_metadata", encoded_metadata)]
+        conflict = session.get("axis_mapping_peer_conflict")
+        if conflict is not None:
+            other = conflict["axis"]
+            if self._staged_or_saved_metadata(other) != conflict["metadata"]:
+                raise self._error("other-axis model changed during automatic mapping; restart calibration")
+            invalidated = copy.deepcopy(conflict["metadata"])
+            invalidated["axis_mapping_invalidated"] = {
+                "reason": "sensor orientation changed or channel reassigned by qualified opposite-axis calibration",
+                "by_axis": axis, "by_run_id": session["run_id"]}
+            staged_metadata[other] = invalidated
+            entries.append((self.model_section, other + "_metadata",
+                            json.dumps(invalidated, separators=(",", ":"), allow_nan=False)))
         if recovery is not None and axis in self.manual_axes:
-            # A model alone loses to explicit shared/axis thresholds on reload.
-            # Let native SAVE_CONFIG replace the selected override or report its
-            # own include conflict; never edit config/include files directly.
-            configfile.set(self.config.get_name(), axis + "_threshold", encoded_threshold)
+            entries.append((self.config.get_name(), axis + "_threshold", encoded_threshold))
         result = {"result": "calibrated", "axis": axis, "threshold_g": threshold,
+                  "impact_metric": "mapped_axis", "axis_mapping": metadata["axis_mapping"],
                   "tested_threshold_g": tested_threshold, "saved_threshold_g": threshold,
                   "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
                   "saved_threshold_tested": False,
@@ -2160,6 +2289,19 @@ class AccelHomingWorkflows:
             result.update(accuracy_recovery=dict(recovery), source_accuracy=session["source_accuracy"])
         save = session["save_config"]
         self._finish(result)
+        # Complete stream/motion cleanup before staging threshold and mapping as
+        # one qualified pair. A failed cleanup must not replace a pending model.
+        try:
+            self._stage_model_settings(configfile, entries)
+        except Exception as exc:
+            self.last_result.update(result="aborted", save_config=False,
+                                    reason="calibration model staging failed: %s" % exc)
+            raise
+        self.pending_model_metadata.update(copy.deepcopy(staged_metadata))
+        if conflict is not None:
+            self.last_result["invalidated_axis"] = conflict["axis"]
+            self._info("%s saved mapping was invalidated by the new %s mapping; recalibrate %s "
+                       "before ordinary homing" % (conflict["axis"].upper(), axis.upper(), conflict["axis"].upper()))
         self._info("%s model %s: ten qualified homes tested at %.12g g with commanded "
                    "travel spread %s mm <= %.2f mm; staging %.12g g "
                    "(tested threshold + %.1f g). The saved threshold was not tested by those homes. %s" % (
@@ -2196,6 +2338,24 @@ class AccelHomingWorkflows:
             except Exception as exc:
                 self.last_result["chart_error"] = str(exc)
                 logging.exception("accel_homing: qualified calibration noise PNG publication failed")
+
+    @staticmethod
+    def _stage_model_settings(configfile, entries):
+        """Stage synchronously; preserve stock Klipper/Kalico pending data on failure."""
+        autosave = getattr(configfile, "autosave", None)
+        parser = getattr(autosave, "fileconfig", None)
+        snapshot = None
+        if isinstance(parser, configparser.RawConfigParser):
+            snapshot = (copy.deepcopy(parser), copy.deepcopy(configfile.status_save_pending),
+                        configfile.save_config_pending)
+        try:
+            # Native configfile.set does not yield to the reactor.
+            for section, option, value in entries:
+                configfile.set(section, option, value)
+        except Exception:
+            if snapshot is not None:
+                autosave.fileconfig, configfile.status_save_pending, configfile.save_config_pending = snapshot
+            raise
 
     def _calibration_saved_threshold(self, tested_threshold):
         # Always derive from the qualified candidate, never from an earlier
@@ -2234,6 +2394,12 @@ class AccelHomingWorkflows:
     def _run_calibration(self):
         session = self.session
         try:
+            snapshot, generation = self._snapshot(), self.owner.operation_generation
+            self._chart_preflight()
+            self._check_running(session)
+            if self._snapshot() != snapshot or self.owner.operation_generation != generation:
+                raise self._error("printer state changed before automatic mapping; manually recenter and retry")
+            self._calibration_axis_mapping(session)
             self._calibration_noise_preflight(session)
             self._calibrate_trials()
         except Exception as exc:
@@ -2244,6 +2410,176 @@ class AccelHomingWorkflows:
                                       and not session.get("early_return_cleanup", False)
                                       and not session.get("axis_only_cleanup", False)))
             raise
+
+    def _axis_mapping_check(self, session):
+        self._check_running(session)
+        if (session.get("finishing")
+                or self.owner.operation_generation != session["axis_mapping_generation"]
+                or getattr(self.owner, "sensor_fault", None) is not None
+                or self.owner.noise_sensor_context() != session["axis_mapping_context"]):
+            raise self._error("automatic axis mapping was interrupted or its sensor context changed")
+
+    def _axis_mapping_plan(self, axis):
+        """A bounded central stroke; it does not change configured homing speed."""
+        toolhead = self.owner.toolhead
+        for name in ("start_beta_motion_capture", "stop_beta_motion_capture", "_enable_motors", "_set_accel"):
+            if not callable(getattr(self.owner, name, None)):
+                raise self._error("automatic axis mapping requires capture capability %s before motion" % name)
+        extractor = self._beta_extractor()
+        current_helper, current_context = self._beta_current_context(axis)
+        velocity, original_accel = toolhead.get_max_velocity()
+        low, high = self.owner.rails_by_axis[axis].get_range()
+        center = (low + high) * .5
+        distance = min(15., (high - low) * .125)
+        speed, accel = min(20., velocity, self.reposition_speed), min(500., original_accel)
+        status = toolhead.get_status(self.reactor.monotonic())
+        ratio = status.get("minimum_cruise_ratio", getattr(toolhead, "min_cruise_ratio", None))
+        if ratio is None and hasattr(toolhead, "max_accel_to_decel"):
+            ratio = 1. - toolhead.max_accel_to_decel / original_accel
+        if (not all(type(value) in (int, float) and math.isfinite(value) and value > 0
+                    for value in (distance, velocity, original_accel, speed, accel))
+                or type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio < 1
+                or not low < center - distance < center + distance < high):
+            raise self._error("automatic axis mapping cannot establish a bounded central motion plan")
+        if distance <= speed * speed / (accel * (1. - ratio)):
+            raise self._error("automatic axis mapping central stroke cannot include acceleration, cruise and braking")
+        return {"axis": axis, "center_mm": center, "distance_mm": distance,
+                "effective_speed_mm_s": speed, "effective_accel_mm_s2": accel,
+                "original_accel_mm_s2": original_accel, "minimum_duration_s": distance / speed + speed / accel,
+                "extractor": extractor, "current_helper": current_helper,
+                "driver_current_context": current_context}
+
+    def _calibration_axis_mapping(self, session):
+        """Learn one signed channel from two independently captured free strokes."""
+        axis, toolhead = session["axis"], self.owner.toolhead
+        continuation = bool(session.get("accuracy_recovery"))
+        self._preflight([axis], continuation=continuation)
+        self._require_unhomed_xy()
+        plan = self._axis_mapping_plan(axis)
+        session.update(state="mapping", axis_mapping_generation=self.owner.operation_generation,
+                       axis_mapping_context=self.owner.noise_sensor_context(), axis_mapping_phase="preflight")
+        self._axis_mapping_check(session)
+        index, kin = AXES[axis], toolhead.get_kinematics()
+        original_position, original_limit = toolhead.get_position()[index], kin.limits[index]
+        current_attempted = completed = False
+        failure, token, passes = None, None, []
+        self._info("Automatically mapping %s using +%.3f/-%.3f mm central strokes at %.3f mm/s "
+                   "and %.3f mm/s^2; the manually confirmed center is assumed" % (
+                       axis.upper(), plan["distance_mm"], plan["distance_mm"],
+                       plan["effective_speed_mm_s"], plan["effective_accel_mm_s2"]))
+        try:
+            position = toolhead.get_position()
+            position[index] = plan["center_mm"]
+            toolhead.set_position(position)
+            self._axis_mapping_check(session)
+            kin.limits[index] = self.owner.rails_by_axis[axis].get_range()
+            self.owner._set_accel(plan["effective_accel_mm_s2"])
+            self._axis_mapping_check(session)
+            self.owner._enable_motors(axis)
+            self._axis_mapping_check(session)
+            if plan["current_helper"] is not None:
+                current_attempted = True
+                plan["current_helper"]([axis], True)
+                self._axis_mapping_check(session)
+            toolhead.wait_moves()
+            self._axis_mapping_check(session)
+            for direction in (1, -1):
+                session["axis_mapping_phase"] = "reference_positive" if direction > 0 else "reference_negative"
+                token = self.owner.start_beta_motion_capture(lambda: self._axis_mapping_check(session))
+                self._axis_mapping_check(session)
+                rate = token.get("sample_rate_hz")
+                duration = plan["minimum_duration_s"] + 1. + 2. * self.owner.stream_timeout
+                if (type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0
+                        or not math.isfinite(duration * rate)
+                        or math.ceil(duration * rate) >= self.owner.capture_limit):
+                    raise self._error("automatic axis mapping exceeds validated capture capacity")
+                start = toolhead.get_last_move_time()
+                target = [None, None, None]
+                target[index] = plan["center_mm"] + direction * plan["distance_mm"]
+                session["axis_mapping_phase"] = "positive_stroke" if direction > 0 else "negative_stroke"
+                toolhead.manual_move(target, plan["effective_speed_mm_s"])
+                self._axis_mapping_check(session)
+                end = toolhead.get_last_move_time()
+                token["motion_end_time_s"] = end
+                toolhead.wait_moves()
+                self._axis_mapping_check(session)
+                segments = self._beta_profile(dict(plan, target_mm=target[index]), start, end,
+                                               token["capture_cutoff_time_s"])
+                closing, token = token, None
+                capture = self.owner.stop_beta_motion_capture(closing, lambda: self._axis_mapping_check(session))
+                self._axis_mapping_check(session)
+                rows = capture.get("samples", ())
+                if (capture.get("fault") or capture.get("dropped") or capture.get("amplitude_limited")
+                        or capture.get("raw_samples_validated") is not True or len(rows) < 2
+                        or capture.get("sensor_context") != session["axis_mapping_context"]
+                        or rows[0][0] > segments[0]["start_time_s"] + 2. / rate
+                        or rows[-1][0] < end - 1. / rate):
+                    raise self._error("automatic axis mapping capture is incomplete, clipped or changed context")
+                passes.append({"direction": direction, "capture": capture, "segments": segments})
+                session["axis_mapping_phase"] = "return_to_center"
+                target[index] = plan["center_mm"]
+                toolhead.manual_move(target, plan["effective_speed_mm_s"])
+                self._axis_mapping_check(session)
+                toolhead.wait_moves()
+                self._axis_mapping_check(session)
+                if self.calibration_settle_time:
+                    toolhead.dwell(self.calibration_settle_time)
+                    self._axis_mapping_check(session)
+                    toolhead.wait_moves()
+                    self._axis_mapping_check(session)
+            mapping = validate_axis_mapping(infer_axis_mapping(axis, passes), axis)
+            other = "y" if axis == "x" else "x"
+            metadata = self._staged_or_saved_metadata(other)
+            previous = self._staged_or_saved_metadata(axis)
+            orientation_changed = False
+            if (previous is not None and previous.get("impact_metric") == "mapped_axis"
+                    and not previous.get("axis_mapping_invalidated")
+                    and previous.get("axis_mapping_context") == session["axis_mapping_context"]):
+                old_map = validate_axis_mapping(previous.get("axis_mapping"), axis)
+                orientation_changed = any(old_map[key] != mapping[key] for key in ("source_axis", "sign"))
+            if (metadata is not None and metadata.get("impact_metric") == "mapped_axis"
+                    and not metadata.get("axis_mapping_invalidated")
+                    and metadata.get("axis_mapping_context") == session["axis_mapping_context"]
+                    and (orientation_changed or
+                         validate_axis_mapping(metadata.get("axis_mapping"), other)["source_axis"] == mapping["source_axis"])):
+                session["axis_mapping_peer_conflict"] = {"axis": other, "metadata": copy.deepcopy(metadata)}
+            self._axis_mapping_check(session)
+            completed = True
+        except Exception as exc:
+            failure = exc
+            raise
+        finally:
+            cleanup_errors = []
+            if token is not None:
+                try:
+                    self.owner.stop_beta_motion_capture(token, lambda: self._axis_mapping_check(session))
+                except Exception as exc:
+                    cleanup_errors.append("capture: %s" % exc)
+            if current_attempted:
+                try:
+                    plan["current_helper"]([axis], False)
+                except Exception as exc:
+                    cleanup_errors.append("homing current: %s" % exc)
+            try:
+                self.owner._set_accel(plan["original_accel_mm_s2"])
+                if completed and not cleanup_errors:
+                    self._axis_mapping_check(session)
+                    position = toolhead.get_position()
+                    position[index] = original_position
+                    toolhead.set_position(position)
+                    self._axis_mapping_check(session)
+            except Exception as exc:
+                cleanup_errors.append("acceleration/frame: %s" % exc)
+            finally:
+                kin.limits[index] = original_limit
+            if cleanup_errors:
+                session["axis_mapping_cleanup_errors"] = cleanup_errors
+                if failure is None:
+                    raise self._error("automatic axis mapping cleanup failed: " + "; ".join(cleanup_errors))
+        self._axis_mapping_check(session)
+        session.update(axis_mapping=mapping, axis_mapping_phase="qualified", state="starting")
+        self._info("%s mapped to configured sensor %s%s; bidirectional free-motion evidence qualified" % (
+            axis.upper(), "+" if mapping["sign"] > 0 else "-", "XYZ"[mapping["source_axis"]]))
 
     def _beta_extractor(self):
         report = self.printer.lookup_object("motion_report", None)
@@ -3225,6 +3561,17 @@ class AccelHomingWorkflows:
         axis = str(gcmd.get("AXIS", "")).strip().lower()
         if axis not in AXES:
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT requires AXIS=X or AXIS=Y")
+        # This historical experiment reconstructs XYZ crossings and has no
+        # independently qualified XYZ threshold parameter. Never reinterpret
+        # a directional calibration threshold, including an unsaved profile.
+        profiles = [self.pending_model_metadata.get(axis)]
+        if self.model is not None and axis in self.model.thresholds:
+            profiles.append(self.model.metadata.get(axis))
+        if any(isinstance(profile, dict) and profile.get("impact_metric") == "mapped_axis"
+               for profile in profiles):
+            raise gcmd.error("ACCEL_HOMING_EXPERIMENT uses XYZ thresholds and cannot use a mapped-axis "
+                             "calibration. Use ACCEL_HOMING_TROUBLESHOOT AXIS=%s CENTERED=1 "
+                             "for mapped-axis homing diagnostics; no motion requested" % axis.upper())
         for key in gcmd.get_command_parameters():
             if key not in ("AXIS", "SAMPLES", "CENTERED", "SPEED", "GC_GUARD", "MAX_SAMPLE_AGE", "MODE"):
                 raise gcmd.error("%s is not supported by ACCEL_HOMING_EXPERIMENT" % key)
@@ -4049,6 +4396,10 @@ class AccelHomingWorkflows:
             if session.get("calibration_preflight"):
                 active.update(purpose="calibration_preflight", calibration_axis=session["axis"])
         elif active is not None:
+            if session.get("axis_mapping") is not None:
+                active["axis_mapping"] = dict(session["axis_mapping"])
+            if session.get("axis_mapping_phase") is not None:
+                active["axis_mapping_phase"] = session["axis_mapping_phase"]
             active["repeatability_limit_mm"] = (CALIBRATION_REPEATABILITY_MM
                                                   if session["mode"] == "calibration" else REPEATABILITY_LIMIT_MM)
             if session["mode"] == "calibration":

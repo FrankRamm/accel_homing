@@ -81,7 +81,7 @@ apply; inspect capture and resting-reference notes separately.
 A legacy `no_motion` means the required conservative proof was unavailable
 within its deadline. It does not establish that the motor physically stayed
 still or that raising a threshold or receipt timeout is the correct fix. New
-simple vector models use a different detector and omit that integrated proof.
+simple mapped-axis models use a different detector and omit that integrated proof during homing.
 Do not compare thresholds between those metrics as if they were identical.
 
 Unexpected early impact can come from motion noise, an obstruction, binding or
@@ -93,12 +93,18 @@ Commanded return completion is not physical arrival feedback.
 
 ### Noise on another accelerometer axis
 
-A Y move can excite the accelerometer's X component through the toolhead and
-mount. The saved XYZ model compares `sqrt(dx*dx + dy*dy + dz*dz)` with the
-threshold for the machine axis being homed; each component has its stationary
-reference subtracted first. Swapping or reversing sensor axes does not change
-that magnitude. A dominant X component during Y movement therefore does not,
-by itself, identify an `axes_map` error.
+A Y move can excite several configured sensor channels through the toolhead
+and mount. New calibration learns physical Y from gentle motion in both
+directions; it does not select the largest endstop-impact peak. Subsequent Y
+homing compares only that mapped component with its threshold. X does the same
+with its own mapping. Other channels remain in diagnostics but cannot trigger
+the mapped-axis detector. A large channel labelled X in a raw stream does not,
+by itself, establish a physical X response or an `axes_map` error.
+
+If mapping is ambiguous, check mounting, sensor configuration and the motion
+response before recalibrating. Changing the sensor or axes map invalidates its
+saved context. Older XYZ-magnitude models require a fresh calibration; do not
+copy their threshold into a mapped model.
 
 Compare raw XYZ during startup, steady travel and the impact in a complete
 troubleshooting bundle from the affected axis. Stationary noise alone cannot
@@ -106,7 +112,7 @@ characterize vibration while moving. Keep speed, acceleration, sensor settings
 and threshold recorded with the comparison. A filter or component weighting
 changes the detector: it can attenuate an impact or delay the threshold crossing,
 and the existing calibrated threshold would need qualification again. There is
-currently no configurable filter for the saved XYZ detector.
+currently no configurable filter for the ordinary mapped-axis detector.
 
 ## Accuracy recovery and save errors
 

@@ -99,8 +99,11 @@ class GenericBoundedEvidenceTests(unittest.TestCase):
         from test_backends import RaisedBaselineFloorTest
         obj, endstop = RaisedBaselineFloorTest().machine(
             threshold=1.5, spreads=(spread, 0.04, 0.02), options={"max_sample_age": 0.020})
-        obj.workflows.session = {"mode": "calibration", "state": "running", "axis": "x"}
-        obj.workflows.in_home, obj.workflows.home_axis = True, "x"
+        # Isolate the legacy motion-proof estimator from the quiet-reference
+        # acquisition gate. General calibration now requires a qualified map
+        # and intentionally has no such estimator; this is not that workflow.
+        obj.workflows.calibration_reference = lambda axis: axis == "x"
+        obj.workflows.simple_detection = lambda axis: False
         obj.toolhead.get_max_velocity = lambda: (500.0, 5000.0)
         obj.session_axes["x"].info = info(speed=50.0, retract=0, second=50.0)
         obj._prepare_reference()

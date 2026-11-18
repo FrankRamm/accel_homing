@@ -12,6 +12,7 @@ import datetime
 import gc
 import gzip
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -1254,7 +1255,8 @@ class Recorder:
                                    reserved_home_row_budget=budget,
                                    retained_sample_ranges=clean(ranges),
                                    omitted_sample_ranges=([[prefix, len(samples) - maximum + prefix]] if len(samples) > maximum else []),
-                                   raw_units="print_time seconds, machine-axis g including gravity/bias",
+                                   raw_units="print_time seconds, configured sensor-stream XYZ g including gravity/bias",
+                                   coordinate_frame="configured_sensor_stream",
                                    source="owner.stop_capture before workflow validation",
                                    truncation=bool(len(samples) > retained or capture.get("dropped")))
         except Exception as exc:
@@ -1723,6 +1725,11 @@ def _plot_comparison(folder, report, Figure, FigureCanvasAgg):
 
 
 def _worker(folder, dependencies):
+    # The isolated -I worker resolves display semantics from this checkout.
+    charts_path = Path(__file__).resolve().with_name("accel_homing_charts.py")
+    charts_spec = importlib.util.spec_from_file_location("_accel_homing_diagnostic_charts", charts_path)
+    charts = importlib.util.module_from_spec(charts_spec)
+    charts_spec.loader.exec_module(charts)
     folder = Path(folder)
     if Path(dependencies).is_dir():
         sys.path.insert(0, str(Path(dependencies)))
@@ -1807,6 +1814,7 @@ def _worker(folder, dependencies):
                 _plot_experiment(folder, report, Figure, FigureCanvasAgg)
         for home in homes:
             record, capture = home.get("record") or {}, home["capture"]
+            metric, mapping = charts._detector_context(record, capture, home["axis"])
             shadow = home.get("shadow") or {}
             onset = record.get("onset_time_s")
             if not finite(onset):
@@ -1850,8 +1858,16 @@ def _worker(folder, dependencies):
             origin = anchor if finite(anchor) else rows[0][0] if rows else 0
             times = [(row[0] - origin) * 1000 for row in rows]
             for index, label in enumerate("XYZ"):
-                plot.plot(times, [row[index + 1] - baseline[index] for row in rows], label=label, linewidth=.8)
-            plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="Original per-home XYZ reference" if shadow else "XYZ norm", color="black", linewidth=1)
+                plot.plot(times, [row[index + 1] - baseline[index] for row in rows],
+                          label="Stream " + label if mapping is not None else label, linewidth=.8)
+            if mapping is not None:
+                channel, sign = mapping["source_axis"], mapping["sign"]
+                mapped = [sign * (row[channel + 1] - baseline[channel]) for row in rows]
+                plot.plot(times, mapped, label=charts._mapped_label(mapping) + " signed", linewidth=1)
+                plot.plot(times, [abs(value) for value in mapped],
+                          label="Physical %s detector magnitude" % mapping["axis"].upper(), color="black", linewidth=1.2)
+            else:
+                plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="Original per-home XYZ reference" if shadow else "XYZ norm", color="black", linewidth=1)
             experimental = (capture.get("detector") or {}).get("experimental") or {}
             profile = home.get("shadow_profile") or ((report.get("experiment") or {}).get("fit") or {}).get("profile") or {}
             weights = profile.get("weights_xyz")
@@ -1874,7 +1890,8 @@ def _worker(folder, dependencies):
             threshold = record.get("threshold_g")
             if finite(threshold):
                 plot.axhline(threshold, color="#d17b00", linestyle="--",
-                             label="Raw bypass threshold" if home["phase"] == "candidate" else "Active detector threshold")
+                             label="Physical %s trigger" % mapping["axis"].upper() if mapping is not None else
+                                   "Raw bypass threshold" if home["phase"] == "candidate" else "Active detector threshold")
             quality = home.get("saturation_diagnostic", {})
             if quality.get("available"):
                 for index, axis in enumerate("xyz"):

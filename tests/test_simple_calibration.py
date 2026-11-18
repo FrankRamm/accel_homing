@@ -1,4 +1,4 @@
-"""Integrated impact-after-20 mm/vector detection regressions; no physical printer."""
+"""Integrated mapped-axis calibration and explicit legacy XYZ regressions."""
 import itertools
 import json
 import math
@@ -11,6 +11,7 @@ import test_backends as backend_tests
 from test_backends import feed
 from test_motion_policy import SignedRamp
 from test_workflows import AccelHomingWorkflows, GCmd, Rig, workflow_module
+from test_mapped_detector import mapping
 
 G = 9806.65
 
@@ -19,7 +20,9 @@ def prepared(axis="x"):
     obj, endstop = backend_tests.RaisedBaselineFloorTest().machine(
         threshold=1.0, axis=axis, spreads=(1.313, .604, .281))
     obj.workflows.session = {"mode": "calibration", "state": "running", "axis": axis,
-                             "algorithm": "impact20_vector_v2"}
+                             "algorithm": workflow_module.SIMPLE_CALIBRATION,
+                             "axis_mapping": mapping(axis, "xy".index(axis)),
+                             "axis_mapping_context": obj.noise_sensor_context()}
     obj.workflows.in_home, obj.workflows.home_axis = True, axis
     obj._prepare_reference()
     when = obj.backend.last_sample_time + 16 / 3200.0
@@ -41,7 +44,7 @@ def packet(obj, attempt, xyz, position=0):
     return params
 
 
-class VectorDetectorTests(unittest.TestCase):
+class MappedDetectorPolicyTests(unittest.TestCase):
     def test_real_prepare_keeps_offset_but_omits_noise_bounds_and_startup_deadline(self):
         for axis in "xy":
             obj, attempt = prepared(axis)
@@ -53,7 +56,7 @@ class VectorDetectorTests(unittest.TestCase):
             self.assertAlmostEqual(attempt.bases[2] * attempt.count_g, 1.0, delta=.002)
             self.assertEqual(obj._motion_proof_status(attempt)["result"], "not_required")
 
-    def test_every_channel_sign_and_diagonal_can_trigger_either_movement_axis(self):
+    def test_only_selected_channel_crossing_can_trigger_each_movement_axis(self):
         vectors = [(1.25 * sign if n == axis else 0.0 for n in range(3))
                    for axis in range(3) for sign in (-1, 1)]
         vectors = [tuple(v) for v in vectors] + [(.8, .8, 0), (.6, -.6, .6)]
@@ -61,10 +64,13 @@ class VectorDetectorTests(unittest.TestCase):
             with self.subTest(move=move_axis, xyz=xyz):
                 obj, attempt = prepared(move_axis)
                 packet(obj, attempt, xyz, position=2)
+                if abs(xyz["xy".index(move_axis)]) < 1.0:
+                    self.assertFalse(attempt.done, attempt.reason)
+                    continue
                 self.assertEqual(attempt.reason, "impact")
                 self.assertEqual(attempt.onset_batch[2], 2)
                 self.assertAlmostEqual(attempt.onset_raw * attempt.count_g,
-                                       math.sqrt(sum(x*x for x in xyz)))
+                                       abs(xyz["xy".index(move_axis)]))
                 self.assertFalse(attempt.motion_seen)
                 with mock.patch.object(obj, "_motion_state", side_effect=AssertionError("velocity proof")):
                     self.assertEqual(obj.trigger_time(attempt), obj.onset_time(attempt))
@@ -80,7 +86,7 @@ class VectorDetectorTests(unittest.TestCase):
         # Exact boundary uses exactly representable raw count arithmetic.
         attempt.bases = (0.0, 0.0, 1000.0)
         attempt.baseline = 0.0
-        rows = [(0., 0., 1000.), (600., 800., 1000.), (3000., 0., 1000.), (0., 0., 1000.)]
+        rows = [(0., 0., 1000.), (1000., 8000., 1000.), (3000., 0., 1000.), (0., 0., 1000.)]
         start = obj.backend.print_time_to_clock(attempt.arm_time + .001)
         obj._inspect({"start_clock": start, "delta_clock": 938,
                       "data": tuple(v for row in rows for v in row), "#receive_time": attempt.arm_time + .003})
@@ -152,10 +158,10 @@ class VectorDetectorTests(unittest.TestCase):
 
     def test_record_labels_metric_and_never_claims_measured_velocity_or_position(self):
         obj, attempt = prepared()
-        packet(obj, attempt, (0., 1.3, 0.))
+        packet(obj, attempt, (1.3, 10., 0.))
         obj.disarm()
         record = attempt.record
-        self.assertEqual(record["impact_metric"], "xyz_magnitude")
+        self.assertEqual(record["impact_metric"], "mapped_axis")
         self.assertEqual(record["direction"], 0)
         self.assertFalse(record["physical_position_verified"])
         self.assertFalse(record["motion_seen"])
@@ -172,6 +178,7 @@ class ImpactDiscoveryTests(unittest.TestCase):
                 rail.info.position_endstop = rail.get_range()[1 if positive else 0]
                 w = rig.workflow
                 w._begin(GCmd(SAVE_CONFIG=0), "calibration", axis)
+                rig.qualify_axis_mapping(w.session)
                 w.session["state"] = "running"
                 initial = rig.toolhead.get_position()
                 z_limits = rig.toolhead.kin.limits[2]
@@ -218,8 +225,10 @@ class ImpactDiscoveryTests(unittest.TestCase):
                 rig = Rig()
                 w = rig.workflow
                 w._begin(GCmd(SAVE_CONFIG=0), "calibration", "x")
+                rig.qualify_axis_mapping(w.session)
                 w.session["state"] = "running"
-                record = {"result": "impact", "impact_metric": "xyz_magnitude",
+                record = {"result": "impact", "impact_metric": "mapped_axis",
+                          "axis_mapping": w.session["axis_mapping"],
                           "travel_mm": round(travel, 3), "travel_mm_exact": travel,
                           "workflow_phase": phase}
                 self.assertEqual(w._quality("x", record)[0], quality)
@@ -254,8 +263,10 @@ class ImpactDiscoveryTests(unittest.TestCase):
             rig = Rig()
             w = rig.workflow
             w._begin(GCmd(SAVE_CONFIG=0), "calibration", "x")
+            rig.qualify_axis_mapping(w.session)
             w.session["state"] = "running"
-            record = {"result": result, "travel_mm": travel, "impact_metric": "xyz_magnitude"}
+            record = {"result": result, "travel_mm": travel, "impact_metric": "mapped_axis",
+                      "axis_mapping": w.session["axis_mapping"]}
             rig.owner.last["x"] = record
             w.session["terminal_home"] = ("x", dict(record), record)
             rig.toolhead.kin.limits[0] = (0., 300.)
@@ -267,6 +278,7 @@ class ImpactDiscoveryTests(unittest.TestCase):
         rig = Rig()
         w = rig.workflow
         w._begin(GCmd(SAVE_CONFIG=0), "calibration", "x")
+        rig.qualify_axis_mapping(w.session)
         w.session["state"] = "running"
         record, _capture = w._home("x", 1.)
         rig.owner.last["x"] = dict(rig.owner.last["x"])
@@ -329,7 +341,7 @@ class SimpleWorkflowTests(unittest.TestCase):
         rig.calibrate(save=0)
         self.assertEqual(len(rig.home_calls), 11)
         metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
-        self.assertEqual(metadata["impact_metric"], "xyz_magnitude")
+        self.assertEqual(metadata["impact_metric"], "mapped_axis")
         self.assertEqual(metadata["minimum_impact_travel_mm"], 20.)
         self.assertEqual(metadata["repeatability_limit_mm"], 2.)
         self.assertEqual(metadata["min_commanded_travel_mm"], 106.188)
@@ -368,15 +380,15 @@ class SimpleWorkflowTests(unittest.TestCase):
         self.assertEqual(rig.workflow.last_result["threshold_g"], 1.75)
         self.assertEqual([call["threshold"] for call in rig.home_calls], [1.] + [1.25] * 11)
 
-    def test_saved_vector_model_uses_same_detector_but_legacy_models_stay_legacy(self):
+    def test_mapped_model_keeps_reference_policy_under_manual_threshold_override(self):
         rig = Rig()
         w = rig.workflow
         self.assertFalse(w.simple_detection("x"))
-        w.model = types.SimpleNamespace(thresholds={"x": 1.25}, metadata={"x": {"impact_metric": "xyz_magnitude"}})
+        w.model = types.SimpleNamespace(thresholds={"x": 1.25}, metadata={"x": {"impact_metric": "mapped_axis"}})
         self.assertTrue(w.simple_detection("x"))
         self.assertFalse(w.simple_detection("y"))
         w.manual_axes.add("x")
-        self.assertFalse(w.simple_detection("x"))
+        self.assertTrue(w.simple_detection("x"))
         w.manual_axes.clear()
         w.model.metadata["x"] = {}
         self.assertFalse(w.simple_detection("x"))
@@ -407,14 +419,16 @@ class SimpleWorkflowTests(unittest.TestCase):
 
 
 class ReloadAndDiagnosticTests(unittest.TestCase):
-    def test_saved_vector_model_prepares_ordinary_home_without_old_quiet_or_motion_guard(self):
+    def test_saved_mapped_model_prepares_ordinary_home_without_old_quiet_or_motion_guard(self):
         obj, endstop = backend_tests.RaisedBaselineFloorTest().machine(
             threshold=1.25, axis="x", spreads=(1.313, .604, .281))
         w = obj.workflows
         w.session = None
         w.in_home, w.home_axis = False, None
         w.model = types.SimpleNamespace(thresholds={"x": 1.25},
-                                       metadata={"x": {"impact_metric": "xyz_magnitude"}})
+                                       metadata={"x": {"impact_metric": "mapped_axis",
+                                            "axis_mapping": mapping("x", 2),
+                                            "axis_mapping_context": obj.noise_sensor_context()}})
         w.manual_axes.clear()
         obj._prepare_reference()
         self.assertFalse(obj.preparation.require_quiet)
@@ -431,7 +445,9 @@ class ReloadAndDiagnosticTests(unittest.TestCase):
     def test_discovery_keeps_full_travel_watchdog_without_motion_proof(self):
         obj, endstop = backend_tests.RaisedBaselineFloorTest().machine(threshold=1.)
         obj.workflows.session = {"mode": "calibration", "state": "running", "axis": "x",
-                                 "algorithm": "impact20_vector_v2"}
+                                 "algorithm": workflow_module.SIMPLE_CALIBRATION,
+                                 "axis_mapping": mapping("x", 0),
+                                 "axis_mapping_context": obj.noise_sensor_context()}
         obj.workflows.in_home, obj.workflows.home_axis = True, "x"
         obj._prepare_reference()
         when = obj.backend.last_sample_time + 16 / 3200.

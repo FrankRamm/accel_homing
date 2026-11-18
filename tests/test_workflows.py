@@ -451,6 +451,16 @@ class Rig:
         self.workflow = AccelHomingWorkflows(self.owner, self.config)
         self.workflow.renderer = FakePNGRenderer()
         self.owner.workflows = self.workflow
+        # State-machine fixtures isolate motion identification from homing
+        # qualification. test_axis_mapping_workflow exercises the real strokes.
+        self.workflow._calibration_axis_mapping = self.qualify_axis_mapping
+
+    def qualify_axis_mapping(self, session):
+        axis = session["axis"]
+        session.update(axis_mapping={"version": 1, "axis": axis, "source_axis": "xy".index(axis),
+                                    "sign": 1, "coordinate_frame": "configured_sensor_stream",
+                                    "method": "bidirectional_velocity_v1", "confidence": 1.},
+                       axis_mapping_context=self.sensor_context(), axis_mapping_phase="qualified")
 
     def lookup_object(self, name, default=None):
         return self.objects.get(name, default)
@@ -507,6 +517,8 @@ class Rig:
         return {"samples": [(t0, 0.0, 0.0, 1.0), (t0 + 0.001, 0.1, 0.0, 1.0),
                             (t0 + 0.002, -4.0, -5.0, 1.0), (t0 + 0.003, 0.0, 0.0, 1.0)],
                 "dropped": 0, "baseline_g": (0.0, 0.0, 1.0), "_record": record,
+                "coordinate_frame": "configured_sensor_stream",
+                "axis_mapping": None if record is None else record.get("axis_mapping"),
                 "detector": None if record is None else {
                     "axis": axis, "attempt_count": 1, "arm_time_s": record["arm_time_s"],
                     "onset_time_s": record["onset_time_s"], "threshold_g": self.owner.threshold_g[axis],
@@ -515,6 +527,7 @@ class Rig:
                     "onset_sample_matches": 1, "onset_sample_index": 2,
                     "onset_g": record.get("onset_g"), "impact_peak_g": record.get("impact_peak_g"),
                     "impact_metric": record.get("impact_metric", "selected_axis"),
+                    "axis_mapping": record.get("axis_mapping"),
                     "direction": record.get("direction", -1),
                     "homing_speed_mm_s": self.owner.rails_by_axis[axis].info.speed,
                     "homing_accel_mm_s2": self.owner.homing_accel}}
@@ -624,7 +637,9 @@ class Rig:
         # Retain this home's context; production _home checks cancellation
         # after the native call and performs its cleanup.
         if session.get("mode") == "calibration":
-            record["impact_metric"] = "xyz_magnitude"
+            record["impact_metric"] = "xyz_magnitude" if session.get("beta") else "mapped_axis"
+            if not session.get("beta"):
+                record["axis_mapping"] = session.get("axis_mapping")
         record.update(result)
         value = record.get("travel_mm_exact", record.get("travel_mm"))
         if (session.get("mode") == "calibration"
@@ -679,6 +694,7 @@ class Rig:
         if save is not None:
             arguments["SAVE_CONFIG"] = save
         self.workflow._begin(GCmd(**arguments), "calibration", axis.lower())
+        self.qualify_axis_mapping(self.workflow.session)
         self.workflow.session["state"] = "running"
         self.workflow._home(axis.lower(), self.workflow.session["candidate"])
         self.workflow._next_calibration_candidate("synthetic retained wait")
@@ -1553,9 +1569,10 @@ class CalibrationRecenterTests(unittest.TestCase):
         rig.workflow.session["state"] = "running"
         rig.toolhead.kin.limits["xy".index(axis)] = rig.owner.rails_by_axis[axis].get_range()
         if mode == "calibration":
+            rig.qualify_axis_mapping(rig.workflow.session)
             center = rig.workflow._geometry(axis)[0]
             record = {"axis": axis, "result": "impact", "travel_mm": center,
-                      "impact_metric": "xyz_magnitude"}
+                      "impact_metric": "mapped_axis", "axis_mapping": rig.workflow.session["axis_mapping"]}
             rig.owner.last[axis] = record
             rig.workflow.session["terminal_home"] = (axis, record, record)
         elif mode == "accuracy":
@@ -1718,6 +1735,9 @@ class CalibrationRecenterTests(unittest.TestCase):
                 obj.toolhead.get_max_velocity = lambda: (500., 5000.)
                 obj.reactor.now = rig.reactor.now
                 obj.workflows.session = {"mode": "calibration", "state": "running", "axis": "x"}
+                # Isolate the retained selected-axis motion-proof/reference
+                # helper here; mapped calibration is covered separately.
+                obj._detection_mapping = lambda axis: None
                 obj.workflows.in_home, obj.workflows.home_axis = True, "x"
                 endstop = FakeEndstop("x")
                 obj.session_axes["x"] = FakeRail(endstop, info(speed=50., retract=0, second=50.))

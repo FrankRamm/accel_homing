@@ -65,7 +65,9 @@ The saved threshold is the candidate that passed ten checks **plus 0.5 g**,
 applied once after qualification. Those checks test the candidate; they do not
 test the higher saved value. The other axis is unchanged.
 
-Both commands first measure fresh stationary noise. The default start grid is
+Both commands first identify the selected physical axis with gentle
+bidirectional strokes around the manual center, then measure fresh stationary
+noise on the learned component. Ambiguous mapping aborts before homing. The default start grid is
 1 g with 0.25 g steps. `START_THRESHOLD` explicitly chooses the first candidate
 but still performs the measurement; `STEP` alone changes grid spacing while
 retaining noise-based selection. Starts are finite and at least 0.5 g; step is
@@ -130,7 +132,7 @@ ACCEL_HOMING_CALIBRATE_NOISE
 
 NOISE leaves motor enable/current and fan state unchanged. Keep the printer
 stationary; it needs an idle, unpaused machine, an empty motion queue and an
-exclusive usable sensor stream. Its mapped component hints do not configure
+exclusive usable sensor stream. Its configured-stream component hints do not configure
 ordinary homing and are not reused by later calibration.
 
 ```gcode
@@ -149,7 +151,7 @@ SET_ACCEL_HOMING AXIS=X THRESHOLD=1
 This changes the active threshold until restart, without saving a model.
 Thresholds must be finite and positive and satisfy known sensor-range limits.
 The current model/manual detector context remains relevant; the command does
-not turn a legacy threshold into a newly qualified XYZ model.
+not turn a legacy threshold into a newly qualified mapped-axis model.
 Cancel an active workflow before changing settings.
 
 For persistent manual changes, edit the existing plugin section and issue

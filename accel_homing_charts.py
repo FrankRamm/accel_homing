@@ -4,6 +4,7 @@ import collections
 import datetime
 import errno
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -34,6 +35,39 @@ _MemoryReceipt = collections.namedtuple("_MemoryReceipt", (
 _PreparedPNG = collections.namedtuple("_PreparedPNG", ("kind", "label", "clock_json", "data"))
 _MAX_CAPTURE_TRACE_POINTS = 4096
 _MAX_CAPTURE_RECEIPT_JSON_BYTES = 128 * 1024
+_AXIS_MAPPING_VALIDATOR = None
+
+
+def _detector_context(record, capture=None, axis=None):
+    """Resolve frozen detector semantics without relabeling the source XYZ rows."""
+    capture = capture or {}
+    sources = (record, capture, capture.get("detector") or {})
+    metrics = {source["impact_metric"] for source in sources if "impact_metric" in source}
+    if len(metrics) > 1:
+        raise ValueError("Capture detector metric does not match its record")
+    metric = next(iter(metrics), None)
+    if metric != "mapped_axis":
+        return metric, None
+    # The isolated -I plotting worker cannot import siblings through sys.path.
+    # Resolve the same checkout as this module, including old symlink installs.
+    global _AXIS_MAPPING_VALIDATOR
+    if _AXIS_MAPPING_VALIDATOR is None:
+        path = Path(__file__).resolve().with_name("accel_homing_axes.py")
+        spec = importlib.util.spec_from_file_location("_accel_homing_chart_axes", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _AXIS_MAPPING_VALIDATOR = module.validate_axis_mapping
+    mappings = [_AXIS_MAPPING_VALIDATOR(source["axis_mapping"], axis or record.get("axis"))
+                for source in sources if "axis_mapping" in source]
+    if not mappings or any(_json(mapping) != _json(mappings[0]) for mapping in mappings[1:]):
+        raise ValueError("Mapped-axis capture requires one consistent axis mapping")
+    return metric, mappings[0]
+
+
+def _mapped_label(mapping):
+    return "Physical %s (= %sstream %s)" % (
+        mapping["axis"].upper(), "+" if mapping["sign"] == 1 else "-",
+        "XYZ"[mapping["source_axis"]])
 
 
 class CapturePaths(dict):
@@ -374,6 +408,11 @@ def _capture_data(capture, record):
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "absolute_peak_g": {axis: max(abs(row[index]) for row in delta)
                                     for index, axis in enumerate("xyz", 1)}}
+    metric, mapping = _detector_context(record, capture)
+    if metric is not None:
+        metadata["impact_metric"] = metric
+    if mapping is not None:
+        metadata.update(axis_mapping=mapping, coordinate_frame="configured_sensor_stream")
     metadata.update(_range_metadata(capture, record))
     _json(record)
     return _envelope(delta), metadata
@@ -481,6 +520,7 @@ def prepare_capture(run_id, axis, capture, record, simulated=False, check_runnin
     if record.get("result", "impact") != "impact" or record.get("capture_valid") is False:
         raise ValueError("Only a valid impact capture can be prepared for publication")
     trace, metadata = _capture_data(capture, record)
+    _detector_context(record, metadata, axis)
     record_json, metadata_json = _json(record), _json(metadata)
     if len(record_json.encode("utf-8")) + len(metadata_json.encode("utf-8")) > _MAX_CAPTURE_RECEIPT_JSON_BYTES:
         raise ValueError("Capture receipt metadata exceeds its memory limit")
@@ -526,6 +566,7 @@ def _prepared_capture(prepared):
                 peaks[axis], max(abs(row[index]) for row in trace), rel_tol=1e-12, abs_tol=1e-12)
                    for index, axis in enumerate("xyz", 1))):
         raise ValueError("Deferred capture measurements do not match its trace")
+    _detector_context(record, metadata, receipt.axis)
     return receipt, record, metadata
 
 
@@ -1003,6 +1044,8 @@ def _validate_accuracy(directory, run_id, axis_results, result, reason, simulate
                                                            rel_tol=1e-12, abs_tol=1e-12)
                     or record.get("workflow_threshold_g") != discovery.get("workflow_threshold_g")):
                 raise ValueError("Accuracy threshold changed during the measured run")
+            if discovery is not None and _detector_context(record, axis=axis) != _detector_context(discovery, axis=axis):
+                raise ValueError("Accuracy detector metric or axis mapping changed during the measured run")
             refs.append(_capture_reference(directory, paths, run_id, axis, record, simulated, check_running))
         discovery_ref = _capture_reference(directory, item.get("discovery_capture_paths"),
                                            run_id, axis, discovery, simulated, check_running) \
@@ -1076,6 +1119,10 @@ def _check_noise_record(run_id, iteration, record):
     if "noise_magnitude_peak_g" in record and (
             not _finite(record["noise_magnitude_peak_g"]) or record["noise_magnitude_peak_g"] < 0):
         raise ValueError("Invalid stationary XYZ-magnitude noise peak")
+    metric, mapping = _detector_context(record)
+    if mapping is not None and not _same_noise_number(
+            record.get("noise_axis_peak_g"), record["noise_peak_g"]["xyz"[mapping["source_axis"]]]):
+        raise ValueError("Mapped-axis noise peak does not match the selected source component")
     for key in ("sensor", "backend", "axis_context"):
         if not isinstance(record.get(key), str) or not record[key] or len(record[key]) > 400:
             raise ValueError("Invalid stationary noise sensor context")
@@ -1261,18 +1308,22 @@ def _absolute_limits(axis):
     axis.set_ylim(bottom=0)
 
 
-def _traces(axis, trace, alpha=1.0, labels=True):
+def _traces(axis, trace, alpha=1.0, labels=True, mapping=None):
     for index, (letter, color) in enumerate(zip("XYZ", ("red", "green", "blue")), 1):
+        selected = mapping is not None and index == mapping["source_axis"] + 1
+        name = (_mapped_label(mapping) if selected else "Stream %s (diagnostic)" % letter) \
+            if mapping is not None else "|%s|" % letter
         axis.plot([row[0] for row in trace], [abs(row[index]) for row in trace], color=color,
-                  linewidth=.75, alpha=alpha, label="|%s|" % letter if labels else None)
+                  linewidth=1.2 if selected else .75, alpha=alpha, label=name if labels else None)
 
 
-def _threshold(axis, record, label=True):
+def _threshold(axis, record, label=True, mapping=None, metric=None):
     threshold = record.get("threshold_g")
     if not _finite(threshold) or threshold <= 0:
         return
-    vector = record.get("impact_metric") == "xyz_magnitude"
-    name = ("XYZ magnitude trigger %s g" % _number(threshold, 4) if vector else
+    vector = (metric or record.get("impact_metric")) == "xyz_magnitude"
+    name = ("Physical %s trigger %s g" % (mapping["axis"].upper(), _number(threshold, 4))
+            if mapping is not None else "XYZ magnitude trigger %s g" % _number(threshold, 4) if vector else
             "Absolute-axis trigger %s g" % _number(threshold, 4))
     axis.axhline(threshold, color="#744b98", linestyle="--", linewidth=1.1,
                  label=name if label else None)
@@ -1282,15 +1333,16 @@ def _plot_capture(figure, payload):
     record, trace, captured = payload["record"], payload["trace"], payload["capture"]
     title = payload.get("title", "Accel Homing " + payload["axis"].upper())
     _title(figure, payload, title)
+    metric, mapping = _detector_context(record, captured, payload["axis"])
     axis = figure.subplots()
     _axes_style(axis)
-    _traces(axis, trace)
-    vector = record.get("impact_metric") == "xyz_magnitude"
+    _traces(axis, trace, mapping=mapping)
+    vector = metric == "xyz_magnitude"
     magnitude = [(row[0], math.sqrt(sum(value * value for value in row[1:4]))) for row in trace]
     if vector:
         axis.plot([row[0] for row in magnitude], [row[1] for row in magnitude],
                   linewidth=1.2, label="XYZ magnitude")
-    _threshold(axis, record)
+    _threshold(axis, record, mapping=mapping, metric=metric)
     onset = record.get("onset_time_s", record.get("onset_time"))
     elapsed = None
     if _finite(onset):
@@ -1299,11 +1351,11 @@ def _plot_capture(figure, payload):
             axis.axvline(elapsed, color="#5e4c77", linestyle=":", linewidth=1.1, label="Detected onset")
         else:
             elapsed = None
-    channel = {"x": 1, "y": 2}[payload["axis"]]
+    channel = mapping["source_axis"] + 1 if mapping is not None else {"x": 1, "y": 2}[payload["axis"]]
     peak = (max(magnitude, key=lambda row: row[1]) if vector else
             max(trace, key=lambda row: abs(row[channel])))
     peak_value = peak[1] if vector else abs(peak[channel])
-    peak_name = "XYZ magnitude" if vector else "|%s|" % payload["axis"].upper()
+    peak_name = "XYZ magnitude" if vector else _mapped_label(mapping) if mapping is not None else "|%s|" % payload["axis"].upper()
     axis.plot([peak[0]], [peak_value], "o", color="#192d45", markersize=4)
     range_summary = _range_summary([(record, captured)], "home_capture", "captures")
     onset_g = record.get("onset_g")
@@ -1456,7 +1508,12 @@ def _plot_accuracy(figure, payload):
         "measured_homes_qualifier_excluded", "homes")
     summary += _range_observation_lines(range_summary)
     _title(figure, payload, "Accel Homing Accuracy " + payload["axis"].upper())
-    vector = bool(trials and trials[0].get("impact_metric") == "xyz_magnitude")
+    contexts = [_detector_context(record, captured, payload["axis"]) for record, captured in
+                zip(trials, payload.get("captures", [{} for _ in trials]))]
+    if any(context != contexts[0] for context in contexts[1:]):
+        raise ValueError("Accuracy detector metric or axis mapping changed during the measured run")
+    metric, mapping = contexts[0] if contexts else (None, None)
+    vector = metric == "xyz_magnitude"
     axes = figure.subplots(5 if vector else 4, 1)
     travel = axes[0]
     _axes_style(travel, "Travel (mm)", zero=False)
@@ -1471,13 +1528,16 @@ def _plot_accuracy(figure, payload):
     _axes_summary(travel, summary)
     for channel, (axis, color, letter) in enumerate(zip(axes[1:],
                     ("red", "green", "blue"), "XYZ"), 1):
-        _axes_style(axis, "|%s| acceleration (g)" % letter)
+        selected = mapping is not None and channel == mapping["source_axis"] + 1
+        name = (_mapped_label(mapping) if selected else "Stream %s (diagnostic)" % letter) \
+            if mapping is not None else "|%s|" % letter
+        _axes_style(axis, name + " acceleration (g)")
         for index, trace in enumerate(traces):
             axis.plot([row[0] for row in trace], [abs(row[channel]) for row in trace], color=color,
                       alpha=.35 if len(traces) > 1 else 1., linewidth=.7,
-                      label="|%s| (%d homes)" % (letter, len(traces)) if index == 0 else None)
-        if not vector and channel == {"x": 1, "y": 2}[payload["axis"]] and trials:
-            _threshold(axis, trials[0])
+                      label="%s (%d homes)" % (name, len(traces)) if index == 0 else None)
+        if not vector and (selected if mapping is not None else channel == {"x": 1, "y": 2}[payload["axis"]]) and trials:
+            _threshold(axis, trials[0], mapping=mapping)
         if traces:
             axis.legend(fontsize=8, loc="best")
         _absolute_limits(axis)
@@ -1501,9 +1561,12 @@ def _plot_noise(figure, payload):
     if recommendation:
         candidates = recommendation["start_threshold_g"]
         fmt = lambda value: "unavailable" if value is None else "%s g" % _number(value, 4)
-        note = "Per-axis diagnostic hints: X %s; Y %s (not XYZ-magnitude calibration starts)." % (
+        note = "Configured-stream diagnostic hints: X %s; Y %s (not saved thresholds)." % (
             fmt(candidates["x"]), fmt(candidates["y"]),
             )
+        metric, mapping = _detector_context(recommendation)
+        if mapping is not None:
+            note = "Calibration uses %s. " % _mapped_label(mapping) + note
     else:
         note = "Incomplete measurement: no starting candidate."
     _title(figure, payload, "Accel Homing Noise")
@@ -1516,14 +1579,19 @@ def _plot_noise(figure, payload):
             axis.set_title("Window %d - no valid data" % (index + 1), fontsize=10)
             continue
         record = records[index]
-        _traces(axis, traces[index])
+        metric, mapping = _detector_context(record)
+        _traces(axis, traces[index], mapping=mapping)
         summary = ["Window %d (%s s)  |  Peak XYZ: %s g" % (
                                 index + 1, _number(record["duration_s"]),
                                 " / ".join(_number(record["noise_peak_g"][key]) for key in "xyz")),
                    "RMS XYZ: %s g" % " / ".join(_number(record["noise_rms_g"][key]) for key in "xyz")]
+        if mapping is not None:
+            summary.append("Physical %s noise peak: %s g (calibration metric)" % (
+                mapping["axis"].upper(), _number(record.get("noise_axis_peak_g"), 4)))
         if "noise_magnitude_peak_g" in record:
-            summary.append("XYZ-magnitude peak: %s g (calibration metric)" %
-                           _number(record["noise_magnitude_peak_g"], 4))
+            summary.append("XYZ-magnitude peak: %s g (%s)" % (
+                _number(record["noise_magnitude_peak_g"], 4),
+                "diagnostic" if mapping is not None else "recorded vector metric"))
         captures = payload.get("captures", [{} for _ in records])
         summary += _range_observation_lines(_range_summary([(record, captures[index])], "noise_window", "windows"))
         _axes_summary(axis, summary)

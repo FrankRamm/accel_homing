@@ -61,7 +61,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | Command | What it does / how to use it |
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Show settings, model, workflow progress, results and PNG paths. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X; use `AXIS=Y` for Y. Measures fresh noise, then qualifies a threshold. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X; use `AXIS=Y` for Y. Identifies the physical axis with gentle central strokes, measures its fresh noise, then qualifies its threshold. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Measure three stationary one-second noise windows and export a PNG; no movement or threshold change. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both axes must use this plugin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
@@ -81,6 +81,13 @@ manual thresholds override ordinary saved models; comment them out and issue
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.
+
+New calibration learns which configured sensor channel and sign correspond to
+the selected physical axis. X homing then uses only the learned X component;
+Y uses only the learned Y component. The sensor's configured `axes_map` is
+preserved. Ambiguous mappings abort before threshold qualification. Older
+XYZ-magnitude models require per-axis recalibration; their thresholds are not
+silently reused as mapped-axis thresholds.
 
 ## Uninstall
 

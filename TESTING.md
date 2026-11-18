@@ -60,6 +60,7 @@ python3 -B -m unittest discover -s tests -p 'test_beta_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_noise_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -v
 python3 -B -m unittest discover -s tests -p 'test_absolute_charts.py' -v
+python3 -B -m unittest discover -s tests -p 'test_mapped_axis_charts.py' -v
 python3 -B -m unittest discover -s tests -p 'test_sample_age*.py' -v
 python3 -B -m unittest discover -s tests -p 'test_warmup_timing.py' -v
 python3 -B -m unittest discover -s tests -p 'test_troubleshoot*.py' -v
@@ -72,6 +73,15 @@ capture/recovery/statistics, PNG rendering and the isolated Beta experiment.
 TROUBLESHOOT adds fixed-setting motion equivalence, passive stop ordering,
 partial evidence retention, bounded collection and post-cleanup export checks.
 A source test file's presence is not proof that it executed successfully.
+
+Mapped-axis checks must exercise signed/permuted configured-stream channels,
+ambiguous bidirectional motion, learned-channel noise selection, saved-map
+context mismatch and old XYZ-model rejection. Chart checks verify that large
+cross-axis signals remain visible diagnostics while the physical-axis peak and
+threshold use only the learned component. Raw XYZ receipts must remain unchanged.
+Installation/update packages include `accel_homing_axes.py`; git-only upgrades
+must still import it from the resolved checkout with the older symlink layout.
+These are synthetic checks; they do not establish physical mapping or contact.
 
 EXPERIMENT checks must additionally cover frozen training/holdout separation,
 startup negatives, raw bypass and two-sample weighted decisions, native-axis

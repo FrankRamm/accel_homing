@@ -44,6 +44,7 @@ class CalibrationRecoveryLimitTests(unittest.TestCase):
         rail.bounds, rail.info.position_endstop = (0., 218.5), 0.
         workflow = rig.workflow
         workflow._begin(GCmd(SAVE_CONFIG=0), "calibration", "y")
+        rig.qualify_axis_mapping(workflow.session)
         session = workflow.session
         # Reproduce the reported previous-return count without accumulating
         # or reconstructing the individual previous halted distances.

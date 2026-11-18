@@ -491,11 +491,14 @@ class AccuracyRecoveryTests(unittest.TestCase):
             rig.home_results.extend([{"travel_mm": 51.175}] + [{}] * 11)
             original = rig.owner._end_session
             fault = OSError("synthetic terminal recovery restoration failure")
-            def fail_after_staging():
+            previous = {("accel_homing_model default", "x_threshold"): "7.25",
+                        ("accel_homing_model default", "x_metadata"): "previous pending model"}
+            rig.configfile.saved.update(previous)
+            def fail_before_staging():
                 original()
-                if rig.configfile.saved:
+                if rig.workflow.session.get("finishing") and rig.workflow.session.get("finish_result") == "calibrated":
                     raise fault
-            with mock.patch.object(rig.owner, "_end_session", side_effect=fail_after_staging), \
+            with mock.patch.object(rig.owner, "_end_session", side_effect=fail_before_staging), \
                     self.assertRaises(OSError) as caught:
                 rig.accuracy()
             self.assertIs(caught.exception, fault)
@@ -505,6 +508,7 @@ class AccuracyRecoveryTests(unittest.TestCase):
             self.assertIn("cleanup failed", result["reason"])
             self.assertIn("source_accuracy", result)
             self.assertNotIn("SAVE_CONFIG", rig.scripts)
+            self.assertEqual(rig.configfile.saved, previous)
             self.assertFalse(any("After SAVE_CONFIG succeeds" in line for line in rig.output))
             self.assertIsNone(rig.workflow.session)
 

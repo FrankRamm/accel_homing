@@ -733,7 +733,12 @@ class CalibrationReferenceTest(unittest.TestCase):
     """Only active calibration omits the quiet-range requirement."""
 
     def context(self, obj, axis="x"):
-        obj.workflows.session = {"mode": "calibration", "state": "running", "axis": axis}
+        from test_mapped_detector import mapping
+        from accel_homing_workflows import SIMPLE_CALIBRATION
+        obj.workflows.session = {"mode": "calibration", "state": "running", "axis": axis,
+                                "algorithm": SIMPLE_CALIBRATION,
+                                "axis_mapping": mapping(axis, "xy".index(axis)),
+                                "axis_mapping_context": obj.noise_sensor_context()}
         obj.workflows.in_home, obj.workflows.home_axis = True, axis
 
     def machine(self, threshold=1.0, axis="x", legacy=False):
@@ -761,10 +766,11 @@ class CalibrationReferenceTest(unittest.TestCase):
         obj.arm(attempt)
         for index in range(3):
             self.assertAlmostEqual(attempt.bases[index] * attempt.count_g, means[index])
-            self.assertAlmostEqual(attempt.proof_noise[index] * attempt.count_g, envelope[index])
+        self.assertIsNone(attempt.proof_noise)
+        self.assertTrue(attempt.vector_mode)
         return attempt
 
-    def test_noisy_calibration_retains_full_reference_and_envelope_at_each_candidate(self):
+    def test_noisy_calibration_retains_full_reference_without_motion_proof_at_each_candidate(self):
         for threshold in (1.0, 1.25, 8.0):
             for axis in ("x", "y"):
                 for legacy in (False, True):
@@ -822,16 +828,17 @@ class CalibrationReferenceTest(unittest.TestCase):
                     obj.workflows.session["state"] = "waiting"
                 else:
                     obj.reactor.now += obj.backend.max_age + 0.010
-                with self.assertRaisesRegex(CommandError, "fresh accelerometer reference"):
+                with self.assertRaisesRegex(CommandError, "reference|mapping"):
                     obj.prepare(endstop, obj.reactor.now + 0.010)
-                self.assertEqual(obj.baseline_status["result"],
-                                 "no_data_before_arm" if mode == "expiry"
-                                 else "calibration_reference_outside_trial")
-                self.assertFalse(obj.homing_active)
-                self.assertIsNone(obj.preparation)
+                if mode != "waiting":
+                    self.assertEqual(obj.baseline_status["result"],
+                                     "no_data_before_arm" if mode == "expiry"
+                                     else "calibration_reference_outside_trial")
+                    self.assertFalse(obj.homing_active)
+                    self.assertIsNone(obj.preparation)
                 self.assertEqual(endstop.trigger_log.messages, [])
 
-    def test_noisy_calibration_cannot_turn_stationary_noise_or_bias_into_motion(self):
+    def test_noisy_calibration_never_claims_acceleration_motion_proof(self):
         for threshold in (1.0, 8.0):
             for bias in (0.0, 0.8):
                 with self.subTest(threshold=threshold, bias=bias):
@@ -843,8 +850,8 @@ class CalibrationReferenceTest(unittest.TestCase):
                         rows = []
                         for offset in range(16):
                             sign = 1 if (number + offset) % 2 else -1
-                            deltas = [bias * bound * attempt.count_g + sign * 0.0001
-                                      for bound in attempt.proof_noise]
+                            deltas = [bias * spread / 2.0 + sign * 0.0001
+                                      for spread in (1.313, 0.604, 0.281)]
                             if bias == 0.0:
                                 deltas = [sign * spread / 2.0 for spread in (1.313, 0.604, 0.281)]
                             values = [(base * attempt.count_g + delta) * G
@@ -856,7 +863,11 @@ class CalibrationReferenceTest(unittest.TestCase):
                     self.assertFalse(attempt.motion_seen)
                     self.assertFalse(attempt.moving)
                     self.assertEqual(attempt.auto_direction, 0)
-                    self.assertEqual(attempt.reason, "no_motion")
+                    self.assertIsNone(attempt.reason)
+                    self.assertEqual(endstop.trigger_log.messages, [])
+                    obj.reactor.now += obj.stream_timeout + .001
+                    obj._watchdog(obj.reactor.now)
+                    self.assertEqual(attempt.reason, "no_data")
                     self.assertEqual(endstop.trigger_log.messages, [[HOST]])
 
     def test_first_raw_contact_uses_selected_one_and_one_quarter_g_candidates(self):

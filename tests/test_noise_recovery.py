@@ -42,6 +42,9 @@ def install_noise_runtime(rig, decoded=False):
     obj.reactor = rig.reactor
     rig.owner.sensor_name = obj.sensor_name
     rig.owner.noise_sensor_context = obj.noise_sensor_context
+    # The homing fixture's qualified map must carry the same sensor provenance
+    # as the real acquisition replacing its synthetic stationary stream.
+    rig.sensor_context = obj.noise_sensor_context
 
     def start():
         rig.noise_calls.append("start")
@@ -359,6 +362,8 @@ class AccuracyStationaryRecoveryTests(unittest.TestCase):
                 self.assertEqual(faults[0]["noise_iteration"], 3)
                 self.assertEqual(faults[0]["reason"], "sample_gap")
                 metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "y_metadata")])
+                self.assertEqual(metadata["impact_metric"], "mapped_axis")
+                self.assertEqual(metadata["axis_mapping_context"], obj.noise_sensor_context())
                 self.assertEqual(metadata["stationary_noise_measurement"]["acquisition_faults"], faults)
                 self.assertTrue(any("discarded" in line and "retry 1/2" in line for line in rig.output))
                 self.assertIsNone(rig.workflow.session)

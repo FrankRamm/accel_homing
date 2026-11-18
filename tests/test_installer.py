@@ -1793,6 +1793,9 @@ class BootstrapFixture(unittest.TestCase):
 
     def test_complete_package_retains_runtime_license_and_notice(self):
         self.assertTrue(set(installer.MODULES).issubset(bootstrap.FILES))
+        self.assertIn("accel_homing_axes.py", installer.MODULES)
+        self.assertEqual((self.source / "accel_homing_axes.py").read_bytes(),
+                         (DIRECTORY / "accel_homing_axes.py").read_bytes())
         for name in ("LICENSE", "NOTICE"):
             self.assertEqual((self.source / name).read_bytes(), (DIRECTORY / name).read_bytes())
 

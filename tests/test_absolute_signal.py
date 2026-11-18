@@ -290,11 +290,11 @@ class RangeAndQualificationTests(unittest.TestCase):
         self.assertEqual(rig.workflow.last_result["successes"], 10)
         metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
         self.assertEqual(metadata["polarity_policy"], plugin.POLARITY_POLICY)
-        self.assertEqual(metadata["impact_metric"], "xyz_magnitude")
+        self.assertEqual(metadata["impact_metric"], "mapped_axis")
         self.assertEqual(metadata["threshold_margin_g"], .5)
         self.assertEqual(rig.configfile.saved[("accel_homing_model default", "version")], "1")
 
-    def test_xyz_schema1_context_and_ten_successes_remain_compatible(self):
+    def test_xyz_schema1_remains_readable_but_requires_recalibration_before_motion(self):
         for generic in (False, True):
             obj = backends.generic() if generic else make_homing()
             endstop = with_endstops(obj, ("x",))["x"]
@@ -306,8 +306,9 @@ class RangeAndQualificationTests(unittest.TestCase):
                                     "x_metadata": json.dumps(metadata)}, name="accel_homing_model default")
             obj.workflows.model = AccelHomingModel(cfg)
             obj.workflows._validate_model_connection()
-            obj.workflows.check_home_axes({"x": None})
-            self.assertTrue(obj.workflows.simple_detection("x"))
+            with self.assertRaisesRegex(CommandError, "recalibrate"):
+                obj.workflows.check_home_axes({"x": None})
+            self.assertFalse(obj.workflows.simple_detection("x"))
             self.assertEqual(obj.workflows._model_context("x"), context)
             self.assertEqual(obj.workflows.model.version, 1)
 

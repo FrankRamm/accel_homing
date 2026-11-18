@@ -81,6 +81,14 @@ been reduced to a plotting envelope, not that hardware delivered every sample.
 Files are generated after the motion sequence and cleanup. A process crash or
 power loss before export can prevent creation of the bundle.
 
+Raw `x_g`, `y_g` and `z_g` columns remain in the configured sensor stream after
+the driver's `axes_map`; they are not reordered by a learned homing mapping.
+Mapped-axis records retain `impact_metric: mapped_axis` and the frozen
+`axis_mapping`. Their impact plots show all signed stream channels, the signed
+physical axis, its absolute detector value and the matching physical-axis
+threshold. A large diagnostic channel does not contribute to that threshold.
+Historical and explicit XYZ experiments retain their vector plots.
+
 ## Reading the timing and plots
 
 Sensor print time and host monotonic time are different clock domains. The

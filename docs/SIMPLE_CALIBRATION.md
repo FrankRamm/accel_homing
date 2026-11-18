@@ -10,11 +10,40 @@ ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
 Use one axis per invocation. `AXIS` selects the printer direction to move,
 not an accelerometer channel. Physically center XY, leave both axes unhomed,
 keep Z supported/clear, and supervise with an accessible emergency stop.
-`CENTERED=1` authorizes movement after stationary preparation succeeds.
+`CENTERED=1` authorizes the mapping strokes as well as subsequent homing.
 
-## Stationary noise before movement
+## Automatic physical-axis mapping
 
-Every new per-axis calibration command first acquires three disjoint one-second
+Every new per-axis calibration first makes gentle, short central strokes in
+both directions on the selected machine axis. It uses the signed motion
+response to identify one configured-stream sensor channel and its sign.
+Each outward stroke is at most 15 mm, with a commanded return to the manual
+center between directions; speed is at most 20 mm/s and acceleration at most
+500 mm/s², respecting lower live limits. Configured homing speed is unchanged.
+This measurement is separate from endstop impacts. An absent, weak, ambiguous
+or inconsistent response aborts before noise-based threshold selection or homing;
+there is no fallback to whichever channel has the largest impact peak.
+
+The mapping acts on the sensor stream **after** the sensor's configured
+`axes_map`; the plugin does not rewrite that configuration or apply it twice.
+The result is stored with the selected axis model and its sensor context.
+Repeat calibration after changing the sensor, orientation, axes map or other
+reported context. Mapping proves a consistent measured response to commanded
+motion; it does not independently verify physical position or clearance.
+
+Recalibrate both axes after remounting the sensor. If a successful calibration
+detects that the previous orientation changed or conflicts with the other
+axis's saved channel, it invalidates that other profile until it is recalibrated.
+It retains the old evidence and threshold, but ordinary homing cannot use the
+invalidated profile, including with a manual threshold override. A failed
+calibration does not stage this invalidation. With `SAVE_CONFIG=0`, new mappings
+remain pending; run `SAVE_CONFIG` and restart before ordinary homing. Successive
+per-axis calibrations consult the pending pair so the second calibration does
+not overwrite the first one's newly qualified mapping.
+
+## Stationary noise after mapping
+
+After mapping and settling, the command acquires three disjoint one-second
 stationary-noise windows. This runs once before the
 first candidate home, not before each threshold retry or same-run continuation.
 X and Y each get a new measurement, including after a save/restart. A previous
@@ -23,7 +52,7 @@ standalone `ACCEL_HOMING_CALIBRATE_NOISE` result is never reused.
 The measurement requires an idle, unpaused printer, an empty motion queue and
 an exclusive sensor stream. It leaves motor enable/current and fan state as
 they are. A failed measurement, changed context or sensor fault aborts calibration
-before movement; it does not fall back to a default threshold. Transient sample
+before threshold qualification; it does not fall back to a default threshold. Transient sample
 gaps and fresh-data/acquisition timeouts permit only the bounded complete-window retries described in
 [the noise policy](PLOTS.md#stationary-noise).
 
@@ -32,7 +61,7 @@ must succeed before the model is staged/saved, and the PNG is published only
 after required cleanup and saving succeed. An aborted calibration saves no PNG.
 
 Without an explicit `START_THRESHOLD`, fresh noise selects the initial
-candidate using the same baseline-subtracted XYZ magnitude as the detector.
+candidate using the same baseline-subtracted mapped component as the detector.
 The configured grid starts at 1.00 g with 0.25 g steps by default. Existing
 `calibration_start_threshold` and `calibration_step` settings remain the grid
 origin and spacing. An explicit `STEP` changes that spacing and still permits
@@ -54,11 +83,14 @@ See the [noise-selection policy and limits](PLOTS.md#stationary-noise).
 Each move acquires a fresh resting XYZ offset (normally 100 ms, at least
 50 contiguous samples), separate from the initial three noise windows.
 It does not test stationary peak-to-peak quietness. For each sample it evaluates
-`sqrt((ax-bx)^2 + (ay-by)^2 + (az-bz)^2)` in g, with the offset fixed for the move.
+`abs(sign * (a[source_axis] - baseline[source_axis]))` in g, with the
+learned channel/sign and the resting offset fixed for the move. X homing uses
+only physical X; Y homing uses only physical Y. Other stream channels remain
+available for diagnostics and do not contribute to the ordinary impact metric.
 The first sample at or above the candidate threshold requests an immediate
-stop. The later recorded impact peak does not delay stopping. Channel
-permutations and sign reversals do not change this metric; no homing-axis
-mapping or impact-sign choice is needed. Ordinary motion can also cross the
+stop. The later recorded impact peak does not delay stopping. The learned sign
+preserves physical-axis orientation; taking the absolute value makes the
+trigger independent of polarity. Ordinary motion can also cross the
 threshold: it is not an independent classifier of mechanical contact.
 
 There is no acceleration-derived velocity integration, noise-envelope motion
@@ -91,8 +123,8 @@ selection; an explicit, otherwise valid `START_THRESHOLD` can still be used.
 Neither value is clamped downward to fit a limit. If the qualified candidate
 plus the final 0.5 g margin exceeds that ceiling, calibration aborts without
 staging a model, saving configuration or publishing its noise PNG.
-Before arming, the derived raw trigger limit and its squared value used by the
-XYZ-magnitude detector must both be finite and positive. This validates numeric
+Before arming, the derived raw trigger representation must be finite and
+positive. This validates numeric
 representation rather than adding a configurable g maximum.
 
 Ordinary and Beta calibration have no total homing-attempt limit. The former
@@ -248,24 +280,27 @@ Console output and saved metadata distinguish `tested_threshold_g`,
 value; `candidate_g` remains the tested candidate. Stationary-noise charts
 continue to describe their measurement and initial-value hints.
 
-New models record `impact_metric: xyz_magnitude` in their JSON metadata. After
-reload, that axis uses the **same vector detector and offset-only reference**
-for ordinary G28, TEST, CHARTS and ACCURACY. Charts label and plot the magnitude.
-Older selected-axis models and explicit `threshold`/`x_threshold`/`y_threshold`
-overrides retain their legacy detector. Leave manual overrides commented out
-to use the new calibrated model; thresholds from different metrics are not
-interchangeable. Existing axes_map remains useful for other Klipper features.
+New models record `impact_metric: mapped_axis` and `axis_mapping` with version,
+machine axis, source channel, sign, `coordinate_frame: configured_sensor_stream`,
+method `bidirectional_velocity_v1`, confidence and diagnostics. After reload,
+ordinary G28, TEST, CHARTS, ACCURACY and TROUBLESHOOT use that axis's mapped
+component and offset-only reference. Charts identify the physical axis and
+keep the other configured-stream channels visible as diagnostics.
+Older XYZ-magnitude qualifications require fresh calibration and cannot supply
+a mapped threshold. Leave manual overrides commented out to use the saved
+threshold; thresholds qualified for different metrics are not interchangeable.
 
 New calibration metadata also records `travel_plausibility_required: true`,
 `recenter_acceleration_policy: restored_normal_limit` and the configured
 settling interval. `physical_position_verified` remains false.
 
 `ACCEL_HOMING_CALIBRATE_NOISE` remains a separate stationary diagnostic. Its
-mapped X/Y component hints do not select a later calibration's initial value;
-that calibration uses its own fresh XYZ-magnitude measurement.
+configured-stream X/Y component hints do not select a later calibration's initial
+value; that calibration learns its axis and measures fresh mapped-axis noise.
 `ACCEL_HOMING_STATUS` reports the discovery/validation phase, threshold,
 restart count and current ten-check spread. Its `stationary_noise` summary
-identifies the fresh measurement, magnitude peak, initial-value source and PNG.
+identifies the fresh measurement, mapped-axis peak, initial-value source and PNG.
+The XYZ-magnitude noise peak is retained as diagnostic evidence.
 The nested `recovery` object in active calibration status, the final result and
 new saved model metadata contains only completed-return telemetry:
 

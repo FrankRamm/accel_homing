@@ -138,7 +138,7 @@ class CalibrationMarginTests(unittest.TestCase):
             rig.owner.full_scale_g = 1.5
 
         with mock.patch.object(rig.workflow, "_release_terminal_home", side_effect=reduced_range), \
-                self.assertRaisesRegex(CommandError, "saved calibration threshold.*headroom"):
+                self.assertRaisesRegex(CommandError, "axis mapping sensor context changed"):
             rig.calibrate(save=0)
         self.assertEqual(rig.configfile.saved, {})
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
