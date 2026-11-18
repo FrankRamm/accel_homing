@@ -6,6 +6,7 @@ owns main-file serialization and restart; this helper only comments those keys
 in included files. It never enables Kalico's global autosave_includes policy.
 """
 import configparser
+import inspect
 import io
 import os
 import re
@@ -143,11 +144,35 @@ class _NativeReader:
             self.strip_duplicates = autosave._strip_duplicates
         if not callable(getattr(self.reader, "_resolve_include", None)):
             raise ValueError("native SAVE_CONFIG include resolver is unavailable")
+        try:
+            signature = inspect.signature(self.reader._resolve_include)
+            self.include_keywords = {"include_vars": None} if "include_vars" in signature.parameters else {}
+            signature.bind(None, None, None, None, **self.include_keywords)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("native SAVE_CONFIG include resolver signature is unsupported") from exc
 
     def included(self, filename, specification):
         # Native resolution includes sorted globs and nested syntax validation.
         # Kalico enables recursive '**'; retained Klipper does not.
-        return self.reader._resolve_include(filename, specification, _parser(), set())
+        return self.reader._resolve_include(filename, specification, _parser(), set(), **self.include_keywords)
+
+    def check_plain_includes(self, data, filename):
+        if not self.include_keywords:
+            return
+        pending = None
+        for line in data.split("\n"):
+            line = line.split("#", 1)[0]
+            match = configparser.RawConfigParser.SECTCRE.match(line)
+            header = match and match.group("header")
+            if header:
+                pending = header[8:].strip() if header.startswith("include ") else None
+            elif pending and line.strip():
+                # Native Kalico renders the included file with these variables
+                # and inherits them in nested includes. Literal-file edits
+                # cannot safely reproduce that generated configuration graph.
+                raise ValueError("parameterized include [%s] in %s is unsupported for calibrated SAVE_CONFIG; "
+                                 "use plain includes before retrying; no files were changed" %
+                                 ("include " + pending, filename))
 
     def checked_root_data(self, data):
         """Reject an unreadable existing envelope before any save-side edits."""
@@ -268,6 +293,7 @@ class CalibrationConfigSave:
             data = snapshot["data"].decode("utf-8")
             if depth == 0:
                 data = regular_root
+            reader.check_plain_includes(data, logical)
             for line in data.split("\n"):
                 line = line.split("#", 1)[0]
                 match = configparser.RawConfigParser.SECTCRE.match(line)

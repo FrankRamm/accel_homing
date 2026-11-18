@@ -104,6 +104,43 @@ class NativeShape:
         return "native result"
 
 
+class IncludeVarsNativeShape(NativeShape):
+    def __init__(self, root):
+        super().__init__(root)
+        self.include_calls = []
+
+    def _resolve_include(self, filename, specification, parser, visited, include_vars):
+        self.include_calls.append((filename, specification, include_vars))
+        if include_vars is not None:
+            raise AssertionError("plain native includes require the native None context")
+        return super()._resolve_include(filename, specification, parser, visited)
+
+
+class ModernAutoSave:
+    def __init__(self, parser):
+        self.fileconfig = parser
+        self.status_save_pending, self.save_config_pending = {}, False
+
+    _find_autosave_data = staticmethod(NativeShape._find_autosave_data)
+
+    @staticmethod
+    def _strip_duplicates(data, parser):
+        return NativeShape._strip_duplicates(data, types.SimpleNamespace(fileconfig=parser))
+
+
+class ConfigFileReader:
+    _resolve_include = staticmethod(NativeShape._resolve_include)
+
+
+class ModernNativeShape(NativeShape):
+    _resolve_include = None
+
+    def __init__(self, root):
+        super().__init__(root, modern=True)
+        self.autosave = ModernAutoSave(self.autosave.fileconfig)
+        self.state = self.autosave
+
+
 class PublicGCode:
     def __init__(self, native):
         self.handlers = {"SAVE_CONFIG": native}
@@ -211,6 +248,147 @@ class CalibrationConfigTests(unittest.TestCase):
         self.rig.save()
         self.assertIn(b"#y_threshold: 7", self.rig.include.read_bytes())
         self.assertIn(b"\nx_threshold: 8", self.rig.include.read_bytes())
+
+    def test_native_required_include_vars_supports_nested_plain_includes(self):
+        rig = self.rig
+        rig.config = IncludeVarsNativeShape(rig.root)
+        rig.gcode = PublicGCode(rig.config.save)
+        nested = Path(self.directory.name) / "nested.cfg"
+        nested.write_text("[include plugin.cfg]\n")
+        rig.root.write_text("[include nested.cfg]\n")
+        rig.stage("x", "2.75")
+        rig.config.set("beacon model default", "model_coef", "1.0,\n  2.0")
+        rig.save()
+        self.assertEqual(rig.config.calls, 1)
+        self.assertTrue(rig.config.include_calls)
+        self.assertTrue(all(context is None for _filename, _specification, context in rig.config.include_calls))
+        self.assertEqual({item[1] for item in rig.config.include_calls}, {"nested.cfg", "plugin.cfg"})
+        self.assertEqual(nested.read_text(), "[include plugin.cfg]\n")
+        self.assertIn(b"#x_threshold: 8", rig.include.read_bytes())
+        self.assertIn(b"\r\ny_threshold: 7", rig.include.read_bytes())
+        self.assertIn("#*# model_coef = 1.0,", rig.root.read_text())
+        self.assertEqual(rig.helper._targets, {})
+
+    def test_modern_reader_without_configfile_resolver_keeps_four_argument_api(self):
+        rig = self.rig
+        rig.config = ModernNativeShape(rig.root)
+        rig.gcode = PublicGCode(rig.config.save)
+        rig.stage("y", "3.25")
+        reader = persistence._NativeReader(rig.config)
+        self.assertIsInstance(reader.reader, ConfigFileReader)
+        self.assertEqual(reader.include_keywords, {})
+        rig.save()
+        self.assertEqual(rig.config.calls, 1)
+        self.assertIn(b"#y_threshold: 7", rig.include.read_bytes())
+        self.assertIn(b"\r\nx_threshold: 8", rig.include.read_bytes())
+        self.assertEqual(rig.helper._targets, {})
+
+    def test_resolver_internal_typeerror_is_not_retried_and_preserves_pending(self):
+        for uses_variables in (False, True):
+            with self.subTest(include_vars=uses_variables):
+                rig = Rig(self.directory.name)
+                calls = []
+                def legacy(filename, specification, parser, visited):
+                    calls.append((filename, specification))
+                    raise TypeError("internal resolver error")
+                def variable(filename, specification, parser, visited, include_vars):
+                    calls.append((filename, specification, include_vars))
+                    raise TypeError("internal resolver error")
+                rig.config._resolve_include = variable if uses_variables else legacy
+                rig.stage()
+                root, included = rig.root.read_bytes(), rig.include.read_bytes()
+                pending = copy.deepcopy(rig.config.state.status_save_pending)
+                targets = dict(rig.helper._targets)
+                with mock.patch.object(persistence, "_replace") as replace:
+                    with self.assertRaisesRegex(SaveError, "internal resolver error") as caught:
+                        rig.save()
+                self.assertIsInstance(caught.exception.__cause__, TypeError)
+                self.assertEqual(len(calls), 1)
+                replace.assert_not_called()
+                self.assertEqual(rig.config.calls, 0)
+                self.assertEqual(rig.root.read_bytes(), root)
+                self.assertEqual(rig.include.read_bytes(), included)
+                self.assertEqual(rig.config.state.status_save_pending, pending)
+                self.assertTrue(rig.config.state.save_config_pending)
+                self.assertEqual(rig.config.autosave.fileconfig.get("accel_homing", "x_threshold"), "2.75")
+                self.assertEqual(rig.helper._targets, targets)
+
+    def test_unknown_required_resolver_capability_is_rejected_before_invocation(self):
+        calls = []
+        def unsupported(filename, specification, parser, visited, include_vars, new_context):
+            calls.append(filename)
+        self.rig.config._resolve_include = unsupported
+        self.rig.stage()
+        root, included = self.rig.root.read_bytes(), self.rig.include.read_bytes()
+        with self.assertRaisesRegex(SaveError, "resolver signature is unsupported"):
+            self.rig.save()
+        self.assertEqual(calls, [])
+        self.assertEqual(self.rig.config.calls, 0)
+        self.assertEqual(self.rig.root.read_bytes(), root)
+        self.assertEqual(self.rig.include.read_bytes(), included)
+        self.assertTrue(self.rig.helper._targets)
+
+    def test_parameterized_root_and_nested_includes_are_rejected_without_writes(self):
+        for depth in (0, 1, 2):
+            with self.subTest(depth=depth):
+                rig = Rig(self.directory.name)
+                rig.config = IncludeVarsNativeShape(rig.root)
+                rig.gcode = PublicGCode(rig.config.save)
+                parameterized = "[include plugin.cfg]\naxis: x\n"
+                if depth == 0:
+                    rig.root.write_text(parameterized)
+                else:
+                    nested = Path(self.directory.name) / "nested.cfg"
+                    nested.write_text(parameterized)
+                    rig.root.write_text("[include nested.cfg]\n")
+                    if depth == 2:
+                        middle = Path(self.directory.name) / "middle.cfg"
+                        middle.write_text("[include nested.cfg]\n")
+                        rig.root.write_text("[include middle.cfg]\n")
+                rig.stage()
+                files = {path: path.read_bytes() for path in Path(self.directory.name).glob("*.cfg")}
+                pending = copy.deepcopy(rig.config.state.status_save_pending)
+                targets = dict(rig.helper._targets)
+                with mock.patch.object(persistence, "_replace") as replace:
+                    with self.assertRaisesRegex(SaveError, "parameterized include.*no files were changed"):
+                        rig.save()
+                replace.assert_not_called()
+                self.assertEqual(rig.config.calls, 0)
+                self.assertEqual({path: path.read_bytes() for path in files}, files)
+                self.assertEqual(rig.config.state.status_save_pending, pending)
+                self.assertEqual(rig.helper._targets, targets)
+                self.assertTrue(rig.config.state.save_config_pending)
+                if depth == 0:
+                    self.assertEqual(rig.config.include_calls, [])
+
+    def test_optional_include_vars_capability_still_rejects_parameterized_graph(self):
+        calls = []
+        def optional(filename, specification, parser, visited, include_vars=None):
+            calls.append((filename, specification, include_vars))
+            return NativeShape._resolve_include(filename, specification, parser, visited)
+        self.rig.config._resolve_include = optional
+        self.rig.root.write_text("[include plugin.cfg]\naxis = x\n")
+        self.rig.stage()
+        root, included = self.rig.root.read_bytes(), self.rig.include.read_bytes()
+        with self.assertRaisesRegex(SaveError, "parameterized include"):
+            self.rig.save()
+        self.assertEqual(calls, [])
+        self.assertEqual(self.rig.root.read_bytes(), root)
+        self.assertEqual(self.rig.include.read_bytes(), included)
+        self.assertTrue(self.rig.config.state.save_config_pending)
+        self.assertTrue(self.rig.helper._targets)
+
+    def test_plain_include_with_gcode_jinja_is_not_treated_as_parameterized(self):
+        rig = self.rig
+        rig.config = IncludeVarsNativeShape(rig.root)
+        rig.gcode = PublicGCode(rig.config.save)
+        macro = (b"\n[gcode_macro TEST]\ngcode:\n"
+                 b"  {% if printer.toolhead.homed_axes %}\n  M118 {printer.toolhead.homed_axes}\n  {% endif %}\n")
+        rig.include.write_bytes(rig.include.read_bytes() + macro)
+        rig.stage()
+        rig.save()
+        self.assertTrue(rig.include.read_bytes().endswith(macro))
+        self.assertEqual(rig.config.calls, 1)
 
     def test_sequential_axis_registry_and_rollback_preserve_prior_target(self):
         self.rig.stage("x", "2.75")
