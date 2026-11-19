@@ -10,9 +10,29 @@ Run in the Linux printer host's shell as the existing Klipper service user,
 with the printer idle:
 
 ```bash
-cd ~
-git clone https://github.com/FrankRamm/accel_homing.git
-~/accel_homing/install.sh
+(
+  set -e
+  url=https://github.com/FrankRamm/accel_homing.git
+  repo="$HOME/accel_homing"
+  if [ -e "$repo/.git" ]; then
+    cd "$repo"
+    if [ "$(git remote get-url origin)" != "$url" ] || [ -n "$(git status --porcelain)" ]; then
+      echo "Expected a clean accel_homing checkout with origin $url." >&2
+      exit 1
+    fi
+    git fetch origin refs/heads/main:refs/remotes/origin/main
+    git switch main
+    git merge --ff-only origin/main
+    if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+      echo "Local main has unpublished commits. Review them before installing." >&2
+      exit 1
+    fi
+    git branch --set-upstream-to=origin/main main
+  else
+    git clone --branch main "$url" "$repo"
+  fi
+  bash "$repo/install.sh"
+)
 ```
 
 The installer configures X/Y homing and Moonraker updates using the current

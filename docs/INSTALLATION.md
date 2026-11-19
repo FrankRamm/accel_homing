@@ -24,14 +24,35 @@ explicit selection. It does not infer electrical wiring or validate mechanics.
 ## Install
 
 ```bash
-cd ~
-git clone https://github.com/FrankRamm/accel_homing.git
-~/accel_homing/install.sh
+(
+  set -e
+  url=https://github.com/FrankRamm/accel_homing.git
+  repo="$HOME/accel_homing"
+  if [ -e "$repo/.git" ]; then
+    cd "$repo"
+    if [ "$(git remote get-url origin)" != "$url" ] || [ -n "$(git status --porcelain)" ]; then
+      echo "Expected a clean accel_homing checkout with origin $url." >&2
+      exit 1
+    fi
+    git fetch origin refs/heads/main:refs/remotes/origin/main
+    git switch main
+    git merge --ff-only origin/main
+    if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+      echo "Local main has unpublished commits. Review them before installing." >&2
+      exit 1
+    fi
+    git branch --set-upstream-to=origin/main main
+  else
+    git clone --branch main "$url" "$repo"
+  fi
+  bash "$repo/install.sh"
+)
 ```
 
-Keep this checkout in place: installed extras are links to its Python modules.
-Moving or deleting the checkout breaks those links. A second `git clone` into
-an existing directory is unnecessary; use the update procedure below.
+Use the same block for a fresh installation or a reinstall. It updates an
+existing clean checkout to the published `main` before running its installer.
+If Git reports an error, the block stops. Keep the checkout in place because
+the installed extras link to its Python modules.
 
 The default managed source must be the complete clean `~/accel_homing` Git
 checkout of `main`, with exact
@@ -220,12 +241,7 @@ original six module links therefore support Git-only updates adding this
 diagnostic. A missing or broken diagnostic module produces an error only when
 that command is invoked; it does not prevent ordinary plugin startup.
 
-For a manual update of an established clean `main` checkout:
-
-```bash
-git -C ~/accel_homing pull --ff-only
-~/accel_homing/install.sh
-```
+For a manual update, run the [install commands](#install) above.
 
 If Git or the installer reports local changes, preserve and review them. Do not
 use a forced reset to conceal an ownership or configuration conflict.
