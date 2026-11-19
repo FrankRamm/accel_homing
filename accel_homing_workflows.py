@@ -15,6 +15,7 @@ import gc
 import html
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -481,6 +482,10 @@ class AccelHomingWorkflows:
         virtual_sd = self.printer.lookup_object("virtual_sdcard", None)
         return (virtual_sd is not None and hasattr(virtual_sd, "is_active")
                 and virtual_sd.is_active())
+
+    def _axis_g28_command(self, axis):
+        letter = axis.upper()
+        return self.gcode.create_gcode_command("G28", "G28 " + letter, {letter: ""})
 
     def _native_g28(self):
         """Bind native homing without inspecting or replacing public G28."""
@@ -1634,8 +1639,7 @@ class AccelHomingWorkflows:
                 else:
                     self.owner.start_capture()
                 capture_started = True
-                letter = axis.upper()
-                gcmd = self.gcode.create_gcode_command("G28", "G28 " + letter, {letter: ""})
+                gcmd = self._axis_g28_command(axis)
                 # Public wrappers may hop Z, force coordinates, run SYNC_MOTORS
                 # or execute arbitrary homing G-code. Invoke native homing for
                 # X/Y here, retaining public handlers and normal homing events.
@@ -2875,7 +2879,14 @@ class AccelHomingWorkflows:
         if factory is not None and callable(getattr(factory, "_set_homing_current", None)):
             if not callable(getattr(self.owner.toolhead, "get_active_rails_for_axis", None)):
                 raise self._error("Beta native homing-current helper lacks its active-rail API before motion")
-            state = factory(self.printer)
+            # Newer Kalico requires a G28 command on its Homing state. Creating
+            # the axis-specific command provides context without dispatching it.
+            try:
+                parameters = inspect.signature(factory).parameters
+                kwargs = {"gcmd": self._axis_g28_command(axis)} if "gcmd" in parameters else {}
+                state = factory(self.printer, **kwargs)
+            except (TypeError, ValueError) as exc:
+                raise self._error("cannot initialize native homing-current helper before motion: %s" % exc) from exc
             helper = state._set_homing_current
         context = {"configured": configured, "settings_available": isinstance(settings, dict) and bool(settings),
                    "native_helper": None if helper is None else native.__module__ + ".Homing._set_homing_current",

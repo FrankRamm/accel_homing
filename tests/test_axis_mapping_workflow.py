@@ -138,6 +138,53 @@ class MappingRig(Rig):
 
 
 class AxisMappingWorkflowTests(unittest.TestCase):
+    def test_kalico_current_helper_receives_selected_axis_and_restores_current(self):
+        rig = MappingRig(axis="y")
+        command = GCmd("ACCEL_HOMING_CALIBRATE", AXIS="Y", CENTERED=1, SAVE_CONFIG=0)
+        states, current_calls = [], []
+
+        class Homing:
+            def __init__(self, printer, gcmd):
+                states.append((printer, gcmd.get_commandline(), gcmd.get_command_parameters()))
+
+            def _set_homing_current(self, axes, pre_homing):
+                current_calls.append((list(axes), pre_homing))
+
+        with mock.patch.dict(workflow_module._PRINTER_G28.__globals__, {"Homing": Homing}), \
+                mock.patch.object(rig.toolhead, "get_active_rails_for_axis", create=True), \
+                mock.patch.object(rig.workflow, "_chart_preflight"), \
+                mock.patch.object(rig.workflow, "_calibration_noise_preflight",
+                                  side_effect=CommandError("stop after mapping")), \
+                self.assertRaisesRegex(CommandError, "stop after mapping"):
+            rig.workflow.cmd_CALIBRATE(command)
+        self.assertEqual(states, [(rig.workflow.printer, "G28 Y", {"Y": ""})])
+        self.assertEqual(current_calls, [(["y"], True), (["y"], False)])
+        self.assertEqual(rig.events.count("capture"), 2)
+        self.assertEqual(rig.home_calls, [])
+
+    def test_native_homing_init_type_error_aborts_before_motion_without_retry(self):
+        rig = MappingRig()
+        attempts = []
+
+        class Homing:
+            def __init__(self, printer, gcmd=None):
+                attempts.append(gcmd.get_commandline())
+                raise TypeError("native initialization failed")
+
+            def _set_homing_current(self, axes, pre_homing):
+                raise AssertionError("motor current changed")
+
+        command = GCmd(AXIS="X", CENTERED=1, SAVE_CONFIG=0)
+        with mock.patch.dict(workflow_module._PRINTER_G28.__globals__, {"Homing": Homing}), \
+                mock.patch.object(rig.toolhead, "get_active_rails_for_axis", create=True), \
+                mock.patch.object(rig.workflow, "_chart_preflight"), \
+                self.assertRaisesRegex(CommandError, "before motion: native initialization failed"):
+            rig.workflow.cmd_CALIBRATE(command)
+        self.assertEqual(attempts, ["G28 X"])
+        self.assertEqual(rig.toolhead.moves, [])
+        self.assertEqual(rig.home_calls, [])
+        self.assertIsNone(rig.workflow.session)
+
     def use_configured_mapping(self, rig, tokens=("x", "y", "z")):
         rig.owner.sensor_name = "adxl345 toolhead"
         declaration = {"sensor_section": rig.owner.sensor_name, "option": "axes_map", "axes_map": list(tokens)}
