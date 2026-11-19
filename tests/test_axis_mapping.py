@@ -36,7 +36,7 @@ def motion_pass(direction, vector=(1., 0., 0.), noise=0., rate=1000., offset=(.1
                         "dropped": 0, "amplitude_limited": False}}
 
 
-def quantized_mapping_pulse(direction, vibration_channel=None):
+def quantized_mapping_pulse(direction, vibration_channel=None, ripple_g=.5, motion_gain=1.):
     """15 mm / 20 mm/s / 500 mm/s2, with optional single-channel ripple.
 
     This is a constructed waveform, not a capture from a printer. Quantization
@@ -60,9 +60,9 @@ def quantized_mapping_pulse(direction, vibration_channel=None):
         for channel in range(3):
             value = baseline[channel]
             if channel == 0:
-                value += direction * acceleration / GRAVITY_MM_S2
+                value += motion_gain * direction * acceleration / GRAVITY_MM_S2
             if channel == vibration_channel:
-                value += .5 * math.cos(2. * math.pi * 100. * (time - 1.))
+                value += ripple_g * math.cos(2. * math.pi * 100. * (time - 1.))
             row.append(round(value / .0078125) * .0078125)
         samples.append(row)
     return {"direction": direction, "segments": segments,
@@ -172,6 +172,7 @@ class AxisMappingDiagnosticsTests(unittest.TestCase):
         diagnostics = {"stale": "discarded"}
         result = infer_axis_mapping("x", passes, diagnostics)
         self.assertEqual(result, expected)
+        self.assertEqual(diagnostics["version"], 2)
         self.assertNotIn("stale", diagnostics)
         self.assertEqual(diagnostics["status"], "accepted")
         self.assertEqual(diagnostics["evaluated_pass_count"], 2)
@@ -190,45 +191,61 @@ class AxisMappingDiagnosticsTests(unittest.TestCase):
             self.assertLessEqual(report["cruise_end_time_s"], 1.679)
             self.assertEqual(report["expected_speed_mm_s"], 20.)
             self.assertEqual(report["alignment"], 1.)
-            self.assertLess(report["total_deviation_to_limit_ratio"], 1.)
+            self.assertEqual(report["stable_cruise_fraction"], 1.)
             for drift, bias in zip(report["endpoint_drift_xyz_mm_s"], report["removed_bias_xyz_mm_s2"]):
                 self.assertAlmostEqual(drift / .79, bias)
         json.dumps(diagnostics, allow_nan=False)
 
-    def test_longitudinal_ripple_is_rejected_with_parallel_metrics_and_no_transverse_error(self):
-        passes = [quantized_mapping_pulse(1, 0), quantized_mapping_pulse(-1, 0)]
-        diagnostics = {}
-        for output in (None, diagnostics):
-            with self.assertRaisesRegex(ValueError, r"unstable \(direction \+1, channel X:.*mm/s exceeds limit.*mm/s"):
-                infer_axis_mapping("x", passes, output)
-        report = diagnostics["passes"][0]
-        self.assertEqual(report["alignment"], 1.)
-        self.assertGreater(report["parallel_median_deviation_mm_s"], report["total_deviation_limit_mm_s"])
-        self.assertAlmostEqual(report["parallel_median_deviation_mm_s"], report["total_median_deviation_mm_s"])
-        self.assertEqual(report["perpendicular_median_deviation_mm_s"], 0.)
-        self.assertEqual(report["sign_agreement_fraction"], 1.)
-        self.assertEqual(report["nonpositive_projection_fraction"], 0.)
-        self.assertEqual(report["near_zero_projection_fraction"], 0.)
-        self.assertGreater(report["total_deviation_ratio"], report["total_deviation_limit_ratio"])
-        self.assertGreater(report["total_deviation_to_limit_ratio"], 1.)
-        self.assertAlmostEqual(report["velocity_norm_mm_s"], 20.092, delta=.002)
-        self.assertAlmostEqual(report["total_median_deviation_mm_s"], 4.491, delta=.002)
+    def test_reported_scale_of_ripple_can_preserve_the_same_signed_channel(self):
+        for channel in (0, 1):
+            with self.subTest(vibration_channel=channel):
+                passes = [quantized_mapping_pulse(d, channel, ripple_g=.71, motion_gain=1.08)
+                          for d in (1, -1)]
+                diagnostics = {}
+                result = infer_axis_mapping("x", passes, diagnostics)
+                self.assertEqual(result, infer_axis_mapping("x", passes))
+                self.assertEqual((result["source_axis"], result["sign"]), (0, 1))
+                for report in diagnostics["passes"]:
+                    self.assertAlmostEqual(report["total_median_deviation_mm_s"], 6.34, delta=.15)
+                    self.assertGreater(report["total_deviation_ratio"], .20)
+                    self.assertEqual(report["stable_cruise_fraction"], 1.)
+                    self.assertAlmostEqual(report["parallel_median_deviation_mm_s"],
+                                           6.34 if channel == 0 else 0., delta=.15)
+                    self.assertAlmostEqual(report["perpendicular_median_deviation_mm_s"],
+                                           6.34 if channel == 1 else 0., delta=.15)
 
-    def test_transverse_ripple_is_rejected_with_perpendicular_metrics(self):
+    def test_brief_stop_during_cruise_is_not_hidden_by_the_stroke_median(self):
+        positive = quantized_mapping_pulse(1)
+        # Slow to rest for 80 ms, then resume. The net velocity change is zero.
+        for row in positive["capture"]["samples"]:
+            if 1.30 <= row[0] < 1.32:
+                row[1] -= 1000. / GRAVITY_MM_S2
+            elif 1.40 <= row[0] < 1.42:
+                row[1] += 1000. / GRAVITY_MM_S2
         diagnostics = {}
         with self.assertRaisesRegex(ValueError, "cruise response is unstable"):
-            infer_axis_mapping("x", [quantized_mapping_pulse(1, 1), quantized_mapping_pulse(-1, 1)], diagnostics)
+            infer_axis_mapping("x", [positive, quantized_mapping_pulse(-1)], diagnostics)
         report = diagnostics["passes"][0]
-        self.assertEqual(report["source_axis"], 0)
-        self.assertGreater(report["perpendicular_median_deviation_mm_s"], report["total_deviation_limit_mm_s"])
-        self.assertGreater(report["perpendicular_median_deviation_mm_s"], report["parallel_median_deviation_mm_s"])
-        self.assertAlmostEqual(report["perpendicular_median_deviation_mm_s"], 4.444, delta=.002)
-        json.dumps(diagnostics, allow_nan=False)
+        self.assertLess(report["total_deviation_ratio"], .20)
+        self.assertLess(report["in_speed_band_fraction"], report["minimum_stable_cruise_fraction"])
+
+    def test_rejects_inconsistent_sample_speed_or_orientation_even_with_aligned_median(self):
+        for channel, failed_check in ((0, "in_speed_band_fraction"), (1, "aligned_cruise_fraction")):
+            with self.subTest(vibration_channel=channel):
+                diagnostics = {}
+                passes = [quantized_mapping_pulse(d, channel, ripple_g=2.) for d in (1, -1)]
+                with self.assertRaisesRegex(ValueError, "unstable .*direction \\+1, channel X"):
+                    infer_axis_mapping("x", passes, diagnostics)
+                report = diagnostics["passes"][0]
+                self.assertGreater(report["alignment"], .99)
+                self.assertLess(report[failed_check], report["minimum_stable_cruise_fraction"])
+                self.assertLess(report["stable_cruise_fraction"], report["minimum_stable_cruise_fraction"])
+                json.dumps(diagnostics, allow_nan=False)
 
     def test_first_failure_retains_only_evaluated_pass_and_original_reason(self):
         diagnostics = {}
         with self.assertRaisesRegex(ValueError, "cruise response is unstable") as caught:
-            infer_axis_mapping("x", [quantized_mapping_pulse(1, 0), None], diagnostics)
+            infer_axis_mapping("x", [quantized_mapping_pulse(1, 0, ripple_g=2.), None], diagnostics)
         self.assertEqual(diagnostics["status"], "rejected")
         self.assertEqual(diagnostics["reason"], str(caught.exception))
         self.assertEqual(diagnostics["rejected_pass_index"], 0)
@@ -241,7 +258,7 @@ class AxisMappingDiagnosticsTests(unittest.TestCase):
     def test_second_pass_failure_keeps_first_pass_and_identifies_negative_direction(self):
         diagnostics = {}
         with self.assertRaisesRegex(ValueError, "direction -1, channel X"):
-            infer_axis_mapping("x", [quantized_mapping_pulse(1), quantized_mapping_pulse(-1, 0)], diagnostics)
+            infer_axis_mapping("x", [quantized_mapping_pulse(1), quantized_mapping_pulse(-1, 0, ripple_g=2.)], diagnostics)
         self.assertEqual(diagnostics["rejected_pass_index"], 1)
         self.assertEqual(diagnostics["evaluated_pass_count"], 2)
         self.assertEqual(diagnostics["unevaluated_pass_count"], 0)
@@ -299,7 +316,7 @@ class AxisMappingDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diagnostics["evaluated_pass_count"], 10)
         self.assertEqual(diagnostics["omitted_pass_report_count"], 2)
         self.assertEqual(diagnostics["unevaluated_pass_count"], 0)
-        passes[9] = quantized_mapping_pulse(1, 0)
+        passes[9] = quantized_mapping_pulse(1, 0, ripple_g=2.)
         with self.assertRaisesRegex(ValueError, "cruise response is unstable"):
             infer_axis_mapping("x", passes, diagnostics)
         self.assertEqual(len(diagnostics["passes"]), 8)

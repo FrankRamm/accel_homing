@@ -18,6 +18,7 @@ CONFIGURED_METHOD = "configured_axes_map_v1"
 GRAVITY_MM_S2 = 9806.65
 MIN_ALIGNMENT = 0.85
 MIN_DIRECTION_AGREEMENT = 0.95
+MIN_STABLE_CRUISE_FRACTION = 0.95
 MAX_DIAGNOSTIC_PASSES = 8
 
 
@@ -255,41 +256,52 @@ def _pass_velocity(axis, item, diagnostics=None):
         raise ValueError("Mapping is ambiguous: best channel %s alignment %.3f is below %.3f; "
                          "sensor tilt or transverse motion is too large" % (
                              "XYZ"[source], alignment, MIN_ALIGNMENT))
-    # A median alone must not hide unstable velocity magnitude or direction.
-    deviations = [math.sqrt(math.fsum((row[i] - vector[i]) ** 2 for i in range(3)))
-                  for row in cruise_vectors]
-    deviation = statistics.median(deviations)
-    limit = 0.20 * norm
+    # Test the property we use for homing: the same signed sensor channel
+    # should identify the stroke even as the estimated velocity fluctuates.
+    unit = tuple(value / norm for value in vector)
+    projections = [math.fsum(value * direction for value, direction in zip(row, unit))
+                   for row in cruise_vectors]
+    parallel = [abs(value - norm) for value in projections]
+    # The stroke median has already passed the commanded-speed check.
+    # Compare individual samples to that median to detect stops and surges.
+    longitudinal_limit = 0.50 * norm
+    sign = 1 if vector[source] > 0 else -1
+    aligned = [
+        sign * row[source] > 0 and sign * row[source] >= MIN_ALIGNMENT * math.hypot(*row)
+        for row in cruise_vectors
+    ]
+    stable_count = sum(on_axis and error <= longitudinal_limit
+                       for on_axis, error in zip(aligned, parallel))
+    size = len(cruise_vectors)
+    stable_fraction = stable_count / size
     if diagnostics is not None:
-        # Diagnostic decomposition only. Acceptance continues to use the
-        # original total Euclidean deviation, including longitudinal ripple.
-        unit = tuple(value / norm for value in vector)
-        projections = [math.fsum(value * direction for value, direction in zip(row, unit))
-                       for row in cruise_vectors]
-        parallel = [abs(value - norm) for value in projections]
         perpendicular = [math.hypot(*(value - projection * direction
                                       for value, direction in zip(row, unit)))
                          for row, projection in zip(cruise_vectors, projections)]
-        size = len(cruise_vectors)
+        deviation = statistics.median(math.hypot(a, b) for a, b in zip(parallel, perpendicular))
         near_zero = 0.10 * norm
         diagnostics.update(
             total_median_deviation_mm_s=_diagnostic_number(deviation),
-            total_deviation_limit_mm_s=_diagnostic_number(limit),
             total_deviation_ratio=_diagnostic_number(deviation / norm),
-            total_deviation_limit_ratio=0.20,
-            total_deviation_to_limit_ratio=_diagnostic_number(deviation / limit),
             parallel_median_deviation_mm_s=_diagnostic_number(statistics.median(parallel)),
+            longitudinal_sample_tolerance_mm_s=_diagnostic_number(longitudinal_limit),
             perpendicular_median_deviation_mm_s=_diagnostic_number(statistics.median(perpendicular)),
+            aligned_cruise_fraction=sum(aligned) / size,
+            in_speed_band_fraction=sum(error <= longitudinal_limit for error in parallel) / size,
+            stable_cruise_fraction=stable_fraction,
+            minimum_stable_cruise_fraction=MIN_STABLE_CRUISE_FRACTION,
             sign_agreement_fraction=sum(row[source] * vector[source] > 0 for row in cruise_vectors) / size,
             nonpositive_projection_fraction=sum(value <= 0 for value in projections) / size,
             near_zero_projection_fraction=sum(abs(value) <= near_zero for value in projections) / size,
             near_zero_projection_limit_mm_s=_diagnostic_number(near_zero))
-    if deviation > limit:
+    if stable_fraction < MIN_STABLE_CRUISE_FRACTION:
         raise ValueError("Mapping cruise response is unstable (direction %+d, channel %s: "
-                         "median deviation %.6g mm/s exceeds limit %.6g mm/s)" % (
-                             item["direction"], "XYZ"[source], deviation, limit))
+                         "%d/%d samples support the signed channel within %.3g mm/s of "
+                         "the cruise speed estimate, need %.0f%%)" % (
+                             item["direction"], "XYZ"[source], stable_count, size,
+                             longitudinal_limit, 100 * MIN_STABLE_CRUISE_FRACTION))
     return {"direction": item["direction"], "source_axis": source,
-            "sign": 1 if vector[source] > 0 else -1, "alignment": alignment,
+            "sign": sign, "alignment": alignment,
             "velocity_mm_s": list(vector), "expected_speed_mm_s": speed,
             "velocity_ratio": norm / speed, "cruise_samples": len(cruise_vectors),
             "start_time_s": start, "end_time_s": end,
@@ -307,7 +319,7 @@ def infer_axis_mapping(axis, passes, diagnostics=None):
         if not isinstance(diagnostics, dict):
             raise TypeError("Mapping diagnostics must be a dictionary")
         diagnostics.clear()
-        diagnostics.update(version=1, axis=axis if axis in ("x", "y") else None,
+        diagnostics.update(version=2, axis=axis if axis in ("x", "y") else None,
                            status="evaluating", passes=[], evaluated_pass_count=0,
                            requested_pass_count=len(passes) if isinstance(passes, (list, tuple)) else 0,
                            unevaluated_pass_count=len(passes) if isinstance(passes, (list, tuple)) else 0,

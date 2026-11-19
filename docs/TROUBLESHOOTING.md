@@ -131,12 +131,21 @@ an integrated velocity estimate; it does not verify physical speed or position.
 JSON and the ZIP remain available if plotting fails; a ZIP failure leaves the
 JSON path available. A cleanup failure skips export and reports that failure.
 
-The cruise gate measures total vector variation, which includes both magnitude
-and direction changes. Diagnostic metrics separate parallel and perpendicular
-variation, record the measured value and rejection limit, and identify the
-rejected pass. Evaluation still stops at the first rejection, so a later pass
-may be present in the raw evidence without evaluated metrics. These reports do
-not change the mapping acceptance criteria, homing thresholds or motion.
+Automatic mapping checks each stroke independently. Its median velocity vector
+must have a magnitude between 50% and 150% of commanded speed. At least 95% of
+the cruise samples must meet both conditions below.
+
+- The selected sensor channel has the expected sign and supplies at least 85%
+  of the velocity vector's magnitude.
+- The sample's velocity projected along the median direction is between 50%
+  and 150% of the median vector's magnitude.
+
+Both strokes must also agree on the signed channel after accounting for the
+commanded direction. In a version 2 inference report, compare
+`aligned_cruise_fraction` and `in_speed_band_fraction` to see which condition
+failed. `stable_cruise_fraction` counts samples meeting both. The total,
+parallel and perpendicular deviations describe the ripple. A large total
+deviation alone can occur on a well-aligned sensor.
 
 The requirement that both X and Y be unhomed still applies. Running `G28`
 before calibration homes those axes and therefore causes that separate
