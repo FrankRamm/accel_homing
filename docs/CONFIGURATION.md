@@ -134,7 +134,10 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `threshold` | Native default 8 g | Historical shared manual fallback; omit when using saved models. |
 | `x_impact_sign`, `y_impact_sign` | `0` | Accepted compatibility values: `-1`, `0`, `1`. RAW impact detection remains independent of acceleration polarity. |
 | `homing_accel` | `5000` | Homing/release/early-return acceleration cap in mm/s²; nonnegative; `0` leaves the live limit unchanged. Never raises a lower live acceleration. |
-| `back_off_dist` | `5` | Final successful XY release and cross-axis release in mm; 0–20, zero disables. Not a second touch. |
+| `back_off_dist` | `5` | Shared fallback for the final successful XY release and cross-axis release in mm; at least 0, no maximum, zero disables. Not a second touch. |
+| `x_back_off_dist`, `y_back_off_dist` | `back_off_dist` | Per-axis override of the release distance in mm; at least 0, no maximum, zero disables that axis. There is no Z back-off option. |
+| `min_home_dist` | `0` | Minimum G28 travel in mm before a home is trusted; a shorter home backs off this distance and homes again (up to 2 times, at homing_speed). 0 disables. Not used by calibration workflows. |
+| `x_min_home_dist`, `y_min_home_dist` | `min_home_dist` | Per-axis override. |
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |
 | `baseline_time` | `0.1` | Fresh reference duration in seconds; 0.05–1, with at least 50 contiguous samples. |
 | `baseline_batches` | `25` | Retained baseline batch capacity; integer 10–200. |
@@ -143,6 +146,8 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `travel_margin` | `1.1` | Full-move travel/time margin multiplier; 1–2. |
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
+
+The Kalico stepper-section `min_home_dist` stays disabled; this plugin option provides the behaviour on both Klipper and Kalico.
 
 ## Experimental notch filter (dev)
 
@@ -170,11 +175,15 @@ explicit manual threshold or requalify an old selected-axis model. Supply an
 explicit `THRESHOLD` or complete fresh calibration when that model's
 qualification is refused.
 
-`back_off_dist` is bounded by the rail limits and existing firmware release;
-it does not repeat an already sufficient release. It applies to ordinary
+The back-off distances are not clamped: a target outside the rail limits fails
+G28 like Kalico's own retract ("Move out of range"). They respect the existing
+firmware release and do not repeat an already sufficient release. It applies to ordinary
 successful homes and the final qualified axis of a workflow. Suspect,
 failed or cancelled trials do not receive a speculative final release.
 No plugin final release requests a Z move.
+The status field `back_off_dist` (`get_status()`, as read by macros through
+the plugin's printer object) is a per-axis dict such as
+`{"x": 5.0, "y": 50.0}`; `ACCEL_HOMING_STATUS` prints both values.
 
 ## Calibration options
 

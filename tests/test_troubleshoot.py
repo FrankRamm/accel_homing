@@ -38,7 +38,7 @@ class TroubleshootTests(unittest.TestCase):
         self.assertFalse(rig.capture_active)
         self.assertFalse(rig.workflow.in_home)
         self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-        self.assertEqual(rig.owner.back_off_dist, 5.0)
+        self.assertEqual(rig.owner.back_off_dist, {"x": 5.0, "y": 5.0})
         self.assertEqual(rig.configfile.saved, {})
         self.assertEqual(rig.noise_calls, [])
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
@@ -145,7 +145,7 @@ class TroubleshootTests(unittest.TestCase):
                     self.assertFalse(rig.workflow.in_home)
                     self.assertIsNone(rig.owner.troubleshoot)
                     self.assertTrue(Path(folder, "manifest.json").exists())
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, {"x": 5.0, "y": 5.0})
                 with mock.patch.object(diagnostics, "render_bundle", side_effect=export_after_cleanup):
                     with self.assertRaises(CommandError):
                         rig.workflow.cmd_TROUBLESHOOT(GCmd(AXIS="X", SAMPLES=2, CENTERED=1))

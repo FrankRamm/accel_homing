@@ -56,6 +56,7 @@ BASELINE_MIN_SAMPLES = 50
 BASELINE_MAX_SAMPLES = 65536  # bounded pre-arm history, never silently evicted
 IMPACT_WINDOW = 0.015      # s after the onset in which the impact peak is kept
 IDLE_CLEANUP = 3.0         # s, closes a homing session left open by an error
+MAX_SHORT_HOME_RETRIES = 2     # re-homes after a G28 travel below min_home_dist
 SECOND_TOUCH_TOLERANCE = 1.5   # mm, only used if a second touch is configured
 MIN_SPEED = 50.0           # mm/s, below this impacts were too soft in testing
 AUTO_DIRECTION_SPEED = 30.0    # mm/s of travel that fixes which way an impact points
@@ -578,7 +579,12 @@ class BeaconAccelHoming:
         self.impact_sign = {a: config.getint("%s_impact_sign" % a, 0, minval=-1, maxval=1)
                             for a in AXES}
         self.homing_accel = config.getfloat("homing_accel", 5000.0, minval=0.0)
-        self.back_off_dist = config.getfloat("back_off_dist", 5.0, minval=0.0, maxval=20.0)
+        shared_back_off = config.getfloat("back_off_dist", 5.0, minval=0.0)
+        self.back_off_dist = {a: config.getfloat("%s_back_off_dist" % a, shared_back_off,
+                                                 minval=0.0) for a in AXES}
+        shared_min_home = config.getfloat("min_home_dist", 0.0, minval=0.0)
+        self.min_home_dist = {a: config.getfloat("%s_min_home_dist" % a, shared_min_home,
+                                                 minval=0.0) for a in AXES}
         self.baseline_batches = config.getint("baseline_batches", 25, minval=10, maxval=200)
         self.baseline_time = config.getfloat("baseline_time", 0.1, minval=0.05, maxval=1.0)
         self.baseline_noise_floor = config.getfloat("baseline_noise_floor", 0.7,
@@ -589,11 +595,16 @@ class BeaconAccelHoming:
         self.travel_margin = config.getfloat("travel_margin", 1.1, minval=1.0, maxval=2.0)
         self.watchdog_margin = config.getfloat("watchdog_margin", 0.15, minval=0.0, maxval=2.0)
         scalar_options = {"homing_accel": self.homing_accel,
-                          "back_off_dist": self.back_off_dist, "baseline_time": self.baseline_time,
+                          "back_off_dist": shared_back_off, "baseline_time": self.baseline_time,
                           "baseline_noise_floor": self.baseline_noise_floor,
                           "enable_settle_time": self.enable_settle_time,
                           "stream_timeout": self.stream_timeout, "travel_margin": self.travel_margin,
                           "watchdog_margin": self.watchdog_margin}
+        for axis, value in self.back_off_dist.items():
+            scalar_options["%s_back_off_dist" % axis] = value
+        scalar_options["min_home_dist"] = shared_min_home
+        for axis, value in self.min_home_dist.items():
+            scalar_options["%s_min_home_dist" % axis] = value
         for option, value in scalar_options.items():
             if not math.isfinite(value):
                 raise config.error("accel_homing: %s must be finite" % option)
@@ -781,7 +792,7 @@ class BeaconAccelHoming:
             return self.kinematics_home(homing)
         suppressed = (self.workflows.session is not None or self.workflows.in_home
                       or self.noise_session is not None)
-        context = {"homing": homing, "rails": {}, "valid": not suppressed}
+        context = {"homing": homing, "rails": {}, "homed": {}, "valid": not suppressed}
         self.ordinary_home = context
         try:
             workflows = self.workflows
@@ -790,6 +801,7 @@ class BeaconAccelHoming:
             else:
                 result = self.kinematics_home(homing)
             if context["valid"]:
+                self._rehome_short_axes(context)
                 self._retract_completed_home(context)
             return result
         finally:
@@ -797,17 +809,19 @@ class BeaconAccelHoming:
             self.ordinary_home = None
 
     def _retract_completed_home(self, context):
-        distance = context.get("distance", self.back_off_dist)
-        if (not distance or not context["rails"]
+        if (not context["rails"]
                 or (hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown())):
             return
-        if not math.isfinite(distance) or distance < 0.0:
-            raise self.printer.command_error("accel_homing: invalid final back-off distance")
         position = self.toolhead.get_position()
         coord, speeds = [None, None, None], []
         for axis, (rail, record) in context["rails"].items():
             if self.last.get(axis) is not record or self._homed(axis) is not True:
                 continue
+            distance = context.get("distance", self.back_off_dist[axis])
+            if not distance:
+                continue
+            if not math.isfinite(distance) or distance < 0.0:
+                raise self.printer.command_error("accel_homing: invalid final back-off distance")
             info = rail.get_homing_info()
             low, high = rail.get_range()
             speed = _back_off_speed(info, self.workflows)
@@ -817,7 +831,8 @@ class BeaconAccelHoming:
                     or low >= high or speed <= 0.0):
                 raise self.printer.command_error("accel_homing: invalid final back-off geometry/speed")
             away = -1.0 if info.positive_dir else 1.0
-            target = min(max(info.position_endstop + away * distance, low), high)
+            target = info.position_endstop + away * distance
+            self._check_back_off_range(axis, target, low, high)
             target_free = (target - info.position_endstop) * away
             free = (current - info.position_endstop) * away
             # Kalico may already have retracted. Never move back toward a stop
@@ -848,6 +863,93 @@ class BeaconAccelHoming:
                     raise self.printer.command_error("accel_homing: final back-off was interrupted")
             finally:
                 self._restore_accel()
+
+    def _rehome_short_axes(self, context):
+        """Back off and re-home axes whose G28 travel was below min_home_dist.
+
+        A genuine short home (carriage already near the stop) is confirmed by
+        a second home from min_home_dist away; a false early trigger is
+        recovered by the longer re-home. Repeated short homes are an error.
+        """
+        if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
+            return
+        generation = self.operation_generation
+
+        def current():
+            return (context["valid"] and self.operation_generation == generation
+                    and not (hasattr(self.printer, "is_shutdown")
+                             and self.printer.is_shutdown()))
+
+        def interrupted():
+            return self.printer.command_error("accel_homing: re-home was interrupted")
+
+        # Every plugin-axis home counts, also one that was not accepted for the
+        # final back-off: an unconfirmed short home must never be kept.
+        for axis, (rail, record) in list(context.get("homed", {}).items()):
+            minimum = self.min_home_dist[axis]
+            if not minimum:
+                continue
+            accepted = (context["rails"].get(axis) or (None, None))[1] is record
+            travels = [record.get("travel_mm_exact")]
+            limit = minimum
+            while not accepted or travels[-1] is None or travels[-1] < limit:
+                if len(travels) > MAX_SHORT_HOME_RETRIES:
+                    raise self.printer.command_error(
+                        "accel_homing: %s homed after %s mm, less than min_home_dist %.1f mm, "
+                        "%d times. The stop was not confirmed, homing stopped"
+                        % (axis.upper(), "/".join("?" if t is None else "%.2f" % t
+                                                  for t in travels), minimum, len(travels)))
+                if not current():
+                    raise interrupted()
+                logging.info("accel_homing: %s homed short (travels %s mm, need %.1f mm), "
+                             "backing off %.1f mm for re-home %d of %d", axis.upper(),
+                             "/".join("?" if t is None else "%.2f" % t for t in travels),
+                             limit, minimum, len(travels), MAX_SHORT_HOME_RETRIES)
+                info = rail.get_homing_info()
+                low, high = rail.get_range()
+                away = -1.0 if info.positive_dir else 1.0
+                target = info.position_endstop + away * minimum
+                self._check_back_off_range(axis, target, low, high)
+                coord = [None, None, None]
+                coord[AXES[axis]] = target
+                try:
+                    self._limit_accel()
+                    if not current():
+                        raise interrupted()
+                    self.toolhead.manual_move(coord, getattr(info, "retract_speed", None)
+                                              or info.speed)
+                    self.toolhead.wait_moves()
+                finally:
+                    self._restore_accel()
+                if not current():
+                    raise interrupted()
+                homepos = [None] * 4
+                homepos[AXES[axis]] = info.position_endstop
+                forcepos = list(homepos)
+                forcepos[AXES[axis]] += (-1.5 * (info.position_endstop - low) if info.positive_dir
+                                         else 1.5 * (high - info.position_endstop))
+                context["rails"].pop(axis, None)
+                context["homed"].pop(axis, None)
+                context["homing"].home_rails([rail], forcepos, homepos)
+                entry = context["rails"].get(axis)
+                if entry is None:
+                    raise self.printer.command_error(
+                        "accel_homing: %s re-home was not accepted" % axis.upper())
+                rail, record = entry
+                accepted = True
+                travels.append(record.get("travel_mm_exact"))
+                limit = minimum - SECOND_TOUCH_TOLERANCE
+            if len(travels) > 1:
+                logging.info("accel_homing: %s re-home accepted, stop confirmed "
+                             "(travels %s mm)", axis.upper(),
+                             "/".join("?" if t is None else "%.2f" % t for t in travels))
+
+    def _check_back_off_range(self, axis, target, low, high):
+        # Kalico's retract fails a target outside the rail limits; never clamp.
+        if target < low - 1e-9 or target > high + 1e-9:
+            raise self.printer.command_error(
+                "accel_homing: Move out of range: %s back-off target %.3f outside %.3f..%.3f"
+                % (axis.upper(), target, low, high))
 
     def release_workflow_home(self, axis, source_record, distance, session):
         """Release only a terminal workflow home after its caller qualifies it."""
@@ -1224,7 +1326,7 @@ class BeaconAccelHoming:
         An axis left pushed into its stop keeps the belts and the gantry loaded,
         which disturbs the next axis (false triggers, lost steps)."""
         others = [(axis, rail) for axis, rail in self.rails_by_axis.items()
-                  if axis != homing_axis and self.back_off_dist and self._homed(axis)]
+                  if axis != homing_axis and self.back_off_dist[axis] and self._homed(axis)]
         if not others:
             return
         coord, speeds = [None, None, None], []
@@ -1234,11 +1336,13 @@ class BeaconAccelHoming:
             away = -1.0 if info.positive_dir else 1.0
             # Distance from the stop into the travel range, negative past the stop.
             free = (position[AXES[axis]] - info.position_endstop) * away
-            if free >= self.back_off_dist - 0.01:
+            distance = self.back_off_dist[axis]
+            if free >= distance - 0.01:
                 continue
             low, high = rail.get_range()
-            target = info.position_endstop + away * self.back_off_dist
-            coord[AXES[axis]] = min(max(target, low), high)
+            target = info.position_endstop + away * distance
+            self._check_back_off_range(axis, target, low, high)
+            coord[AXES[axis]] = target
             speeds.append(_back_off_speed(info, self.workflows))
         if speeds:
             self.toolhead.manual_move(coord, min(speeds))
@@ -1276,6 +1380,8 @@ class BeaconAccelHoming:
                 and attempt is not None and attempt.axis in self.session_axes
                 and any(rail is self.session_axes[attempt.axis] for rail in rails)):
             record = attempt.record
+            context.setdefault("homed", {})[attempt.axis] = (
+                self.session_axes[attempt.axis], record)
             accepted = (attempt.reason == "impact" and
                         (record.get("moving") or record.get("motion_seen")
                          or record.get("impact_metric") in ("xyz_magnitude", "mapped_axis"))) or (
@@ -4130,7 +4236,8 @@ class BeaconAccelHoming:
             "threshold_g": dict(self.threshold_g),
             "impact_sign": dict(self.impact_sign),
             "homing_accel": self.homing_accel,
-            "back_off_dist": self.back_off_dist,
+            "back_off_dist": dict(self.back_off_dist),
+            "min_home_dist": dict(self.min_home_dist),
             "homing": self.homing_active,
             "baseline": (None if self.baseline_status is None else
                          {key: dict(value) if isinstance(value, dict) else value
@@ -4152,6 +4259,9 @@ class BeaconAccelHoming:
         gcmd.respond_info("accel_homing: signal filters %s; notch preserves the active detector metric;"
                           " mapped calibration uses its selected stream component" %
                           json.dumps({axis: self.filter_settings(axis) for axis in AXES}, sort_keys=True))
+        gcmd.respond_info("accel_homing: back-off X %.12g mm, Y %.12g mm"
+                          " (final and cross-axis release; 0 disables)"
+                          % (self.back_off_dist["x"], self.back_off_dist["y"]))
         gcmd.respond_info("accel_homing: baseline policy: legacy ordinary homing requires quiet XYZ;"
                           " mapped-axis calibration and saved models require a post-settle"
                           " %.2f ms / %d sample reference without a quiet-range limit;"

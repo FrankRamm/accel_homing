@@ -709,9 +709,24 @@ def make_plan(source, selected, args):
                            "Preserved configured" if args.homing_speed is None else "Explicitly selected",
                            ", ".join("%s=%.12g mm/s" % (axis.upper(), speed)
                                      for axis, (_rail, speed, _effective) in speeds.items())))
+    migrated = {}
+    for axis, (rail, _speed, _effective) in speeds.items():
+        try:
+            distance = float(rail.get("min_home_dist", "0"))
+        except ValueError:
+            distance = math.nan
+        if not math.isfinite(distance) or distance < 0:
+            raise InstallError("%s min_home_dist must be a finite nonnegative number. No files changed."
+                               % axis.upper())
+        if distance > 0:
+            migrated[axis + "_min_home_dist"] = "%.12g" % distance
+    if migrated:
+        messages.append("Moved stepper min_home_dist into [accel_homing] as %s (accel_homing re-homes short homes)."
+                        % ", ".join("%s=%s" % item for item in migrated.items()))
+    plugin_options = dict(overrides, **migrated)
     if existing:
         existing.replace("accel_chip", sensor)
-        for name, value in overrides.items():
+        for name, value in plugin_options.items():
             existing.replace(name, value)
         if gentle_accel is not None:
             existing.replace("gentle_homing", "True")
@@ -730,7 +745,7 @@ def make_plan(source, selected, args):
                    "# Independent overrides; leave commented to use SAVE_CONFIG calibration models.\n"
                    "[accel_homing]\naccel_chip: " + sensor + "\n"
                     "#x_threshold: 8.0\n#y_threshold: 8.0\n#model: default\n"
-                    + "".join("%s: %s\n" % item for item in overrides.items()))
+                    + "".join("%s: %s\n" % item for item in plugin_options.items()))
         if included_managed is not None:
             included_managed.insertions.setdefault(included_managed.active_end, []).append(
                 included_managed.newline + content.replace("\n", included_managed.newline))

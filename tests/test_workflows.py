@@ -21,6 +21,9 @@ from accel_homing_charts import write_capture
 from accel_homing_model import AccelHomingModel
 from harness import CommandError, ConfigError, FakeReactor, plugin
 
+# Default per-axis back-off of the simulated owner.
+BACK_OFF = {"x": 5.0, "y": 5.0}
+
 
 class FakePNGRenderer:
     """Exercise payload/provenance integration without importing plotting libs."""
@@ -436,7 +439,7 @@ class Rig:
         self.owner = types.SimpleNamespace(
             printer=self, reactor=self.reactor, toolhead=self.toolhead, name="accel_homing",
             threshold_g={"x": 8.0, "y": 9.0}, impact_sign={"x": 0, "y": 0},
-            homing_accel=5000.0, back_off_dist=5.0, full_scale_g=16.0,
+            homing_accel=5000.0, back_off_dist={"x": 5.0, "y": 5.0}, full_scale_g=16.0,
             homing_active=False, attempt=None, last={}, operation_generation=0, saved_accel=None,
             endstops={"x": object(), "y": object()},
             rails_by_axis={"x": Rail(), "y": Rail(bounds=(0.0, 200.0))},
@@ -450,7 +453,7 @@ class Rig:
         self.owner.stop_noise_measurement = self.stop_noise
         self.owner.collect_noise_window = self.collect_noise
         for method in ("_retract_completed_home", "release_workflow_home", "_limit_accel",
-                       "_restore_accel", "_set_accel"):
+                       "_restore_accel", "_set_accel", "_check_back_off_range", "_rehome_short_axes"):
             setattr(self.owner, method, types.MethodType(getattr(plugin.BeaconAccelHoming, method), self.owner))
         self.workflow = AccelHomingWorkflows(self.owner, self.config)
         self.workflow.renderer = FakePNGRenderer()
@@ -989,7 +992,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                 self.assertEqual(rig.capture_stops, 11)
                 self.assertFalse(rig.capture_active)
                 self.assertIsNone(rig.workflow.session)
-                self.assertEqual(rig.owner.back_off_dist, 5.0)
+                self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                 self.assertEqual(rig.workflow.last_result["result"], "calibrated")
 
     def test_native_owner_is_revalidated_between_trials_and_after_manual_center_wait(self):
@@ -1021,7 +1024,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                     self.assertFalse(rig.capture_active)
                     self.assertIsNone(rig.workflow.session)
                     self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                     self.assertEqual(rig.workflow.last_result["result"], "aborted")
 
     def test_unavailable_native_api_or_command_factory_fails_before_side_effects(self):
@@ -1066,7 +1069,7 @@ class SafeZHomingWorkflowTests(unittest.TestCase):
                 self.assertFalse(rig.workflow.in_home)
                 self.assertIsNone(rig.workflow.home_axis)
                 self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                self.assertEqual(rig.owner.back_off_dist, 5.0)
+                self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                 self.assertEqual(rig.gcode.gcode_handlers["G28"], registered)
                 self.assertEqual(safe.calls, [])
                 self.assertEqual(rig.toolhead.moves, [])
@@ -1349,7 +1352,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     self.assertFalse(rig.capture_active)
                     self.assertIsNone(rig.workflow.session)
                     self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                     self.assertEqual(rig.workflow.last_result["result"], "aborted")
 
     def test_active_scripts_are_rechecked_between_trials_and_manual_center_wait(self):
@@ -1381,7 +1384,7 @@ class HomingOverrideWorkflowTests(unittest.TestCase):
                     self.assertFalse(rig.capture_active)
                     self.assertIsNone(rig.workflow.session)
                     self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                     self.assertEqual(rig.workflow.last_result["result"], "aborted")
 
 
@@ -1430,7 +1433,7 @@ class CalibrationTests(unittest.TestCase):
                              values[("accel_homing_model default", axis.lower() + "_threshold")])
             self.assertNotIn(("accel_homing", "XY"[1 - index].lower() + "_threshold"), values)
             self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-            self.assertEqual(rig.owner.back_off_dist, 5.0)
+            self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
             self.assertEqual(rig.toolhead.position[2:], [40.0, 6.0])
             self.assertFalse(rig.capture_active)
             self.assertIsNone(rig.workflow.session)
@@ -1512,7 +1515,7 @@ class CalibrationTests(unittest.TestCase):
             with self.assertRaises(CommandError):
                 rig.calibrate()
             self.assertFalse(rig.capture_active)
-            self.assertEqual(rig.owner.back_off_dist, 5.0)
+            self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
             self.assertIsNone(rig.workflow.session)
             self.assertEqual(rig.toolhead.moves, [])
 
@@ -1565,7 +1568,7 @@ class CalibrationTests(unittest.TestCase):
             rig.calibrate()
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.owner.threshold_g["x"], 8.0)
-        self.assertEqual(rig.owner.back_off_dist, 5.0)
+        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
         self.assertFalse(rig.capture_active)
         self.assertEqual(rig.workflow.last_result["result"], "save_failed")
 
@@ -2372,7 +2375,7 @@ class GuardTests(unittest.TestCase):
                       lambda r: r.owner.impact_sign.__setitem__("x", -1),
                       lambda r: r.owner.threshold_g.__setitem__("x", 7.0),
                       lambda r: setattr(r.owner, "homing_accel", 4000.0),
-                      lambda r: setattr(r.owner, "back_off_dist", 3.0),
+                      lambda r: setattr(r.owner, "back_off_dist", {"x": 3.0, "y": 5.0}),
                       lambda r: r.toolhead.kin.limits.__setitem__(0, (0.0, 300.0)),
                       lambda r: setattr(r, "print_state", "printing"),
                       lambda r: setattr(r, "paused", True),
@@ -2557,7 +2560,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                     self.assertEqual(payloads[0]["record"]["workflow_attempt"], 1)
                     self.assertTrue(Path(result["paths"][0]["png"]).is_file())
                     self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                     self.assertEqual(rig.configfile.saved, {})
                     self.assertEqual(rig.disabled, [])
                     self.assertIsNone(rig.workflow.session)
@@ -2617,7 +2620,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                                      "aborted" if failure == "export" else "rejected")
                     self.assertEqual(rig.configfile.saved, {})
                     self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                     self.assertFalse(rig.capture_active)
                     self.assertIsNone(rig.workflow.session)
 
@@ -2697,7 +2700,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                 self.assertEqual(rig.workflow.last_result["result"], "complete")
                 self.assertEqual(rig.toolhead.position[2:], [40.0, 6.0])
                 self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                self.assertEqual(rig.owner.back_off_dist, 5.0)
+                self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertEqual(rig.dispatched_scripts, [])
                 self.assertIsNone(rig.workflow.session)
@@ -2743,7 +2746,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                         self.assertIsNone(rig.workflow.session)
                         self.assertEqual(rig.configfile.saved, {})
                         self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                        self.assertEqual(rig.owner.back_off_dist, 5.0)
+                        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                         self.assertFalse(rig.capture_active)
 
     def test_execution_failures_abort_restore_and_never_save_a_model(self):
@@ -2770,7 +2773,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                     self.assertFalse(rig.capture_active)
                     self.assertEqual(rig.configfile.saved, {})
                     self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
 
     def test_retry_cancel_timeout_shutdown_and_status_use_only_console_messages(self):
         for ending in ("cancel", "timeout", "shutdown"):
@@ -2798,7 +2801,7 @@ class TestAndChartWorkflowTests(unittest.TestCase):
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertIsNone(rig.workflow.session)
                 self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-                self.assertEqual(rig.owner.back_off_dist, 5.0)
+                self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                 self.assertEqual(rig.workflow._timeout(rig.reactor.now), rig.reactor.NEVER)
                 rig.workflow.cmd_CANCEL(GCmd())
                 rig.workflow.cmd_STATUS(GCmd())

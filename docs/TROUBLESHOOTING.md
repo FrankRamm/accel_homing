@@ -91,6 +91,27 @@ bounds. Above-band travel, missing impact, a sensor fault or failed return
 aborts; inspect the machine and manually prepare XY before a new command.
 Commanded return completion is not physical arrival feedback.
 
+### `homed after ... mm, less than min_home_dist ... times`
+
+The full error is `accel_homing: <AXIS> homed after <t1>/<t2>/<t3> mm, less than
+min_home_dist <N> mm, 3 times. The stop was not confirmed, homing stopped`.
+
+The min-home-distance check fired on three consecutive attempts before the
+physical stop was reached. Each short home backed off and homed again, and the
+command failed with homing stopped. The trigger repeatedly fired before the
+physical stop, which points to stepper desync, a loose belt, or a motor that
+snapped to a stop early.
+
+Checks:
+
+- Belts and motor synchronization: look for slipping, loose belts, or a stepper
+  that skips steps.
+- Threshold too low: a low accelerometer threshold lets noise or vibration
+  trigger an early stop. Raise it only after the belts and motors check out.
+- `min_home_dist` (or `<axis>_min_home_dist`) larger than the normal distance
+  from the back-off position to the physical stop: the trigger fires on a valid
+  home. Lower the value to match the real travel.
+
 ### Automatic mapping interruption
 
 Automatic mapping runs only when the selected sensor has no explicit

@@ -117,7 +117,7 @@ class CompareWorkflowTests(unittest.TestCase):
         self.assertIs(rig.owner.experimental_profile, previous)
         self.assertFalse(rig.capture_active)
         self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
-        self.assertEqual(rig.owner.back_off_dist, 5.)
+        self.assertEqual(rig.owner.back_off_dist, {"x": 5., "y": 5.})
         self.assertEqual(rig.configfile.saved, {})
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
         self.assertTrue(all(coords[2] is None for coords, _speed in rig.toolhead.moves))

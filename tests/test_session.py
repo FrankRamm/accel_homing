@@ -367,6 +367,15 @@ class StatusTest(unittest.TestCase):
         self.assertIn("without a quiet-range limit", policy)
         self.assertIn("no acceleration-derived motion proof for mapped-axis or explicit XYZ detection", policy)
 
+    def test_status_reports_per_axis_back_off(self):
+        obj = make_homing(options={"back_off_dist": "5", "y_back_off_dist": "50"})
+        messages = []
+        obj.cmd_STATUS(types.SimpleNamespace(respond_info=messages.append))
+        lines = [message for message in messages if "back-off" in message]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("X 5 mm", lines[0])
+        self.assertIn("Y 50 mm", lines[0])
+
     def test_status_is_a_copy(self):
         obj = make_homing(options={"y_notch_frequency": 100.})
         self.assertIsNone(obj.get_status(0.0)["sample_timing_fault"])
@@ -384,7 +393,7 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(obj.filter_settings("y")["frequency_hz"], 100.)
         obj.notch_profiles["y"]["q"] = 20.
         self.assertEqual(status["signal_filter"]["y"]["q"], 10.)
-        self.assertEqual(set(status), {"threshold_g", "impact_sign", "homing_accel", "back_off_dist",
+        self.assertEqual(set(status), {"threshold_g", "impact_sign", "homing_accel", "back_off_dist", "min_home_dist",
                                        "homing", "baseline", "sample_timing_fault", "last", "sensor",
                                        "backend", "workflows", "signal_filter"})
 

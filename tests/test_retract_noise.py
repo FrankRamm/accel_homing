@@ -93,10 +93,15 @@ class FinalRetractTests(unittest.TestCase):
     def test_both_directions_bounds_and_existing_kalico_retract(self):
         for positive, bounds, expected in ((False, (0.0, 300.0), 5.0),
                                             (True, (0.0, 300.0), 295.0),
-                                            (False, (0.0, 3.0), 3.0),
-                                            (True, (0.0, 3.0), 0.0)):
+                                            (False, (0.0, 3.0), None),
+                                            (True, (0.0, 3.0), None)):
             with self.subTest(positive=positive, bounds=bounds):
                 obj, kin, _state = self.machine("x", positive, bounds)
+                if expected is None:
+                    with self.assertRaisesRegex(CommandError, "out of range"):
+                        kin.home(object())
+                    self.assertEqual(obj.toolhead.moves, [])
+                    continue
                 kin.home(object())
                 self.assertEqual(obj.toolhead.moves, [([expected, None, None], 100.0)])
         obj, kin, _state = self.machine("x", final_free=5.0)
@@ -127,7 +132,7 @@ class FinalRetractTests(unittest.TestCase):
 
     def test_zero_disables_and_repeated_connect_does_not_stack(self):
         obj, kin, state = self.machine("x")
-        obj.back_off_dist = 0.0
+        obj.back_off_dist = dict.fromkeys(obj.back_off_dist, 0.0)
         obj.fake_printer.send_event("klippy:connect")
         kin.home(object())
         self.assertEqual(state.calls, 1)

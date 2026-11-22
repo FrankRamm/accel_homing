@@ -119,6 +119,8 @@ Beacon sections retain their aliases. Only the selected axes are changed.
 
 Associated X/Y TMC `diag_pin`, `diag0_pin`, `diag1_pin`, `home_current` and rail
 `homing_accel`/`min_home_dist` settings are commented with their former values.
+A stepper-section `min_home_dist` value is copied into `accel_homing.cfg` as
+`<axis>_min_home_dist`.
 Existing `run_current`, thresholds, Z/probe settings, unrelated macros and other
 axes are preserved. Default installation preserves configured homing speeds;
 `--homing-speed` explicitly requests a speed change. An update does not infer
