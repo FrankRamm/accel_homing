@@ -103,6 +103,19 @@ class MinHomeDistTests(unittest.TestCase):
         self.go(kin, state)
         self.assertEqual(len(state.rehomes), 1)
 
+    def test_rehome_logs_each_attempt_and_acceptance(self):
+        obj, kin, state = self.machine("x", {"x": [3.0, 2.0, 9.0]})
+        with self.assertLogs(level="INFO") as logs:
+            self.go(kin, state)
+        lines = [r.getMessage() for r in logs.records if "accel_homing: X" in r.getMessage()]
+        self.assertEqual(lines, [
+            "accel_homing: X homed short (travels 3.00 mm, need 10.0 mm), "
+            "backing off 10.0 mm for re-home 1 of 2",
+            "accel_homing: X homed short (travels 3.00/2.00 mm, need 8.5 mm), "
+            "backing off 10.0 mm for re-home 2 of 2",
+            "accel_homing: X re-home accepted, stop confirmed (travels 3.00/2.00/9.00 mm)",
+        ])
+
     def test_repeated_short_homes_raise_and_never_back_off(self):
         obj, kin, state = self.machine("x", {"x": [3.0, 2.0, 2.5]})
         with self.assertRaisesRegex(CommandError, "less than min_home_dist 10.0 mm, 3 times"):

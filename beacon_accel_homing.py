@@ -901,6 +901,10 @@ class BeaconAccelHoming:
                                                   for t in travels), minimum, len(travels)))
                 if not current():
                     raise interrupted()
+                logging.info("accel_homing: %s homed short (travels %s mm, need %.1f mm), "
+                             "backing off %.1f mm for re-home %d of %d", axis.upper(),
+                             "/".join("?" if t is None else "%.2f" % t for t in travels),
+                             limit, minimum, len(travels), MAX_SHORT_HOME_RETRIES)
                 info = rail.get_homing_info()
                 low, high = rail.get_range()
                 away = -1.0 if info.positive_dir else 1.0
@@ -935,8 +939,9 @@ class BeaconAccelHoming:
                 accepted = True
                 travels.append(record.get("travel_mm_exact"))
                 limit = minimum - SECOND_TOUCH_TOLERANCE
-                logging.info("accel_homing: %s homed short, re-homed from min_home_dist %.1f mm "
-                             "(travels %s mm)", axis.upper(), minimum,
+            if len(travels) > 1:
+                logging.info("accel_homing: %s re-home accepted, stop confirmed "
+                             "(travels %s mm)", axis.upper(),
                              "/".join("?" if t is None else "%.2f" % t for t in travels))
 
     def _check_back_off_range(self, axis, target, low, high):
