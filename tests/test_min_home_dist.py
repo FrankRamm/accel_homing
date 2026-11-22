@@ -128,6 +128,22 @@ class MinHomeDistTests(unittest.TestCase):
         self.go(kin, state)
         self.assertEqual(state.rehomes, [])
 
+    def test_gentle_retry_backoff_respects_the_axis_speed(self):
+        obj, kin, state = self.machine("y", {"y": [3., 10.]})
+        rail = obj.rails_by_axis["y"]
+        rail.info = rail.info._replace(speed=40., retract_speed=125.)
+        obj.workflows.gentle_homing = True
+        self.go(kin, state)
+        self.assertEqual(obj.toolhead.moves, [([None, 10., None], 40.), ([None, 5., None], 40.)])
+
+    def test_cancellation_during_an_otherwise_accepted_retry_is_reported(self):
+        obj, kin, state = self.machine("y", {"y": [3., 10.]})
+        state.on_rehome = obj._cancel_pending_operations
+        with self.assertRaisesRegex(CommandError, "re-home was interrupted"):
+            self.go(kin, state)
+        self.assertEqual(len(state.rehomes), 1)
+        self.assertEqual(len(obj.toolhead.moves), 1)
+
     def test_missing_travel_counts_as_short(self):
         obj, kin, state = self.machine("x", {"x": [None, 9.5]})
         self.go(kin, state)

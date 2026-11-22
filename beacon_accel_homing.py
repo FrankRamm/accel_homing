@@ -916,8 +916,7 @@ class BeaconAccelHoming:
                     self._limit_accel()
                     if not current():
                         raise interrupted()
-                    self.toolhead.manual_move(coord, getattr(info, "retract_speed", None)
-                                              or info.speed)
+                    self.toolhead.manual_move(coord, _back_off_speed(info, self.workflows))
                     self.toolhead.wait_moves()
                 finally:
                     self._restore_accel()
@@ -931,6 +930,8 @@ class BeaconAccelHoming:
                 context["rails"].pop(axis, None)
                 context["homed"].pop(axis, None)
                 context["homing"].home_rails([rail], forcepos, homepos)
+                if not current():
+                    raise interrupted()
                 entry = context["rails"].get(axis)
                 if entry is None:
                     raise self.printer.command_error(
