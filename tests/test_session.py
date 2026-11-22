@@ -393,7 +393,7 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(obj.filter_settings("y")["frequency_hz"], 100.)
         obj.notch_profiles["y"]["q"] = 20.
         self.assertEqual(status["signal_filter"]["y"]["q"], 10.)
-        self.assertEqual(set(status), {"threshold_g", "impact_sign", "homing_accel", "back_off_dist",
+        self.assertEqual(set(status), {"threshold_g", "impact_sign", "homing_accel", "back_off_dist", "min_home_dist",
                                        "homing", "baseline", "sample_timing_fault", "last", "sensor",
                                        "backend", "workflows", "signal_filter"})
 

@@ -56,6 +56,7 @@ BASELINE_MIN_SAMPLES = 50
 BASELINE_MAX_SAMPLES = 65536  # bounded pre-arm history, never silently evicted
 IMPACT_WINDOW = 0.015      # s after the onset in which the impact peak is kept
 IDLE_CLEANUP = 3.0         # s, closes a homing session left open by an error
+MAX_SHORT_HOME_RETRIES = 2     # re-homes after a G28 travel below min_home_dist
 SECOND_TOUCH_TOLERANCE = 1.5   # mm, only used if a second touch is configured
 MIN_SPEED = 50.0           # mm/s, below this impacts were too soft in testing
 AUTO_DIRECTION_SPEED = 30.0    # mm/s of travel that fixes which way an impact points
@@ -581,6 +582,9 @@ class BeaconAccelHoming:
         shared_back_off = config.getfloat("back_off_dist", 5.0, minval=0.0)
         self.back_off_dist = {a: config.getfloat("%s_back_off_dist" % a, shared_back_off,
                                                  minval=0.0) for a in AXES}
+        shared_min_home = config.getfloat("min_home_dist", 0.0, minval=0.0)
+        self.min_home_dist = {a: config.getfloat("%s_min_home_dist" % a, shared_min_home,
+                                                 minval=0.0) for a in AXES}
         self.baseline_batches = config.getint("baseline_batches", 25, minval=10, maxval=200)
         self.baseline_time = config.getfloat("baseline_time", 0.1, minval=0.05, maxval=1.0)
         self.baseline_noise_floor = config.getfloat("baseline_noise_floor", 0.7,
@@ -598,6 +602,9 @@ class BeaconAccelHoming:
                           "watchdog_margin": self.watchdog_margin}
         for axis, value in self.back_off_dist.items():
             scalar_options["%s_back_off_dist" % axis] = value
+        scalar_options["min_home_dist"] = shared_min_home
+        for axis, value in self.min_home_dist.items():
+            scalar_options["%s_min_home_dist" % axis] = value
         for option, value in scalar_options.items():
             if not math.isfinite(value):
                 raise config.error("accel_homing: %s must be finite" % option)
@@ -794,6 +801,7 @@ class BeaconAccelHoming:
             else:
                 result = self.kinematics_home(homing)
             if context["valid"]:
+                self._rehome_short_axes(context)
                 self._retract_completed_home(context)
             return result
         finally:
@@ -855,6 +863,60 @@ class BeaconAccelHoming:
                     raise self.printer.command_error("accel_homing: final back-off was interrupted")
             finally:
                 self._restore_accel()
+
+    def _rehome_short_axes(self, context):
+        """Back off and re-home axes whose G28 travel was below min_home_dist.
+
+        A genuine short home (carriage already near the stop) is confirmed by
+        a second home from min_home_dist away; a false early trigger is
+        recovered by the longer re-home. Repeated short homes are an error.
+        """
+        if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
+            return
+        for axis, (rail, record) in list(context["rails"].items()):
+            minimum = self.min_home_dist[axis]
+            if not minimum:
+                continue
+            travels = [record.get("travel_mm_exact")]
+            limit = minimum
+            while travels[-1] is None or travels[-1] < limit:
+                if len(travels) > MAX_SHORT_HOME_RETRIES:
+                    raise self.printer.command_error(
+                        "accel_homing: %s homed after %s mm, less than min_home_dist %.1f mm, "
+                        "%d times. The stop was not confirmed, homing stopped"
+                        % (axis.upper(), "/".join("?" if t is None else "%.2f" % t
+                                                  for t in travels), minimum, len(travels)))
+                info = rail.get_homing_info()
+                low, high = rail.get_range()
+                away = -1.0 if info.positive_dir else 1.0
+                target = info.position_endstop + away * minimum
+                self._check_back_off_range(axis, target, low, high)
+                coord = [None, None, None]
+                coord[AXES[axis]] = target
+                try:
+                    self._limit_accel()
+                    self.toolhead.manual_move(coord, getattr(info, "retract_speed", None)
+                                              or info.speed)
+                    self.toolhead.wait_moves()
+                finally:
+                    self._restore_accel()
+                homepos = [None] * 4
+                homepos[AXES[axis]] = info.position_endstop
+                forcepos = list(homepos)
+                forcepos[AXES[axis]] += (-1.5 * (info.position_endstop - low) if info.positive_dir
+                                         else 1.5 * (high - info.position_endstop))
+                context["rails"].pop(axis, None)
+                context["homing"].home_rails([rail], forcepos, homepos)
+                entry = context["rails"].get(axis)
+                if entry is None:
+                    raise self.printer.command_error(
+                        "accel_homing: %s re-home was not accepted" % axis.upper())
+                rail, record = entry
+                travels.append(record.get("travel_mm_exact"))
+                limit = minimum - SECOND_TOUCH_TOLERANCE
+                logging.info("accel_homing: %s homed short, re-homed from min_home_dist %.1f mm "
+                             "(travels %s mm)", axis.upper(), minimum,
+                             "/".join("?" if t is None else "%.2f" % t for t in travels))
 
     def _check_back_off_range(self, axis, target, low, high):
         # Kalico's retract fails a target outside the rail limits; never clamp.
@@ -4147,6 +4209,7 @@ class BeaconAccelHoming:
             "impact_sign": dict(self.impact_sign),
             "homing_accel": self.homing_accel,
             "back_off_dist": dict(self.back_off_dist),
+            "min_home_dist": dict(self.min_home_dist),
             "homing": self.homing_active,
             "baseline": (None if self.baseline_status is None else
                          {key: dict(value) if isinstance(value, dict) else value
