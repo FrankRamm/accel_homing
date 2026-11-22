@@ -501,7 +501,7 @@ class HostFixture(unittest.TestCase):
         self.config.write_text(CONFIG.replace("[beacon]", "[adxl345 toolhead]")
                                .replace("max_accel: 5000", "max_accel: 5360")
                                + "\n[accel_homing]\naccel_chip: adxl345 toolhead\n" + saved_y)
-        self.axes.write_text(AXES.replace("homing_speed: 150", "homing_speed: 50")
+        self.axes.write_text(AXES.replace("min_home_dist: 10\n", "").replace("homing_speed: 150", "homing_speed: 50")
                              .replace("homing_speed: 35", "homing_speed: 50")
                              .replace("endstop_pin: !PA0", "endstop_pin: accel_homing:y")
                              .replace("homing_retract_dist: 3", "homing_retract_dist: 0"))
@@ -525,7 +525,7 @@ class HostFixture(unittest.TestCase):
                 self.config.write_text(CONFIG.replace("[beacon]", "[adxl345 toolhead]") +
                                        "\n[accel_homing]\naccel_chip: adxl345 toolhead\n"
                                        + option + ": " + value + "\n" + SAVED)
-                self.axes.write_text(AXES.replace("homing_speed: 150", "homing_speed: 75"))
+                self.axes.write_text(AXES.replace("homing_speed: 150", "homing_speed: 75").replace("min_home_dist: 10\n", ""))
                 before = self.config.read_bytes()
                 with self.assertRaisesRegex(installer.InstallError, conflict):
                     self.plan()
@@ -768,7 +768,7 @@ class HostFixture(unittest.TestCase):
                     "  max_report_travel = 01.500 # chosen reporting limit\n"
                     "max_startup_travel: 4.500 # chosen startup limit\n")
         self.config.write_text(CONFIG.replace("[beacon]", "[adxl345 toolhead]") + settings + SAVED)
-        self.axes.write_text(AXES.replace("homing_speed: 150", "homing_speed: 75"))
+        self.axes.write_text(AXES.replace("homing_speed: 150", "homing_speed: 75").replace("min_home_dist: 10\n", ""))
         before = self.config.read_bytes()
         changes = self.plan()[0]
         self.assertNotIn(self.config, changes)
@@ -943,6 +943,50 @@ class HostFixture(unittest.TestCase):
         self.assertIn(b"homing_retract_dist: 0", planned)
         self.assertIn(b"# min_home_dist: 10", planned)
 
+    def test_min_home_dist_migrates_into_plugin_section(self):
+        changes = self.plan()[0]
+        managed = changes[self.config.parent / installer.MANAGED]["data"]
+        self.assertIn(b"x_min_home_dist: 10\n", managed)
+        self.assertNotIn(b"y_min_home_dist", managed)
+        self.assertIn(b"# min_home_dist: 10", changes[self.axes]["data"])
+
+    def test_min_home_dist_zero_or_absent_not_migrated(self):
+        for value in ("min_home_dist: 0", "min_home_dist: 0.0"):
+            with self.subTest(value=value):
+                self.axes.write_text(AXES.replace("min_home_dist: 10", value))
+                managed = self.plan()[0][self.config.parent / installer.MANAGED]["data"]
+                self.assertNotIn(b"_min_home_dist:", managed)
+        self.axes.write_text(AXES.replace("min_home_dist: 10\n", ""))
+        managed = self.plan()[0][self.config.parent / installer.MANAGED]["data"]
+        self.assertNotIn(b"_min_home_dist:", managed)
+
+    def test_min_home_dist_invalid_value_changes_nothing(self):
+        for value in ("abc", "-1", "nan", "inf"):
+            with self.subTest(value=value):
+                self.axes.write_text(AXES.replace("min_home_dist: 10", "min_home_dist: " + value))
+                before = self.config.read_bytes(), self.axes.read_bytes()
+                with self.assertRaisesRegex(installer.InstallError, "No files changed"):
+                    self.plan()
+                self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), before)
+
+    def test_min_home_dist_rerun_does_not_duplicate(self):
+        self.require_symlinks()
+        changes = self.plan()[0]
+        installer.apply_plan({path: state for path, state in changes.items() if state["kind"] != "symlink"}, self.config)
+        again = self.plan()[0]
+        managed = again.get(self.config.parent / installer.MANAGED, {}).get("data", self.config.parent.joinpath(installer.MANAGED).read_bytes())
+        self.assertEqual(managed.count(b"x_min_home_dist:"), 1)
+        self.assertIn(b"x_min_home_dist: 10\n", managed)
+        self.assertEqual(managed.count(b"y_min_home_dist:"), 0)
+
+    def test_min_home_dist_existing_section_gets_value(self):
+        self.config.write_text(CONFIG.replace("[beacon]", "[adxl345 toolhead]") +
+                               "\n[accel_homing]\nmax_sample_age: 0.020\n" + SAVED)
+        changes = self.plan()[0]
+        planned = changes[self.config]["data"]
+        self.assertIn(b"x_min_home_dist: 10", planned)
+        self.assertNotIn(self.config.parent / installer.MANAGED, changes)
+
     def test_cli_retained_second_pass_conflict_precedes_service_checks_and_writes(self):
         self.retained_y_policy_fixture("homing_retract_dist: 3\nsecond_homing_speed: 75")
         policy = installer.load_motion_policy()
@@ -1054,7 +1098,7 @@ class HostFixture(unittest.TestCase):
         legacy = ("\n [beacon_accel_homing] ; Preserve header comment\nbeacon: beacon\naccel_chip: beacon\n"
                   "x_threshold: 6.1\ny_threshold: 7.2\n# printer.beacon_accel_homing is historical\n")
         self.config.write_bytes((CONFIG + legacy + SAVED).encode())
-        self.axes.write_bytes(AXES.replace("tmc2209_stepper_x:virtual_endstop", "beacon_accel:x")
+        self.axes.write_bytes(AXES.replace("min_home_dist: 10\n", "").replace("tmc2209_stepper_x:virtual_endstop", "beacon_accel:x")
                               .replace("!PA0", "beacon_accel:y").encode())
         changes, _, sensor = self.plan("--generic-names", "--axes", "x")
         self.assertEqual(sensor, "beacon")
