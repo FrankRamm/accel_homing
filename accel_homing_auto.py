@@ -464,6 +464,9 @@ class AutoNotchCalibration:
             reserved = True
             cooperate = lambda: self._debug_cooperate(session)
             self.debug_cooperate = cooperate
+            failed_home = session.pop("auto_notch_failed_home", None)
+            if failed_home is not None:
+                self.retain_debug_capture(session, "home", **failed_home)
             result.setdefault("artifacts", {}).update(directory=str(self.folder),
                 report=str(self.folder / "report.json"), archive=str(archive),
                 archive_snapshot=self.debug_phase)

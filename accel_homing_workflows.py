@@ -1973,6 +1973,7 @@ class AccelHomingWorkflows:
         self.in_home, self.home_axis = True, axis
         capture_started = False
         capture = None
+        auto_controller = session.get("auto_notch_controller")
         recorder = session.get("troubleshoot_recorder")
         try:
             try:
@@ -1999,23 +2000,26 @@ class AccelHomingWorkflows:
                 finally:
                     try:
                         capture = self.owner.stop_capture() if capture_started else {"samples": [], "dropped": 0}
-                        if session.get("auto_notch"):
-                            session["auto_notch_controller"].retain_debug_capture(
-                                session, "home", session["attempts"], capture,
-                                record=self.owner.last.get(axis))
                         if recorder is not None:
                             recorder.retain_capture(capture)
                     finally:
                         if session["mode"] == "calibration" and self.session is not session:
                             self._invalidate_calibration_axis(session)
         except Exception as exc:
-            if session.get("auto_notch") and capture is None:
-                controller = session["auto_notch_controller"]
-                controller.retain_debug_capture(session, "home", session["attempts"], None,
-                    record=self.owner.last.get(axis), error=controller._exception(exc, controller.debug_phase))
+            if auto_controller is not None:
+                # Native G28 can raise before wait_moves(). Keep the stopped
+                # acquisition in memory until AUTO finalizes after cleanup.
+                record = self.owner.last.get(axis)
+                session["auto_notch_failed_home"] = dict(
+                    number=session["attempts"], capture=capture if capture_started else None,
+                    record=record if record is not old_record else None,
+                    error=auto_controller._exception(exc, auto_controller.debug_phase))
             if session["mode"] in ("accuracy", "troubleshoot") and self.session is session:
                 self._remember_accuracy_record(session, axis, old_record)
             raise
+        if auto_controller is not None:
+            auto_controller.retain_debug_capture(session, "home", session["attempts"], capture,
+                                                record=self.owner.last.get(axis))
         self._check_running(session)
         record = self.owner.last.get(axis)
         if record is None or record is old_record:
