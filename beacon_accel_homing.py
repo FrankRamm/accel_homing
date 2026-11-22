@@ -792,7 +792,7 @@ class BeaconAccelHoming:
             return self.kinematics_home(homing)
         suppressed = (self.workflows.session is not None or self.workflows.in_home
                       or self.noise_session is not None)
-        context = {"homing": homing, "rails": {}, "valid": not suppressed}
+        context = {"homing": homing, "rails": {}, "homed": {}, "valid": not suppressed}
         self.ordinary_home = context
         try:
             workflows = self.workflows
@@ -873,19 +873,34 @@ class BeaconAccelHoming:
         """
         if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
             return
-        for axis, (rail, record) in list(context["rails"].items()):
+        generation = self.operation_generation
+
+        def current():
+            return (context["valid"] and self.operation_generation == generation
+                    and not (hasattr(self.printer, "is_shutdown")
+                             and self.printer.is_shutdown()))
+
+        def interrupted():
+            return self.printer.command_error("accel_homing: re-home was interrupted")
+
+        # Every plugin-axis home counts, also one that was not accepted for the
+        # final back-off: an unconfirmed short home must never be kept.
+        for axis, (rail, record) in list(context.get("homed", {}).items()):
             minimum = self.min_home_dist[axis]
             if not minimum:
                 continue
+            accepted = (context["rails"].get(axis) or (None, None))[1] is record
             travels = [record.get("travel_mm_exact")]
             limit = minimum
-            while travels[-1] is None or travels[-1] < limit:
+            while not accepted or travels[-1] is None or travels[-1] < limit:
                 if len(travels) > MAX_SHORT_HOME_RETRIES:
                     raise self.printer.command_error(
                         "accel_homing: %s homed after %s mm, less than min_home_dist %.1f mm, "
                         "%d times. The stop was not confirmed, homing stopped"
                         % (axis.upper(), "/".join("?" if t is None else "%.2f" % t
                                                   for t in travels), minimum, len(travels)))
+                if not current():
+                    raise interrupted()
                 info = rail.get_homing_info()
                 low, high = rail.get_range()
                 away = -1.0 if info.positive_dir else 1.0
@@ -895,23 +910,29 @@ class BeaconAccelHoming:
                 coord[AXES[axis]] = target
                 try:
                     self._limit_accel()
+                    if not current():
+                        raise interrupted()
                     self.toolhead.manual_move(coord, getattr(info, "retract_speed", None)
                                               or info.speed)
                     self.toolhead.wait_moves()
                 finally:
                     self._restore_accel()
+                if not current():
+                    raise interrupted()
                 homepos = [None] * 4
                 homepos[AXES[axis]] = info.position_endstop
                 forcepos = list(homepos)
                 forcepos[AXES[axis]] += (-1.5 * (info.position_endstop - low) if info.positive_dir
                                          else 1.5 * (high - info.position_endstop))
                 context["rails"].pop(axis, None)
+                context["homed"].pop(axis, None)
                 context["homing"].home_rails([rail], forcepos, homepos)
                 entry = context["rails"].get(axis)
                 if entry is None:
                     raise self.printer.command_error(
                         "accel_homing: %s re-home was not accepted" % axis.upper())
                 rail, record = entry
+                accepted = True
                 travels.append(record.get("travel_mm_exact"))
                 limit = minimum - SECOND_TOUCH_TOLERANCE
                 logging.info("accel_homing: %s homed short, re-homed from min_home_dist %.1f mm "
@@ -1354,6 +1375,8 @@ class BeaconAccelHoming:
                 and attempt is not None and attempt.axis in self.session_axes
                 and any(rail is self.session_axes[attempt.axis] for rail in rails)):
             record = attempt.record
+            context.setdefault("homed", {})[attempt.axis] = (
+                self.session_axes[attempt.axis], record)
             accepted = (attempt.reason == "impact" and
                         (record.get("moving") or record.get("motion_seen")
                          or record.get("impact_metric") in ("xyz_magnitude", "mapped_axis"))) or (

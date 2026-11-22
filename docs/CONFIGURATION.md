@@ -147,7 +147,7 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
 
-The stepper-section `min_home_dist` stays disabled; this plugin option replaces it on Klipper and Kalico.
+The Kalico stepper-section `min_home_dist` stays disabled; this plugin option provides the behaviour on both Klipper and Kalico.
 
 ## Experimental notch filter (dev)
 

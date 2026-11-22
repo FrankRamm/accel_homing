@@ -10,11 +10,13 @@ from test_workflows import Kin
 
 class MinHomeDistTests(unittest.TestCase):
     def machine(self, axes="xy", travels=None, minimum=10.0, bounds=(0.0, 300.0),
-                positive=False, reason="impact", kept_origin=False, extra=None):
+                positive=False, reason="impact", kept_origin=False, extra=None,
+                reasons=None):
+        reason_default = reason
         """travels: {axis: [first, rehome1, ...]} scripted travel_mm_exact per home."""
         travels = {a: list((travels or {}).get(a, [150.0])) for a in axes}
         kin = Kin()
-        state = types.SimpleNamespace(rehomes=[], homes={a: 0 for a in axes})
+        state = types.SimpleNamespace(rehomes=[], homes={a: 0 for a in axes}, on_rehome=None)
         objects = {}
 
         def run_home(homing, axis):
@@ -23,6 +25,8 @@ class MinHomeDistTests(unittest.TestCase):
             index = "xy".index(axis)
             script = travels[axis]
             travel = script[min(state.homes[axis], len(script) - 1)]
+            reason = (reasons or {}).get(axis, [reason_default])[
+                min(state.homes[axis], len((reasons or {}).get(axis, [0])) - 1)]
             state.homes[axis] += 1
             obj.homing_active = True
             obj.session_axes = {axis: rail}
@@ -47,6 +51,8 @@ class MinHomeDistTests(unittest.TestCase):
                 state.rehomes.append((list(rails), list(forcepos), list(homepos)))
                 axis = next(a for a in axes if objects["owner"].rails_by_axis[a] is rails[0])
                 run_home(self_, axis)
+                if state.on_rehome:
+                    state.on_rehome()
 
         kin.home = home
         options = {"min_home_dist": str(minimum)}
@@ -141,6 +147,53 @@ class MinHomeDistTests(unittest.TestCase):
         obj.workflows.session = object()
         self.go(kin, state)
         self.assertEqual(state.rehomes, [])
+
+    def test_cancel_between_attempts_raises_without_back_off(self):
+        obj, kin, state = self.machine("x", {"x": [3.0, 2.0, 2.5]})
+        state.on_rehome = obj._cancel_pending_operations
+        with self.assertRaisesRegex(CommandError, "re-home was interrupted"):
+            self.go(kin, state)
+        self.assertEqual(len(state.rehomes), 1)
+        self.assertEqual(len(obj.toolhead.moves), 1)
+
+    def test_shutdown_before_back_off_raises_without_move(self):
+        obj, kin, state = self.machine("x", {"x": [3.0, 2.0, 2.5]})
+        state.on_rehome = lambda: setattr(obj.printer, "is_shutdown", lambda: True)
+        with self.assertRaisesRegex(CommandError, "re-home was interrupted"):
+            self.go(kin, state)
+        self.assertEqual(len(obj.toolhead.moves), 1)
+
+    def test_rehome_not_accepted_raises(self):
+        obj, kin, state = self.machine("x", {"x": [3.0, 150.0]}, reasons={"x": ["impact", "pressed"]})
+        with self.assertRaisesRegex(CommandError, "X re-home was not accepted"):
+            self.go(kin, state)
+        self.assertEqual(len(state.rehomes), 1)
+
+    def test_unaccepted_home_is_rehomed_when_min_set(self):
+        obj, kin, state = self.machine("x", {"x": [150.0, 150.0]},
+                                       reasons={"x": ["pressed", "impact"]})
+        self.go(kin, state)
+        self.assertEqual(len(state.rehomes), 1)
+        self.assertEqual(obj.toolhead.moves[-1][0], [5.0, None, None])
+
+    def test_unaccepted_home_untouched_when_min_zero(self):
+        obj, kin, state = self.machine("x", {"x": [0.5]}, minimum=0.0,
+                                       reasons={"x": ["pressed"]})
+        self.go(kin, state)
+        self.assertEqual(state.rehomes, [])
+        self.assertEqual(obj.toolhead.moves, [])
+
+    def test_positive_dir_backs_off_toward_lower_values(self):
+        obj, kin, state = self.machine("x", {"x": [3.0, 150.0]}, positive=True)
+        self.go(kin, state)
+        self.assertEqual(obj.toolhead.moves[0][0], [290.0, None, None])
+        self.assertEqual(state.rehomes[0][1][0], 300.0 + -1.5 * 300.0)
+        self.assertEqual(obj.toolhead.moves[-1][0], [295.0, None, None])
+
+    def test_none_travel_renders_question_mark_in_error(self):
+        obj, kin, state = self.machine("x", {"x": [None, 2.0, 2.5]})
+        with self.assertRaisesRegex(CommandError, r"after \?/2\.00/2\.50 mm"):
+            self.go(kin, state)
 
 
 if __name__ == "__main__":
