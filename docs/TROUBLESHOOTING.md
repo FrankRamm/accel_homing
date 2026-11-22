@@ -100,6 +100,12 @@ strokes. Fresh noise and threshold qualification still run and can report their
 own acquisition faults. Only configure a map that matches the sensor's mounting;
 the configured path trusts that orientation rather than measuring it.
 
+For example, a Beacon mounted so positive machine X corresponds to positive
+sensor Y, positive machine Y to negative sensor X, and machine Z to sensor Z
+uses `accel_axes_map: y, -x, z` in its `[beacon]` section. After changing
+the map, reload the configuration and calibrate X and Y for that mounting.
+Thresholds are specific to the printer and axis.
+
 The earlier message `automatic axis mapping was interrupted or its sensor
 context changed` also covered sensor acquisition faults; it did not establish
 that the configured axes map had changed. A retained fault from that failed,
@@ -116,6 +122,14 @@ abort it. There is no automatic retry of a mapping movement. Manually prepare
 and center XY again before retrying; an aborted stroke does not establish that
 the toolhead returned to the center.
 
+On Beacon, a small change in the sample period estimated from consecutive
+packets can occur even when the next packet arrives on time. Calibration
+allows a period change of up to 25% of the current packet's sample period,
+with a 3 us minimum tolerance. A gap longer than five current sample periods
+plus 3 us still invalidates the window. For a `sample_gap`, compare `gap_s`
+with `gap_limit_s` and the two sample periods with `interval_change_limit_s`
+when those fields are present.
+
 If both strokes were captured but inference rejects the mapping, for example
 `Mapping cruise response is unstable`, calibration exports an evidence bundle
 after successful cleanup. The console prints its ZIP path, and STATUS retains
@@ -131,21 +145,30 @@ an integrated velocity estimate; it does not verify physical speed or position.
 JSON and the ZIP remain available if plotting fails; a ZIP failure leaves the
 JSON path available. A cleanup failure skips export and reports that failure.
 
-Automatic mapping checks each stroke independently. Its median velocity vector
-must have a magnitude between 50% and 150% of commanded speed. At least 95% of
-the cruise samples must meet both conditions below.
+Automatic mapping checks the steady-speed part of each stroke. It averages
+the signed XYZ velocity estimates in windows of up to 20 ms. The median of
+those vectors must have a magnitude between 50% and 150% of commanded speed.
+Both strokes must identify the same sensor channel and sign once their
+opposite travel directions are accounted for.
 
-- The selected sensor channel has the expected sign and supplies at least 85%
-  of the velocity vector's magnitude.
-- The sample's velocity projected along the median direction is between 50%
-  and 150% of the median vector's magnitude.
+Version 3 inference reports distinguish two ways a stroke can fail.
 
-Both strokes must also agree on the signed channel after accounting for the
-commanded direction. In a version 2 inference report, compare
-`aligned_cruise_fraction` and `in_speed_band_fraction` to see which condition
-failed. `stable_cruise_fraction` counts samples meeting both. The total,
-parallel and perpendicular deviations describe the ripple. A large total
-deviation alone can occur on a well-aligned sensor.
+- `raw_coherent_cruise_time_fraction` measures how often the individual
+  velocity estimates point along the selected channel with the expected sign.
+  That channel must supply at least 85% of the vector magnitude for at least
+  95% of cruise time. A low fraction points to conflicting direction evidence.
+- `pooled_stable_cruise_fraction` measures how much cruise time the window
+  averages spend aligned with that signed channel and within the speed band.
+  The forward component must be 50% to 150% of the median speed for a window
+  to count. At least 95% of cruise time must qualify, and every window must
+  show at least 25% of the median speed in the forward direction. Compare
+  `minimum_pooled_projection_mm_s`
+  with `minimum_local_motion_mm_s` to identify a local slowdown or reversal.
+
+Earlier reports counted individual samples meeting both direction and speed
+criteria. That count alone cannot distinguish speed ripple from an ambiguous
+direction. The signed captures in `mapping.json` allow the same stroke to be
+evaluated with the updated checks.
 
 The requirement that both X and Y be unhomed still applies. Running `G28`
 before calibration homes those axes and therefore causes that separate

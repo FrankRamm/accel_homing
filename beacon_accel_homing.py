@@ -63,6 +63,7 @@ MOTION_LAG = 0.015         # s, commanded speed is taken this much earlier, so s
 COMMAND_WINDOW = 0.004     # s, window for the commanded speed
 EARLY_INTERVAL = 0.003     # s, watchdog interval until the toolhead is seen moving
 GAP_SAMPLES = 5            # missing samples that make the integrated speed untrustworthy
+BEACON_BATCH_INTERVAL_TOLERANCE = 0.25  # packet-derived periods include native timestamp jitter
 NOISE_WINDOW_RETRIES = 2   # fresh complete reacquisitions; stationary workflows only
 NOISE_SESSION_RETRIES = 3  # shared by all requested stationary windows
 ENABLE_SETTLE = 0.25       # s, motors switched on before homing settle before the reading
@@ -1448,6 +1449,21 @@ class BeaconAccelHoming:
             return start, (end - start) / max(count - 1.0, 1.0)
         return (self.clock_to_time(params["start_clock"]),
                 params["delta_clock"] / max(count - 1.0, 1.0) / self.beacon_freq)
+
+    def _batch_interval_change_limit(self, interval):
+        # Beacon supplies one span for a small packet, not individual sample
+        # timestamps. Allow its packet-to-packet period jitter independently
+        # of the missing-sample guard. Decoded drivers keep their stricter gate.
+        ratio = BEACON_BATCH_INTERVAL_TOLERANCE if self.backend is None else 0.10
+        return max(0.000003, interval * ratio)
+
+    def _sample_time_advances(self, when, previous):
+        # Interpolating a native packet endpoint and converting the next
+        # packet's start clock can differ by floating roundoff at the same
+        # MCU tick. Half a tick rejects that duplicate without rejecting an
+        # actual one-tick advance. Decoded timestamps keep exact comparisons.
+        minimum = 0.5 / self.beacon_freq if self.backend is None else 0.0
+        return when - previous > minimum
 
     def _collect_reference(self, params, data, count, now):
         """Validate sensor time and every axis while no homing move is armed."""
@@ -3094,6 +3110,7 @@ class BeaconAccelHoming:
                 or 1.0 / interval < minimum_rate):
             self._sensor_fault("sample_rate")
             return
+        interval_change_limit = self._batch_interval_change_limit(interval)
         now = self.reactor.monotonic()
         sensor_now = self.main_mcu.estimated_print_time(now)
         if quality is not None:
@@ -3126,12 +3143,12 @@ class BeaconAccelHoming:
                     return
                 if window["last"] is not None:
                     gap = when - window["last"]
-                    if gap <= 0.0:
+                    if not self._sample_time_advances(when, window["last"]):
                         self._sensor_fault("invalid_data")
                         return
                     if (gap > 5.0 * interval + 0.000003
                             or (window["interval"] is not None
-                                and abs(interval - window["interval"]) > max(0.000003, interval * 0.10))):
+                                and abs(interval - window["interval"]) > interval_change_limit)):
                         if quality is not None:
                             quality["gap_observations"] += 1
                         window["fault_details"] = {
@@ -3139,7 +3156,7 @@ class BeaconAccelHoming:
                             "gap_s": gap, "gap_limit_s": 5.0 * interval + 0.000003,
                             "sample_interval_s": interval,
                             "previous_sample_interval_s": window["interval"],
-                            "interval_change_limit_s": max(0.000003, interval * 0.10),
+                            "interval_change_limit_s": interval_change_limit,
                             "rejected_sample_time_s": when, "sensor_now_s": sensor_now,
                             "batch_start_clock": params["start_clock"],
                             "batch_delta_clock": params["delta_clock"],
@@ -3397,9 +3414,9 @@ class BeaconAccelHoming:
                           or start + (count - 1) * interval - now > 0.005):
                         reason = "stale_data"
                     elif (state["last_sample_time_s"] is not None
-                          and (start <= state["last_sample_time_s"]
+                          and (not self._sample_time_advances(start, state["last_sample_time_s"])
                                or start - state["last_sample_time_s"] > 5 * interval + 0.000003
-                               or abs(interval - state["interval_s"]) > max(0.000003, interval * 0.10))):
+                               or abs(interval - state["interval_s"]) > self._batch_interval_change_limit(interval))):
                         reason = "sample_gap"
                         quality["gap_observations"] += 1
                     else:

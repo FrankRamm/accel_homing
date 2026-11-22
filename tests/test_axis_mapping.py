@@ -70,6 +70,44 @@ def quantized_mapping_pulse(direction, vibration_channel=None, ripple_g=.5, moti
                         "fault": None, "dropped": 0}}
 
 
+def coherent_ripple_pass(direction, rate=3300., frequency=100., phase=0.,
+                         ripple_mm_s=9.35, motion_gain=.9, vector=(0., 1., 0.),
+                         ripple_vector=None, cruise_duration=.71, jitter=0.):
+    """Synthetic velocity ripple with smooth rest endpoints, not recorded data.
+
+    The derivative of the enveloped velocity ripple is added to acceleration,
+    so its size is specified in mm/s without depending on sensor sample rate.
+    """
+    item = quantized_mapping_pulse(direction)
+    ramp = .04
+    cruise_end, end = 1.04 + cruise_duration, 1.08 + cruise_duration
+    item["segments"][1]["end_time_s"] = cruise_end
+    item["segments"][2].update(start_time_s=cruise_end, end_time_s=end)
+    baseline = item["capture"]["baseline_g"]
+    ripple_vector = vector if ripple_vector is None else ripple_vector
+    samples = []
+    for index in range(math.ceil((end + .02 - .98) * rate) + 1):
+        time = .98 + (index + jitter * math.sin(index * 1.7)) / rate
+        acceleration = 500. if 1. <= time < 1.04 else -500. if cruise_end <= time < end else 0.
+        envelope, derivative = 0., 0.
+        if 1. < time < 1.04:
+            angle = math.pi * (time - 1.) / ramp
+            envelope, derivative = .5 - .5 * math.cos(angle), .5 * math.pi / ramp * math.sin(angle)
+        elif 1.04 <= time <= cruise_end:
+            envelope = 1.
+        elif cruise_end < time < end:
+            angle = math.pi * (time - cruise_end) / ramp
+            envelope, derivative = .5 + .5 * math.cos(angle), -.5 * math.pi / ramp * math.sin(angle)
+        angle = 2. * math.pi * frequency * (time - 1.) + phase
+        ripple = ripple_mm_s * (derivative * math.sin(angle)
+                               + envelope * 2. * math.pi * frequency * math.cos(angle))
+        samples.append([time] + [baseline[channel] + direction * (
+            vector[channel] * acceleration * motion_gain + ripple_vector[channel] * ripple) / GRAVITY_MM_S2
+            for channel in range(3)])
+    item["capture"]["samples"] = samples
+    return item
+
+
 class AxisMappingInferenceTests(unittest.TestCase):
     def test_all_source_channels_and_signs_for_both_machine_axes(self):
         for axis in "xy":
@@ -172,7 +210,7 @@ class AxisMappingDiagnosticsTests(unittest.TestCase):
         diagnostics = {"stale": "discarded"}
         result = infer_axis_mapping("x", passes, diagnostics)
         self.assertEqual(result, expected)
-        self.assertEqual(diagnostics["version"], 2)
+        self.assertEqual(diagnostics["version"], 3)
         self.assertNotIn("stale", diagnostics)
         self.assertEqual(diagnostics["status"], "accepted")
         self.assertEqual(diagnostics["evaluated_pass_count"], 2)
@@ -213,6 +251,102 @@ class AxisMappingDiagnosticsTests(unittest.TestCase):
                                            6.34 if channel == 0 else 0., delta=.15)
                     self.assertAlmostEqual(report["perpendicular_median_deviation_mm_s"],
                                            6.34 if channel == 1 else 0., delta=.15)
+
+    def test_coherent_ripple_near_reported_beacon_scale_passes_temporal_checks(self):
+        # Representative of the separate 82.56% / 99.6% / 100% report, not a
+        # replay or reconstruction of its unavailable raw capture.
+        vector = (math.sqrt(1. - .996 ** 2), .996, 0.)
+        diagnostics = {}
+        result = infer_axis_mapping("y", [coherent_ripple_pass(d, frequency=97., vector=vector)
+                                          for d in (1, -1)], diagnostics)
+        self.assertEqual((result["source_axis"], result["sign"]), (1, 1))
+        for report in diagnostics["passes"]:
+            self.assertAlmostEqual(report["in_speed_band_fraction"], .8256, delta=.035)
+            self.assertAlmostEqual(report["total_median_deviation_mm_s"], 6.62, delta=.15)
+            self.assertAlmostEqual(report["alignment"], .996)
+            self.assertEqual(report["sign_agreement_fraction"], 1.)
+            self.assertLess(report["stable_cruise_fraction"], report["minimum_stable_cruise_fraction"])
+            self.assertEqual(report["pooled_stable_cruise_fraction"], 1.)
+            self.assertEqual(report["raw_coherent_cruise_time_fraction"], 1.)
+            self.assertTrue(report["local_motion_supported"])
+
+    def test_coherent_ripple_uses_time_not_fixed_sample_blocks(self):
+        for rate, frequency, phase, jitter in ((800., 87., .7, 0.), (1000., 113., 1.3, .2),
+                                               (3200., 97., 2.1, .2), (6400., 137., .4, 0.)):
+            with self.subTest(rate=rate, frequency=frequency, phase=phase, jitter=jitter):
+                passes = [coherent_ripple_pass(d, rate, frequency, phase, jitter=jitter,
+                                               vector=(0., -1., 0.), ripple_mm_s=11.) for d in (1, -1)]
+                diagnostics = {}
+                result = infer_axis_mapping("y", passes, diagnostics)
+                self.assertEqual((result["source_axis"], result["sign"]), (1, -1))
+                for report in diagnostics["passes"]:
+                    self.assertLess(report["in_speed_band_fraction"], .95)
+                    self.assertEqual(report["pooled_stable_cruise_fraction"], 1.)
+                    self.assertAlmostEqual(report["pooled_cruise_duration_s"], .71 * .8)
+                    self.assertLessEqual(report["maximum_cruise_window_s"], .020 + 1e-12)
+                    self.assertGreater(report["minimum_cruise_window_s"], .019)
+                json.dumps(diagnostics, allow_nan=False)
+
+    def test_pooling_cannot_manufacture_direction_from_opposing_or_cross_channel_vectors(self):
+        for ripple_vector, ripple in (((0., 1., 0.), 30.), ((1., 0., 0.), 18.)):
+            with self.subTest(ripple_vector=ripple_vector):
+                diagnostics = {}
+                passes = [coherent_ripple_pass(d, ripple_vector=ripple_vector, ripple_mm_s=ripple)
+                          for d in (1, -1)]
+                with self.assertRaisesRegex(ValueError, "cruise response is unstable"):
+                    infer_axis_mapping("y", passes, diagnostics)
+                report = diagnostics["passes"][0]
+                self.assertGreater(report["alignment"], .99)
+                self.assertEqual(report["pooled_stable_cruise_fraction"], 1.)
+                self.assertLess(report["raw_coherent_cruise_time_fraction"], .95)
+
+    def test_low_frequency_speed_variation_is_not_excused_by_coherent_direction(self):
+        diagnostics = {}
+        passes = [coherent_ripple_pass(d, frequency=5., ripple_mm_s=13.) for d in (1, -1)]
+        with self.assertRaisesRegex(ValueError, "cruise response is unstable"):
+            infer_axis_mapping("y", passes, diagnostics)
+        report = diagnostics["passes"][0]
+        self.assertEqual(report["sign_agreement_fraction"], 1.)
+        self.assertLess(report["pooled_stable_cruise_fraction"], .95)
+
+    def test_roughly_half_raw_support_does_not_prove_direction_after_pooling(self):
+        # The separate 824/1779 report contains no angular/sign evidence.
+        # A similar aggregate fraction can instead hide cross-channel motion.
+        diagnostics = {}
+        passes = [coherent_ripple_pass(d, frequency=97., ripple_vector=(1., 0., 0.), ripple_mm_s=16.8)
+                  for d in (1, -1)]
+        with self.assertRaisesRegex(ValueError, "cruise response is unstable"):
+            infer_axis_mapping("y", passes, diagnostics)
+        report = diagnostics["passes"][0]
+        self.assertAlmostEqual(report["stable_cruise_fraction"], 824 / 1779, delta=.03)
+        self.assertEqual(report["pooled_stable_cruise_fraction"], 1.)
+        self.assertLess(report["raw_coherent_cruise_time_fraction"], .95)
+
+    def test_signed_pooling_does_not_turn_pure_vibration_into_commanded_motion(self):
+        with self.assertRaisesRegex(ValueError, "commanded speed"):
+            infer_axis_mapping("y", [coherent_ripple_pass(d, motion_gain=0., ripple_mm_s=30.)
+                                      for d in (1, -1)])
+
+    def test_local_80ms_stop_or_reversal_rejects_even_below_five_percent_of_long_cruise(self):
+        for acceleration in (900., 1800.):
+            for stop_start in (1.60, 2.30, 5.10):
+                with self.subTest(acceleration=acceleration, stop_start=stop_start):
+                    positive = coherent_ripple_pass(1, ripple_mm_s=0., cruise_duration=4.71, rate=1000.)
+                    # Rest or reverse for 80 ms between two 20 ms ramps at
+                    # several locations within the trimmed cruise interval.
+                    for row in positive["capture"]["samples"]:
+                        if stop_start <= row[0] < stop_start + .02:
+                            row[2] -= acceleration / GRAVITY_MM_S2
+                        elif stop_start + .10 <= row[0] < stop_start + .12:
+                            row[2] += acceleration / GRAVITY_MM_S2
+                    diagnostics = {}
+                    with self.assertRaisesRegex(ValueError, "cruise response is unstable"):
+                        infer_axis_mapping("y", [positive, coherent_ripple_pass(-1)], diagnostics)
+                    report = diagnostics["passes"][0]
+                    self.assertGreater(report["pooled_stable_cruise_fraction"], .95)
+                    self.assertFalse(report["local_motion_supported"])
+                    self.assertAlmostEqual(report["pooled_cruise_duration_s"], .8 * 4.71)
+                    self.assertLess(report["minimum_pooled_projection_mm_s"], report["minimum_local_motion_mm_s"])
 
     def test_brief_stop_during_cruise_is_not_hidden_by_the_stroke_median(self):
         positive = quantized_mapping_pulse(1)

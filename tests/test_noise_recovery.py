@@ -212,7 +212,7 @@ class StationaryNoiseRecoveryTests(unittest.TestCase):
             if (window is not None and window["index"] == 1
                     and len(window["samples"]) >= 8 and not changed[0]):
                 changed[0] = True
-                params = dict(params, delta_clock=params["delta_clock"] * 1.2)
+                params = dict(params, delta_clock=params["delta_clock"] * .7)
             inspect(params)
 
         obj._inspect = alter_period

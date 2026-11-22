@@ -19,6 +19,8 @@ GRAVITY_MM_S2 = 9806.65
 MIN_ALIGNMENT = 0.85
 MIN_DIRECTION_AGREEMENT = 0.95
 MIN_STABLE_CRUISE_FRACTION = 0.95
+CRUISE_WINDOW_S = 0.020
+MIN_LOCAL_MOTION_RATIO = 0.25
 MAX_DIAGNOSTIC_PASSES = 8
 
 
@@ -108,6 +110,30 @@ def _diagnostic_number(value):
 
 def _diagnostic_vector(values):
     return [_diagnostic_number(value) for value in values[:3]]
+
+
+def _cruise_windows(times, vectors, left, right):
+    """Time-weighted signed means, with full coverage and no long final bin.
+
+    Pool XYZ before taking a norm or projection: rectifying first could turn
+    opposing motion into false evidence of a channel. Integrate the piecewise
+    linear velocity at exact time boundaries, independent of the sample rate.
+    """
+    count = max(1, math.ceil((right - left) / CRUISE_WINDOW_S))
+    width = (right - left) / count
+    result = []
+    for index in range(count):
+        start = left + index * width
+        end = right if index == count - 1 else left + (index + 1) * width
+        first, last = bisect.bisect_right(times, start), bisect.bisect_left(times, end)
+        points = [(start, _interpolate(times, vectors, start))]
+        points.extend(zip(times[first:last], vectors[first:last]))
+        points.append((end, _interpolate(times, vectors, end)))
+        mean = tuple(math.fsum((v0[channel] + v1[channel]) * .5 * (t1 - t0)
+                               for (t0, v0), (t1, v1) in zip(points, points[1:])) / (end - start)
+                     for channel in range(3))
+        result.append((end - start, mean))
+    return result
 
 
 def _pass_velocity(axis, item, diagnostics=None):
@@ -214,7 +240,11 @@ def _pass_velocity(axis, item, diagnostics=None):
         diagnostics.update(endpoint_drift_xyz_mm_s=_diagnostic_vector(drift),
                            removed_bias_xyz_mm_s2=_diagnostic_vector(
                                tuple(value / (end - start) for value in drift)))
-    cruise_vectors, expected_speeds = [], []
+    integrated_times = [time for time, _ in integrated]
+    signed_vectors = [tuple((value - bias * (time - start) / (end - start)) * item["direction"]
+                            for value, bias in zip(vector, drift))
+                      for time, vector in integrated]
+    cruise_vectors, cruise_weights, expected_speeds, windows = [], [], [], []
     for segment in motion:
         if segment["phase"] != "cruise":
             continue
@@ -223,20 +253,25 @@ def _pass_velocity(axis, item, diagnostics=None):
             raise ValueError("Mapping cruise speed must be finite and positive")
         trim = 0.1 * (segment["end_time_s"] - segment["start_time_s"])
         left, right = segment["start_time_s"] + trim, segment["end_time_s"] - trim
-        for time, vector in integrated:
-            if left <= time <= right:
-                fraction = (time - start) / (end - start)
-                cruise_vectors.append(tuple((v - d * fraction) * item["direction"]
-                                            for v, d in zip(vector, drift)))
-                expected_speeds.append(speed)
-                if diagnostics is not None:
-                    diagnostics.setdefault("cruise_start_time_s", time)
-                    diagnostics["cruise_end_time_s"] = time
+        first, last = bisect.bisect_left(integrated_times, left), bisect.bisect_right(integrated_times, right)
+        for index in range(first, last):
+            time = integrated_times[index]
+            # Assign each raw observation its local time coverage, so changing
+            # the sampling density cannot conceal conflicting directions.
+            before = left if index == first else (integrated_times[index - 1] + time) * .5
+            after = right if index == last - 1 else (time + integrated_times[index + 1]) * .5
+            cruise_weights.append(after - before)
+            cruise_vectors.append(signed_vectors[index])
+            expected_speeds.append(speed)
+            if diagnostics is not None:
+                diagnostics.setdefault("cruise_start_time_s", time)
+                diagnostics["cruise_end_time_s"] = time
+        windows.extend(_cruise_windows(integrated_times, signed_vectors, left, right))
     if diagnostics is not None:
         diagnostics["cruise_samples"] = len(cruise_vectors)
     if len(cruise_vectors) < 10:
         raise ValueError("Mapping capture has insufficient full-speed cruise samples")
-    vector = tuple(statistics.median(row[i] for row in cruise_vectors) for i in range(3))
+    vector = tuple(statistics.median(row[i] for _, row in windows) for i in range(3))
     norm = math.sqrt(math.fsum(v * v for v in vector))
     speed = statistics.median(expected_speeds)
     if diagnostics is not None:
@@ -274,6 +309,18 @@ def _pass_velocity(axis, item, diagnostics=None):
                        for on_axis, error in zip(aligned, parallel))
     size = len(cruise_vectors)
     stable_fraction = stable_count / size
+    cruise_duration = math.fsum(duration for duration, _ in windows)
+    raw_coherent_fraction = math.fsum(weight for weight, on_axis in zip(cruise_weights, aligned)
+                                     if on_axis) / math.fsum(cruise_weights)
+    pooled_projections = [math.fsum(value * direction for value, direction in zip(row, unit))
+                          for _, row in windows]
+    pooled_stable_duration = math.fsum(
+        duration for (duration, row), projection in zip(windows, pooled_projections)
+        if sign * row[source] > 0 and sign * row[source] >= MIN_ALIGNMENT * math.hypot(*row)
+        and abs(projection - norm) <= longitudinal_limit)
+    pooled_stable_fraction = min(1., pooled_stable_duration / cruise_duration)
+    minimum_motion = MIN_LOCAL_MOTION_RATIO * norm
+    local_motion = min(pooled_projections) >= minimum_motion
     if diagnostics is not None:
         perpendicular = [math.hypot(*(value - projection * direction
                                       for value, direction in zip(row, unit)))
@@ -293,13 +340,33 @@ def _pass_velocity(axis, item, diagnostics=None):
             sign_agreement_fraction=sum(row[source] * vector[source] > 0 for row in cruise_vectors) / size,
             nonpositive_projection_fraction=sum(value <= 0 for value in projections) / size,
             near_zero_projection_fraction=sum(abs(value) <= near_zero for value in projections) / size,
-            near_zero_projection_limit_mm_s=_diagnostic_number(near_zero))
-    if stable_fraction < MIN_STABLE_CRUISE_FRACTION:
+            near_zero_projection_limit_mm_s=_diagnostic_number(near_zero),
+            cruise_pooling_method="signed_time_mean",
+            velocity_estimate_method="median_signed_time_means",
+            cruise_window_limit_s=CRUISE_WINDOW_S,
+            cruise_window_count=len(windows),
+            minimum_cruise_window_s=_diagnostic_number(min(duration for duration, _ in windows)),
+            maximum_cruise_window_s=_diagnostic_number(max(duration for duration, _ in windows)),
+            pooled_cruise_duration_s=_diagnostic_number(cruise_duration),
+            raw_coherent_cruise_time_fraction=_diagnostic_number(raw_coherent_fraction),
+            pooled_stable_cruise_fraction=_diagnostic_number(pooled_stable_fraction),
+            minimum_pooled_projection_mm_s=_diagnostic_number(min(pooled_projections)),
+            minimum_local_motion_mm_s=_diagnostic_number(minimum_motion),
+            local_motion_supported=local_motion)
+    # High-frequency longitudinal ripple may cross the sample speed band while
+    # its signed time means consistently show motion. Raw angular/sign evidence
+    # must still agree: averaging cannot invent an axis from opposing vectors.
+    # The local floor catches a real stop/reversal even on a stroke so long that
+    # it would occupy less than the allowed 5% of total cruise time.
+    if (raw_coherent_fraction < MIN_STABLE_CRUISE_FRACTION
+            or pooled_stable_fraction < MIN_STABLE_CRUISE_FRACTION or not local_motion):
         raise ValueError("Mapping cruise response is unstable (direction %+d, channel %s: "
-                         "%d/%d samples support the signed channel within %.3g mm/s of "
-                         "the cruise speed estimate, need %.0f%%)" % (
-                             item["direction"], "XYZ"[source], stable_count, size,
-                             longitudinal_limit, 100 * MIN_STABLE_CRUISE_FRACTION))
+                         "%.1f%% raw signed-channel support, %.1f%% stable cruise time in "
+                         "<=%.0f ms windows, need %.0f%%; minimum forward speed %.3g, "
+                         "need %.3g mm/s)" % (
+                             item["direction"], "XYZ"[source], 100 * raw_coherent_fraction,
+                             100 * pooled_stable_fraction, 1000 * CRUISE_WINDOW_S,
+                             100 * MIN_STABLE_CRUISE_FRACTION, min(pooled_projections), minimum_motion))
     return {"direction": item["direction"], "source_axis": source,
             "sign": sign, "alignment": alignment,
             "velocity_mm_s": list(vector), "expected_speed_mm_s": speed,
@@ -319,7 +386,7 @@ def infer_axis_mapping(axis, passes, diagnostics=None):
         if not isinstance(diagnostics, dict):
             raise TypeError("Mapping diagnostics must be a dictionary")
         diagnostics.clear()
-        diagnostics.update(version=2, axis=axis if axis in ("x", "y") else None,
+        diagnostics.update(version=3, axis=axis if axis in ("x", "y") else None,
                            status="evaluating", passes=[], evaluated_pass_count=0,
                            requested_pass_count=len(passes) if isinstance(passes, (list, tuple)) else 0,
                            unevaluated_pass_count=len(passes) if isinstance(passes, (list, tuple)) else 0,

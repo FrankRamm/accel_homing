@@ -91,6 +91,17 @@ _TROUBLESHOOT_MODULE = None
 _EXPERIMENT_MODULE = None
 
 
+class _HomingCurrentAxis(str):
+    """A native axis letter that also implements Python's index protocol.
+
+    Kalico variants either forward letters to is_active_axis(axis.encode())
+    or select a letter with "xyz"[axis] in the homing helper or toolhead.
+    Both contracts work without probing or retrying a current-setting call.
+    """
+    def __index__(self):
+        return AXES[self]
+
+
 def _load_experiment_module():
     """Load the opt-in experiment without adding a boot-time dependency."""
     global _EXPERIMENT_MODULE
@@ -2887,7 +2898,17 @@ class AccelHomingWorkflows:
                 state = factory(self.printer, **kwargs)
             except (TypeError, ValueError) as exc:
                 raise self._error("cannot initialize native homing-current helper before motion: %s" % exc) from exc
-            helper = state._set_homing_current
+            native_helper = state._set_homing_current
+
+            def helper(axes, pre_homing):
+                # Use the same representation for activation and restoration;
+                # a failed activation may already have changed some drivers.
+                try:
+                    return native_helper([_HomingCurrentAxis(value) for value in axes], pre_homing)
+                except TypeError as exc:
+                    raise self._error(
+                        "native homing-current helper failed; check Kalico/accel_homing API "
+                        "compatibility and include klippy.log when reporting this error: %s" % exc) from exc
         context = {"configured": configured, "settings_available": isinstance(settings, dict) and bool(settings),
                    "native_helper": None if helper is None else native.__module__ + ".Homing._set_homing_current",
                    "matching": "native_homing_current_helper" if helper is not None else
