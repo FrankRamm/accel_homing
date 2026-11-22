@@ -373,6 +373,11 @@ def describe_motion_proof(proof):
                value("deadline_after_arm_ms"), noise))
 
 
+def _back_off_speed(info, workflows):
+    speed = getattr(info, "retract_speed", None) or info.speed
+    return min(speed, info.speed) if getattr(workflows, "gentle_homing", False) else speed
+
+
 def homing_warnings(name, info):
     """Rail settings known to weaken detection. Advice only, never an error."""
     warnings = []
@@ -779,7 +784,11 @@ class BeaconAccelHoming:
         context = {"homing": homing, "rails": {}, "valid": not suppressed}
         self.ordinary_home = context
         try:
-            result = self.kinematics_home(homing)
+            workflows = self.workflows
+            if getattr(workflows, "gentle_homing", False) and workflows.in_home and workflows.session:
+                result = workflows.centered_gentle_home(homing)
+            else:
+                result = self.kinematics_home(homing)
             if context["valid"]:
                 self._retract_completed_home(context)
             return result
@@ -801,7 +810,7 @@ class BeaconAccelHoming:
                 continue
             info = rail.get_homing_info()
             low, high = rail.get_range()
-            speed = getattr(info, "retract_speed", None) or info.speed
+            speed = _back_off_speed(info, self.workflows)
             current = position[AXES[axis]]
             if (not all(math.isfinite(value) for value in
                         (low, high, info.position_endstop, speed, current))
@@ -1230,7 +1239,7 @@ class BeaconAccelHoming:
             low, high = rail.get_range()
             target = info.position_endstop + away * self.back_off_dist
             coord[AXES[axis]] = min(max(target, low), high)
-            speeds.append(getattr(info, "retract_speed", None) or info.speed)
+            speeds.append(_back_off_speed(info, self.workflows))
         if speeds:
             self.toolhead.manual_move(coord, min(speeds))
             # Let the gantry settle before the resting reading is taken.
@@ -1757,7 +1766,10 @@ class BeaconAccelHoming:
                 "sample_rate_hz": (reference.count - 1) / (reference.last - reference.first),
                 "sample_rate_source": "fresh_reference_timestamps",
                 "reference_sample_count": reference.count,
-                "reference_first_time_s": reference.first, "reference_last_time_s": reference.last}
+                "reference_first_time_s": reference.first, "reference_last_time_s": reference.last,
+                "reference_validation": {"source": "live_prepare_reference_check",
+                    "clock_domain": "main_mcu_print_time", "result": "ready",
+                    "time_s": now, "scheduled_arm_time_s": print_time}}
         self._prepare_notch(attempt, reference)
         reference_quality = self._signal_quality("stationary_reference", count_g,
                                                   mapping=capture_axes_map)

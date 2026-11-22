@@ -19,7 +19,7 @@ except ImportError:
     from accel_homing_axes import validate_axis_mapping
 
 
-VERSION = "independent_mapped_motion_reference_stop_notch_v2"
+VERSION = "independent_mapped_motion_reference_stop_notch_v3"
 MIN_USABLE_CRUISE_SECONDS = 0.25
 CRUISE_EDGE_SECONDS = 0.020
 MIN_CRUISE_SECONDS = MIN_USABLE_CRUISE_SECONDS + 2 * CRUISE_EDGE_SECONDS
@@ -98,6 +98,8 @@ def _policy():
             "motion_labels": "actual commanded trapq segments; no physical-position proof",
             "home_labels": "qualified raw trigger reference_stop_events; not independent contact labels",
             "home_replay_end": "original raw trigger sample inclusive; post-trigger tail never scored",
+            "reference_freshness": "250 ms at motion capture cutoff or recorded live home preparation; scheduled lookahead is not reference acquisition age",
+            "home_prearm_gap": "only the exact reference-end to first-armed-sample boundary, with recorded live preparation and scheduled arm provenance",
             "requires_fresh_full_homing_validation": True,
             "rationale": {
                 "welch": "overlapping Hann segments reduce single-periodogram variance; only recurring narrow peaks propose filters",
@@ -108,7 +110,7 @@ def _policy():
                 "threshold": "20 percent or 0.1 g measured-noise margin, including causal startup, then fresh exact-threshold homes"}}
 
 
-def _reference_rate(meta, first, *, motion):
+def _reference_rate(meta, first, *, motion, arm_time=None):
     if motion:
         rate = meta.get("sample_rate_hz")
         count = meta.get("baseline_sample_count")
@@ -127,8 +129,26 @@ def _reference_rate(meta, first, *, motion):
     measured = (count - 1) / (end - start)
     _require(abs(measured / rate - 1) <= RATE_TOLERANCE,
              "reference sample-rate provenance mismatch")
-    _require(-1.02 / rate <= first - end <= MAX_REFERENCE_AGE_SECONDS,
-             "reference is stale or later than the replay arm")
+    freshness_time = first
+    if not motion and "reference_validation" in meta:
+        validation = meta["reference_validation"]
+        _require(isinstance(validation, dict)
+                 and validation.get("source") == "live_prepare_reference_check"
+                 and validation.get("clock_domain") == "main_mcu_print_time"
+                 and validation.get("result") == "ready"
+                 and _finite(validation.get("time_s"))
+                 and _finite(validation.get("scheduled_arm_time_s"))
+                 and _finite(arm_time)
+                 and validation["scheduled_arm_time_s"] == arm_time
+                 and validation["time_s"] <= arm_time + 1.02 / rate,
+                 "invalid live reference preparation or scheduled arm provenance")
+        freshness_time = validation["time_s"]
+    if not motion and "reference_validation" not in meta:
+        _require(first - end <= MAX_REFERENCE_AGE_SECONDS,
+                 "home reference exceeds 250 ms without recorded live preparation timing")
+    _require(-1.02 / rate <= freshness_time - end <= MAX_REFERENCE_AGE_SECONDS
+             and end <= first + 1.02 / rate,
+             "reference is stale or later than its acquisition boundary")
     return float(rate)
 
 
@@ -236,7 +256,13 @@ def _prepare(item, kind, index, raw_threshold, np, check_running):
         cruise = next(segment for segment in segments if segment["phase"] == "cruise")
         braking = next(segment for segment in segments if segment["phase"] == "braking")
         arm = acceleration["start_time_s"]
-        rate = _reference_rate(capture, arm, motion=True)
+        cutoff = capture.get("capture_cutoff_time_s")
+        _require(_finite(cutoff) and cutoff <= arm
+                 and abs(cutoff - segments[0]["start_time_s"]) <= 1e-6,
+                 capture_id + ": missing or mismatched motion capture cutoff")
+        rate = _reference_rate(capture, cutoff, motion=True)
+        _require(0 <= times[0] - cutoff <= 1.02 / rate,
+                 capture_id + ": missing first eligible motion capture sample")
         start = int(np.searchsorted(times, arm, side="left"))
         end = int(np.searchsorted(times, braking["start_time_s"], side="left"))
         lo, hi = cruise["start_time_s"] + CRUISE_EDGE_SECONDS, cruise["end_time_s"] - CRUISE_EDGE_SECONDS
@@ -268,7 +294,6 @@ def _prepare(item, kind, index, raw_threshold, np, check_running):
                  and meta.get("initial_state") == "zero_at_first_armed_sample"
                  and meta.get("complete") is True,
                  capture_id + ": incomplete or ambiguous first armed sample identity")
-        rate = _reference_rate(meta, times[start], motion=False)
         onset = detector.get("onset_sample_index")
         arm = detector.get("arm_time_s")
         _require(type(onset) is int and start + 3 <= onset < len(rows)
@@ -281,6 +306,7 @@ def _prepare(item, kind, index, raw_threshold, np, check_running):
                  and math.isclose(detector["threshold_g"], raw_threshold, rel_tol=1e-12, abs_tol=1e-12)
                  and _finite(arm),
                  capture_id + ": missing exact raw reference-trigger identity")
+        rate = _reference_rate(meta, times[start], motion=False, arm_time=arm)
         _home_eligibility(meta, times[start], arm, rate)
         _require(capture.get("signal_filter", DISABLED) == DISABLED,
                  capture_id + ": reference homes must use the disabled detector")
@@ -294,8 +320,14 @@ def _prepare(item, kind, index, raw_threshold, np, check_running):
         result.update(start=start, end=onset + 1, onset=onset, speed=float(speed), accel=float(accel),
                       arm=arm, arm_source="recorded_live_first_eligible_sample",
                       lead_limit=min(2.0 / rate, 0.25 / speed))
-    intervals = np.diff(times)
-    _require(bool(np.all(np.abs(intervals * rate - 1) <= RATE_TOLERANCE + 1e-8)),
+    regular = np.abs(np.diff(times) * rate - 1) <= RATE_TOLERANCE + 1e-8
+    if kind == "home" and start > 0 and "reference_validation" in meta:
+        # The reference stream may stop while the homing move is scheduled.
+        # The detector starts from zero at `start`; no filter state crosses
+        # this one boundary. Every other gap (including armed data) rejects.
+        if abs(times[start - 1] - meta["reference_last_time_s"]) <= 1e-9:
+            regular[start - 1] = True
+    _require(bool(np.all(regular)),
              capture_id + ": sample-rate drift or missing/nonuniform samples")
     result["rate"] = rate
     result["raw"] = raw_levels

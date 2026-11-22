@@ -58,6 +58,8 @@ def load_filter_module():
 
 GRAVITY = 9806.65
 CLOCK_FREQ = 1000000.0
+GENTLE_MAX_SPEED = 40.0  # mm/s, selected rail's first approach
+GENTLE_MAX_ACCEL = 1000.0  # mm/s²
 REPORT_TRAVEL_MIN = 0.1
 REPORT_TRAVEL_MAX = 2.0
 STARTUP_REQUEST_TRAVEL_LIMIT = None  # disabled unless explicitly configured

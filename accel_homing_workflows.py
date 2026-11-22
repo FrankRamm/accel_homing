@@ -29,7 +29,7 @@ import urllib.parse
 import uuid
 
 if __package__:
-    from .accel_homing_backends import _ah_compat_sibling_module
+    from .accel_homing_backends import _ah_compat_sibling_module, GENTLE_MAX_SPEED, GENTLE_MAX_ACCEL
     from .accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                       PNGRenderer, default_dependency_directory, preflight_renderer,
                                       validate_accuracy, write_accuracy, write_capture, write_noise,
@@ -38,7 +38,7 @@ if __package__:
                                       publish_captures, prepare_noise, publish_noise,
                                       write_axis_mapping_failure)
 else:  # Standalone offline analysis; do not mask package dependency errors.
-    from accel_homing_backends import _ah_compat_sibling_module
+    from accel_homing_backends import _ah_compat_sibling_module, GENTLE_MAX_SPEED, GENTLE_MAX_ACCEL
     from accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                      PNGRenderer, default_dependency_directory, preflight_renderer,
                                      validate_accuracy, write_accuracy, write_capture, write_noise,
@@ -74,6 +74,9 @@ SIGNAL_QUALITY_FIELDS = ("amplitude_limited", "excess_amplitude_unknown", "peak_
                         "reference_signal_quality")
 CALIBRATION_MIN_TRAVEL_MM = 20.0
 CALIBRATION_REPEATABILITY_MM = 2.0
+# The operator confirms the midpoint, with this much allowance on either side.
+GENTLE_CENTER_TOLERANCE_MM = 2.0
+GENTLE_MAX_POST_TRIGGER_MM = 0.5
 CALIBRATION_THRESHOLD_MARGIN_G = 0.5
 SIMPLE_CALIBRATION = "impact20_mapped_axis_v1"
 REQUIRED_SUCCESSES = 10
@@ -306,6 +309,8 @@ class AccelHomingWorkflows:
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object("gcode")
+        self.gentle_homing = (config.get("gentle_homing", None) is not None
+                              and config.getboolean("gentle_homing"))
         self.model_name = config.get("model", "default")
         if not re.fullmatch(r"[A-Za-z0-9_-]+", self.model_name):
             raise config.error("model must contain only letters, numbers, _ or -")
@@ -551,6 +556,8 @@ class AccelHomingWorkflows:
             rail = self.owner.rails_by_axis.get(axis)
             if rail is None or axis not in self.owner.endstops:
                 raise self._error("axis %s must use this module's accelerometer endstop" % axis.upper())
+            if self.gentle_homing:
+                self._check_gentle_limits(axis, self.printer.command_error)
             info = rail.get_homing_info()
             if info.retract_dist or getattr(info, "min_home_dist", 0.0):
                 raise self._error("workflow axes require homing_retract_dist: 0 and min_home_dist: 0")
@@ -733,8 +740,8 @@ class AccelHomingWorkflows:
         if self.session and self.session.get("mode") == "calibration":
             return
         self._check_filter_model(axis)
-        if (self.model is None or axis not in self.model.thresholds or axis in self.manual_axes
-                or self._temporary_manual_threshold(axis)):
+        if (self.model is None or axis not in self.model.thresholds
+                or not self.gentle_homing and (axis in self.manual_axes or self._temporary_manual_threshold(axis))):
             return
         from_filter = self.model.metadata[axis].get("filter_sample_rate_hz")
         if from_filter is None or abs(rate / from_filter - 1) > 0.02:
@@ -742,6 +749,9 @@ class AccelHomingWorkflows:
                               % axis.upper())
 
     def _validate_model_connection(self):
+        if self.gentle_homing:
+            for axis in self.owner.rails_by_axis:
+                self._check_gentle_limits(axis, self.printer.config_error)
         if self.model is None:
             return
         for axis in self.model.thresholds:
@@ -754,6 +764,9 @@ class AccelHomingWorkflows:
             current = self._model_context(axis)
             for key, value in current.items():
                 if key not in saved or saved[key] != value:
+                    if self.gentle_homing and key in ("homing_speed_mm_s", "homing_accel_mm_s2"):
+                        # Let the host connect to recalibrate this axis. G28 checks the model before motion.
+                        continue
                     raise self.printer.config_error(
                         "Saved %s homing model does not match current %s; recalibrate "
                         "or set an explicit %s_threshold override" % (axis.upper(), key, axis))
@@ -900,6 +913,48 @@ class AccelHomingWorkflows:
             return self.reactor.NEVER
         return self.session["expires"]
 
+    def _check_gentle_limits(self, axis, error):
+        info = self.owner.rails_by_axis[axis].get_homing_info()
+        accel = self.owner.homing_accel
+        if (not 0 < info.speed <= GENTLE_MAX_SPEED or not 0 < accel <= GENTLE_MAX_ACCEL
+                or info.retract_dist or getattr(info, "min_home_dist", 0.)
+                or getattr(info, "accel", None) is not None):
+            raise error("accel_homing: gentle homing requires a single pass at up to 40 mm/s "
+                        "and a plugin homing_accel up to 1000 mm/s² with no rail acceleration override")
+        velocity_limit, accel_limit = self.owner.toolhead.get_max_velocity()
+        if not (velocity_limit >= info.speed and accel_limit >= accel):
+            raise error("accel_homing: current toolhead limits are below the gentle homing plan; "
+                        "restore the limits or lower the homing settings and recalibrate")
+
+    def _check_gentle_model(self, axis):
+        saved = self.model.metadata.get(axis, {}) if self.model else {}
+        threshold = self.owner.threshold_g[axis]
+        if (saved.get("gentle_homing") is not True or saved.get("impact_metric") != "mapped_axis"
+                or saved.get("saved_threshold_tested") is not True
+                or saved.get("tested_threshold_g") != threshold
+                or saved.get("saved_threshold_g") != threshold
+                or self.model.thresholds.get(axis) != threshold
+                or any(saved.get(key) != value for key, value in self._model_context(axis).items())
+                or saved.get("signal_filter") != self._filter_settings(axis)):
+            raise self._error("Gentle homing on %s requires its saved threshold qualified at these "
+                              "motion settings. Manually center XY and run ACCEL_HOMING_CALIBRATE "
+                              "AXIS=%s CENTERED=1" % (axis.upper(), axis.upper()))
+
+    def centered_gentle_home(self, homing):
+        """Use the native single-rail homing routine with a bounded commanded seek."""
+        axis = self.home_axis
+        index = AXES[axis]
+        if list(homing.get_axes()) != [index]:
+            raise self._error("Gentle centered homing requires exactly the selected axis")
+        rail = self.owner.rails_by_axis[axis]
+        info = rail.get_homing_info()
+        center, _ = self._geometry(axis)
+        forcepos, target = [None] * 4, [None] * 4
+        extra = GENTLE_CENTER_TOLERANCE_MM if info.positive_dir else -GENTLE_CENTER_TOLERANCE_MM
+        forcepos[index] = center - extra
+        target[index] = info.position_endstop
+        return homing.home_rails([rail], forcepos, target)
+
     def check_home_axes(self, axes):
         """Called by core before an accelerometer homing session can move."""
         if self.session is not None and (not self.in_home or set(axes) != {self.home_axis}):
@@ -907,6 +962,10 @@ class AccelHomingWorkflows:
                               "command or use CANCEL")
         calibrating = bool(self.session and self.session.get("mode") == "calibration")
         for axis in axes:
+            if self.gentle_homing:
+                self._check_gentle_limits(axis, self.printer.command_error)
+                if not calibrating:
+                    self._check_gentle_model(axis)
             if calibrating or (self._experimental_home(axis) and
                     self.session["experiment"].get("impact_metric") != "mapped_axis"):
                 continue
@@ -953,6 +1012,10 @@ class AccelHomingWorkflows:
         # it does not force stock G28's all-motor fault cleanup for an early hit.
         if self.in_home and record.get("axis", "").lower() != self.home_axis:
             raise self._error("unexpected homing result axis")
+        if self.gentle_homing and not self.in_home and record.get("result") == "impact":
+            reason = self._gentle_halt_error(record["axis"], record)
+            if reason:
+                raise self._error(reason)
 
     def _invalidate_calibration_axis(self, session):
         if session.get("axis_touched"):
@@ -1191,6 +1254,8 @@ class AccelHomingWorkflows:
         self._preflight(axes, continuation=previous_accuracy is not None)
         if mode != "calibration":
             for selected_axis in axes:
+                if self.gentle_homing:
+                    self._check_gentle_model(selected_axis)
                 self._check_filter_model(selected_axis)
         if mode == "calibration" and self._geometry(axis)[1] <= CALIBRATION_MIN_TRAVEL_MM:
             raise gcmd.error("center-to-endstop travel must exceed 20 mm for impact discovery")
@@ -1219,6 +1284,14 @@ class AccelHomingWorkflows:
             self._clear_noise_seeds()
 
     def _announce_calibration(self, session):
+        if self.gentle_homing:
+            center, expected = self._geometry(session["axis"])
+            self._info("Gentle %s: mapped threshold %.6g g, midpoint %.3f mm, expected travel "
+                       "%.3f +/- %.1f mm. A rejected contact ends this run. Commanded travel "
+                       "after trigger must be <= %.2f mm." % (
+                           session["axis"].upper(), session["candidate"], center, expected,
+                           GENTLE_CENTER_TOLERANCE_MM, GENTLE_MAX_POST_TRIGGER_MM))
+            return
         self._info("%s signal filter: %s; stationary noise seed remains a raw mapped-axis starting heuristic, "
                    "not a bound on filtered transients" %
                    (session["axis"].upper(), json.dumps(self._filter_settings(session["axis"]), sort_keys=True)))
@@ -1527,6 +1600,147 @@ class AccelHomingWorkflows:
         session["recommendation"] = self._noise_recommend(session)
         self._check_noise_running(session)
 
+    def _gentle_collect_motion_noise(self, session):
+        """Acquire bounded free strokes before any gentle calibration contact."""
+        if not getattr(self, "gentle_homing", False):
+            return
+        if self._filter_settings(session["axis"]) != {"type": "disabled"}:
+            raise self._error("gentle calibration requires unfiltered moving-noise evidence; "
+                              "use NOTCH=AUTO or disable the fixed notch before calibration")
+        if session.get("auto_notch"):
+            # AUTO owns its existing three captures. Never duplicate motion or
+            # silently replace a partial AUTO acquisition with another set.
+            return
+        session.update(beta_generation=self.owner.operation_generation,
+                       beta_motion_iterations=[])
+        plan = self._beta_motion_plan(session)
+        session["beta_motion_plan"] = {key: value for key, value in plan.items()
+                                       if key not in ("extractor", "current_helper")}
+        self._beta_motion_noise(session, plan)
+        session["beta_phase"] = "gentle_motion_complete"
+        self._require_unhomed_xy()
+
+    def _gentle_motion_seed_peak(self, session):
+        """Measure the mapped component, not XYZ magnitude or a braking tail."""
+        mapping = self._validate_current_axis_mapping(session["axis_mapping"], session["axis"])
+        settings = self._filter_settings(session["axis"])
+        if settings != {"type": "disabled"}:
+            raise self._error("gentle calibration cannot qualify a fixed-notch startup response; "
+                              "use NOTCH=AUTO or disable the fixed notch")
+        items = session.get("beta_motion_iterations", ())
+        plan = session.get("beta_motion_plan")
+        evidence = {"complete": False, "run_id": session["run_id"],
+                    "source": "independent_mapped_forward_motion_noise",
+                    "impact_metric": "mapped_axis", "axis_mapping": copy.deepcopy(mapping),
+                    "signal_filter": copy.deepcopy(settings),
+                    "sensor_context": copy.deepcopy(session.get("axis_mapping_context")),
+                    "kinematic_context": copy.deepcopy(self._model_context(session["axis"])),
+                    "seed_phases": ["startup", "acceleration", "cruise"],
+                    "excluded_seed_phases": ["braking", "return"], "iterations": []}
+        session["gentle_motion_noise"] = evidence
+        if (len(items) != NOISE_ITERATIONS or not isinstance(plan, dict)
+                or evidence["sensor_context"] != self.owner.noise_sensor_context()):
+            raise self._error("gentle calibration requires three complete current moving-noise captures")
+        finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+        info = self.owner.rails_by_axis[session["axis"]].get_homing_info()
+        velocity, accel = self.owner.toolhead.get_max_velocity()
+        expected_accel = min(accel, self.owner.homing_accel) if self.owner.homing_accel else accel
+        if getattr(info, "accel", None) is not None:
+            expected_accel = info.accel
+        if (plan.get("axis") != session["axis"]
+                or plan.get("effective_speed_mm_s") != min(info.speed, velocity)
+                or plan.get("effective_accel_mm_s2") != expected_accel):
+            raise self._error("gentle moving-noise plan no longer matches effective homing kinematics")
+        previous_end = None
+        for iteration, item in enumerate(items, 1):
+            self._check_running(session)
+            record, capture = item.get("record", {}), item.get("capture", {})
+            rows, baseline = capture.get("samples", ()), capture.get("baseline_g", ())
+            rate = capture.get("sample_rate_hz")
+            segments = record.get("segments", ())
+            if (capture.get("raw_samples_validated") is not True
+                    or any(capture.get(key) for key in ("fault", "dropped", "raw_rows_omitted",
+                        "invalid_rows", "truncation", "unavailable", "retention_error",
+                        "amplitude_limited", "excess_amplitude_unknown", "clipped_axis_values",
+                        "range_limit_axis_values", "saturation_axis_values"))
+                    or record.get("run_id") != session["run_id"]
+                    or record.get("iteration") != iteration
+                    or record.get("phase_time_source") != "actual_commanded_trapq"
+                    or capture.get("sensor_context") != evidence["sensor_context"]
+                    or len(baseline) != 3 or not all(finite(value) for value in baseline)
+                    or not finite(rate) or rate <= 0 or len(rows) < 2
+                    or not segments):
+                raise self._error("gentle moving-noise capture %d is incomplete or invalid" % iteration)
+            for key in ("axis", "effective_speed_mm_s", "effective_accel_mm_s2"):
+                if record.get(key) != plan.get(key):
+                    raise self._error("gentle moving-noise capture does not match target homing kinematics")
+            phase_names = set()
+            previous_segment_end = None
+            for segment in segments:
+                left, right = segment.get("start_time_s"), segment.get("end_time_s")
+                phase = segment.get("phase")
+                if (phase not in ("startup", "acceleration", "cruise", "braking")
+                        or segment.get("axis") != session["axis"]
+                        or not finite(left) or not finite(right) or right <= left
+                        or previous_segment_end is not None
+                        and not math.isclose(left, previous_segment_end, abs_tol=1e-6)):
+                    raise self._error("gentle moving-noise actual motion phases are invalid")
+                phase_names.add(phase)
+                previous_segment_end = right
+            if not {"acceleration", "cruise", "braking"}.issubset(phase_names):
+                raise self._error("gentle moving-noise capture lacks actual acceleration/cruise/braking")
+            phase_peaks = dict.fromkeys(evidence["seed_phases"], 0.0)
+            phase_counts = dict.fromkeys(evidence["seed_phases"], 0)
+            last_time = None
+            for index, row in enumerate(rows):
+                if index % 2048 == 0:
+                    self._check_running(session)
+                if len(row) != 4 or not all(finite(value) for value in row):
+                    raise self._error("gentle moving-noise capture contains invalid samples")
+                when = row[0]
+                if last_time is not None and not 0 < when - last_time <= 5.0 / rate + .000003:
+                    raise self._error("gentle moving-noise capture contains a sample gap")
+                last_time = when
+                for segment in segments:
+                    phase = segment["phase"]
+                    if phase in phase_peaks and segment["start_time_s"] <= when < segment["end_time_s"]:
+                        level = abs(row[mapping["source_axis"] + 1] - baseline[mapping["source_axis"]])
+                        phase_peaks[phase] = max(phase_peaks[phase], level)
+                        phase_counts[phase] += 1
+            if (rows[0][0] > segments[0]["start_time_s"] + 2.0 / rate
+                    or rows[-1][0] < segments[-1]["end_time_s"] - 1.0 / rate
+                    or any(phase_counts[phase] < 2 for phase in phase_names if phase in phase_counts)
+                    or previous_end is not None and rows[0][0] <= previous_end):
+                raise self._error("gentle moving-noise capture is incomplete or not independent")
+            previous_end = rows[-1][0]
+            evidence["iterations"].append({"iteration": iteration,
+                "sample_count": len(rows), "first_sample_time_s": rows[0][0],
+                "last_sample_time_s": rows[-1][0], "sample_rate_hz": rate,
+                "phase_peak_g": phase_peaks, "phase_sample_count": phase_counts,
+                "mapped_peak_g": max(phase_peaks.values()), "segments": copy.deepcopy(segments)})
+        evidence.update(motion_peak_g=max(item["mapped_peak_g"] for item in evidence["iterations"]),
+                        effective_speed_mm_s=plan["effective_speed_mm_s"],
+                        effective_accel_mm_s2=plan["effective_accel_mm_s2"])
+        return evidence["motion_peak_g"]
+
+    def _gentle_validate_motion_seed(self, session):
+        """Resuming must not bypass the measured startup bound or its context."""
+        if not getattr(self, "gentle_homing", False):
+            return
+        evidence = session.get("gentle_motion_noise") or {}
+        if (evidence.get("complete") is not True or evidence.get("run_id") != session["run_id"]
+                or evidence.get("axis_mapping") != session.get("axis_mapping")
+                or evidence.get("sensor_context") != self.owner.noise_sensor_context()
+                or evidence.get("signal_filter") != self._filter_settings(session["axis"])
+                or evidence.get("kinematic_context") != self._model_context(session["axis"])):
+            raise self._error("gentle calibration moving-noise evidence is missing or changed; restart calibration")
+        required = evidence.get("required_threshold_g")
+        if (type(required) not in (int, float) or not math.isfinite(required)
+                or any(type(session.get(key)) not in (int, float)
+                       or not math.isfinite(session[key]) or session[key] < required
+                       for key in ("start_threshold_g", "candidate"))):
+            raise self._error("gentle calibration threshold is below its measured moving-noise requirement")
+
     def _calibration_noise_preflight(self, session):
         # _begin has validated CENTERED, the command parameters and the motion
         # policy without moving or changing motor state. Keep this exact active
@@ -1566,7 +1780,10 @@ class AccelHomingWorkflows:
                 not isinstance(peak, (int, float)) or isinstance(peak, bool)
                 or not math.isfinite(peak) or peak < 0.0 for peak in peaks)):
             raise self._error("calibration requires three measured mapped-axis noise peaks")
-        peak = max(peaks)
+        peak = stationary_peak = max(peaks)
+        gentle = getattr(self, "gentle_homing", False)
+        if gentle:
+            peak = max(peak, self._gentle_motion_seed_peak(session))
         magnitude_peak = max(item["record"]["noise_magnitude_peak_g"] for item in session["iterations"])
         start, step = session["start_threshold_g"], session["threshold_step_g"]
         # Decimal avoids an extra grid step from binary roundoff at an exact
@@ -1586,12 +1803,23 @@ class AccelHomingWorkflows:
             "noise_metric": "raw_mapped_axis_starting_heuristic",
             "signal_filter": self._filter_settings(session["axis"]),
             "impact_metric": "mapped_axis", "axis_mapping": dict(mapping),
-            "noise_axis_peak_g": peak, "noise_magnitude_peak_g": magnitude_peak,
+            "noise_axis_peak_g": stationary_peak, "noise_magnitude_peak_g": magnitude_peak,
             "initial_threshold_source": "explicit_start_threshold" if explicit else "stationary_noise",
             "start_threshold_g": start if explicit else candidate,
             "acquisition_faults": list(noise_result["acquisition_faults"]),
             "summary_paths": {}}
         session["deferred_noise_result"] = noise_result
+        if gentle:
+            evidence = session["gentle_motion_noise"]
+            if not explicit:
+                session["stationary_noise"]["initial_threshold_source"] = "gentle_motion_and_stationary_noise"
+            evidence.update(stationary_peak_g=stationary_peak, seed_peak_g=peak,
+                            required_threshold_g=required, minimum_grid_threshold_g=candidate,
+                            configured_start_g=start, candidate_step_g=step,
+                            margin_factor=1.2, margin_g=0.1, threshold_limit_g=limit)
+            if explicit and (start < required or start <= peak):
+                raise self._error("explicit START_THRESHOLD %.6g g is below the gentle moving-noise "
+                                  "requirement %.6g g; no contact was attempted" % (start, required))
         if not explicit:
             if limit is None:
                 raise self._error("stationary mapped-axis noise cannot select a calibration start "
@@ -1611,13 +1839,24 @@ class AccelHomingWorkflows:
                 "configured_start_g": start, "candidate_step_g": step, "threshold_limit_g": limit,
                 "margin_factor": 1.2, "margin_g": 0.1}
             session.update(start_threshold_g=candidate, candidate=candidate)
-            self._info("Fresh stationary mapped-axis peak %.6g g selects initial candidate %.6g g; "
-                       "ten-home qualification remains required" % (peak, candidate))
-        else:
+            if not gentle:
+                self._info("Fresh stationary mapped-axis peak %.6g g selects initial candidate %.6g g; "
+                           "ten-home qualification remains required" % (peak, candidate))
+        elif not gentle:
             self._info("Fresh stationary mapped-axis peak %.6g g measured; explicit START_THRESHOLD "
                        "%.6g g remains the initial candidate" % (peak, start))
+        if gentle:
+            evidence.update(complete=True, selected_threshold_g=session["start_threshold_g"])
+            if "noise_seed" in session:
+                session["noise_seed"].update(source="gentle_motion_and_stationary_noise",
+                    noise_metric="raw_mapped_forward_motion_and_stationary_peak",
+                    motion_peak_g=evidence["motion_peak_g"], stationary_peak_g=stationary_peak)
+            self._gentle_validate_motion_seed(session)
+            self._info("Gentle mapped moving-noise peak %.6g g and stationary peak %.6g g "
+                       "select %.6g g before contact" % (
+                           evidence["motion_peak_g"], stationary_peak, session["start_threshold_g"]))
         session["recommendation"].update(calibration_axis=session["axis"], impact_metric="mapped_axis",
-                                         axis_mapping=dict(mapping), noise_axis_peak_g=peak)
+                                         axis_mapping=dict(mapping), noise_axis_peak_g=stationary_peak)
         self._announce_calibration(session)
         self._check_running(session)
         self._check_stopped_noise_context(session)
@@ -1984,6 +2223,10 @@ class AccelHomingWorkflows:
         record["configured_homing_speed_mm_s"] = self.owner.rails_by_axis[axis].get_homing_info().speed
         record["homing_speed_mm_s"] = detector.get("homing_speed_mm_s")
         record["homing_accel_mm_s2"] = detector.get("homing_accel_mm_s2")
+        if self.gentle_homing and (
+                record["homing_speed_mm_s"] != record["configured_homing_speed_mm_s"]
+                or record["homing_accel_mm_s2"] != self.owner.homing_accel):
+            raise self._error("gentle contact capture does not match the planned speed and acceleration")
         session["last_arm_time"] = arm
 
     def _validate_experimental_receipt(self, session, source_record, detector, capture):
@@ -2067,6 +2310,10 @@ class AccelHomingWorkflows:
                     return "fatal", "calibration homing result has different automatic axis mapping"
             if result != "impact":
                 return "fatal", "sensor/homing failure (%s)" % result
+            if self.gentle_homing:
+                reason = self._gentle_contact_error(axis, record, travel)
+                if reason:
+                    return "implausible", reason
             if travel <= CALIBRATION_MIN_TRAVEL_MM:
                 return "early", "early trigger at %.3f mm (impact must occur after 20 mm)" % travel
             _center, expected = self._geometry(axis)
@@ -2088,6 +2335,10 @@ class AccelHomingWorkflows:
             return "fatal", "sensor/homing failure (%s)" % result
         if not isinstance(travel, (int, float)) or not math.isfinite(travel):
             return "fatal", "missing commanded travel measurement"
+        if self.gentle_homing and session:
+            reason = self._gentle_contact_error(axis, record, record.get("travel_mm_exact", travel))
+            if reason:
+                return "fatal", reason
         if result == "pressed" or travel <= MIN_TRAVEL:
             return "early", "pressed start or early trigger at %.2f mm (must exceed 10 mm)" % travel
         if not (record.get("moving") or record.get("motion_seen")
@@ -2100,6 +2351,25 @@ class AccelHomingWorkflows:
         if travel > expected * (1.0 + self.travel_tolerance):
             return "fatal", "travel %.2f mm exceeds expected center travel %.2f mm" % (travel, expected)
         return "good", "qualified center-to-stop home"
+
+    def _gentle_contact_error(self, axis, record, travel):
+        expected = self._geometry(axis)[1]
+        if abs(travel - expected) > GENTLE_CENTER_TOLERANCE_MM:
+            return ("gentle %s contact at %.4f mm is outside %.4f +/- %.1f mm of commanded "
+                    "center travel" % (axis.upper(), travel, expected, GENTLE_CENTER_TOLERANCE_MM))
+        return self._gentle_halt_error(axis, record)
+
+    @staticmethod
+    def _gentle_halt_error(axis, record):
+        trigger = record.get("trigger_travel_mm_signed")
+        halt = record.get("halt_travel_mm_signed")
+        if any(type(v) not in (int, float) or not math.isfinite(v) for v in (trigger, halt)):
+            return "gentle contact lacks finite trigger and halt step positions"
+        after = abs(halt - trigger)
+        if after > GENTLE_MAX_POST_TRIGGER_MM:
+            return ("gentle %s commanded %.4f mm between trigger and halt, above %.2f mm; "
+                    "inspect the stop before another home" % (axis.upper(), after, GENTLE_MAX_POST_TRIGGER_MM))
+        return None
 
     @staticmethod
     def _repeatability_spread(records):
@@ -2136,12 +2406,16 @@ class AccelHomingWorkflows:
         coordinates[AXES[axis]] = center
         info = self.owner.rails_by_axis[axis].get_homing_info()
         toolhead = self.owner.toolhead
-        # _home -> _end_session restored the ordinary acceleration limit.
-        # Calibration and accuracy must return and settle under the same policy.
-        # Never restore an unexplained active cap here or reduce homing speed.
-        toolhead.manual_move(coordinates, min(self.reposition_speed, info.speed))
-        self._check_running(session)
-        toolhead.wait_moves()
+        try:
+            if self.gentle_homing:
+                self.owner._limit_accel()
+                self._check_running(session)
+            toolhead.manual_move(coordinates, min(self.reposition_speed, info.speed))
+            self._check_running(session)
+            toolhead.wait_moves()
+        finally:
+            if self.gentle_homing:
+                self.owner._restore_accel()
         self._check_running(session)
         settle = (self.calibration_settle_time
                   if session["mode"] in ("calibration", "accuracy", "troubleshoot") else 0.0)
@@ -2288,6 +2562,9 @@ class AccelHomingWorkflows:
                 # Reject immediately, then require fresh discovery and ten checks.
                 reason = "%s validation spread %s mm exceeds 2 mm after %d checks" % (
                     axis.upper(), spread, session["successes"])
+                if self.gentle_homing:
+                    raise self._error(self._mark_implausible_calibration(
+                        axis, session["terminal_home"][2], reason))
                 candidate = self._next_calibration_candidate(reason)
                 session["last_rejected_spread_mm"] = spread
                 self._info(reason + "; restart from impact discovery at %.2f g" % candidate)
@@ -2347,6 +2624,11 @@ class AccelHomingWorkflows:
                     or record.get("workflow_phase") != ("discovery" if index == 0 else "validation") \
                     or self._quality(axis, record)[0] != "good":
                 raise self._error(message)
+        if self.gentle_homing:
+            info = self.owner.rails_by_axis[axis].get_homing_info()
+            if any(r.get("homing_speed_mm_s") != info.speed
+                   or r.get("homing_accel_mm_s2") != self.owner.homing_accel for r in window):
+                raise self._error("gentle qualification homes must match the saved speed and acceleration")
         if self._repeatability_spread(qualified) > CALIBRATION_REPEATABILITY_MM:
             raise self._error(message)
         return qualified
@@ -2364,7 +2646,8 @@ class AccelHomingWorkflows:
         # Final release may yield while its motion completes. Recheck all ten
         # accepted trials before staging any model settings.
         self._qualified_validation_records()
-        threshold = tested_threshold if session.get("auto_notch") else self._calibration_saved_threshold(tested_threshold)
+        exact = bool(self.gentle_homing or session.get("auto_notch"))
+        threshold = tested_threshold if exact else self._calibration_saved_threshold(tested_threshold)
         noise_png = None
         if session.get("deferred_noise_result") is not None:
             generation, preflight = self.owner.operation_generation, self.preflight_generation
@@ -2385,7 +2668,9 @@ class AccelHomingWorkflows:
             self._qualified_validation_records()
             # Rendering can yield; the final value must still fit the current
             # sensor headroom, not just the lower threshold used by the trials.
-            threshold = tested_threshold if session.get("auto_notch") else self._calibration_saved_threshold(tested_threshold)
+            if not exact:
+                threshold = self._calibration_saved_threshold(tested_threshold)
+        self._validate_calibration_threshold(threshold, "saved calibration threshold")
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
                     "axis_mapping": self._validate_current_axis_mapping(session["axis_mapping"], axis),
                     "axis_mapping_context": session["axis_mapping_context"],
@@ -2410,12 +2695,17 @@ class AccelHomingWorkflows:
                     "calibration_step_g": session["threshold_step_g"],
                     "tested_threshold_g": tested_threshold,
                     "saved_threshold_g": threshold,
-                    "threshold_margin_g": 0.0 if session.get("auto_notch") else CALIBRATION_THRESHOLD_MARGIN_G,
-                    "saved_threshold_tested": bool(session.get("auto_notch")),
+                    "threshold_margin_g": 0.0 if exact else CALIBRATION_THRESHOLD_MARGIN_G,
+                    "saved_threshold_tested": exact,
                     "calibration_quiet_range_enforced": session["quiet_range_enforced"],
                     "calibration_settle_time_s": session["calibration_settle_time_s"],
                     "recovery": self._calibration_recovery_status(session),
                     "physical_position_verified": False}
+        if self.gentle_homing:
+            metadata.update(gentle_homing=True, gentle_motion_noise=copy.deepcopy(session["gentle_motion_noise"]),
+                            center_tolerance_mm=GENTLE_CENTER_TOLERANCE_MM,
+                            max_commanded_post_trigger_mm=GENTLE_MAX_POST_TRIGGER_MM,
+                            recenter_acceleration_policy="qualified_homing_acceleration")
         metadata["runtime_threshold_setting"] = {
             "version": 1, "section": self.config.get_name(), "option": axis + "_threshold",
             "threshold_g": threshold, "run_id": session["run_id"]}
@@ -2468,13 +2758,15 @@ class AccelHomingWorkflows:
         result = {"result": "calibrated", "axis": axis, "threshold_g": threshold,
                   "impact_metric": "mapped_axis", "axis_mapping": metadata["axis_mapping"],
                   "tested_threshold_g": tested_threshold, "saved_threshold_g": threshold,
-                  "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
-                  "saved_threshold_tested": False,
+                  "threshold_margin_g": metadata["threshold_margin_g"],
+                  "saved_threshold_tested": exact,
                   "successes": REQUIRED_SUCCESSES, "model": self.model_name,
                   "run_id": session["run_id"], "save_config": session["save_config"],
                   "repeatability_spread_mm": spread,
                   "repeatability_limit_mm": CALIBRATION_REPEATABILITY_MM,
                   "algorithm": SIMPLE_CALIBRATION, "restarts": session["restarts"]}
+        if self.gentle_homing:
+            result.update(gentle_homing=True, gentle_motion_noise=metadata["gentle_motion_noise"])
         if recovery is not None:
             result.update(accuracy_recovery=dict(recovery), source_accuracy=session["source_accuracy"])
         save = session["save_config"]
@@ -2499,12 +2791,16 @@ class AccelHomingWorkflows:
             self.last_result["invalidated_axis"] = conflict["axis"]
             self._info("%s saved mapping was invalidated by the new %s mapping; recalibrate %s "
                        "before ordinary homing" % (conflict["axis"].upper(), axis.upper(), conflict["axis"].upper()))
-        self._info("%s model %s: ten qualified homes tested at %.12g g with commanded "
-                   "travel spread %s mm <= %.2f mm; staging %.12g g "
-                   "(tested threshold + %.1f g). The saved threshold was not tested by those homes. %s" % (
-            axis.upper(), self.model_name, tested_threshold, spread, CALIBRATION_REPEATABILITY_MM,
-            threshold, CALIBRATION_THRESHOLD_MARGIN_G,
-            "The calibrated %s_threshold and model become active after SAVE_CONFIG and restart." % axis))
+        if self.gentle_homing:
+            self._info("%s gentle model: staging the tested %.12g g threshold after ten homes "
+                       "with a commanded travel spread of %s mm" % (axis.upper(), threshold, spread))
+        else:
+            self._info("%s model %s: ten qualified homes tested at %.12g g with commanded "
+                       "travel spread %s mm <= %.2f mm; staging %.12g g "
+                       "(tested threshold + %.1f g). The saved threshold was not tested by those homes. %s" % (
+                           axis.upper(), self.model_name, tested_threshold, spread, CALIBRATION_REPEATABILITY_MM,
+                           threshold, CALIBRATION_THRESHOLD_MARGIN_G,
+                           "The calibrated %s_threshold and model become active after SAVE_CONFIG and restart." % axis))
         if save:
             if recovery is not None:
                 self._info("After SAVE_CONFIG succeeds and Klipper restarts, release and manually center XY, "
@@ -2569,6 +2865,8 @@ class AccelHomingWorkflows:
 
     def cmd_CALIBRATE(self, gcmd):
         notch = gcmd.get("NOTCH", None)
+        if gcmd.get("CONTACT_ONLY", None) is not None and str(notch).strip().upper() != "AUTO":
+            raise gcmd.error("CONTACT_ONLY requires NOTCH=AUTO to capture the diagnostic ZIP")
         if notch is not None:
             if str(notch).strip().upper() != "AUTO":
                 raise gcmd.error("NOTCH must be AUTO when specified")
@@ -2609,6 +2907,7 @@ class AccelHomingWorkflows:
             if self._snapshot() != snapshot or self.owner.operation_generation != generation:
                 raise self._error("printer state changed before automatic mapping; manually recenter and retry")
             self._calibration_axis_mapping(session)
+            self._gentle_collect_motion_noise(session)
             self._calibration_noise_preflight(session)
             self._calibrate_trials()
         except Exception as exc:
@@ -3655,6 +3954,8 @@ class AccelHomingWorkflows:
                     emit("attempt.%d.%s" % (attempt, key), value)
 
     def cmd_BETA_CALIBRATE(self, gcmd):
+        if self.gentle_homing:
+            raise gcmd.error("Gentle homing requires mapped-axis ACCEL_HOMING_CALIBRATE")
         axis = gcmd.get("AXIS", "").lower()
         if axis not in AXES:
             raise gcmd.error("AXIS must be X or Y")
@@ -3723,6 +4024,8 @@ class AccelHomingWorkflows:
                 raise self._error("printer state changed while awaiting manual recentering; restart workflow")
             self._require_unhomed_xy()
             session["state"] = "running"
+            if self.gentle_homing:
+                self._gentle_validate_motion_seed(session)
             self.reactor.update_timer(self.timer, self.reactor.NEVER)
             self._calibrate_trials()
         except Exception as exc:
@@ -4071,6 +4374,10 @@ class AccelHomingWorkflows:
         if axis not in AXES:
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT requires AXIS=X or AXIS=Y")
         experiment_mode = str(gcmd.get("MODE", "LIVE")).strip().upper()
+        if self.gentle_homing:
+            self._check_gentle_model(axis)
+            if experiment_mode != "COMPARE":
+                raise gcmd.error("Gentle homing requires the mapped-axis experiment MODE=COMPARE")
         # Only the transport comparison can use a mapped calibration. The
         # historical fitter and live/shadow paths still require XYZ evidence.
         profiles = [self.pending_model_metadata.get(axis)]
@@ -5037,7 +5344,8 @@ class AccelHomingWorkflows:
                     active["stationary_noise"] = dict(session["stationary_noise"])
         if active is not None and session.get("auto_notch"):
             active["auto_notch"] = session["auto_notch_controller"].summary(session)
-        return {"model": self.model_name, "manual_threshold_overrides": sorted(self.manual_axes),
+        return {"model": self.model_name, "gentle_homing": self.gentle_homing,
+                "manual_threshold_overrides": sorted(self.manual_axes),
                 "active": active, "last_result": self.last_result,
                 "noise_recommendation": self.noise_recommendation,
                 "noise_seed_axes": sorted(self.noise_seeds),

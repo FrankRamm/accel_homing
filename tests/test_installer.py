@@ -153,6 +153,139 @@ class HostFixture(unittest.TestCase):
                              .replace("endstop_pin: !PA0", "endstop_pin: accel_homing:y")
                              .replace("homing_retract_dist: 3", options))
 
+    def gentle_homing_fixture(self, sensor="adxl345 toolhead", acceleration="5000"):
+        plugin = "\n[accel_homing]\naccel_chip: " + sensor + "\nmax_sample_age: 0.020\n"
+        if acceleration is not None:
+            plugin += "homing_accel: " + acceleration + "\n"
+        self.config.write_bytes((CONFIG.replace("[beacon]", "[" + sensor + "]") + plugin + SAVED).encode())
+        self.axes.write_bytes(AXES.replace("tmc2209_stepper_x:virtual_endstop", "accel_homing:x")
+                             .replace("endstop_pin: !PA0", "endstop_pin: accel_homing:y")
+                             .replace("homing_speed: 150", "homing_speed: 125")
+                             .replace("homing_speed: 35", "homing_speed: 25")
+                             .replace("homing_retract_dist: 5", "homing_retract_dist: 0")
+                             .replace("homing_retract_dist: 3", "homing_retract_dist: 0")
+                             .replace("homing_accel: 1000\n", "")
+                             .replace("min_home_dist: 10", "min_home_dist: 0").encode())
+
+    def test_gentle_homing_caps_installed_rails_and_preserves_hardware_and_saved_models(self):
+        self.gentle_homing_fixture()
+        before = self.config.read_bytes(), self.axes.read_bytes()
+        changes, messages, sensor = self.plan("--gentle-homing")
+        self.assertEqual(sensor, "adxl345 toolhead")
+        axes = changes[self.axes]["data"].decode()
+        self.assertEqual(self.planned_speed(changes, "x"), 40.)
+        self.assertEqual(self.planned_speed(changes, "y"), 25.)
+        for line in ("home_current: 0.6", "diag_pin: ^PB0", "diag0_pin: PB1",
+                     "run_current: 1.2", "min_home_dist: 0", "endstop_pin: accel_homing:x"):
+            self.assertIn("\n" + line + "\n", axes)
+            self.assertNotIn("# " + line, axes)
+        self.assertEqual(axes.count("homing_retract_dist: 0"), 2)
+        main = changes[self.config]["data"].decode()
+        self.assertIn("gentle_homing: True", main)
+        self.assertIn("\nhoming_accel: 1000\n", main)
+        self.assertTrue(main.endswith(SAVED))
+        self.assertIn("Recalibrate all selected axes", "\n".join(messages))
+        self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), before)
+
+    def test_gentle_homing_caps_never_raise_lower_positive_acceleration(self):
+        for original, expected in ((None, "1000"), ("0", "1000"), ("500", "500"),
+                                   ("1000", "1000"), ("5000", "1000")):
+            with self.subTest(original=original):
+                self.gentle_homing_fixture(acceleration=original)
+                changes, _, _ = self.plan("--gentle-homing")
+                self.assertIn("\nhoming_accel: " + expected + "\n", changes[self.config]["data"].decode())
+
+    def test_gentle_homing_requires_exact_existing_plugin_axis_scope(self):
+        self.gentle_homing_fixture()
+        before = self.config.read_bytes(), self.axes.read_bytes()
+        with self.assertRaisesRegex(installer.InstallError, "all and only existing plugin-owned axes"):
+            self.plan("--gentle-homing", "--axes", "x")
+        self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), before)
+        self.axes.write_text(self.axes.read_text().replace("endstop_pin: accel_homing:y", "endstop_pin: !PA0"))
+        before_y = self.axes.read_text().split("[stepper_y]", 1)[1]
+        with self.assertRaisesRegex(installer.InstallError, "cannot convert physical endstops"):
+            self.plan("--gentle-homing")
+        changes, _, _ = self.plan("--gentle-homing", "--axes", "x")
+        self.assertEqual(changes[self.axes]["data"].decode().replace("\r\n", "\n").split("[stepper_y]", 1)[1], before_y)
+
+    def test_gentle_homing_rejects_fresh_installs_and_missing_owned_rails(self):
+        with self.assertRaisesRegex(installer.InstallError, "requires an existing"):
+            self.plan("--gentle-homing")
+        self.gentle_homing_fixture()
+        self.axes.write_text(AXES)
+        with self.assertRaisesRegex(installer.InstallError, "cannot convert physical endstops"):
+            self.plan("--gentle-homing")
+
+    def test_gentle_homing_rejects_second_pass_and_rail_acceleration_without_mutation(self):
+        for old, new, message in (
+                ("homing_retract_dist: 0", "homing_retract_dist: 3", "active second pass"),
+                ("min_home_dist: 0", "min_home_dist: 3", "active second pass"),
+                ("min_home_dist: 0", "min_home_dist: 0\nhoming_accel: 5000", "rail homing_accel")):
+            with self.subTest(setting=new):
+                self.gentle_homing_fixture()
+                self.axes.write_text(self.axes.read_text().replace(old, new, 1))
+                before = self.config.read_bytes(), self.axes.read_bytes()
+                with self.assertRaisesRegex(installer.InstallError, message):
+                    self.plan("--gentle-homing")
+                self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), before)
+
+    def test_gentle_homing_validates_policies_using_both_resulting_caps(self):
+        self.gentle_homing_fixture()
+        changes, _, _ = self.plan("--gentle-homing", "--max-report-travel", "1", "--max-startup-travel", "2.8")
+        self.assertEqual(self.planned_speed(changes, "x"), 40.)
+        before = self.config.read_bytes(), self.axes.read_bytes()
+        with self.assertRaisesRegex(installer.InstallError, "acceleration 1000.*2.72 mm"):
+            self.plan("--gentle-homing", "--max-report-travel", "1", "--max-startup-travel", "2.5")
+        self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), before)
+
+    def test_gentle_homing_rejects_invalid_configured_motion_values(self):
+        for option, value in (("homing_speed", "nan"), ("homing_speed", "inf"), ("homing_speed", "0"),
+                              ("homing_accel", "nan"), ("homing_accel", "-1")):
+            with self.subTest(option=option, value=value):
+                self.gentle_homing_fixture()
+                path, old = (self.axes, "125") if option == "homing_speed" else (self.config, "5000")
+                path.write_text(path.read_text().replace(option + ": " + old, option + ": " + value))
+                with self.assertRaisesRegex(installer.InstallError, "finite"):
+                    self.plan("--gentle-homing")
+
+    def test_gentle_homing_is_idempotent_for_existing_configuration(self):
+        self.gentle_homing_fixture()
+        changes, _, _ = self.plan("--gentle-homing")
+        for path, change in changes.items():
+            if change["kind"] == "file":
+                path.write_bytes(change["data"])
+        changes, _, _ = self.plan("--gentle-homing")
+        self.assertNotIn(self.config, changes)
+        self.assertNotIn(self.axes, changes)
+
+    def test_gentle_homing_accepts_native_beacon_without_changing_hardware(self):
+        self.gentle_homing_fixture(sensor="beacon")
+        changes, _, sensor = self.plan("--gentle-homing")
+        self.assertEqual(sensor, "beacon")
+        self.assertEqual(self.planned_speed(changes, "x"), 40.)
+        self.assertIn(b"\nhome_current: 0.6\n", changes[self.axes]["data"])
+
+    def test_persisted_gentle_homing_keeps_hardware_and_prevents_implicit_conversion(self):
+        self.gentle_homing_fixture()
+        self.config.write_bytes(self.config.read_bytes().replace(b"[accel_homing]\n", b"[accel_homing]\ngentle_homing: True\n"))
+        changes, _, _ = self.plan()
+        self.assertEqual(self.planned_speed(changes, "x"), 40.)
+        self.assertIn(b"\nhome_current: 0.6\n", changes[self.axes]["data"])
+        with self.assertRaisesRegex(installer.InstallError, "cannot be combined with --homing-speed"):
+            self.plan("--homing-speed", "100")
+        self.axes.write_bytes(self.axes.read_bytes().replace(b"endstop_pin: accel_homing:y", b"endstop_pin: !PA0"))
+        before = self.config.read_bytes(), self.axes.read_bytes()
+        with self.assertRaisesRegex(installer.InstallError, "cannot convert physical endstops"):
+            self.plan()
+        self.assertEqual((self.config.read_bytes(), self.axes.read_bytes()), before)
+        changes, _, _ = self.plan("--axes", "x")
+        self.assertIn(b"\nendstop_pin: !PA0\n", changes[self.axes]["data"])
+
+    def test_gentle_homing_cli_rejects_conflicting_actions(self):
+        for flags in (("--homing-speed", "40"), ("--uninstall",), ("--rollback", "fixture")):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                installer.arguments(["--gentle-homing", *flags])
+
     def require_symlinks(self):
         link = self.home / "symlink-test"
         try:

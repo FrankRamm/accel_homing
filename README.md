@@ -86,7 +86,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | Command | What it does / how to use it |
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Show settings, model, workflow progress, results and PNG paths. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X; use `AXIS=Y` for Y. Uses the sensor's explicit axes map, or identifies the axis with gentle central strokes when no map is configured; measures fresh noise and qualifies its threshold. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | Calibrate X. Use `AXIS=Y` for Y. Uses the sensor's explicit axes map or identifies the axis with central strokes, then measures fresh noise and qualifies the threshold. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Measure three stationary one-second noise windows and export a PNG; no movement or threshold change. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both axes must use this plugin. |
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
@@ -97,8 +97,8 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 
 **CALIBRATE saves the selected axis and restarts Klipper by default.** It adds
-0.5 g once to the candidate after ten checks pass; those homes test the candidate,
-not the higher saved value. The other axis is unchanged. Prepare
+0.5 g once to the candidate after ten checks pass in the default mode. Gentle
+homing saves the exact threshold those ten homes tested. Prepare
 XY again after restart before calibrating the other axis. Successful calibration
 saves the selected axis's runtime threshold together with its model through
 `SAVE_CONFIG`, replacing its previous manual value. A shared threshold remains
@@ -110,6 +110,53 @@ would save. To report a tester run, send the ZIP printed by each command
 (`MODE=COMPARE` and `NOTCH=AUTO`). Include the axis and how the individual
 homes felt. Each ZIP contains the available measurements, host log for that
 command, and diagnostic context. The report identifies missing evidence.
+
+### Gentle homing on dev
+
+For a printer already using this plugin for its selected XY endstops, run this
+in the printer's SSH terminal while idle:
+
+```bash
+cd ~/accel_homing && git fetch origin dev && git switch dev && git merge --ff-only origin/dev && bash ./install.sh --gentle-homing
+```
+
+The installer enables `gentle_homing: True`, caps the existing plugin axes at
+40 mm/s and their homing acceleration at 1000 mm/s², and preserves lower
+positive settings. Driver currents retain their configured values. Review the
+printed installation plan if a rail uses a second pass or a separate acceleration
+override. Each axis needs a new calibration at its effective speed and acceleration
+before ordinary homing.
+
+Wait for Klipper to report ready. Run `ACCEL_HOMING_STATUS` in the printer
+console and confirm `"gentle_homing": true` before the first contact. If
+installation used `--no-restart`, first run the host service restart command
+printed by the installer to load the updated Python modules.
+
+**First test one contact.** Leave both axes unhomed, support Z, and use a ruler
+or a center mark to place the toolhead within 2 mm of the configured XY midpoint.
+With the tester at the printer, run the following in the printer console:
+
+```text
+ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1
+```
+
+The command measures three free strokes and stationary noise on the mapped
+channel, derives an initial threshold, and makes at most one approach to the
+endstop. It prints a diagnostic ZIP and leaves the threshold and filter unsaved.
+After a smooth X contact, release XY and manually center again for the same
+command with `AXIS=Y`. If either axis hits hard, skips steps, or aborts, stop
+there and share that ZIP. It contains the motion captures, contact samples when
+available, trigger and halt step positions, effective settings, and host log.
+
+Gentle supervised approaches command at most the midpoint-to-endstop distance
+plus 2 mm. An impact outside the midpoint tolerance, or more than 0.5 mm of
+commanded travel from trigger to halt, aborts the sequence. Ordinary G28 also
+checks that trigger-to-halt distance. These distances come from step commands.
+The physical toolhead position and motor slip require observation.
+
+After each axis feels acceptable, run the ordinary calibration command above
+for that axis, starting from the same manually confirmed midpoint each time.
+The single-contact check alone does not qualify a model for G28.
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.

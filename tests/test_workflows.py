@@ -66,6 +66,9 @@ class Config:
     def get(self, name, default=None):
         return self.options.get(name, default)
 
+    def getboolean(self, name):
+        return str(self.options[name]).lower() in ("true", "1", "yes", "on")
+
     def getfloat(self, name, default=None, minval=None, maxval=None):
         return self._number(float, name, default, minval, maxval)
 

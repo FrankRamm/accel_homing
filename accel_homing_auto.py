@@ -198,7 +198,7 @@ class AutoNotchCalibration:
         self.debug_context = {"workflow": "auto_notch", "run_id": self.debug_run_id,
                               "axis": axis, "command": "ACCEL_HOMING_CALIBRATE",
                               "arguments": {key: value for key, value in gcmd.get_command_parameters().items()
-                                            if key in ("AXIS", "CENTERED", "NOTCH", "SAVE_CONFIG", "START_THRESHOLD", "STEP")}}
+                                            if key in ("AXIS", "CENTERED", "NOTCH", "SAVE_CONFIG", "START_THRESHOLD", "STEP", "CONTACT_ONLY")}}
         self.event("preflight", self.debug_session)
         try:
             diagnostics = load_companion_module("accel_homing_troubleshoot")
@@ -246,6 +246,9 @@ class AutoNotchCalibration:
         if w.session is not None:
             raise self.error("cancel the active workflow before starting a new AUTO run")
         save = bool(gcmd.get_int("SAVE_CONFIG", 0, minval=0, maxval=1))
+        contact_only = bool(gcmd.get_int("CONTACT_ONLY", 0, minval=0, maxval=1))
+        if contact_only and (not w.gentle_homing or save):
+            raise self.error("CONTACT_ONLY=1 requires gentle_homing and SAVE_CONFIG=0")
         if save and axis in w.manual_axes:
             raise self.error("SAVE_CONFIG=1 requires removing the selected axis/shared explicit threshold first; "
                              "use SAVE_CONFIG=0 for a report-only run")
@@ -291,8 +294,12 @@ class AutoNotchCalibration:
                 raise self.error("central stroke cannot provide the required %.3f s cruise at the existing speed; "
                                  "no motion was started" % self.analysis.MIN_CRUISE_SECONDS)
             session["beta_motion_plan"] = {k: v for k, v in plan.items() if k not in ("extractor", "current_helper")}
-            w._info("AUTO %s: three independent central moving-noise captures, raw discovery + ten centered "
-                    "reference homes, then fresh fixed-profile discovery + ten checks; save=%s" % (axis.upper(), save))
+            if contact_only:
+                w._info("Gentle %s contact check: three central moving-noise captures and one centered "
+                        "contact attempt. The diagnostic ZIP records the result." % axis.upper())
+            else:
+                w._info("AUTO %s: three independent central moving-noise captures, raw discovery + ten centered "
+                        "reference homes, then fresh fixed-profile discovery + ten checks; save=%s" % (axis.upper(), save))
             # Never reuse a prior saved map: qualify this run before collecting
             # evidence that will choose a detector profile.
             self.event("axis_mapping", session)
@@ -316,6 +323,23 @@ class AutoNotchCalibration:
             self.event("stationary_noise", session)
             w._calibration_noise_preflight(session)
             self.check(session)
+            if contact_only:
+                self.event("single_contact", session)
+                record, _capture = w._home(axis, session["candidate"])
+                quality, reason = w._quality(axis, record)
+                if quality == "implausible":
+                    reason = w._mark_implausible_calibration(axis, session["terminal_home"][2], reason)
+                if quality != "good":
+                    raise self.error(reason)
+                w._release_terminal_home(axis, record)
+                result = {"result": "contact_check_complete", "axis": axis, "run_id": session["run_id"],
+                          "contact": record, "commanded_post_trigger_mm": abs(
+                              record["halt_travel_mm_signed"] - record["trigger_travel_mm_signed"]),
+                          "save_config": False, "model_staged": False, "persistence": "report_only",
+                          "physical_position_verified": False}
+                w._finish(result)
+                self.event("single_contact_complete", session)
+                return
             self.event("raw_reference_homes", session)
             w._calibrate_trials()
         except Exception as exc:
@@ -709,6 +733,7 @@ class AutoNotchCalibration:
                   "axis_mapping": session.get("axis_mapping"), "analysis": session.get("auto_notch_analysis"),
                   "summary": self.summary(session), "sources": sources,
                   "motion_plan": session.get("beta_motion_plan"), "motion_cleanup": session.get("beta_restore"),
+                  "gentle_motion_noise": session.get("gentle_motion_noise"),
                   "proposed_model": session.get("auto_notch_proposed_model"),
                   "qualification_records": session["validation_records"], "retained_attempt_records": session["records"],
                   "omitted_attempt_records": session["auto_notch_record_offset"],

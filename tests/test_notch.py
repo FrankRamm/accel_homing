@@ -199,6 +199,12 @@ class NotchTests(unittest.TestCase):
         self.assertEqual(provenance["eligibility_source"], "native_sensor_clock")
         self.assertEqual(provenance["first_sample_time_s"], captured["samples"][7][0])
         self.assertAlmostEqual(provenance["sample_rate_hz"], 1000.)
+        validation = provenance["reference_validation"]
+        self.assertEqual(validation["source"], "live_prepare_reference_check")
+        self.assertEqual(validation["clock_domain"], "main_mcu_print_time")
+        self.assertEqual(validation["result"], "ready")
+        self.assertEqual(validation["scheduled_arm_time_s"], two.arm_time)
+        self.assertLessEqual(validation["time_s"], two.arm_time)
         for failure in ("changed_rate", "one_missing_sample", "frozen", "clocksync"):
             obj = make_homing(threshold=8., options={"notch_frequency": 100.})
             native_baseline(obj, (0, 0, 128))

@@ -95,7 +95,96 @@ def run_analysis(motions, homes, **options):
                         threshold_min_g=.5, threshold_max_g=8.0, **options)
 
 
+def scheduled_home(index=0):
+    """Retain an exact reference, then resume at a scheduled arm 260 ms later."""
+    item = synthetic_item("home", index)
+    capture = item["capture"]
+    meta, detector = capture["auto_notch_replay"], capture["detector"]
+    reference = [(meta["reference_first_time_s"] + n / RATE, *capture["baseline_g"])
+                 for n in range(meta["reference_sample_count"])]
+    rows = [(row[0] + .21, *row[1:]) for row in capture["samples"][50:]]
+    capture["samples"] = reference + rows
+    meta.update(first_sample_index=len(reference), first_sample_time_s=rows[0][0])
+    detector.update(arm_time_s=detector["arm_time_s"] + .21,
+                    onset_sample_index=detector["onset_sample_index"] + len(reference) - 50,
+                    onset_time_s=detector["onset_time_s"] + .21)
+    meta["reference_validation"] = {
+        "source": "live_prepare_reference_check", "clock_domain": "main_mcu_print_time", "result": "ready",
+        "time_s": meta["reference_last_time_s"] + .01,
+        "scheduled_arm_time_s": detector["arm_time_s"]}
+    return item
+
+
 class AutoNotchTests(unittest.TestCase):
+    def test_motion_freshness_uses_capture_cutoff_before_scheduled_acceleration(self):
+        motion = synthetic_item("motion", 0)
+        segments = motion["record"]["segments"]
+        segments[0]["end_time_s"] = segments[1]["start_time_s"] = 10.30
+        segments[1]["end_time_s"] = segments[2]["start_time_s"] = 10.40
+        prepared = auto._prepare(motion, "motion", 0, RAW_THRESHOLD, np, None)
+        self.assertEqual(prepared["arm"], 10.30)
+        for failure in ("stale", "missing_cutoff", "mismatched_cutoff", "missing_start"):
+            bad = copy.deepcopy(motion)
+            capture = bad["capture"]
+            if failure == "stale":
+                capture["baseline_first_sample_time_s"] -= 1.
+                capture["baseline_last_sample_time_s"] -= 1.
+            elif failure == "missing_cutoff":
+                del capture["capture_cutoff_time_s"]
+            elif failure == "mismatched_cutoff":
+                capture["capture_cutoff_time_s"] += .01
+            else:
+                capture["samples"] = capture["samples"][2:]
+            with self.subTest(failure=failure), self.assertRaises(auto.InsufficientData):
+                auto._prepare(bad, "motion", 0, RAW_THRESHOLD, np, None)
+
+    def test_home_scheduled_prearm_gap_needs_recorded_live_preparation(self):
+        home = scheduled_home()
+        prepared = auto._prepare(home, "home", 0, RAW_THRESHOLD, np, None)
+        meta = home["capture"]["auto_notch_replay"]
+        self.assertGreater(meta["first_sample_time_s"] - meta["reference_last_time_s"], .25)
+        self.assertEqual(prepared["start"], 101)
+        motions, _ = dataset()
+        report = run_analysis(motions, [scheduled_home(index) for index in range(10)])
+        self.assertEqual(report["status"], "selected", report["reasons"])
+        for failure in ("missing_timing", "stale_reconstructed_reference", "future_reference", "different_arm",
+                        "future_preparation", "unknown_source", "wrong_clock", "failed_validation",
+                        "malformed_validation", "missing_prefix_sample", "missing_armed_sample", "unexplained_gap"):
+            bad = copy.deepcopy(home)
+            capture = bad["capture"]
+            meta = capture["auto_notch_replay"]
+            validation = meta["reference_validation"]
+            if failure == "missing_timing":
+                del meta["reference_validation"]
+            elif failure == "stale_reconstructed_reference":
+                for key in ("reference_first_time_s", "reference_last_time_s"):
+                    meta[key] -= 1.
+                capture["samples"][:101] = [(row[0] - 1., *row[1:]) for row in capture["samples"][:101]]
+            elif failure == "future_reference":
+                validation["time_s"] = meta["reference_last_time_s"] - .01
+            elif failure == "different_arm":
+                validation["scheduled_arm_time_s"] += .001
+            elif failure == "future_preparation":
+                validation["time_s"] = validation["scheduled_arm_time_s"] + .01
+            elif failure == "unknown_source":
+                validation["source"] = "inferred_from_gap"
+            elif failure == "wrong_clock":
+                validation["clock_domain"] = "host_monotonic"
+            elif failure == "failed_validation":
+                validation["result"] = "no_data_before_arm"
+            elif failure == "malformed_validation":
+                meta["reference_validation"] = None
+            elif failure in ("missing_prefix_sample", "missing_armed_sample"):
+                del capture["samples"][50 if failure == "missing_prefix_sample" else 200]
+                capture["detector"]["onset_sample_index"] -= 1
+                if failure == "missing_prefix_sample":
+                    meta["first_sample_index"] -= 1
+            else:
+                row = capture["samples"][100]
+                capture["samples"][100] = (row[0] - .0001, *row[1:])
+            with self.subTest(failure=failure), self.assertRaises(auto.InsufficientData):
+                auto._prepare(bad, "home", 0, RAW_THRESHOLD, np, None)
+
     def test_recurring_signed_spectrum_selects_frequency_q_and_frozen_threshold(self):
         motions, homes = dataset()
         report = run_analysis(motions, homes)

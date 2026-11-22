@@ -438,8 +438,58 @@ def validate_generic_names(graph, existing):
                                    "no files changed." % (document.path, index + 1))
 
 
-def validate_homing_speeds(graph, args, family, existing):
+def plan_gentle_homing(graph, args, existing):
+    """Opt in an already-installed set of rails without reconverting hardware."""
+    configured = existing.get("gentle_homing", "False").strip().lower() if existing else "false"
+    if configured not in ("0", "false", "no", "off", "1", "true", "yes", "on"):
+        raise InstallError("gentle_homing must be a boolean. No files changed.")
+    if not getattr(args, "gentle_homing", False) and configured in ("0", "false", "no", "off"):
+        return None
+    if args.homing_speed is not None:
+        raise InstallError("--gentle-homing cannot be combined with --homing-speed. No files changed.")
+    if existing is None:
+        raise InstallError("--gentle-homing requires an existing accel_homing installation. No files changed.")
+    acceleration_limit = load_motion_policy().GENTLE_MAX_ACCEL
+    owned = {}
+    for axis in ("x", "y"):
+        rail = graph.one("stepper_" + axis, False)
+        if (rail is not None and rail.get("endstop_pin", "").lstrip("!^~") in
+                ("accel_homing:" + axis, "beacon_accel:" + axis)):
+            owned[axis] = rail
+    if not owned or set(args.axes) != set(owned):
+        raise InstallError("--gentle-homing must select all and only existing plugin-owned axes "
+                           "(%s); it cannot convert physical endstops. Use --axes %s. No files changed."
+                           % (", ".join(owned) or "none", ",".join(owned) or "<installed axes>"))
+    for axis, rail in owned.items():
+        try:
+            retract = float(rail.get("homing_retract_dist", "5"))
+            minimum = float(rail.get("min_home_dist", str(retract)))
+        except ValueError:
+            raise InstallError("--gentle-homing requires numeric %s homing distances. No files changed."
+                               % axis.upper())
+        if not all(math.isfinite(value) and value >= 0 for value in (retract, minimum)):
+            raise InstallError("--gentle-homing requires finite nonnegative %s homing distances. No files changed."
+                               % axis.upper())
+        if retract or minimum:
+            raise InstallError("--gentle-homing does not change %s retract/rehome settings; an active second pass "
+                               "is unsupported. Review homing_retract_dist/min_home_dist first. No files changed."
+                               % axis.upper())
+        if rail.get("homing_accel") is not None:
+            raise InstallError("--gentle-homing does not remove %s rail homing_accel; that override can bypass "
+                               "the shared acceleration cap. Review it first. No files changed." % axis.upper())
+    try:
+        acceleration = float(existing.get("homing_accel", str(acceleration_limit)))
+    except ValueError:
+        raise InstallError("--gentle-homing requires numeric plugin homing_accel. No files changed.")
+    if not math.isfinite(acceleration) or acceleration < 0:
+        raise InstallError("--gentle-homing requires finite nonnegative plugin homing_accel. No files changed.")
+    return min(acceleration, acceleration_limit) if acceleration else acceleration_limit
+
+
+def validate_homing_speeds(graph, args, family, existing, homing_accel_override=None):
     """Validate selected rails and retained users of explicit shared limits."""
+    gentle_speed_limit = (load_motion_policy().GENTLE_MAX_SPEED
+                          if homing_accel_override is not None else None)
     overrides = {name: getattr(args, name) for name in
                  ("max_report_travel", "max_startup_travel")
                  if getattr(args, name) is not None}
@@ -454,6 +504,8 @@ def validate_homing_speeds(graph, args, family, existing):
             velocity = float(printer.get("max_velocity", "nan"))
             acceleration = float(printer.get("max_accel", "nan"))
             homing_accel = float(existing.get("homing_accel", "5000")) if existing else 5000.0
+            if homing_accel_override is not None:
+                homing_accel = homing_accel_override
             age = float(existing.get("max_sample_age", "0.070")) if existing else 0.070
             travel = (overrides["max_report_travel"] if "max_report_travel" in overrides else
                       existing.get("max_report_travel") if existing else None)
@@ -501,6 +553,10 @@ def validate_homing_speeds(graph, args, family, existing):
             raise InstallError("%s homing_speed must be numeric. No files changed." % axis.upper())
         requested = args.homing_speed is not None and axis in args.axes
         speed = args.homing_speed if requested else original_speed
+        if gentle_speed_limit is not None:
+            if not math.isfinite(original_speed) or original_speed <= 0:
+                raise InstallError("--gentle-homing requires finite positive configured homing speeds. No files changed.")
+            speed = min(original_speed, gentle_speed_limit)
         if not math.isfinite(speed) or speed <= 0:
             raise InstallError("Homing speeds must be finite and positive. No files changed.")
         effective = min(speed, velocity) if family != "beacon" else speed
@@ -615,7 +671,8 @@ def make_plan(source, selected, args):
                for location in ("extras", "plugins")):
         raise InstallError("Configured [%s] has no installed driver in klippy/extras or klippy/plugins. "
                            "Install its normal driver first." % sensor)
-    speeds = validate_homing_speeds(graph, args, family, existing)
+    gentle_accel = plan_gentle_homing(graph, args, existing)
+    speeds = validate_homing_speeds(graph, args, family, existing, gentle_accel)
     changes, messages = PlannedChanges(), []
     for path, document in graph.documents.items():
         changes.expected[path] = dict(snapshot(path), data=base64.b64encode(document.original).decode("ascii"))
@@ -648,13 +705,22 @@ def make_plan(source, selected, args):
                         "limits are not physical stopping guarantees."
                         % ", ".join("%s=%s mm" % item for item in overrides.items()))
         messages.append("%s homing_speed: %s."
-                        % ("Preserved configured" if args.homing_speed is None else "Explicitly selected",
+                        % ("Gentle capped" if gentle_accel is not None else
+                           "Preserved configured" if args.homing_speed is None else "Explicitly selected",
                            ", ".join("%s=%.12g mm/s" % (axis.upper(), speed)
                                      for axis, (_rail, speed, _effective) in speeds.items())))
     if existing:
         existing.replace("accel_chip", sensor)
         for name, value in overrides.items():
             existing.replace(name, value)
+        if gentle_accel is not None:
+            existing.replace("gentle_homing", "True")
+            existing.replace("homing_accel", "%.12g" % gentle_accel)
+            messages.append("Gentle homing explicitly enabled: %s; shared homing_accel %.12g mm/s^2. "
+                            "Existing currents, diagnostic pins and retract/rehome settings are preserved. "
+                            "Recalibrate all selected axes at these settings before ordinary homing."
+                            % (", ".join("%s=%.12g mm/s" % (axis.upper(), speed)
+                                         for axis, (_rail, speed, _effective) in speeds.items()), gentle_accel))
     else:
         managed = selected["config"].parent / MANAGED
         included_managed = graph.documents.get(canonical(managed))
@@ -674,6 +740,9 @@ def make_plan(source, selected, args):
             main = graph.documents[selected["config"]]
             main.insertions.setdefault(main.active_end, []).append(main.newline + "[include " + MANAGED + "]" + main.newline + main.newline)
     for axis, (rail, speed, actual_speed) in speeds.items():
+        if gentle_accel is not None:
+            rail.replace("homing_speed", "%.12g" % speed)
+            continue
         if not (generic_names and rail.get("endstop_pin") == "beacon_accel:" + axis):
             rail.replace("endstop_pin", prefix + ":" + axis)
         rail.replace("homing_retract_dist", "0")
@@ -1314,6 +1383,8 @@ def arguments(argv=None):
     parser.add_argument("--axes", default="x,y", help="x,y (default), x or y")
     parser.add_argument("--homing-speed", type=float,
                         help="explicitly replace selected homing speeds; default preserves configured values and rejects policy conflicts")
+    parser.add_argument("--gentle-homing", action="store_true",
+                        help="opt in all existing plugin axes to gentle homing, at most 40 mm/s and 1000 mm/s^2; preserve hardware settings")
     parser.add_argument("--max-report-travel", type=float,
                         help="opt into generic max_report_travel in mm (finite 0.1..2); otherwise preserve an explicit configured limit or leave disabled")
     parser.add_argument("--max-startup-travel", type=float,
@@ -1336,6 +1407,8 @@ def arguments(argv=None):
         parser.error("--max-report-travel and --max-startup-travel apply only to installation/update")
     if (args.rollback or args.uninstall) and args.generic_names:
         parser.error("--generic-names applies only to installation/update")
+    if args.gentle_homing and (args.rollback or args.uninstall or args.homing_speed is not None):
+        parser.error("--gentle-homing applies only to installation/update and cannot be combined with --homing-speed")
     return args
 
 
