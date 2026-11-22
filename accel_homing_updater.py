@@ -314,11 +314,11 @@ def assert_identity(moon, selected, api):
             _fail(api, "Moonraker configuration changed after planning: %s" % path)
 
 
-def stanza(repo):
+def stanza(repo, branch=BRANCH):
     return ("# Managed by the accelerometer homing installer.\n"
             "[update_manager accel_homing]\n"
             "type: git_repo\nchannel: dev\npath: %s\norigin: %s\nprimary_branch: %s\n"
-            "is_system_service: False\nmanaged_services: klipper\n" % (repo, ORIGIN, BRANCH)).encode()
+            "is_system_service: False\nmanaged_services: klipper\n" % (repo, ORIGIN, branch)).encode()
 
 
 def main_suffix(add_base, add_include):
@@ -331,13 +331,13 @@ def main_suffix(add_base, add_include):
     return text.encode() if add_base or add_include else b""
 
 
-def direct_suffix(repo, add_base, add_stanza):
+def direct_suffix(repo, add_base, add_stanza, branch=BRANCH):
     if not add_base and not add_stanza:
         return b""
     text = b"\n# accel_homing managed Moonraker update registration\n"
     if add_base:
         text += b"[update_manager]\n"
-    return text + (stanza(repo) if add_stanza else b"")
+    return text + (stanza(repo, branch) if add_stanza else b"")
 
 
 def _origin(value):
@@ -487,11 +487,11 @@ def _replace_registration_option(section, name, value):
             "%s: %s%s" % (name, value, section.document.newline))
 
 
-def _context(moon, repo, section, base):
+def _context(moon, repo, section, base, branch):
     path = section.document.path
     return dict(moon_config=str(moon["config"]), moon_data=str(moon["data"]),
                 moon_socket=str(moon["socket"]), managed_repo=str(repo), origin=ORIGIN,
-                branch=BRANCH, registration_path=str(path),
+                branch=branch, registration_path=str(path),
                 registration_sha256=_registration_digest(section, base, path))
 
 
@@ -524,36 +524,41 @@ def make_plan(source, selected, args, api):
         _fail(api, "managed checkout path cannot be represented safely in Moonraker configuration")
     graph, changes = moon["graph"], {}
     existing = graph.one(SECTION, False)
+    branch = identity["branch"]
     migrating = legacy_installation(selected, api)
     if existing:
         for name in existing.options:
             existing.get(name)
+        registration_edits = {}
+        current_branch = existing.get("primary_branch", BRANCH)
         if legacy_context({"origin": existing.get("origin")}):
             if existing.get("type", "").lower() != "git_repo":
                 _fail(api, "conflicting existing [%s] transport; preserve/reconcile it before installing" % SECTION)
-            # Update transport identity in the current chosen file, retaining all
-            # operator settings and comments instead of restoring old contents.
+            registration_edits = {"path": repo, "origin": ORIGIN, "primary_branch": branch}
+        elif not matching_stanza(existing, repo, api, moon):
+            _fail(api, "conflicting existing [%s] path/origin/type; preserve/reconcile it instead of overwriting" % SECTION)
+        elif current_branch in (BRANCH, "dev") and current_branch != branch:
+            registration_edits["primary_branch"] = branch
+        if registration_edits:
             document = api.ConfigDocument(existing.document.path, existing.document.original)
             edited = next(section for section in document.sections if section.name.lower() == SECTION)
-            for name, value in (("path", repo), ("origin", ORIGIN), ("primary_branch", BRANCH)):
+            for name, value in registration_edits.items():
                 _replace_registration_option(edited, name, value)
             rendered = document.rendered()
             changes[document.path] = dict(kind="file", data=rendered)
             existing = next(section for section in api.ConfigDocument(document.path, rendered).sections
                             if section.name.lower() == SECTION)
-        elif not matching_stanza(existing, repo, api, moon):
-            _fail(api, "conflicting existing [%s] path/origin/type; preserve/reconcile it instead of overwriting" % SECTION)
     base = graph.one("update_manager", False)
     if base:
         for name in base.options:
             base.get(name)
-    suffix = direct_suffix(repo, base is None, existing is None)
+    suffix = direct_suffix(repo, base is None, existing is None, branch)
     if suffix:
         original = changes.get(moon["config"], {}).get("data", graph.documents[moon["config"]].original)
         changes[moon["config"]] = dict(kind="file", data=original + suffix)
     if existing is None:
-        existing = api.ConfigDocument(moon["config"], stanza(repo)).sections[0]
-    context = _context(moon, repo, existing, base)
+        existing = api.ConfigDocument(moon["config"], stanza(repo, branch)).sections[0]
+    context = _context(moon, repo, existing, base, branch)
     receipt = selected["config"].parent / RECEIPT
     receipt_state = api.snapshot(receipt)
     if receipt_state["kind"] not in ("absent", "file"):
@@ -628,14 +633,14 @@ def repo_identity(repo, api):
     origin = git(repo, ["remote", "get-url", "origin"], api)
     branch = git(repo, ["symbolic-ref", "--short", "HEAD"], api)
     upstream = git(repo, ["rev-parse", "--abbrev-ref", "@{upstream}"], api)
-    if origin != ORIGIN or branch != BRANCH or upstream != "origin/" + BRANCH:
+    if origin != ORIGIN or branch not in (BRANCH, "dev") or upstream != "origin/" + branch:
         _fail(api, "managed checkout origin/branch/upstream differs; nothing was reset or stashed")
     if git(repo, ["status", "--porcelain=v1", "--untracked-files=all"], api):
         _fail(api, "managed checkout is dirty; preserve/reconcile those changes before updating")
     commit = git(repo, ["rev-parse", "HEAD"], api)
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         _fail(api, "standalone checkout did not return a full commit SHA")
-    git(repo, ["merge-base", "--is-ancestor", commit, "origin/" + BRANCH], api)
+    git(repo, ["merge-base", "--is-ancestor", commit, "origin/" + branch], api)
     return dict(commit=commit, origin=origin, branch=branch, upstream=upstream)
 
 

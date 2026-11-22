@@ -4,11 +4,14 @@ import json
 import math
 
 if __package__:
-    from .accel_homing_backends import _ah_compat_sibling_module
+    from .accel_homing_backends import _ah_compat_sibling_module, load_filter_module
 else:
-    from accel_homing_backends import _ah_compat_sibling_module
+    from accel_homing_backends import _ah_compat_sibling_module, load_filter_module
 
 validate_axis_mapping = _ah_compat_sibling_module("accel_homing_axes", __package__, __file__).validate_axis_mapping
+
+_filter = load_filter_module()
+DISABLED, coefficients, profile = _filter.DISABLED, _filter.coefficients, _filter.profile
 
 
 def _finite_metadata(value):
@@ -27,7 +30,7 @@ class AccelHomingModel:
         self.thresholds = {}
         self.successes = {}
         self.metadata = {}
-        self.version = config.getint("version", 1, minval=1, maxval=1)
+        self.version = config.getint("version", 1, minval=1, maxval=2)
         for axis in "xy":
             threshold = config.getfloat(axis + "_threshold", None,
                                         minval=0.5)
@@ -44,6 +47,18 @@ class AccelHomingModel:
                     metadata["axis_mapping"] = validate_axis_mapping(metadata.get("axis_mapping"), axis)
                     if not isinstance(metadata.get("axis_mapping_context"), dict):
                         raise ValueError("mapped-axis model requires its sensor context")
+                settings = metadata.get("signal_filter", DISABLED)
+                if not isinstance(settings, dict):
+                    raise ValueError("signal_filter must be an object")
+                if settings != DISABLED:
+                    if (self.version != 2 or metadata.get("impact_metric") not in ("mapped_axis", "xyz_magnitude")
+                            or profile(settings.get("frequency_hz", float("nan")),
+                                       settings.get("q", float("nan"))) != settings):
+                        raise ValueError("notch model requires version 2 and an exact filter identity and supported impact metric")
+                    rate = metadata.get("filter_sample_rate_hz")
+                    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+                        raise ValueError("notch model requires its measured sensor sample rate")
+                    coefficients(settings, rate)
             except (ValueError, TypeError) as exc:
                 raise config.error("Invalid %s model metadata: %s" % (axis, exc))
             self.metadata[axis] = metadata

@@ -24,6 +24,76 @@ def _number(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def validate_mapped_comparison_capture(capture, record, frozen, *, max_age_s):
+    """Verify the actual mapped crossing and age receipt, without an XYZ model."""
+    detector = capture.get("detector") or {}
+    mapping, threshold = frozen["axis_mapping"], frozen["threshold_g"]
+    axis, channel = frozen["axis"], mapping["source_axis"]
+    if (capture.get("fault") or capture.get("error") or capture.get("dropped", 0)
+            or record.get("result") != "impact" or record.get("axis") != axis
+            or detector.get("axis") != axis or detector.get("experimental") is not None
+            or any(item.get("impact_metric") != "mapped_axis" for item in (record, detector))
+            or any(item.get("axis_mapping") != mapping for item in (capture, record, detector))
+            or detector.get("onset_sample_matches") != 1
+            or not _number(threshold) or threshold <= 0):
+        raise ValueError("receipt differs from the frozen calibrated mapped detector")
+    if any(not _number(item.get("threshold_g"))
+           or not math.isclose(item["threshold_g"], threshold, rel_tol=1e-12, abs_tol=1e-12)
+           for item in (record, detector)):
+        raise ValueError("receipt differs from the frozen calibrated mapped threshold")
+    expected_filter = frozen["signal_filter"]
+    observed_filter = detector.get("signal_filter", {"type": "disabled"})
+    if any(observed_filter.get(key) != value for key, value in expected_filter.items()):
+        raise ValueError("receipt differs from the frozen signal filter")
+    envelope = detector.get("experimental_envelope") or {}
+    oldest, newest = envelope.get("max_oldest_eligible_age_s"), envelope.get("max_newest_eligible_age_s")
+    if (not _number(max_age_s) or not .001 <= max_age_s <= .5
+            or not _number(oldest) or not _number(newest)
+            or type(envelope.get("eligible_batches")) is not int or envelope["eligible_batches"] <= 0
+            or envelope.get("future_sample_seen") is not False
+            or envelope.get("sample_age_limit_enforced") is not True
+            or envelope.get("max_sample_age_s") != max_age_s
+            or envelope.get("detector_metric") != "mapped_axis"
+            or envelope.get("age_observation") != "current_host_dispatch"
+            or newest > oldest + 1e-9 or oldest > max_age_s):
+        raise ValueError("mapped home lacks a valid within-limit detector-processing age envelope")
+    rows, baseline = capture["samples"], capture["baseline_g"]
+    index = detector.get("onset_sample_index")
+    arm = detector.get("capture_arm_time_s", detector.get("arm_time_s"))
+    if (type(index) is not int or not 0 <= index < len(rows)
+            or not _number(arm) or rows[index][0] < arm):
+        raise ValueError("mapped onset is outside the armed retained samples")
+    filtered = expected_filter.get("type") != "disabled"
+    if filtered:
+        metadata = capture.get("signal_filter") or {}
+        first, values = metadata.get("first_sample_index"), capture.get("filtered_samples")
+        if (metadata.get("first_sample_matches") != 1 or type(first) is not int
+                or not isinstance(values, (tuple, list)) or not values
+                or not 0 <= first <= index < first + len(values)
+                or any(metadata.get(key) != value for key, value in expected_filter.items())):
+            raise ValueError("mapped filtered onset lacks its complete causal replay")
+        samples = []
+        for position in range(first, index + 1):
+            row = values[position - first]
+            if len(row) != 4 or row[0] != rows[position][0]:
+                raise ValueError("mapped filtered sample does not match its retained raw row")
+            samples.append((position, abs(row[channel + 1])))
+    else:
+        samples = [(position, abs(row[channel + 1] - baseline[channel]))
+                   for position, row in enumerate(rows[:index + 1]) if row[0] >= arm]
+    tolerance = max(1e-9, threshold * 1e-8)
+    if (not samples or samples[-1][0] != index
+            or any(not _number(value) for _, value in samples)
+            or samples[-1][1] + tolerance < threshold
+            or any(value > threshold + tolerance for _, value in samples[:-1])):
+        raise ValueError("retained mapped samples do not reproduce the first calibrated threshold crossing")
+    return {"verified": True, "impact_metric": "mapped_axis", "axis_mapping": mapping,
+            "threshold_g": threshold, "signal_filter": expected_filter,
+            "retained_onset_index": index, "mapped_onset_g": samples[-1][1],
+            "max_oldest_eligible_age_s": oldest, "max_sample_age_s": max_age_s,
+            "xyz_fit_used": False, "physical_contact_verified": False}
+
+
 def validate_profile(profile, axis, raw_threshold_g):
     """Return an independent, JSON-safe snapshot or reject before arming."""
     if not isinstance(profile, dict) or profile.get("version") != VERSION:

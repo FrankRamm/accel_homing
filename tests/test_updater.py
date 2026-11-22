@@ -761,6 +761,20 @@ class IsolatedGitSourceTests(unittest.TestCase):
         self.refresh()
         return plan, backup
 
+    def test_switch_from_main_to_tracking_dev_updates_only_registration_branch(self):
+        with self.migration_links() as (_, write):
+            self.install(write)
+            before = self.moon_config.read_bytes()
+            self.run_git(self.remote, "branch", "dev", "main")
+            self.run_git(self.source, "fetch", self.remote.as_uri(), "dev:refs/remotes/origin/dev")
+            self.run_git(self.source, "switch", "--track", "origin/dev")
+            plan, _ = self.install(write)
+            self.assertEqual(plan["context"]["branch"], "dev")
+            self.assertIn(b"primary_branch: main", before)
+            self.assertEqual(self.moon_config.read_bytes(), before.replace(b"primary_branch: main", b"primary_branch: dev"))
+            self.assertNotIn(self.moon_config, self.updater_plan()["changes"])
+            self.assertEqual(self.run_git(self.source, "rev-parse", "main"), self.commit)
+
     def test_native_clone_without_manifest_is_reused_without_git_mutations_or_source_backups(self):
         plan = self.updater_plan()
         self.assertFalse((self.source / ".source.json").exists())

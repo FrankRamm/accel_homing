@@ -1,26 +1,29 @@
 # Experimental homing comparison
 
 `ACCEL_HOMING_EXPERIMENT MODE=COMPARE` compares normal and shorter batch-delivery
-intervals using the original raw XYZ detector for every home. It also evaluates
-a frozen weighted profile offline, with startup and cruise noise margins.
+intervals using the calibrated detector for the selected axis. A loaded
+`mapped_axis` calibration uses its saved channel, threshold and any fixed notch
+for every comparison home. It adds no discovery or fitting homes and never
+fits, replays or activates a weighted XYZ profile. The historical XYZ path
+retains its frozen offline profile and startup/cruise noise-margin diagnostics.
 The existing `MODE=SHADOW`
 keeps every home on the raw detector and evaluates the frozen weighted profile
 after each home. `MODE=LIVE` retains the original experiment's stricter checks
 before allowing the weighted profile to control candidate homes. `LIVE` remains
 the default; specify `COMPARE` for the paired delivery test below.
-It is an opt-in experiment on `main`; ordinary G28, CALIBRATE, the legacy
+It is an opt-in experiment; ordinary G28, CALIBRATE, the legacy
 TEST command and TROUBLESHOOT retain their policies outside this command.
 
-This historical XYZ experiment rejects a selected axis with a saved or staged
-`mapped_axis` calibration, including manual threshold overrides. Its XYZ
-detector cannot reuse a threshold qualified on one component. After automatic
-axis calibration, use `ACCEL_HOMING_TROUBLESHOOT AXIS=X CENTERED=1` (or Y)
-to collect homing diagnostics with the mapped detector. Beta's separate XYZ
-proposal remains isolated and does not save a general-calibration model.
+`LIVE` and `SHADOW` still reject mapped calibrations: a threshold qualified on
+one component cannot become an XYZ limit. Mapped `COMPARE` requires a saved,
+loaded calibration with its original active threshold, sensor context, speed,
+acceleration and filter. Staged calibration, invalidated mapping, a manual
+threshold override or changed filter is rejected before motion. Save and restart
+after calibration before comparison. Beta's separate XYZ proposal remains isolated.
 
 ## Run
 
-Update the existing `main` installation with the normal Moonraker updater or
+Update the selected installation with the normal Moonraker updater or
 the [installation procedure](INSTALLATION.md), then restart the selected
 Klipper/Kalico **host service** to reload Python. A console RESTART alone does
 not reload imported modules. The optional experiment module supports existing
@@ -32,7 +35,7 @@ nozzle, appropriate motor state and operator supervision. `CENTERED=1` confirms
 that preparation; it does not measure position or automatically center the head.
 
 ```gcode
-ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=10
+ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2
 ```
 
 Use `AXIS=Y` in a separately prepared run for Y. The command requires one axis
@@ -43,13 +46,31 @@ measurement or separate fan/temperature/load adjustment is required for this run
 | Parameter | Default | Meaning |
 |---|---|---|
 | `AXIS` | Required | `X` or `Y`; no combined XY run. |
-| `MODE` | `LIVE` | `COMPARE` pairs normal/shorter delivery using RAW throughout. `SHADOW` records raw homes and replays the frozen profile afterward. `LIVE` preserves the original live candidate workflow and its +/-1 ms compatibility requirement. |
-| `SAMPLES` | `10` | In COMPARE, number of pairs: 20 comparison homes at the default. In SHADOW/LIVE, number of fresh homes. Range 2–40; ten reference homes and discovery are additional. |
+| `MODE` | `LIVE` | `COMPARE` pairs normal/shorter delivery using the calibrated mapped detector or the historical RAW XYZ path. `SHADOW` and `LIVE` require XYZ calibration context. |
+| `SAMPLES` | `10` | In COMPARE, number of pairs. Mapped `SAMPLES=2` performs exactly four homes; the default performs 20. Historical XYZ paths additionally collect discovery plus ten references. Range 2–40. |
 | `CENTERED` | Required `1` | Operator confirms the preparation above. |
 | `GC_GUARD` | `1` | Suppress automatic and supported reactor GC during each native home. `0` leaves the existing collection policy unchanged. Unsupported guarded reactors reject before movement. |
-| `MAX_SAMPLE_AGE` | `0.040` | Candidate age limit in seconds for the oldest eligible sample in a delivered batch. Valid range: 0.001 to 0.5 seconds. COMPARE uses this for shadow qualification, without changing the original RAW detector's freshness policy. |
+| `MAX_SAMPLE_AGE` | `0.040` | Oldest eligible sample limit at detector processing, in seconds (0.001–0.5). Mapped COMPARE enforces it during every home and verifies the retained age envelope before automatic return. The historical XYZ comparison uses it for shadow qualification and retains its original RAW freshness policy. |
 
-## Paired RAW delivery comparison
+## Mapped-axis delivery comparison
+
+With a loaded mapped calibration, `SAMPLES=2` runs CONTROL, FAST, FAST, CONTROL
+at the same configured homing speed and calibrated threshold. A calibrated
+notch stays fixed: the experiment never selects or retunes it. Each retained
+capture must reproduce the first mapped threshold crossing from the raw channel
+or the causal filtered channel. Mapping, filter, threshold and age receipts are
+checked before any automatic return. No discovery/training/holdout homes are added.
+
+The Cartographer-backed Klipper batch adapter uses the existing interval controls
+described below. The ZIP includes `manifest.json`, `experiment.json`,
+`comparison.json/.csv`, `delivery.json/.csv`, per-home raw and optional filtered
+samples, timing evidence and `tester-summary.txt`. The frozen detector and each
+verified mapped crossing are retained. Missing timing measurements stay missing;
+four homes can compare delivery observations but cannot establish physical impact
+reduction or statistical certainty. Cancellation, invalid samples and stream
+cleanup failures abort without an automatic return, and remain visible in the ZIP.
+
+## Historical XYZ delivery comparison
 
 COMPARE runs one discovery home followed by ten reference homes at the original
 threshold and configured, qualified speed. Six reference homes train the shadow
@@ -217,6 +238,19 @@ experimental phases, GC guard state and partial failures. See
 bounded retention, plots and export limitations.
 Results are written below `charts_directory/experiment/<run_id>/`, including
 `experiment.json`, the manifest and plots. The console reports the ZIP path.
+The same ZIP includes `debug/context.json` and available host log excerpts. The
+debug index states missing sources, truncation and capture limits; existing raw
+samples, per-home timings and partial failures remain in the bundle. Idle
+preflight rejections also produce a separate run bundle with the arguments,
+reason and available debug context. An unrelated active workflow, homing move,
+queued motion or print prevents this extra file/log work; the console states
+that the preflight bundle was skipped. A missing diagnostic module or an
+unwritable output directory is reported without replacing the original error.
+Failures also retain exception type, phase and a bounded traceback directly, so
+diagnosis does not depend on the host log queue flushing before export. Raw,
+packet and timing serialization and ZIP packaging yield during post-cleanup
+work; a cancellation already handled during homing or rendering remains in the
+exported failure bundle.
 
 For COMPARE, `experiment.delivery_comparison` records the planned pair order,
 supported/effective intervention, original and requested intervals, and restoration

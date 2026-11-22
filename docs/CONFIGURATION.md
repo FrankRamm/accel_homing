@@ -144,6 +144,26 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
 
+## Experimental notch filter (dev)
+
+| Option | Default | Meaning and accepted range |
+| --- | --- | --- |
+| `notch_frequency` | `0` | Shared notch frequency in Hz. Finite, nonnegative; zero disables. Enabled frequency must be below half the sensor sample rate. |
+| `notch_q` | `10` | Shared notch quality factor; finite, 0.5–1000. Higher Q rejects a narrower band. |
+| `x_notch_frequency`, `y_notch_frequency` | `notch_frequency` | Per-homing-axis frequency override. Zero explicitly disables filtering for that machine axis. |
+| `x_notch_q`, `y_notch_q` | `notch_q` | Per-homing-axis quality-factor override, with the same accepted range. |
+
+Choose frequency from moving captures, or use
+`ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO` for automatic selection.
+AUTO defaults to report-only and stages nothing; explicit `SAVE_CONFIG=1`
+measures, qualifies and saves the chosen per-axis profile and model together.
+For a mapped-axis calibration, the stop decision uses the filtered component
+for that machine axis. Filter settings belong to the
+calibration: changing them requires requalification of affected saved models.
+See [configuration, calibration and comparison](NOTCH.md).
+
+## Compatibility and release settings
+
 The compatibility sign options do not select detector polarity. An
 `IMPACT_SIGN`-only SET changes the retained setting but does not register an
 explicit manual threshold or requalify an old selected-axis model. Supply an

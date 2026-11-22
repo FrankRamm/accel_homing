@@ -715,6 +715,32 @@ class AccelHomingWorkflows:
         except (TypeError, ValueError, configparser.Error):
             return False
 
+    def _filter_settings(self, axis):
+        getter = getattr(self.owner, "filter_settings", None)
+        return {"type": "disabled"} if getter is None else getter(axis)
+
+    def _check_filter_model(self, axis):
+        if (self.model is None or axis not in self.model.thresholds or axis in self.manual_axes
+                or self._temporary_manual_threshold(axis)):
+            return
+        saved = self.model.metadata[axis].get("signal_filter", {"type": "disabled"})
+        if saved != self._filter_settings(axis):
+            raise self._error("Saved %s threshold uses a different signal filter; recalibrate with "
+                              "ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1 or set an explicit "
+                              "%s_threshold for the configured metric" % (axis.upper(), axis.upper(), axis))
+
+    def check_filter_rate(self, axis, rate):
+        if self.session and self.session.get("mode") == "calibration":
+            return
+        self._check_filter_model(axis)
+        if (self.model is None or axis not in self.model.thresholds or axis in self.manual_axes
+                or self._temporary_manual_threshold(axis)):
+            return
+        from_filter = self.model.metadata[axis].get("filter_sample_rate_hz")
+        if from_filter is None or abs(rate / from_filter - 1) > 0.02:
+            raise self._error("Saved %s notch threshold uses a different sensor sample rate; recalibrate"
+                              % axis.upper())
+
     def _validate_model_connection(self):
         if self.model is None:
             return
@@ -744,9 +770,13 @@ class AccelHomingWorkflows:
         if session is None:
             return
         if session["mode"] == "noise":
-            if session.get("sensor_started"):
-                self.owner.stop_noise_measurement()
-            session["sensor_stopped"] = True
+            try:
+                if session.get("sensor_started"):
+                    self.owner.stop_noise_measurement()
+                session["sensor_stopped"] = True
+            finally:
+                if session.get("auto_notch") and (session.get("finishing") or session.get("auto_notch_restore_requested")):
+                    session["auto_notch_controller"].restore(session)
             return
         try:
             self.owner._end_session()
@@ -755,6 +785,8 @@ class AccelHomingWorkflows:
             self.owner.back_off_dist = session["saved_back_off"]
             if "saved_experimental_profile" in session:
                 self.owner.experimental_profile = session["saved_experimental_profile"]
+            if session.get("auto_notch") and (session.get("finishing") or session.get("auto_notch_restore_requested")):
+                session["auto_notch_controller"].restore(session)
             self.in_home, self.home_axis = False, None
 
     def _finish(self, result, release=False):
@@ -789,6 +821,8 @@ class AccelHomingWorkflows:
                     self._axis_mapping_note_failure(session, result.get("reason", result.get("result")))
                 if session.get("axis_mapping_diagnostics") is not None:
                     result["axis_mapping_diagnostics"] = copy.deepcopy(session["axis_mapping_diagnostics"])
+                if session.get("auto_notch"):
+                    result["auto_notch"] = session["auto_notch_controller"].summary(session)
             session["finishing"] = True
             session["finish_result"] = result.get("result")
         try:
@@ -873,8 +907,10 @@ class AccelHomingWorkflows:
                               "command or use CANCEL")
         calibrating = bool(self.session and self.session.get("mode") == "calibration")
         for axis in axes:
-            if calibrating or self._experimental_home(axis):
+            if calibrating or (self._experimental_home(axis) and
+                    self.session["experiment"].get("impact_metric") != "mapped_axis"):
                 continue
+            self._check_filter_model(axis)
             self._check_pending_mapping(axis)
             if self.model is None or axis not in self.model.thresholds:
                 continue
@@ -1008,7 +1044,9 @@ class AccelHomingWorkflows:
     def detection_axis_mapping(self, axis):
         """Return the qualified channel in the configured sensor stream frame."""
         session = self.session
-        if self._experimental_home(axis) or (session and session.get("beta")):
+        if ((self._experimental_home(axis)
+             and session["experiment"].get("impact_metric") != "mapped_axis")
+                or (session and session.get("beta"))):
             return None
         if session and session.get("axis") == axis and session.get("mode") == "calibration":
             if not self.calibration_reference(axis):
@@ -1151,6 +1189,9 @@ class AccelHomingWorkflows:
             calibration_grid = self._calibration_grid(gcmd)
         axes = axes if axes is not None else [axis] if axis else ["x", "y"]
         self._preflight(axes, continuation=previous_accuracy is not None)
+        if mode != "calibration":
+            for selected_axis in axes:
+                self._check_filter_model(selected_axis)
         if mode == "calibration" and self._geometry(axis)[1] <= CALIBRATION_MIN_TRAVEL_MM:
             raise gcmd.error("center-to-endstop travel must exceed 20 mm for impact discovery")
         self._require_unhomed_xy()
@@ -1178,6 +1219,9 @@ class AccelHomingWorkflows:
             self._clear_noise_seeds()
 
     def _announce_calibration(self, session):
+        self._info("%s signal filter: %s; stationary noise seed remains a raw mapped-axis starting heuristic, "
+                   "not a bound on filtered transients" %
+                   (session["axis"].upper(), json.dumps(self._filter_settings(session["axis"]), sort_keys=True)))
         self._info("%s calibration starts at %.6g g with %.6g g steps; mapped-axis absolute acceleration; "
                    "impact after >20 mm then ten centered endstop checks with spread <= 2 mm; "
                    "no quietness or acceleration-derived motion proof; returns settle for %.3f s; "
@@ -1229,6 +1273,7 @@ class AccelHomingWorkflows:
 
     def _noise_context(self):
         return {"sensor": self.owner.noise_sensor_context(),
+                "signal_filter": {axis: self._filter_settings(axis) for axis in AXES},
                 "calibration_start_threshold": self.start_threshold,
                 "calibration_step": self.threshold_step,
                 "calibration_settle_time_s": self.calibration_settle_time,
@@ -1275,7 +1320,7 @@ class AccelHomingWorkflows:
             self._check_running(session)
         if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
             raise self._error("printer is shut down")
-        continuation = session is not None and bool(session.get("accuracy_recovery") or session.get("axis_mapping"))
+        continuation = session is not None and bool(session.get("accuracy_recovery") or session.get("axis_mapping") or session.get("auto_notch"))
         if self._printing() or (not continuation
                                and self._status("idle_timeout").get("state") == "Printing"):
             raise self._error("noise measurement requires an idle printer, not printing or paused")
@@ -1348,6 +1393,8 @@ class AccelHomingWorkflows:
                                                 for index, axis in enumerate("xyz", 1)))
                              for row in samples)
         return {"run_id": session["run_id"], "noise_iteration": iteration,
+                "noise_metric": "raw_xyz_magnitude_starting_heuristic",
+                "signal_filter": {axis: self._filter_settings(axis) for axis in AXES},
                 **self._signal_metadata(capture),
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
@@ -1458,6 +1505,8 @@ class AccelHomingWorkflows:
             capture = self.owner.collect_noise_window(lambda: self._check_noise_running(session),
                                                       NOISE_DURATION, recover_transient=True,
                                                       on_acquisition_fault=acquisition_fault)
+            if session.get("auto_notch"):
+                session["auto_notch_controller"].retain_debug_capture(session, "stationary", iteration, capture)
             self._check_noise_running(session)
             record = self._noise_record(session, iteration, capture)
             if session.get("axis_mapping") is not None:
@@ -1485,7 +1534,7 @@ class AccelHomingWorkflows:
         self._begin_noise(session)
         session["calibration_preflight"] = True
         self._chart_preflight()
-        continuation = bool(session.get("accuracy_recovery") or session.get("axis_mapping"))
+        continuation = bool(session.get("accuracy_recovery") or session.get("axis_mapping") or session.get("auto_notch"))
         self._preflight([session["axis"]], continuation=continuation)
         self._require_unhomed_xy()
         self._preflight_noise(session)
@@ -1534,6 +1583,8 @@ class AccelHomingWorkflows:
         explicit = session["explicit_start_threshold"]
         session["stationary_noise"] = {
             "run_id": session["run_id"], "iterations": NOISE_ITERATIONS,
+            "noise_metric": "raw_mapped_axis_starting_heuristic",
+            "signal_filter": self._filter_settings(session["axis"]),
             "impact_metric": "mapped_axis", "axis_mapping": dict(mapping),
             "noise_axis_peak_g": peak, "noise_magnitude_peak_g": magnitude_peak,
             "initial_threshold_source": "explicit_start_threshold" if explicit else "stationary_noise",
@@ -1552,6 +1603,8 @@ class AccelHomingWorkflows:
                                       candidate, limit))
             session["noise_seed"] = {
                 "run_id": session["run_id"], "source": "stationary_noise",
+                "noise_metric": "raw_mapped_axis_starting_heuristic",
+                "signal_filter": self._filter_settings(session["axis"]),
                 "impact_metric": "mapped_axis", "axis_mapping": dict(mapping),
                 "noise_axis_peak_g": peak, "noise_magnitude_peak_g": magnitude_peak,
                 "required_threshold_g": required, "start_threshold_g": candidate,
@@ -1642,6 +1695,7 @@ class AccelHomingWorkflows:
             session.pop("early_halt", None)
         self.in_home, self.home_axis = True, axis
         capture_started = False
+        capture = None
         recorder = session.get("troubleshoot_recorder")
         try:
             try:
@@ -1668,12 +1722,20 @@ class AccelHomingWorkflows:
                 finally:
                     try:
                         capture = self.owner.stop_capture() if capture_started else {"samples": [], "dropped": 0}
+                        if session.get("auto_notch"):
+                            session["auto_notch_controller"].retain_debug_capture(
+                                session, "home", session["attempts"], capture,
+                                record=self.owner.last.get(axis))
                         if recorder is not None:
                             recorder.retain_capture(capture)
                     finally:
                         if session["mode"] == "calibration" and self.session is not session:
                             self._invalidate_calibration_axis(session)
-        except Exception:
+        except Exception as exc:
+            if session.get("auto_notch") and capture is None:
+                controller = session["auto_notch_controller"]
+                controller.retain_debug_capture(session, "home", session["attempts"], None,
+                    record=self.owner.last.get(axis), error=controller._exception(exc, controller.debug_phase))
             if session["mode"] in ("accuracy", "troubleshoot") and self.session is session:
                 self._remember_accuracy_record(session, axis, old_record)
             raise
@@ -1715,7 +1777,15 @@ class AccelHomingWorkflows:
                     or (previous is not None and sample[0] <= previous):
                 raise self._error("homing capture has invalid or stale sensor samples")
             previous = sample[0]
-        if session["mode"] in ("accuracy", "troubleshoot", "charts"):
+        if session.get("auto_notch"):
+            self._validate_accuracy_capture(session, axis, source_record, detector_record,
+                                            record, capture, record["workflow_threshold_g"])
+            record.update(capture_valid=True, physical_position_verified=False,
+                          auto_notch_reference=("qualified_raw_trigger_reference"
+                              if session["auto_notch_phase"] == "raw_reference" else "fresh_fixed_profile_qualification"))
+            if early_calibration:
+                record["early_capture_valid"] = True
+        elif session["mode"] in ("accuracy", "troubleshoot", "charts"):
             self._validate_accuracy_capture(session, axis, source_record, detector_record,
                                             record, capture)
             record["capture_valid"] = True
@@ -1738,6 +1808,8 @@ class AccelHomingWorkflows:
             self._append_beta_home(session, compact_beta_home(capture, record))
         if session["mode"] not in ("accuracy", "troubleshoot"):
             session["records"].append(record)
+            if session.get("auto_notch"):
+                session["auto_notch_controller"].bound_records(session)
         self._info("%s home: result %s; onset %s g; peak %s g; threshold %s g; "
                    "commanded travel %s mm" % (
             axis.upper(), record.get("result"), record.get("onset_g"),
@@ -1833,6 +1905,15 @@ class AccelHomingWorkflows:
                     raise ValueError("mapped-axis receipts differ")
             except (TypeError, ValueError) as exc:
                 raise self._error("homing capture axis mapping does not belong to the current detector: %s" % exc)
+        expected_filter = self._filter_settings(axis)
+        observed_filter = detector.get("signal_filter", {"type": "disabled"})
+        if any(observed_filter.get(key) != value for key, value in expected_filter.items()):
+            raise self._error("homing capture does not belong to the current signal filter")
+        if expected_filter.get("type") != "disabled":
+            metadata = capture.get("signal_filter", {})
+            if (metadata.get("first_sample_matches") != 1 or not capture.get("filtered_samples")
+                    or any(metadata.get(key) != value for key, value in observed_filter.items())):
+                raise self._error("homing capture lacks reproducible filtered samples")
         samples = capture["samples"]
         if not samples[0][0] < arm <= samples[-1][0]:
             raise self._error("homing capture lacks the current pre-arm reference or armed samples")
@@ -2082,6 +2163,8 @@ class AccelHomingWorkflows:
     def _next_calibration_candidate(self, reason, apply=True):
         session = self.session
         self._check_running(session)
+        if session.get("auto_notch") and session.get("auto_notch_phase") == "qualification":
+            raise self._error(reason + "; AUTO fixed-profile qualification failed; threshold was not changed")
         candidate = float(Decimal(str(session["candidate"])) + Decimal(str(session["threshold_step_g"])))
         if not math.isfinite(candidate) or candidate <= session["candidate"]:
             raise self._error(reason + "; next calibration candidate must be finite and increase the threshold")
@@ -2090,6 +2173,9 @@ class AccelHomingWorkflows:
             session.update(candidate=candidate, successes=0, candidate_qualified=False,
                            candidate_attempt=None, validation_records=[], repeatability_spread_mm=None,
                            restarts=session["restarts"] + 1)
+            if session.get("auto_notch"):
+                session["auto_notch_omitted"] += len(session["auto_notch_homes"])
+                session["auto_notch_homes"] = []
         return candidate
 
     def _return_early_calibration(self, axis, record):
@@ -2181,6 +2267,8 @@ class AccelHomingWorkflows:
                                 candidate, session["recovery"]["count"], session["recovery"]["last_return_mm_signed"],
                                 session["attempts"]))
                 continue
+            if session.get("auto_notch"):
+                session["auto_notch_controller"].retain_home(session, record, _capture, discovery)
             if discovery:
                 session["candidate_qualified"] = True
                 session["candidate_attempt"] = record["workflow_attempt"]
@@ -2208,6 +2296,9 @@ class AccelHomingWorkflows:
             if session["successes"] < REQUIRED_SUCCESSES:
                 self._recenter(axis)
                 continue
+            if session.get("auto_notch") and session["auto_notch_phase"] == "raw_reference":
+                session["auto_notch_controller"].select(session)
+                continue
             self._save_model()
             return
 
@@ -2222,6 +2313,7 @@ class AccelHomingWorkflows:
         axis, threshold = session.get("axis"), session.get("candidate")
         threshold_limit = self._threshold_limit()
         candidate_attempt = session.get("candidate_attempt")
+        record_offset = session.get("auto_notch_record_offset", 0) if session.get("auto_notch") else 0
         records, qualified = session.get("records"), session.get("validation_records")
         if session.get("mode") != "calibration" or session.get("state") != "running" \
                 or not isinstance(axis, str) or axis not in AXES \
@@ -2233,12 +2325,14 @@ class AccelHomingWorkflows:
                 or type(candidate_attempt) is not int or candidate_attempt < 1 \
                 or type(session.get("attempts")) is not int \
                 or session.get("attempts") != candidate_attempt + REQUIRED_SUCCESSES \
-                or not isinstance(records, list) or len(records) != session["attempts"] \
+                or type(record_offset) is not int or record_offset < 0 \
+                or not isinstance(records, list) or len(records) + record_offset != session["attempts"] \
+                or candidate_attempt <= record_offset \
                 or not isinstance(qualified, list) or len(qualified) != REQUIRED_SUCCESSES \
                 or not isinstance(session.get("run_id"), str) or not session["run_id"] \
                 or type(session.get("save_config")) is not bool:
             raise self._error(message)
-        discovery = records[candidate_attempt - 1]
+        discovery = records[candidate_attempt - 1 - record_offset]
         window = [discovery] + qualified
         if len({id(record) for record in window}) != REQUIRED_SUCCESSES + 1 \
                 or any(actual is not expected for actual, expected in
@@ -2270,7 +2364,7 @@ class AccelHomingWorkflows:
         # Final release may yield while its motion completes. Recheck all ten
         # accepted trials before staging any model settings.
         self._qualified_validation_records()
-        threshold = self._calibration_saved_threshold(tested_threshold)
+        threshold = tested_threshold if session.get("auto_notch") else self._calibration_saved_threshold(tested_threshold)
         noise_png = None
         if session.get("deferred_noise_result") is not None:
             generation, preflight = self.owner.operation_generation, self.preflight_generation
@@ -2291,10 +2385,11 @@ class AccelHomingWorkflows:
             self._qualified_validation_records()
             # Rendering can yield; the final value must still fit the current
             # sensor headroom, not just the lower threshold used by the trials.
-            threshold = self._calibration_saved_threshold(tested_threshold)
+            threshold = tested_threshold if session.get("auto_notch") else self._calibration_saved_threshold(tested_threshold)
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
                     "axis_mapping": self._validate_current_axis_mapping(session["axis_mapping"], axis),
                     "axis_mapping_context": session["axis_mapping_context"],
+                    "signal_filter": self._filter_settings(axis),
                     "polarity_policy": POLARITY_POLICY,
                     "signal_quality": [self._signal_metadata(record) for record in qualified],
                     "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -2315,8 +2410,8 @@ class AccelHomingWorkflows:
                     "calibration_step_g": session["threshold_step_g"],
                     "tested_threshold_g": tested_threshold,
                     "saved_threshold_g": threshold,
-                    "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
-                    "saved_threshold_tested": False,
+                    "threshold_margin_g": 0.0 if session.get("auto_notch") else CALIBRATION_THRESHOLD_MARGIN_G,
+                    "saved_threshold_tested": bool(session.get("auto_notch")),
                     "calibration_quiet_range_enforced": session["quiet_range_enforced"],
                     "calibration_settle_time_s": session["calibration_settle_time_s"],
                     "recovery": self._calibration_recovery_status(session),
@@ -2328,12 +2423,32 @@ class AccelHomingWorkflows:
             metadata["stationary_noise_seed"] = dict(session["noise_seed"])
         if session.get("stationary_noise") is not None:
             metadata["stationary_noise_measurement"] = dict(session["stationary_noise"])
+        if metadata["signal_filter"]["type"] != "disabled":
+            rates = [r.get("signal_filter", {}).get("sample_rate_hz") for r in qualified]
+            if (any(type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0 for rate in rates)
+                    or any(any(r.get("signal_filter", {}).get(key) != value
+                               for key, value in metadata["signal_filter"].items()) for r in qualified)
+                    or any(abs(rate / rates[0] - 1) > 0.02 for rate in rates)):
+                raise self._error("qualified notch homes do not have a consistent sensor sample rate")
+            metadata["filter_sample_rate_hz"] = rates[0]
         encoded_metadata = json.dumps(metadata, separators=(",", ":"), allow_nan=False)
+        if session.get("auto_notch"):
+            session["auto_notch_controller"].complete(session, metadata, qualified, noise_png)
+            return
         configfile = self.printer.lookup_object("configfile")
         recovery = session.get("accuracy_recovery")
         encoded_threshold = "%.17g" % threshold
+        staged = getattr(self, "staged_filter_axes", set())
+        if not hasattr(self, "staged_filter_axes") and self.model is not None:
+            staged = {a for a in self.model.thresholds
+                      if self.model.metadata[a].get("signal_filter", {}).get("type", "disabled") != "disabled"}
+        staged = set(staged)
+        if metadata["signal_filter"]["type"] == "disabled":
+            staged.discard(axis)
+        else:
+            staged.add(axis)
         staged_metadata = {axis: metadata}
-        entries = [(self.model_section, "version", "1"),
+        entries = [(self.model_section, "version", "2" if staged else "1"),
                    (self.model_section, axis + "_threshold", encoded_threshold),
                    (self.model_section, axis + "_successes", str(REQUIRED_SUCCESSES)),
                    (self.model_section, axis + "_metadata", encoded_metadata)]
@@ -2378,6 +2493,7 @@ class AccelHomingWorkflows:
             self.last_result.update(result="aborted", save_config=False,
                                     reason="calibration model staging failed: %s" % exc)
             raise
+        self.staged_filter_axes = staged
         self.pending_model_metadata.update(copy.deepcopy(staged_metadata))
         if conflict is not None:
             self.last_result["invalidated_axis"] = conflict["axis"]
@@ -2452,6 +2568,16 @@ class AccelHomingWorkflows:
         return threshold
 
     def cmd_CALIBRATE(self, gcmd):
+        notch = gcmd.get("NOTCH", None)
+        if notch is not None:
+            if str(notch).strip().upper() != "AUTO":
+                raise gcmd.error("NOTCH must be AUTO when specified")
+            if __package__:
+                from .accel_homing_backends import load_companion_module
+            else:
+                from accel_homing_backends import load_companion_module
+            load_companion_module("accel_homing_auto").AutoNotchCalibration(self).run(gcmd)
+            return
         if self.session is None:
             self._clear_noise_seeds()
         axis = gcmd.get("AXIS", "").lower()
@@ -2753,6 +2879,10 @@ class AccelHomingWorkflows:
                 closing, token = token, None
                 session["axis_mapping_phase"] = "capture_positive" if direction > 0 else "capture_negative"
                 capture = self.owner.stop_beta_motion_capture(closing, lambda: self._axis_mapping_check(session))
+                if session.get("auto_notch"):
+                    session["auto_notch_controller"].retain_debug_capture(
+                        session, "mapping", 1 if direction > 0 else 2, capture,
+                        record={"direction": direction, "segments": segments})
                 self._axis_mapping_check(session)
                 rows = capture.get("samples", ())
                 if (capture.get("fault") or capture.get("dropped") or capture.get("amplitude_limited")
@@ -2808,7 +2938,11 @@ class AccelHomingWorkflows:
             cleanup_errors = []
             if token is not None:
                 try:
-                    self.owner.stop_beta_motion_capture(token, lambda: self._axis_mapping_check(session))
+                    partial_capture = self.owner.stop_beta_motion_capture(token, lambda: self._axis_mapping_check(session))
+                    if session.get("auto_notch"):
+                        session["auto_notch_controller"].retain_debug_capture(
+                            session, "mapping-partial", 1 if direction > 0 else 2, partial_capture,
+                            record={"phase": session.get("axis_mapping_phase")})
                 except Exception as exc:
                     cleanup_errors.append("capture: %s" % exc)
             if current_attempted:
@@ -2980,6 +3114,14 @@ class AccelHomingWorkflows:
         if (self.owner.operation_generation != session["beta_generation"]
                 or getattr(self.owner, "sensor_fault", None) is not None):
             raise self._error("Beta was interrupted or the accelerometer reported a fault")
+        if session.get("auto_notch_axis_mapping") is not None:
+            expected_filter = ({"type": "disabled"} if session["auto_notch_phase"] == "raw_reference"
+                               else session["auto_notch_analysis"]["profile"])
+            if (self._validate_current_axis_mapping(session.get("axis_mapping"), session["axis"])
+                    != session["auto_notch_axis_mapping"]
+                    or self.owner.noise_sensor_context() != session["axis_mapping_context"]
+                    or self._filter_settings(session["axis"]) != expected_filter):
+                raise self._error("AUTO mapped detector, sensor context or filter changed")
 
     def _beta_profile(self, plan, start, end, cutoff):
         extracted, references = plan["extractor"](start, end)
@@ -3103,6 +3245,9 @@ class AccelHomingWorkflows:
                     closing_token = token
                     token = None
                     capture = self.owner.stop_beta_motion_capture(closing_token, lambda: self._beta_check(session))
+                    if session.get("auto_notch"):
+                        session["auto_notch_controller"].retain_debug_capture(
+                            session, "motion", iteration, capture, record=session.get("beta_current_motion"))
                     self._beta_check(session)
                     samples = capture.get("samples", ())
                     interval = 1.0 / rate
@@ -3128,7 +3273,11 @@ class AccelHomingWorkflows:
                 finally:
                     if token is not None and getattr(self.owner, "beta_motion_capture", None) is token:
                         try:
-                            self.owner.stop_beta_motion_capture(token, lambda: self._beta_check(session))
+                            partial_capture = self.owner.stop_beta_motion_capture(token, lambda: self._beta_check(session))
+                            if session.get("auto_notch"):
+                                session["auto_notch_controller"].retain_debug_capture(
+                                    session, "motion-partial", iteration, partial_capture,
+                                    record=session.get("beta_current_motion"))
                         except Exception as exc:
                             session["beta_capture_cleanup_error"] = str(exc)
                             if capture_failure is None:
@@ -3509,6 +3658,9 @@ class AccelHomingWorkflows:
         axis = gcmd.get("AXIS", "").lower()
         if axis not in AXES:
             raise gcmd.error("AXIS must be X or Y")
+        if self._filter_settings(axis)["type"] != "disabled":
+            raise gcmd.error("Beta moving-noise calibration does not support notch filtering; "
+                             "use ACCEL_HOMING_CALIBRATE for this axis")
         self._require_centered(gcmd)
         if gcmd.get_int("SAVE_CONFIG", 0, minval=0, maxval=1):
             raise gcmd.error("Beta produces a PNG and threshold suggestion only; SAVE_CONFIG=1 is unsupported")
@@ -3852,26 +4004,93 @@ class AccelHomingWorkflows:
         self._run_diagnostic(gcmd, list(requested), samples)
 
     def cmd_EXPERIMENT(self, gcmd):
+        previous_result = self.last_result
+        diagnostic_module, log_cursor = None, None
+        try:
+            if self._experiment_export_idle():
+                diagnostic_module = _load_troubleshoot_module()
+                cursor = getattr(diagnostic_module, "debug_log_cursor", None)
+                if callable(cursor):
+                    log_cursor = cursor(self.printer)
+        except Exception:
+            # Preserve the ordinary command's exact missing-module error.
+            pass
+        try:
+            response = self._cmd_EXPERIMENT(gcmd)
+        except Exception as exc:
+            current = self.last_result if self.last_result is not previous_result else None
+            artifacts = current.get("artifacts") if isinstance(current, dict) else None
+            if not artifacts or not artifacts.get("archive"):
+                if not self._experiment_export_idle():
+                    self._info("Experiment failure evidence was not exported while another workflow or motion is active")
+                    raise
+                try:
+                    module = diagnostic_module or _load_troubleshoot_module()
+                    result = module.export_experiment_failure(self, gcmd, str(exc),
+                        log_cursor=log_cursor, partial=current,
+                        exception=module.exception_context(exc, "command" if current else "preflight"))
+                    # A rejected command must not replace an active workflow's
+                    # result or borrow its run ID and evidence directory.
+                    if self.session is None:
+                        self.last_result = result
+                    paths = result["artifacts"]
+                    self._info("Experiment evidence folder: %s" % paths["folder"])
+                    self._info("Experiment shareable ZIP: %s" % paths["archive"])
+                except Exception as export_error:
+                    self._info("Experiment failure evidence could not be exported: %s" % export_error)
+            raise
+        else:
+            current = self.last_result if self.last_result is not previous_result else None
+            if (isinstance(current, dict) and current.get("export_error")
+                    and not (current.get("artifacts") or {}).get("archive")
+                    and self._experiment_export_idle()):
+                try:
+                    module = diagnostic_module or _load_troubleshoot_module()
+                    self.last_result = module.export_experiment_failure(self, gcmd, current["export_error"],
+                        log_cursor=log_cursor, partial=current, exception=current.get("export_exception"))
+                    paths = self.last_result["artifacts"]
+                    self._info("Experiment evidence folder: %s" % paths["folder"])
+                    self._info("Experiment shareable ZIP: %s" % paths["archive"])
+                except Exception as export_error:
+                    self._info("Experiment failure evidence could not be exported: %s" % export_error)
+            return response
+
+    def _experiment_export_idle(self):
+        """Never perform preflight log/file work during unrelated printer motion."""
+        try:
+            if (self.session is not None or self.owner.homing_active
+                    or self.owner.attempt is not None or self._printing()):
+                return False
+            queued, estimated, empty = self.owner.toolhead.check_busy(self.reactor.monotonic())
+            return bool(empty and queued <= estimated + .1)
+        except Exception:
+            return False
+
+    def _cmd_EXPERIMENT(self, gcmd):
         axis = str(gcmd.get("AXIS", "")).strip().lower()
         if axis not in AXES:
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT requires AXIS=X or AXIS=Y")
-        # This historical experiment reconstructs XYZ crossings and has no
-        # independently qualified XYZ threshold parameter. Never reinterpret
-        # a directional calibration threshold, including an unsaved profile.
+        experiment_mode = str(gcmd.get("MODE", "LIVE")).strip().upper()
+        # Only the transport comparison can use a mapped calibration. The
+        # historical fitter and live/shadow paths still require XYZ evidence.
         profiles = [self.pending_model_metadata.get(axis)]
         if self.model is not None and axis in self.model.thresholds:
             profiles.append(self.model.metadata.get(axis))
-        if any(isinstance(profile, dict) and profile.get("impact_metric") == "mapped_axis"
-               for profile in profiles):
+        mapped_compare = any(isinstance(profile, dict) and profile.get("impact_metric") == "mapped_axis"
+                             for profile in profiles)
+        if mapped_compare and experiment_mode != "COMPARE":
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT uses XYZ thresholds and cannot use a mapped-axis "
                              "calibration. Use ACCEL_HOMING_TROUBLESHOOT AXIS=%s CENTERED=1 "
                              "for mapped-axis homing diagnostics; no motion requested" % axis.upper())
         for key in gcmd.get_command_parameters():
             if key not in ("AXIS", "SAMPLES", "CENTERED", "SPEED", "GC_GUARD", "MAX_SAMPLE_AGE", "MODE"):
                 raise gcmd.error("%s is not supported by ACCEL_HOMING_EXPERIMENT" % key)
-        experiment_mode = str(gcmd.get("MODE", "LIVE")).strip().upper()
         if experiment_mode not in ("LIVE", "SHADOW", "COMPARE"):
             raise gcmd.error("MODE must be LIVE, SHADOW or COMPARE")
+        if not mapped_compare and self._filter_settings(axis).get("type") != "disabled":
+            raise gcmd.error("historical XYZ experiments require an unfiltered calibrated threshold; "
+                             "an active notch cannot reuse its filtered threshold as RAW XYZ. "
+                             "Use mapped-axis MODE=COMPARE after calibration; no motion requested")
         samples = gcmd.get_int("SAMPLES", 10, minval=2, maxval=40)
         guard = bool(gcmd.get_int("GC_GUARD", 1, minval=0, maxval=1))
         max_age = gcmd.get_float("MAX_SAMPLE_AGE", .040, minval=.001, maxval=.5)
@@ -3886,12 +4105,15 @@ class AccelHomingWorkflows:
             raise gcmd.error("SPEED must equal the configured, qualified homing speed (%.6g mm/s); "
                              "a saved threshold is not qualified at a different speed. No motion requested"
                              % configured_speed)
+        frozen_detector = self._mapped_comparison_detector(axis) if mapped_compare else None
         if guard:
             self._experimental_gc_preflight()
         try:
             module = _load_experiment_module()
             _load_troubleshoot_module()
-            if experiment_mode in ("SHADOW", "COMPARE") and not callable(getattr(module, "replay_shadow_capture", None)):
+            if mapped_compare and not callable(getattr(module, "validate_mapped_comparison_capture", None)):
+                raise ImportError("experiment module does not support mapped MODE=COMPARE")
+            if not mapped_compare and experiment_mode in ("SHADOW", "COMPARE") and not callable(getattr(module, "replay_shadow_capture", None)):
                 raise ImportError("experiment module does not support MODE=%s" % experiment_mode)
         except Exception as exc:
             raise gcmd.error("ACCEL_HOMING_EXPERIMENT modules could not load: %s. "
@@ -3927,9 +4149,66 @@ class AccelHomingWorkflows:
                 limits=experiment["limits"] + [
                     "An invalid shadow profile does not stop qualified raw delivery-comparison homes.",
                     "Delivery interval is not sensor sampling rate or proof of less physical impact."])
+        if mapped_compare:
+            experiment.update(
+                impact_metric="mapped_axis", frozen_detector=frozen_detector,
+                baseline_samples=0, training_samples=0, heldout_samples=0,
+                discovery_samples=0, raw_threshold_g=None,
+                detector_threshold_g=frozen_detector["threshold_g"],
+                comparison_design="paired calibrated mapped-axis homes; alternate control/fast then fast/control; no discovery, XYZ fitting or replay",
+                gc_policy="same guard for every mapped-axis control/fast home; stationary collection before each guarded native home",
+                noise_margin_policy=None,
+                shadow_validation={"status": "not_applicable", "live_use_authorized": False,
+                                   "reason": "mapped transport comparison does not fit or replay XYZ profiles"},
+                limits=["Host freshness checks and watchdogs are reactor-dependent; no MCU-independent stop-time guarantee.",
+                        "Mapping, calibrated threshold and any fixed notch are frozen for the entire comparison.",
+                        "No automatic notch selection, XYZ fitting, speed search or persistence.",
+                        "Delivery interval is not sensor sampling rate or proof of less physical impact.",
+                        "A rejected or faulted home stops without an automatic return."])
         self._run_diagnostic(gcmd, [axis], samples, experiment=experiment,
-                             fitter=module.fit_experimental_profile,
-                             shadow_replayer=getattr(module, "replay_shadow_capture", None))
+                             fitter=None if mapped_compare else module.fit_experimental_profile,
+                             shadow_replayer=getattr(module, "replay_shadow_capture", None),
+                             mapped_validator=getattr(module, "validate_mapped_comparison_capture", None))
+
+    def _mapped_comparison_detector(self, axis):
+        """Require a loaded calibrated detector; manual/staged limits are not its qualification."""
+        self._check_pending_mapping(axis)
+        model = self.model
+        if model is None or axis not in model.thresholds:
+            raise self._error("mapped comparison requires a loaded calibrated model; SAVE_CONFIG and restart first")
+        metadata = model.metadata[axis]
+        if metadata.get("impact_metric") != "mapped_axis":
+            raise self._error("mapped comparison requires a loaded mapped-axis model")
+        pending = self.pending_model_metadata.get(axis)
+        if pending is not None and pending != metadata:
+            raise self._error("mapped comparison has a staged calibration; SAVE_CONFIG and restart first")
+        threshold = self.owner.threshold_g[axis]
+        if (axis in self.manual_axes or self._temporary_manual_threshold(axis)
+                or type(threshold) not in (int, float) or not math.isfinite(threshold)
+                or threshold <= 0 or threshold != model.thresholds[axis]):
+            raise self._error("mapped comparison requires the calibrated threshold without a manual override")
+        mapping = self.detection_axis_mapping(axis)
+        if mapping is None:
+            raise self._error("mapped comparison lacks its calibrated axis mapping")
+        context = self._model_context(axis)
+        if any(metadata.get(key) != value for key, value in context.items()):
+            raise self._error("mapped comparison calibration context changed; recalibrate before motion")
+        signal_filter = self._filter_settings(axis)
+        if metadata.get("signal_filter", {"type": "disabled"}) != signal_filter:
+            raise self._error("mapped comparison calibration uses a different signal filter; recalibrate before motion")
+        filter_rate = metadata.get("filter_sample_rate_hz")
+        if signal_filter.get("type") != "disabled" and (
+                type(filter_rate) not in (int, float) or not math.isfinite(filter_rate) or filter_rate <= 0):
+            raise self._error("mapped comparison calibrated notch lacks its sensor sample rate; recalibrate before motion")
+        return json.loads(json.dumps({"impact_metric": "mapped_axis", "axis": axis,
+            "axis_mapping": mapping, "threshold_g": threshold, "signal_filter": signal_filter,
+            "filter_sample_rate_hz": metadata.get("filter_sample_rate_hz"),
+            "model_context": context}, allow_nan=False))
+
+    def _check_mapped_comparison_detector(self, session):
+        expected = session["experiment"]["frozen_detector"]
+        if self._mapped_comparison_detector(expected["axis"]) != expected:
+            raise self._error("mapped comparison detector changed; no further motion or automatic return")
 
     def _diagnostic_recenter(self, session, recorder, axis):
         before = troubleshoot_snapshot(self)
@@ -4128,7 +4407,8 @@ class AccelHomingWorkflows:
                 home["delivery_interval_restored"] = False
                 raise
 
-    def _run_diagnostic(self, gcmd, axes, samples, experiment=None, fitter=None, shadow_replayer=None):
+    def _run_diagnostic(self, gcmd, axes, samples, experiment=None, fitter=None, shadow_replayer=None,
+                        mapped_validator=None):
         # Same idle/native-home/unhomed/geometry preflight as ACCURACY. PNG
         # dependencies are deliberately optional: evidence must survive failure.
         self._begin(gcmd, "troubleshoot", axes=axes)
@@ -4136,9 +4416,11 @@ class AccelHomingWorkflows:
         mode = "experiment" if experiment else "troubleshoot"
         shadow_mode = bool(experiment and experiment.get("mode") == "SHADOW")
         compare_mode = bool(experiment and experiment.get("mode") == "COMPARE")
-        total_samples = samples * (2 if compare_mode else 1) + (10 if experiment else 0)
+        mapped_compare = bool(compare_mode and experiment.get("impact_metric") == "mapped_axis")
+        total_samples = samples * (2 if compare_mode else 1) + (10 if experiment and not mapped_compare else 0)
+        first_sample = 1 if mapped_compare else 0
         session.update(state="running", axes=axes, samples_requested=samples,
-                       attempt_limit=len(axes) * (total_samples + 1), sample_index=0,
+                       attempt_limit=len(axes) * (total_samples + 1 - first_sample), sample_index=0,
                        configured_speeds={axis: self.owner.rails_by_axis[axis].get_homing_info().speed
                                           for axis in axes},
                        pending_record=None, last_arm_time=None,
@@ -4170,12 +4452,17 @@ class AccelHomingWorkflows:
                 recorder.record_event("experimental_delivery_preflight", comparison=delivery)
                 if not delivery["preflight_safe"]:
                     raise self._error("delivery comparison preflight rejected: " + delivery["reason"])
-                self._info("Experiment COMPARE: one discovery, 6 training and 4 heldout RAW homes, then "
+                if mapped_compare:
+                    self._info("Experiment COMPARE: %d pairs (%d mapped-axis homes), alternating control/fast then fast/control. "
+                               "Calibrated mapping, threshold and fixed notch are frozen; no discovery, fitting or persistence"
+                               % (samples, samples * 2))
+                else:
+                    self._info("Experiment COMPARE: one discovery, 6 training and 4 heldout RAW homes, then "
                            "%d pairs (%d RAW homes), alternating control/fast then fast/control. "
                            "Original threshold, configured speed and same GC guard; no weighted activation or persistence"
                            % (samples, samples * 2))
                 if not delivery["supported"]:
-                    self._info("Delivery intervention unavailable: %s. Homes remain RAW and are labelled unavailable; "
+                    self._info("Delivery intervention unavailable: %s. Homes retain the active detector and are labelled unavailable; "
                                "this run cannot demonstrate a delivery speedup" % delivery["reason"])
             elif shadow_mode:
                 self._info("Experiment SHADOW: one discovery, 6 training and 4 heldout raw homes, then "
@@ -4193,7 +4480,7 @@ class AccelHomingWorkflows:
             session["accuracy_center_reference"] = self._accuracy_position_reference()
             for axis_index, axis in enumerate(axes):
                 session["axis"] = axis
-                for sample in range(total_samples + 1):
+                for sample in range(first_sample, total_samples + 1):
                     self._check_running(session)
                     session.update(sample_index=sample, pending_record=None)
                     recorder.begin_home(axis, sample)
@@ -4203,26 +4490,40 @@ class AccelHomingWorkflows:
                         phase = ("discovery" if sample == 0 else "training" if sample <= 6
                                  else "holdout" if sample <= 10 else "shadow" if shadow_mode else "candidate")
                         if compare_mode:
-                            plan = delivery["planned_order"][sample - 11] if sample > 10 else None
+                            plan_index = sample - 1 if mapped_compare else sample - 11
+                            plan = delivery["planned_order"][plan_index] if plan_index >= 0 else None
                             planned_variant = plan["variant"] if plan else "control"
                             recorder.current_home.update(comparison_pair=plan["pair"] if plan else None,
                                                          comparison_order=plan["order"] if plan else None)
                             if plan:
                                 phase = "delivery_" + (planned_variant if delivery["supported"] else "unavailable")
-                                self._info("COMPARE pair %d/%d, home %d/2: %s%s; RAW detector"
+                                self._info("COMPARE pair %d/%d, home %d/2: %s%s; %s detector"
                                            % (plan["pair"], samples, plan["order"], planned_variant.upper(),
-                                              "" if delivery["supported"] else " (intervention unavailable)"))
+                                              "" if delivery["supported"] else " (intervention unavailable)",
+                                              "calibrated mapped-axis" if mapped_compare else "RAW XYZ"))
                         session["experiment_phase"] = experiment["phase"] = phase
                         recorder.current_home.update(phase=phase,
                             gc_guard={"requested": experiment["gc_guard_requested"], "restored": None},
-                            profile_frozen=(phase in ("candidate", "shadow") or
+                            profile_frozen=(mapped_compare or phase in ("candidate", "shadow") or
                                             (compare_mode and sample > 10 and
                                              session.get("comparison_shadow_profile") is not None)))
                     try:
+                        if mapped_compare:
+                            self._check_mapped_comparison_detector(session)
+                            recorder.current_home["frozen_detector"] = experiment["frozen_detector"]
                         home_scope = (self._experimental_delivery_scope(session, planned_variant)
                                       if compare_mode else contextlib.nullcontext())
                         with home_scope:
                             record, capture = self._home(axis)
+                        if mapped_compare:
+                            self._check_mapped_comparison_detector(session)
+                            try:
+                                receipt = mapped_validator(capture, record, experiment["frozen_detector"],
+                                                           max_age_s=experiment["max_sample_age_s"])
+                            except (ValueError, TypeError, KeyError, IndexError) as exc:
+                                raise self._error("mapped comparison capture rejected: %s; no automatic return" % exc)
+                            recorder.current_home["mapped_comparison_receipt"] = receipt
+                            record["mapped_comparison_verified"] = True
                         quality, reason = self._quality(axis, record)
                         recorder.current_home["quality"] = quality
                         if experiment:
@@ -4264,9 +4565,9 @@ class AccelHomingWorkflows:
                             record["shadow_capture_verified"] = valid_shadow
                         if sample == 0:
                             session["axis_results"][axis]["discovery"] = record
-                        elif not experiment or sample > 10:
+                        elif mapped_compare or not experiment or sample > 10:
                             session["axis_results"][axis]["trials"].append(record)
-                        if experiment and 1 <= sample <= 10:
+                        if experiment and not mapped_compare and 1 <= sample <= 10:
                             baseline_captures.append(capture)
                             baseline_records.append(record)
                             if sum(len(item["samples"]) for item in baseline_captures) > 1000000:
@@ -4278,7 +4579,7 @@ class AccelHomingWorkflows:
                         # Do not substitute a previous home's record.
                         recorder.finish_home(pending, exc)
                         raise
-                    if experiment and sample == 10:
+                    if experiment and not mapped_compare and sample == 10:
                         self._check_running(session)
                         envelope = self._experimental_reference_envelope(
                             baseline_captures, experiment["max_sample_age_s"])
@@ -4345,10 +4646,14 @@ class AccelHomingWorkflows:
                             experiment["candidate_activated"] = True
                     del capture
                     if sample < total_samples or axis_index < len(axes) - 1:
+                        if mapped_compare:
+                            self._check_mapped_comparison_detector(session)
                         if compare_mode and session.get("delivery_state"):
                             self._experimental_delivery_check(session, session["delivery_state"]["normal"])
                         self._diagnostic_recenter(session, recorder, axis)
             axis, record, _source = session["terminal_home"]
+            if mapped_compare:
+                self._check_mapped_comparison_detector(session)
             if compare_mode and session.get("delivery_state"):
                 self._experimental_delivery_check(session, session["delivery_state"]["normal"])
             recorder.record_event("terminal_release_planned", axis=axis,
@@ -4357,6 +4662,9 @@ class AccelHomingWorkflows:
             recorder.record_event("terminal_release_completed", after=troubleshoot_snapshot(self))
             self._finish({"result": "complete", "mode": mode})
         except Exception as exc:
+            if experiment:
+                experiment["failure_exception"] = _load_troubleshoot_module().exception_context(
+                    exc, session.get("experiment_phase", "diagnostic"))
             if self.session is session and not session.get("finishing"):
                 self._finish({"result": "aborted", "mode": mode, "reason": str(exc)}, release=True)
             raise
@@ -4370,6 +4678,8 @@ class AccelHomingWorkflows:
                     self._experimental_delivery_restore(session)
                 except Exception as exc:
                     delivery_cleanup_error = str(exc)
+                    experiment["delivery_cleanup_exception"] = _load_troubleshoot_module().exception_context(
+                        exc, "delivery_cleanup")
             if experiment:
                 self.owner.experimental_profile = session["saved_experimental_profile"]
                 baseline_captures.clear()
@@ -4389,7 +4699,8 @@ class AccelHomingWorkflows:
                     [record for record in session["records"] if record.get("workflow_phase") == phase
                      and record.get("capture_valid") and record.get("experiment_quality") == "good"
                      and (phase != "shadow" or record.get("shadow_capture_verified"))])
-                    for phase in (("training", "holdout", "delivery_control", "delivery_fast", "delivery_unavailable")
+                    for phase in (("delivery_control", "delivery_fast", "delivery_unavailable") if mapped_compare else
+                                  ("training", "holdout", "delivery_control", "delivery_fast", "delivery_unavailable")
                                   if compare_mode else ("training", "holdout", "shadow") if shadow_mode else
                                   ("training", "holdout", "candidate"))}
                 experiment["runtime_restored"] = {
@@ -4404,6 +4715,14 @@ class AccelHomingWorkflows:
                     experiment["runtime_restored"]["interval"] = bool(
                         experiment.get("delivery_comparison", {}).get("restoration", {}).get("complete", False)
                         and delivery_cleanup_error is None)
+                if mapped_compare:
+                    try:
+                        self._check_mapped_comparison_detector(session)
+                        experiment["runtime_restored"]["detector"] = True
+                    except Exception as exc:
+                        experiment["runtime_restored"]["detector"] = False
+                        experiment["frozen_detector_cleanup_error"] = str(exc)
+                        result.update(result="aborted", reason=result.get("reason") or str(exc))
                 result["experiment"] = experiment
             try:
                 if recorder is not None:
@@ -4414,10 +4733,16 @@ class AccelHomingWorkflows:
                     self._info("%s evidence folder: %s" % (mode.capitalize(), result["artifacts"]["folder"]))
                     if result["artifacts"].get("archive"):
                         self._info("%s shareable ZIP: %s" % (mode.capitalize(), result["artifacts"]["archive"]))
+                    else:
+                        self._info("%s ZIP could not be created: %s; evidence remains in %s" % (
+                            mode.capitalize(), result["artifacts"].get("zip_error", "archive unavailable"),
+                            result["artifacts"]["folder"]))
                     if result["artifacts"]["render"]["result"] != "complete":
                         self._info("Troubleshoot PNG export failed; raw CSV and manifest remain available")
             except Exception as exc:
                 result["export_error"] = str(exc)
+                if experiment:
+                    result["export_exception"] = _load_troubleshoot_module().exception_context(exc, "export")
                 result["artifact_folder"] = getattr(recorder, "folder", None)
                 self._info("Troubleshoot evidence export failed: %s; partial folder: %s" % (
                     exc, result["artifact_folder"]))
@@ -4710,6 +5035,8 @@ class AccelHomingWorkflows:
                               phase="validation" if session["candidate_qualified"] else "discovery")
                 if session.get("stationary_noise") is not None:
                     active["stationary_noise"] = dict(session["stationary_noise"])
+        if active is not None and session.get("auto_notch"):
+            active["auto_notch"] = session["auto_notch_controller"].summary(session)
         return {"model": self.model_name, "manual_threshold_overrides": sorted(self.manual_axes),
                 "active": active, "last_result": self.last_result,
                 "noise_recommendation": self.noise_recommendation,

@@ -14,6 +14,7 @@ FILES = ("install.sh", "uninstall.sh", "installer.py", "uninstaller.py",
          "accel_homing_backends.py", "accel_homing_workflows.py",
          "accel_homing_model.py", "accel_homing_axes.py", "accel_homing_config.py", "accel_homing_charts.py", "accel_homing_troubleshoot.py",
          "accel_homing_experiment.py",
+         "accel_homing_filter.py", "accel_homing_auto.py", "accel_homing_auto_notch.py",
          "LICENSE", "NOTICE")
 
 

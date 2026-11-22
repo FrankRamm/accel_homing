@@ -13,16 +13,20 @@ import gc
 import gzip
 import hashlib
 import importlib.util
+import itertools
 import json
 import math
 import os
 from pathlib import Path
 import platform
+import stat as stat_mode
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
+import uuid
 import zipfile
 
 SCHEMA = "accel_homing_troubleshoot_v1"
@@ -107,6 +111,65 @@ def clean(value, depth=0):
     return {"unavailable_type": type(value).__name__}
 
 
+def exception_context(exc, phase):
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return {"type": type(exc).__module__ + "." + type(exc).__name__, "message": str(exc),
+            "phase": phase, "traceback": text[-4000:], "traceback_characters": len(text),
+            "traceback_truncated": len(text) > 4000}
+
+
+def export_experiment_failure(workflow, gcmd, reason, *, log_cursor=None, partial=None, exception=None):
+    """Export rejected command evidence without beginning a motion workflow."""
+    starting_result = workflow.last_result
+    partial = partial if isinstance(partial, dict) and partial.get("mode") == "experiment" else None
+    run_id = partial.get("run_id") if partial else None
+    valid_id = isinstance(run_id, str) and len(run_id) == 32 and all(c in "0123456789abcdef" for c in run_id)
+    run_id = run_id if valid_id else uuid.uuid4().hex
+    root = Path(workflow.charts_directory) / "experiment"
+    root.mkdir(parents=True, exist_ok=True)
+    folder = root / run_id
+    if not (partial and valid_id and folder.is_dir()):
+        folder.mkdir()
+    supplied = gcmd.get_command_parameters()
+    allowed = {"AXIS", "MODE", "SAMPLES", "CENTERED", "SPEED", "GC_GUARD", "MAX_SAMPLE_AGE"}
+    arguments = {key: value for key, value in supplied.items() if key in allowed}
+    details = {"command": "ACCEL_HOMING_EXPERIMENT", "run_id": run_id,
+               "phase": "export_failure" if partial else "preflight", "reason": reason,
+               "arguments": arguments, "unsupported_argument_names": sorted(set(supplied) - allowed),
+               "log_cursor": log_cursor, "partial_result": partial, "exception": exception}
+    result = dict(partial or {}, mode="experiment", run_id=run_id,
+                  result=(partial or {}).get("result", "rejected"), reason=reason)
+    result.pop("artifacts", None)
+    if exception is not None:
+        result["exception"] = exception
+    report = {"schema": SCHEMA, "command": "ACCEL_HOMING_EXPERIMENT", "run_id": run_id,
+              "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "phase": details["phase"], "arguments": clean(arguments),
+              "unsupported_argument_names": details["unsupported_argument_names"],
+              "ending": clean(result), "snapshot": snapshot(workflow),
+              "debug": write_debug_context(folder, workflow.printer, details=details)}
+    if partial is None:
+        # Cached detector records may belong to an earlier unrelated command.
+        report["snapshot"].get("runtime", {}).pop("last", None)
+    # A partially exported run may already have its complete home/capture
+    # manifest. Keep it intact and add the command failure as separate evidence.
+    manifest = folder / ("command-failure.json" if (folder / "manifest.json").exists() else "manifest.json")
+    write_json(manifest, report)
+    archive = folder.with_suffix(".zip")
+    if archive.exists():
+        archive = folder.with_name(folder.name + "-failure-" + uuid.uuid4().hex[:8]).with_suffix(".zip")
+    def cooperate():
+        if workflow.last_result is not starting_result or not workflow._experiment_export_idle():
+            raise ValueError("failure archive interrupted by another workflow or motion")
+        workflow.reactor.pause(workflow.reactor.monotonic())
+        if workflow.last_result is not starting_result or not workflow._experiment_export_idle():
+            raise ValueError("failure archive interrupted by another workflow or motion")
+    write_run_archive(folder, archive, cooperate=cooperate, prefix=folder.name)
+    result["artifacts"] = {"folder": str(folder), "manifest": str(manifest), "archive": str(archive),
+                           "debug": report["debug"], "render": {"result": "not_attempted"}}
+    return result
+
+
 def _observe(obj, method, *args):
     try:
         callback = getattr(obj, method, None)
@@ -156,19 +219,24 @@ def snapshot(workflow):
         return {"unavailable": "cached state snapshot", "error": str(exc)}
 
 
-def environment(workflow):
-    owner = workflow.owner
-    settings = workflow._status("configfile").get("settings", {})
+def _diagnostic_settings(settings, sensor_name):
     # Never include macros, network/auth settings or arbitrary complete configs.
     allowed = lambda name: name in ("printer", "accel_homing", "beacon_accel_homing", "beacon", "cartographer", "mcu") or name.startswith((
         "stepper_", "tmc", "mcu ", "accel_homing_model ", "adxl345", "lis2dw", "lis3dh", "icm20948", "mpu9250"))
     sections = {name: clean(values) for name, values in settings.items()
-                if allowed(name) or name == getattr(owner, "sensor_name", None)}
+                if allowed(name) or name == sensor_name}
     for name, values in sections.items():
         if isinstance(values, dict):
             for key in list(values):
                 if any(word in key.lower() for word in ("password", "secret", "token", "credential")):
                     values[key] = "<redacted>"
+    return sections
+
+
+def environment(workflow):
+    owner = workflow.owner
+    settings = workflow._status("configfile").get("settings", {})
+    sections = _diagnostic_settings(settings, getattr(owner, "sensor_name", None))
     backend = getattr(owner, "backend", None)
     helper = getattr(owner, "helper", None)
     sensor = getattr(backend, "sensor", getattr(owner, "sensor", None))
@@ -639,12 +707,14 @@ class TimingTrace:
             except Exception:
                 self.errors += 1
 
-    def export(self, folder):
+    def export(self, folder, cooperate=None):
         summaries = {}
         with gzip.open(folder / "timing.jsonl.gz", "wt", encoding="utf-8") as stream:
             for home_id, group in sorted(self.groups.items()):
                 retained = {row["sequence"]: row for row in list(group["slow"]) + list(group["rows"])}
-                for _, row in sorted(retained.items()):
+                for index, (_, row) in enumerate(sorted(retained.items())):
+                    if cooperate is not None and index % 128 == 0:
+                        cooperate()
                     stream.write(json.dumps(clean(row), allow_nan=False) + "\n")
                 summaries[str(home_id)] = {"observed": group["observed"], "retained": len(retained),
                     "omitted": group["observed"] - len(retained),
@@ -700,7 +770,7 @@ def adxl_saturation_profile(context):
         return {"available": False, "reason": "invalid ADXL345 mapping"}
 
 
-def diagnose_saturation(public, raw, profile, stop_time):
+def diagnose_saturation(public, raw, profile, stop_time, cooperate=None):
     """Correct exported evidence only, after motion; never mutate detector/model state."""
     if not profile.get("available"):
         public["saturation_diagnostic"] = profile
@@ -711,6 +781,8 @@ def diagnose_saturation(public, raw, profile, stop_time):
               ("before_arm", "armed_before_onset", "after_onset_before_stop", "after_stop", "unattributed")}
     counts, first, last = dict.fromkeys("xyz", 0), None, None
     for offset in range(0, len(raw), 4):
+        if cooperate is not None and offset % 1024 == 0:
+            cooperate()
         when = raw[offset]
         phase = ("unattributed" if not finite(when) else
                  "before_arm" if finite(arm) and when < arm else
@@ -930,6 +1002,7 @@ def _distribution(values, total):
 
 def comparison_report(report):
     experiment = report.get("experiment") or {}
+    mapped_compare = experiment.get("impact_metric") == "mapped_axis"
     timing_homes = report.get("timing", {}).get("homes", {})
     rows = []
     for home in report["homes"]:
@@ -942,6 +1015,9 @@ def comparison_report(report):
             "delivery_control_interval_s", "delivery_requested_interval_s", "delivery_effective_interval_s",
             "delivery_supported", "delivery_intervention_applied")}
         row["delivery_observation"] = home.get("delivery_observation")
+        row.update(impact_metric=record.get("impact_metric"), threshold_g=record.get("threshold_g"),
+                   axis_mapping=record.get("axis_mapping"),
+                   mapped_comparison_verified=(home.get("mapped_comparison_receipt") or {}).get("verified"))
         row["onset_to_host_dispatch_estimate_ms"] = millis(home.get("stop_timing", {}).get("onset_to_host_dispatch_estimate_s"))
         for key in ("batch_last_to_adapter", "detector_to_request"):
             row[key + "_ms"] = millis(delivery.get("segments", {}).get(key, {}).get("duration_s"))
@@ -972,6 +1048,8 @@ def comparison_report(report):
                 if (row.get("error") or not row.get("delivery_supported") or not observed.get("count")
                         or observed.get("consistent") is not True or not finite(row.get("delivery_effective_interval_s"))):
                     reason = "home error or active delivery intervention evidence unavailable/inconsistent"
+                if mapped_compare and row.get("mapped_comparison_verified") is not True:
+                    reason = "mapped detector crossing/freshness receipt unavailable or rejected"
             if not fast[0].get("delivery_intervention_applied"):
                 reason = "fast intervention not observed"
         matched = reason is None
@@ -983,6 +1061,8 @@ def comparison_report(report):
             "delta_fast_minus_control": deltas})
     return {"schema": "accel_homing_delivery_comparison_v1", "mode": "COMPARE",
         "design": clean(experiment.get("delivery_comparison") or {}),
+        "impact_metric": "mapped_axis" if mapped_compare else "xyz_magnitude",
+        "frozen_detector": clean(experiment.get("frozen_detector")),
         "shadow_validation": clean(experiment.get("shadow_validation") or {}),
         "noise_margin_policy": clean(experiment.get("noise_margin_policy") or {}),
         "restoration": clean(experiment.get("runtime_restored") or {}),
@@ -992,11 +1072,13 @@ def comparison_report(report):
         "bounds": {"max_homes": MAX_HOMES, "home_rows": len(rows),
                    "reference_homes_excluded_from_pairs": len(rows) - len(measured),
                    "timing_rows_omitted": sum(item.get("omitted", 0) for item in timing_homes.values())},
-        "interpretation": ["All physical homes use fixed raw XYZ detection. Shadow validation never authorizes live use.",
+        "interpretation": [("All physical homes use the frozen calibrated mapped-axis detector, threshold and any fixed notch; no XYZ fitting or replay."
+                             if mapped_compare else "All physical homes use fixed raw XYZ detection. Shadow validation never authorizes live use."),
             "Pair deltas are fast minus control: negative latency values mean earlier host observations, not earlier physical stops.",
             "Commanded halt minus trigger is step accounting, not physical carriage travel or measured physical overshoot.",
             "Missing numbers remain null/blank; group distributions retain partial homes and expose per-metric missing counts.",
-            "Discovery and references are retained but excluded from delivery groups and pairs.",
+            ("Every home belongs to a comparison pair; no discovery or reference fitting homes are added."
+             if mapped_compare else "Discovery and references are retained but excluded from delivery groups and pairs."),
             "Armed metrics cover calls entered with an active unfinished attempt; whole-home recenter/reference timing is excluded.",
             "Interleaved pairs reduce order effects; small samples and changing host/thermal state do not establish causality.",
             "MCU receipt, physical contact/halt and exact decoded-sample-to-message mapping remain unavailable."]}
@@ -1006,6 +1088,7 @@ def export_comparison(folder, report):
     comparison = comparison_report(report)
     write_json(folder / "comparison.json", comparison)
     fields = ["row_type", "home_id", "axis", "phase", "quality", "comparison_pair", "comparison_order",
+              "impact_metric", "threshold_g", "mapped_comparison_verified",
               "delivery_variant", "delivery_planned_variant", "delivery_supported", "delivery_intervention_applied",
               "delivery_control_interval_s", "delivery_requested_interval_s", "delivery_effective_interval_s",
               "matched", "reason"] + list(COMPARISON_METRICS)
@@ -1019,7 +1102,8 @@ def export_comparison(folder, report):
                 "comparison_pair": pair["pair"], "matched": pair["matched"], "reason": pair["reason"],
                 **pair["delta_fast_minus_control"]})
     design = comparison["design"]
-    lines = ["ACCEL_HOMING_EXPERIMENT MODE=COMPARE", "All physical homes use RAW XYZ; shadow replay never controls motion.",
+    lines = ["ACCEL_HOMING_EXPERIMENT MODE=COMPARE", comparison["interpretation"][0],
+        "Frozen detector: " + json.dumps(comparison["frozen_detector"], ensure_ascii=True),
         "Delivery support: %s; reason: %s" % (design.get("supported", "unknown"), design.get("reason")),
         "Observed intervention: %s" % design.get("intervention_observed", "unknown"),
         "Matched pairs: %d / %d" % (sum(pair["matched"] for pair in comparison["pairs"]), len(comparison["pairs"])),
@@ -1089,7 +1173,7 @@ class Recorder:
         path = args.get("log_file")
         try:
             stat = Path(path).stat()
-            return {"path": str(path), "offset": stat.st_size, "inode": stat.st_ino}
+            return {"path": str(path), "offset": stat.st_size, "inode": stat.st_ino, "device": stat.st_dev}
         except (TypeError, OSError) as exc:
             return {"unavailable": str(exc)}
 
@@ -1213,7 +1297,7 @@ class Recorder:
                 "phase": "discovery" if sample == 0 else "measurement",
                 "previous_home_id": previous["home_id"] if previous else None,
                 "previous_return_completed": previous.get("return_completed", False) if previous else None,
-                "before": snapshot(self.workflow), "raw": array("d"),
+                "before": snapshot(self.workflow), "raw": array("d"), "filtered": array("d"),
                 "capture": {"unavailable": "capture did not complete"},
                 "packet_prefix": [], "packet_tail": deque(maxlen=MAX_HOME_BATCHES - INITIAL_HOME_BATCHES),
                 "batches_observed": 0, "batches_retained": 0, "batches_omitted": 0}
@@ -1247,8 +1331,17 @@ class Recorder:
                         invalid += int(not all(finite(value) for value in row))
                         raw.extend(value if finite(value) else float("nan") for value in row)
             retained = len(raw) // 4
+            metadata = capture.get("signal_filter", {})
+            filtered = capture.get("filtered_samples", ())
+            start = metadata.get("first_sample_index")
+            if type(start) is int and filtered:
+                for first, end in ranges:
+                    for index in range(first, end):
+                        row = filtered[index - start] if start <= index < start + len(filtered) else None
+                        home["filtered"].extend(row[1:] if row is not None else (float("nan"),) * 3)
             self.raw_rows += retained
-            home["capture"] = clean({key: value for key, value in capture.items() if key not in ("samples", "_record")})
+            home["capture"] = clean({key: value for key, value in capture.items()
+                                     if key not in ("samples", "filtered_samples", "_record")})
             home["capture"].update(raw_rows_received=len(samples), raw_rows_retained=retained,
                                    raw_rows_omitted=len(samples) - retained,
                                    invalid_rows=invalid, retention="first reference prefix and last impact tail; original sample indices; no averaging",
@@ -1259,6 +1352,10 @@ class Recorder:
                                    coordinate_frame="configured_sensor_stream",
                                    source="owner.stop_capture before workflow validation",
                                    truncation=bool(len(samples) > retained or capture.get("dropped")))
+            if filtered:
+                home["capture"].update(filtered_rows_retained=len(home["filtered"]) // 3,
+                                       filtered_retention="same original indices as raw; blank before first armed sample",
+                                       filtered_replay_complete=not bool(len(samples) > retained or capture.get("dropped")))
         except Exception as exc:
             home["capture"]["retention_error"] = str(exc)
             self.observer_errors += 1
@@ -1341,16 +1438,28 @@ class Recorder:
         folder = root / self.session["run_id"]
         folder.mkdir()  # Unique UUID; deliberately never overwrite another report.
         self.folder = str(folder)
+        export_deadline = time.monotonic()
+        def cooperate_export():
+            nonlocal export_deadline
+            if time.monotonic() < export_deadline:
+                return
+            if self.workflow.session is not None and self.workflow.session is not self.session:
+                raise ValueError("evidence export interrupted by another workflow")
+            self.workflow.reactor.pause(self.workflow.reactor.monotonic())
+            if self.workflow.session is not None and self.workflow.session is not self.session:
+                raise ValueError("evidence export interrupted by another workflow")
+            export_deadline = time.monotonic() + .020
         homes = []
         profile = adxl_saturation_profile(self.context)
         for home in self.homes:
-            public = {key: value for key, value in home.items() if key not in ("raw", "packet_prefix", "packet_tail")}
+            public = {key: value for key, value in home.items()
+                      if key not in ("raw", "filtered", "packet_prefix", "packet_tail")}
             public["stop_timing"] = self._stop_timing(home["home_id"])
             public["delivery_diagnostic"] = delivery_diagnostic(public, self.events,
                 list(home["packet_prefix"]) + list(home["packet_tail"]))
             stop = next((event["fields"].get("request_estimated_print_time_s") for event in self.events
                          if event["home_id"] == home["home_id"] and event["kind"] == "stop_request"), None)
-            diagnose_saturation(public, home["raw"], profile, stop)
+            diagnose_saturation(public, home["raw"], profile, stop, cooperate=cooperate_export)
             public["packet_retention"] = {"policy": "first prefix and rolling last tail; omitted middle",
                 "prefix_limit": INITIAL_HOME_BATCHES, "tail_limit": MAX_HOME_BATCHES - INITIAL_HOME_BATCHES,
                 "retained_sequence_ranges": [[rows[0]["home_packet_sequence"], rows[-1]["home_packet_sequence"]]
@@ -1359,19 +1468,34 @@ class Recorder:
             public["raw_file"] = name
             with gzip.open(folder / name, "wt", encoding="utf-8", newline="") as stream:
                 writer = csv.writer(stream)
-                writer.writerow(("sample_index", "print_time_s", "x_g", "y_g", "z_g"))
+                filtered = home.get("filtered", ())
+                columns = ("sample_index", "print_time_s", "x_g", "y_g", "z_g")
+                if filtered:
+                    columns += ("filtered_x_g", "filtered_y_g", "filtered_z_g", "filtered_magnitude_g")
+                writer.writerow(columns)
                 raw = home["raw"]
                 offset = 0
                 for first, end in home.get("raw_ranges", ()):
                     for original_index in range(first, end):
-                        writer.writerow([original_index] + [value if finite(value) else "" for value in raw[offset:offset + 4]])
+                        if original_index % 256 == 0:
+                            cooperate_export()
+                        row = [original_index] + [value if finite(value) else "" for value in raw[offset:offset + 4]]
+                        if filtered:
+                            xyz = filtered[(offset // 4) * 3:(offset // 4) * 3 + 3]
+                            row += ([*xyz, math.sqrt(sum(value * value for value in xyz))]
+                                    if all(finite(value) for value in xyz) else [""] * 4)
+                        writer.writerow(row)
                         offset += 4
             homes.append(public)
         export_delivery(folder, homes)
         with gzip.open(folder / "packets.jsonl.gz", "wt", encoding="utf-8") as stream:
             for group in [self.batches] + [rows for home in self.homes for rows in (home["packet_prefix"], home["packet_tail"])]:
-                for row in group:
+                for index, row in enumerate(group):
+                    if index % 128 == 0:
+                        cooperate_export()
                     stream.write(json.dumps(row, allow_nan=False) + "\n")
+        if self.session.get("troubleshoot_late_ending"):
+            ending.update(self.session["troubleshoot_late_ending"])
         report = {"schema": SCHEMA, "command": command,
                   "run_id": self.session["run_id"], "created_utc": self.started_utc,
                   "ending": clean(ending), "axes": self.session["axes"],
@@ -1381,7 +1505,7 @@ class Recorder:
                   "environment": self.context, "installed_identity": self._source_identity(),
                   "before": self.before, "after": snapshot(self.workflow), "homes": homes,
                   "events": self.events, "log": self._export_log(folder),
-                  "timing": self.timing.export(folder),
+                  "timing": self.timing.export(folder, cooperate=cooperate_export),
                   "collector_closed_host_monotonic_s": self.closed_at,
                   "bounds": {"max_raw_rows": MAX_RAW_ROWS, "max_home_rows": MAX_HOME_ROWS,
                              "raw_rows_retained": self.raw_rows, "max_events": MAX_EVENTS,
@@ -1398,15 +1522,22 @@ class Recorder:
                       "Discovery is retained and excluded from measured-trial statistics.",
                       "Rejected/partial homes are retained; no automatic recalibration or threshold change.",
                       "Empty CSV cells represent invalid/missing numbers; see capture invalid_rows.",
+                      "Optional filtered columns are signed baseline-subtracted XYZ, with causal zero state at the exact first armed sample. Raw columns are unchanged. Replay requires every intervening raw sample; omitted middle ranges prevent full replay.",
                       "Charts use impact windows; raw retained CSV rows are not decimated."]}
         if experimental:
             report["experiment"] = clean(experimental)
             compare_mode = experimental.get("mode") == "COMPARE"
+            mapped_compare = compare_mode and experimental.get("impact_metric") == "mapped_axis"
+            if mapped_compare:
+                report["interpretation"] = [text for text in report["interpretation"]
+                                            if text != "Discovery is retained and excluded from measured-trial statistics."]
             shadow_mode = experimental.get("mode") in ("SHADOW", "COMPARE")
             report["interpretation"] += [
-                ("OFFLINE SHADOW: every physical home uses raw XYZ magnitude; frozen profile replay never controls the stop."
+                ("Every physical home uses the calibrated mapped axis, threshold and any fixed notch; no XYZ fitting or replay."
+                 if mapped_compare else "OFFLINE SHADOW: every physical home uses raw XYZ magnitude; frozen profile replay never controls the stop."
                  if shadow_mode else "Training and heldout reference homes use raw XYZ magnitude; candidates use a frozen fitted profile with raw bypass."),
-                ("SAMPLES counts interleaved control/fast pairs; discovery plus ten reference homes are additional."
+                ("SAMPLES counts interleaved control/fast pairs, with exactly two homes per pair and no added discovery or references."
+                 if mapped_compare else "SAMPLES counts interleaved control/fast pairs; discovery plus ten reference homes are additional."
                  if compare_mode else "SAMPLES counts additional raw shadow homes only; discovery plus ten reference homes are additional."
                  if shadow_mode else "SAMPLES counts candidate homes only; discovery plus ten reference homes are additional."),
                 "The same requested GC policy applies to every phase; this comparison does not isolate GC causality.",
@@ -1420,16 +1551,22 @@ class Recorder:
                 report["comparison"] = {"summary": "comparison.json", "csv": "comparison.csv",
                     "tester_summary": "tester-summary.txt", "noise_margins": "noise-margin.json",
                     "chart": "comparison.png"}
+        report["debug"] = write_debug_context(folder, self.workflow.printer, details={
+            "command": command, "run_id": self.session["run_id"], "phase": "after_cleanup",
+            "ending": clean(ending), "experiment": clean(experimental),
+            "log_cursor": self.log_start, "retained_homes": len(homes), "bounds": report["bounds"]})
         write_json(folder / "manifest.json", report)
         (folder / "README.txt").write_text(
             command + " evidence\n\n"
             "Share the entire folder or ZIP. Read manifest.json first.\n"
             "home-*.csv.gz: every retained raw decoded XYZ sample before graph reduction, in g including gravity/bias.\n"
+            "Optional filtered_* columns: causal notch after resting-offset subtraction; blank before arm. Coefficients/rate/start identity are in manifest.json.\n"
             "packets.jsonl.gz: bounded callback timing, pending/filtered packet context.\n"
             "timing.jsonl.gz: MCU host receive, driver/query/decode, detector/observer, reactor and GC timing. See manifest timing hook availability and omissions.\n"
             "delivery.json / delivery.csv: per-home source-batch tail, aggregate delivery/driver, adapter/detector and host request timing; clock bases and missing evidence are explicit.\n"
             "MODE=COMPARE also provides comparison.json/.csv, tester-summary.txt, noise-margin.json and comparison.png: observed intervention, paired deltas, margins, omissions and restoration.\n"
             "manifest.json: home/return/next-home linkage, detector/reference/quality metadata, errors, config, installed source SHA256, bounds.\n"
+            "debug/: bounded host logs and runtime/configuration context, with missing/truncated-source details in debug/context.json.\n"
             "Each home records capture/core drops and recorder omissions. Missing is not zero.\n"
             "No physical-position sensor is present; travel is commanded step accounting.\n"
             "Stop markers distinguish sensor print_time from host dispatch. Hardware receipt is unknown.\n"
@@ -1442,23 +1579,41 @@ class Recorder:
             render_bundle(folder, self.workflow.renderer, self.workflow.reactor, check_render)
             report["render"] = {"result": "complete", "files": sorted(path.name for path in folder.glob("*.png"))}
         except Exception as exc:
-            report["render"] = {"result": "failed", "error": str(exc)}
+            report["render"] = {"result": "failed", "error": str(exc),
+                                "exception": exception_context(exc, "render")}
         if self.session.get("troubleshoot_late_ending"):
             ending.update(self.session["troubleshoot_late_ending"])
             report["ending"] = clean(ending)
         write_json(folder / "manifest.json", report)
         archive = folder.with_suffix(".zip")
         try:
-            with zipfile.ZipFile(archive, "x", zipfile.ZIP_DEFLATED) as zipped:
-                for path in sorted(folder.iterdir()):
-                    if path.is_file():
-                        zipped.write(path, folder.name + "/" + path.name)
+            # A cancellation already handled during homing/rendering is part of
+            # the evidence to package. Only a new interruption cancels packaging.
+            archive_interruption = self.session.get("finish_interrupted")
+            archive_ending = self.session.get("troubleshoot_late_ending")
+            def check_archive():
+                if (self.session.get("finish_interrupted") != archive_interruption
+                        or self.session.get("troubleshoot_late_ending") is not archive_ending):
+                    raise ValueError("archive export interrupted after motion cleanup")
+                if self.workflow.session is not None and self.workflow.session is not self.session:
+                    raise ValueError("archive export interrupted by another workflow")
+            def cooperate_archive():
+                check_archive()
+                self.workflow.reactor.pause(self.workflow.reactor.monotonic())
+                check_archive()
+            write_run_archive(folder, archive, cooperate=cooperate_archive, prefix=folder.name)
         except Exception as exc:
             report["zip_error"] = str(exc)
+            report["zip_exception"] = exception_context(exc, "archive")
+            if self.session.get("troubleshoot_late_ending"):
+                ending.update(self.session["troubleshoot_late_ending"])
+                report["ending"] = clean(ending)
             write_json(folder / "manifest.json", report)
             archive = None
         return {"folder": str(folder), "manifest": str(folder / "manifest.json"),
                 "archive": str(archive) if archive else None, "render": report["render"],
+                "debug": report["debug"],
+                "zip_error": report.get("zip_error"),
                 "retained_homes": len(homes), "bounds": report["bounds"]}
 
     def _stop_timing(self, home_id):
@@ -1491,6 +1646,197 @@ class Recorder:
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def write_run_archive(folder, archive, cooperate=None, prefix=None):
+    """Package a finished run incrementally; publish a new ZIP only on success."""
+    folder, archive = Path(folder), Path(archive)
+    # The temporary file is outside the run directory and on the target filesystem.
+    with tempfile.NamedTemporaryFile(dir=str(archive.parent), prefix="." + archive.name + ".",
+                                     suffix=".tmp", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        deadline = time.monotonic()
+        with zipfile.ZipFile(temporary, "w") as bundle:
+            for path in sorted(folder.rglob("*")):
+                relative = path.relative_to(folder)
+                if (any(part.startswith(".") for part in relative.parts)
+                        or path.is_symlink() or not path.is_file()):
+                    continue
+                name = (Path(prefix) / relative if prefix else relative).as_posix()
+                member = zipfile.ZipInfo.from_file(path, name)
+                member.compress_type = (zipfile.ZIP_STORED if path.suffix in (".gz", ".zip", ".png")
+                                        else zipfile.ZIP_DEFLATED)
+                with path.open("rb") as src, bundle.open(member, "w", force_zip64=True) as dst:
+                    while True:
+                        if cooperate is not None and time.monotonic() >= deadline:
+                            cooperate()
+                            deadline = time.monotonic() + .020
+                        data = src.read(64 * 1024)
+                        if not data:
+                            break
+                        dst.write(data)
+        if cooperate is not None:
+            cooperate()
+        os.replace(temporary, archive)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def debug_log_cursor(printer):
+    cursor = {"started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "host_monotonic_s": time.monotonic()}
+    try:
+        path = Path(printer.get_start_args()["log_file"])
+        info = path.stat()
+        if not stat_mode.S_ISREG(info.st_mode):
+            raise ValueError("Klippy log is not a regular file")
+        cursor.update(path=str(path), offset=info.st_size, inode=info.st_ino, device=info.st_dev)
+    except Exception as exc:
+        cursor["unavailable"] = str(exc)
+    return cursor
+
+
+def _debug_run_log(folder, args, cursor):
+    """Read only the command's log interval. Keep the error tail even on overflow."""
+    path = Path(args["log_file"])
+    if cursor.get("path") != str(path) or type(cursor.get("offset")) is not int:
+        return {"unavailable": "no starting offset for this log", "cursor": cursor}
+    files, gaps = [], []
+    info = path.stat()
+    if not stat_mode.S_ISREG(info.st_mode):
+        raise ValueError("Klippy log is not a regular file")
+    offset = cursor["offset"]
+    identity = cursor.get("device", info.st_dev), cursor.get("inode")
+    if (info.st_dev, info.st_ino) != identity:
+        # Klippy normally uses a dated suffix; logrotate can use a numeric one.
+        # Match the original file identity, not the name of the newest backup.
+        try:
+            with os.scandir(path.parent) as siblings:
+                previous = _find_log_by_identity(siblings, path.name, identity)
+        except OSError as exc:
+            gaps.append("cannot locate rotated log: %s" % exc)
+        else:
+            if previous is None:
+                gaps.append("rotated log inode unavailable in bounded directory scan")
+            elif previous[1] < offset:
+                gaps.append("rotated log truncated during command")
+            else:
+                files.append((previous[0], offset, previous[1]))
+        offset = 0
+    if info.st_size < offset:
+        gaps.append("log truncated during command")
+        offset = 0
+    files.append((path, offset, info.st_size))
+    total = sum(max(0, end - start) for _, start, end in files)
+    # Retain a prefix and the final failure context if a busy host exceeds the cap.
+    regions = [(0, total)] if total <= LOG_LIMIT else [
+        (0, LOG_LIMIT // 2), (total - LOG_LIMIT // 2, total)]
+    if total > LOG_LIMIT:
+        gaps.append("middle omitted at capture byte limit")
+    result = {"file": "debug/klippy.log", "run_bytes_available": total,
+              "byte_limit": LOG_LIMIT, "gaps": gaps, "segments": []}
+    prior = folder.parent / "klippy-run.log"
+    if len(files) == 1 and not gaps and prior.is_file() and prior.stat().st_size == total:
+        result.update(file="klippy-run.log", segments=[{"source": path.name, "offset": offset,
+                                                       "bytes": total}])
+        return result
+    with (folder / "klippy.log").open("wb") as out:
+        for index, (begin, finish) in enumerate(regions):
+            if index:
+                out.write(b"\n--- middle of run omitted (byte limit) ---\n")
+            position = 0
+            for source, start, end in files:
+                length = max(0, end - start)
+                left = max(0, begin - position)
+                right = min(length, finish - position)
+                position += length
+                if right <= left:
+                    continue
+                try:
+                    with source.open("rb") as stream:
+                        stream.seek(start + left)
+                        data = stream.read(right - left)
+                except OSError as exc:
+                    gaps.append("cannot read %s: %s" % (source.name, exc))
+                    continue
+                out.write(data)
+                result["segments"].append({"source": source.name, "offset": start + left,
+                                           "bytes": len(data)})
+                if len(data) != right - left:
+                    gaps.append("log changed during export")
+    return result
+
+
+def _find_log_by_identity(siblings, basename, identity):
+    for entry in itertools.islice(siblings, 512):
+        if not entry.name.startswith(basename + "."):
+            continue
+        try:
+            info = os.stat(entry.path, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat_mode.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == identity:
+            return Path(entry.path), info.st_size
+    return None
+
+
+def write_debug_context(directory, printer, details=None):
+    """Write passive diagnostic evidence after cleanup, including on partial runs."""
+    folder = Path(directory) / "debug"
+    result = {"files": [], "errors": {}}
+    try:
+        folder.mkdir(exist_ok=True)
+        info = dict(details or {})
+        cursor = info.pop("log_cursor", {}) or {}
+        payload = {"schema": "accel_homing_run_debug_v1", "run": clean(info),
+                   "started": clean(cursor), "finished_host_monotonic_s": time.monotonic(),
+                   "exported_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                   "python": sys.version, "platform": sys.platform,
+                   "printer_state": _observe(printer, "get_state_message"), "errors": result["errors"]}
+        try:
+            args = printer.get_start_args()
+            payload["host"] = clean({k: args.get(k) for k in ("software_version", "git_version", "cpu_info")})
+            log = _debug_run_log(folder, args, cursor)
+            if log.get("file"):
+                result["files"].append(log["file"])
+            payload["log"] = log
+        except Exception as exc:
+            result["errors"]["klippy_log"] = str(exc)
+        try:
+            now = printer.get_reactor().monotonic()
+            config = printer.lookup_object("configfile").get_status(now)
+            payload["effective_config_sections"] = _diagnostic_settings(config.get("settings", {}), info.get("sensor"))
+        except Exception as exc:
+            result["errors"]["config"] = str(exc)
+        try:
+            mcus = {}
+            now = printer.get_reactor().monotonic()
+            for name, obj in printer.lookup_objects():
+                if name != "mcu" and not name.startswith("mcu "):
+                    continue
+                status = obj.get_status(now)
+                mcus[name] = clean({k: status.get(k) for k in ("mcu_version", "mcu_build_versions", "last_stats")})
+            payload["mcus"] = mcus
+        except Exception as exc:
+            result["errors"]["mcus"] = str(exc)
+        source = Path(__file__).resolve().parent
+        fingerprints = {}
+        for filename in ("accel_homing_workflows.py", "beacon_accel_homing.py", "accel_homing_backends.py",
+                         "accel_homing_auto.py", "accel_homing_auto_notch.py", "accel_homing_filter.py",
+                         "accel_homing_troubleshoot.py", "accel_homing_experiment.py", "accel_homing_axes.py",
+                         "accel_homing_config.py", "accel_homing_model.py", "accel_homing_charts.py"):
+            try:
+                fingerprints[filename] = hashlib.sha256((source / filename).read_bytes()).hexdigest()
+            except OSError as exc:
+                result["errors"][filename] = str(exc)
+        payload["installed_sha256"] = fingerprints
+        write_json(folder / "context.json", payload)
+        result["files"].append("debug/context.json")
+    except Exception as exc:
+        result["errors"]["debug_export"] = str(exc)
+    return result
 
 
 def render_bundle(folder, renderer, reactor=None, check_running=None):
@@ -1713,7 +2059,8 @@ def _plot_comparison(folder, report, Figure, FigureCanvasAgg):
         for plot in (group_plot, pair_plot):
             plot.grid(True, alpha=.25)
     design = comparison["design"]
-    figure.suptitle("RAW delivery comparison: interleaved control/fast and fast/control\n"
+    figure.suptitle(("Mapped-axis" if comparison["impact_metric"] == "mapped_axis" else "RAW XYZ") +
+        " delivery comparison: interleaved control/fast and fast/control\n"
         "Supported: %s; observed intervention: %s; shadow: %s; delivery restored: %s\n"
         "Missing is not zero. Host dispatch and commanded step counts do not measure physical contact or halt." % (
             design.get("supported", "unknown"), design.get("intervention_observed", "unknown"),
@@ -1841,13 +2188,17 @@ def _worker(folder, dependencies):
                     if finite(first) and finite(evidence):
                         first = min(first, evidence - .005)
                     if not finite(anchor) or first <= sample[0] <= anchor + .100:
+                        try:
+                            sample += [float(row[key]) for key in ("filtered_x_g", "filtered_y_g", "filtered_z_g")]
+                        except (KeyError, ValueError):
+                            sample += [float("nan")] * 3
                         rows.append(sample)
             # Window retains all samples/outliers. Bound unknown-onset plots by
             # displaying a prefix explicitly; raw files remain unchanged.
             omitted = max(0, len(rows) - 20000)
             # Preserve both the early shadow evidence and the original onset
             # when a wide replay span exceeds the plot-only bound.
-            rows = rows[:10000] + [[math.nan] * 4] + rows[-10000:] if omitted else rows
+            rows = rows[:10000] + [[math.nan] * 7] + rows[-10000:] if omitted else rows
             wide_shadow = finite(onset) and finite(shadow.get("evidence_time_s")) and shadow["evidence_time_s"] < onset - .025
             figure = Figure(figsize=(11, 9 if wide_shadow else 5), dpi=110)
             FigureCanvasAgg(figure)
@@ -1857,6 +2208,7 @@ def _worker(folder, dependencies):
                 plot, overview = figure.subplots(), None
             origin = anchor if finite(anchor) else rows[0][0] if rows else 0
             times = [(row[0] - origin) * 1000 for row in rows]
+            has_filtered = any(all(finite(value) for value in row[4:7]) for row in rows)
             for index, label in enumerate("XYZ"):
                 plot.plot(times, [row[index + 1] - baseline[index] for row in rows],
                           label="Stream " + label if mapping is not None else label, linewidth=.8)
@@ -1865,7 +2217,8 @@ def _worker(folder, dependencies):
                 mapped = [sign * (row[channel + 1] - baseline[channel]) for row in rows]
                 plot.plot(times, mapped, label=charts._mapped_label(mapping) + " signed", linewidth=1)
                 plot.plot(times, [abs(value) for value in mapped],
-                          label="Physical %s detector magnitude" % mapping["axis"].upper(), color="black", linewidth=1.2)
+                          label=("Raw mapped-axis magnitude" if has_filtered else
+                                 "Physical %s detector magnitude" % mapping["axis"].upper()), color="black", linewidth=1.2)
             else:
                 plot.plot(times, [math.sqrt(sum((row[index + 1] - baseline[index]) ** 2 for index in range(3))) for row in rows], label="Original per-home XYZ reference" if shadow else "XYZ norm", color="black", linewidth=1)
             experimental = (capture.get("detector") or {}).get("experimental") or {}
@@ -1890,7 +2243,8 @@ def _worker(folder, dependencies):
             threshold = record.get("threshold_g")
             if finite(threshold):
                 plot.axhline(threshold, color="#d17b00", linestyle="--",
-                             label="Physical %s trigger" % mapping["axis"].upper() if mapping is not None else
+                             label=("Physical %s filtered trigger" % mapping["axis"].upper() if has_filtered else
+                                    "Physical %s trigger" % mapping["axis"].upper()) if mapping is not None else
                                    "Raw bypass threshold" if home["phase"] == "candidate" else "Active detector threshold")
             quality = home.get("saturation_diagnostic", {})
             if quality.get("available"):
@@ -1902,6 +2256,13 @@ def _worker(folder, dependencies):
                     if limited:
                         plot.scatter([t for t, _ in limited], [v for _, v in limited], marker="x", s=20,
                                      label=axis.upper() + " native range limit", zorder=5)
+            if has_filtered:
+                plot.plot(times, [abs(row[4 + mapping["source_axis"]]) if mapping is not None else
+                           math.sqrt(sum(value * value for value in row[4:7])) for row in rows],
+                          label="Filtered mapped-axis magnitude" if mapping is not None else "Filtered XYZ magnitude", color="#d17b00", linewidth=1.2)
+                threshold = record.get("threshold_g")
+                if finite(threshold) and mapping is None:
+                    plot.axhline(threshold, color="#d17b00", linestyle="--", label="Filtered trigger")
             if finite(onset):
                 plot.axvline(0, color="red", label="retained sensor onset")
             for event in report["events"]:

@@ -54,9 +54,9 @@ existing clean checkout to the published `main` before running its installer.
 If Git reports an error, the block stops. Keep the checkout in place because
 the installed extras link to its Python modules.
 
-The default managed source must be the complete clean `~/accel_homing` Git
-checkout of `main`, with exact
-origin `https://github.com/FrankRamm/accel_homing.git` and upstream `origin/main`.
+The managed source must be a complete clean `~/accel_homing` Git checkout.
+The stable branch tracks `origin/main`. The tester procedure below tracks
+`origin/dev`. Both use origin `https://github.com/FrankRamm/accel_homing.git`.
 The installer refuses conflicting source identity or ownership; it does not
 reset or stash local changes to make them disappear. One managed Klipper
 instance may use this per-user clone; a discovered second instance using its
@@ -69,6 +69,40 @@ To inspect a plan without writes or automatic restarts:
 ```
 
 A dry run reports missing plotting dependencies but does not install them.
+
+### Switch an existing tester installation to dev
+
+With the printer idle, run these commands over SSH as the Klipper service user.
+The installer links the additional modules and reloads the host services.
+
+```bash
+(
+  set -e
+  cd ~/accel_homing
+  test "$(git remote get-url origin)" = https://github.com/FrankRamm/accel_homing.git
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "Preserve your local plugin edits before switching branches." >&2
+    exit 1
+  fi
+  git fetch origin
+  if git show-ref --verify --quiet refs/heads/dev &&
+     ! git merge-base --is-ancestor dev origin/dev; then
+    git branch -m dev "dev-before-sync-$(git rev-parse --short dev)"
+  fi
+  git switch dev
+  git branch --set-upstream-to=origin/dev
+  git merge --ff-only origin/dev
+  bash ./install.sh
+)
+```
+
+The branch rename preserves any local commits from the old dev history. If
+this is a single-branch clone, run `git remote set-branches --add origin dev`
+inside the checkout before the block. The dev installer updates an existing
+standard `primary_branch: main` registration to `dev`, including in an
+included Moonraker configuration. Subsequent frontend updates follow dev.
+Verify the checkout with `git -C ~/accel_homing status -sb`; it should show
+`dev...origin/dev`.
 
 ## What installation changes
 

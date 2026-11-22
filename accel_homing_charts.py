@@ -308,6 +308,15 @@ def write_axis_mapping_failure(directory, axis, passes, diagnostic, renderer=Non
     return paths
 
 
+def write_notch_auto(directory, run_id, axis, analysis, renderer=None, check_running=None, simulated=False):
+    _identity(run_id, axis)
+    clock = _clock()
+    payload = {"kind": "notch_auto", "axis": axis, "analysis": analysis,
+               "simulated": bool(simulated), **clock}
+    data = (renderer or PNGRenderer()).render(payload, check_running=check_running)
+    return {"png": _publish(directory, "Accel Homing AUTO " + axis.upper(), clock, data, check_running)}
+
+
 def _clock():
     instant = datetime.datetime.now(datetime.timezone.utc)
     local = instant.astimezone()
@@ -491,6 +500,26 @@ def _capture_data(capture, record):
         raise ValueError("Invalid accelerometer baseline")
     delta = [(row[0] - samples[0][0],) + tuple(row[i + 1] - baseline[i] for i in range(3))
              for row in samples]
+    filter_metadata = capture.get("signal_filter", {"type": "disabled"})
+    extra = {}
+    if filter_metadata.get("type") != "disabled":
+        filtered = capture.get("filtered_samples")
+        start_index = filter_metadata.get("first_sample_index")
+        if (type(start_index) is not int or not 0 <= start_index < len(samples)
+                or filter_metadata.get("first_sample_matches") != 1
+                or not isinstance(filtered, (tuple, list)) or len(filtered) != len(samples) - start_index
+                or not filtered
+                or any(len(row) != 4 or not all(_finite(value) for value in row)
+                       or row[0] != samples[start_index + index][0] for index, row in enumerate(filtered))):
+            raise ValueError("Notch chart lacks its complete filtered capture and start identity")
+        origin = filtered[0][0]
+        raw_delta = [(row[0] - origin,) + tuple(row[i + 1] - baseline[i] for i in range(3))
+                     for row in samples]
+        extra = {"signal_filter": filter_metadata, "raw_sample_count": len(samples),
+                 "raw_first_sample_time_s": samples[0][0], "raw_trace": _envelope(raw_delta, 64),
+                 "trace_metric": "independent causal stream-channel notches after baseline subtraction; begins at first armed sample"}
+        samples = filtered
+        delta = [(row[0] - origin,) + tuple(row[1:]) for row in filtered]
     metadata = {"sample_count": len(samples), "baseline_g": list(baseline),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "absolute_peak_g": {axis: max(abs(row[index]) for row in delta)
@@ -500,6 +529,7 @@ def _capture_data(capture, record):
         metadata["impact_metric"] = metric
     if mapping is not None:
         metadata.update(axis_mapping=mapping, coordinate_frame="configured_sensor_stream")
+    metadata.update(extra)
     metadata.update(_range_metadata(capture, record))
     _json(record)
     return _envelope(delta), metadata
@@ -634,7 +664,8 @@ def _prepared_capture(prepared):
             or record.get("workflow_attempt") != receipt.iteration):
         raise ValueError("Deferred capture metadata does not match its receipt")
     trace = receipt.trace
-    if (not isinstance(trace, tuple) or not 2 <= len(trace) <= _MAX_CAPTURE_TRACE_POINTS
+    filtered = metadata.get("signal_filter", {}).get("type", "disabled") != "disabled"
+    if (not isinstance(trace, tuple) or not (1 if filtered else 2) <= len(trace) <= _MAX_CAPTURE_TRACE_POINTS
             or any(not isinstance(row, tuple) or len(row) != 4
                    or not all(_finite(value) for value in row) for row in trace)
             or any(first[0] >= second[0] for first, second in zip(trace, trace[1:]))
@@ -646,7 +677,7 @@ def _prepared_capture(prepared):
     if (type(count) is not int or not len(trace) <= count <= _MAX_SAMPLES
             or not isinstance(baseline, list) or len(baseline) != 3
             or not all(_finite(value) for value in baseline)
-            or not _finite(first) or not _finite(last) or last <= first
+            or not _finite(first) or not _finite(last) or last < first or (last == first and not filtered)
             or not math.isclose(trace[-1][0], last - first, rel_tol=1e-12, abs_tol=1e-9)
             or not isinstance(peaks, dict) or set(peaks) != set("xyz")
             or any(not _finite(peaks[axis]) or not math.isclose(
@@ -1416,6 +1447,8 @@ def _worker_main(source, target, dependency_directory):
             _plot_beta(figure, payload)
         elif kind == "axis_mapping_failure":
             _plot_axis_mapping_failure(figure, payload)
+        elif kind == "notch_auto":
+            _plot_notch_auto(figure, payload)
         else:
             raise ValueError("Unknown PNG chart render kind")
         canvas.print_png(target, metadata={
@@ -1436,6 +1469,60 @@ def _title(figure, payload, title):
     if payload.get("simulated"):
         title = "SIMULATED / NOT PRINTER MEASUREMENT\n" + title
     figure.suptitle("%s\n%s" % (title, payload["timestamp"]), fontsize=12)
+
+
+def _plot_notch_auto(figure, payload):
+    from matplotlib.ticker import FuncFormatter
+    report = payload["analysis"]
+    plot_data = report.get("plot", {})
+    _metric, mapping = _detector_context(report, plot_data, payload["axis"])
+    component = _mapped_label(mapping) if mapping is not None else "XYZ"
+    _title(figure, payload, "AUTO notch %s: %s, selected threshold %s g" %
+           (payload["axis"].upper(), report.get("decision"), _number(report.get("threshold_g"), 5)))
+    axes = figure.subplots(3, 1)
+    spectra, motion, timing = axes
+    for index, item in enumerate(plot_data.get("spectra", []), 1):
+        label = "Stroke %d (%s)" % (index, item["role"])
+        frequencies = item["frequency_hz"]
+        spectra.semilogy(frequencies, [max(1e-15, v) for v in item["raw_power_g2_hz"]], linewidth=.8,
+                         label=label + " raw")
+        spectra.semilogy(frequencies, [max(1e-15, v) for v in item["filtered_power_g2_hz"]], linewidth=.8,
+                         linestyle="--", label=label + " candidate")
+    frequency = plot_data.get("profile", {}).get("frequency_hz")
+    if _finite(frequency):
+        spectra.axvline(frequency, color="#333333", linestyle=":", label="Candidate %.5g Hz, Q %s" %
+                        (frequency, _number(plot_data["profile"].get("q"), 4)))
+    spectra.set(xlabel="Frequency (Hz)",
+                ylabel="Mapped signed component PSD (g²/Hz)" if mapping is not None else "Signed XYZ summed PSD (g²/Hz)",
+                title="Independent commanded cruise: " + component)
+    spectra.yaxis.set_major_formatter(FuncFormatter(lambda value, position: "%.0e" % value))
+    spectra.legend(fontsize=6, ncol=2)
+    traces = plot_data.get("traces", [])
+    moving = next((item for item in traces if item.get("kind") == "motion" and item.get("role") == "holdout"), None)
+    if moving:
+        origin = moving["time_s"][0]
+        times = [t - origin for t in moving["time_s"]]
+        motion.plot(times, moving["raw_magnitude_g"], linewidth=.8, label="Held-out moving trace: raw")
+        motion.plot(times, moving["filtered_magnitude_g"], linewidth=.8, label="Held-out moving trace: candidate")
+        if _finite(moving.get("threshold_g")):
+            motion.axhline(moving["threshold_g"], linestyle=":", color="#333333", label="Evaluated candidate threshold")
+    motion.set(xlabel="Time from virtual arm (s)",
+               ylabel="Mapped component magnitude (g)" if mapping is not None else "XYZ magnitude (g)",
+               title="Causal state starts at commanded acceleration: " + component)
+    motion.legend(fontsize=7)
+    homes = [item for item in traces if item.get("kind") == "home"]
+    for index, item in enumerate(homes, 1):
+        crossing, reference = item.get("filtered_crossing_time_s"), item.get("reference_stop_time_s")
+        if _finite(crossing) and _finite(reference):
+            timing.plot(index, (crossing - reference) * 1000., "o", color="#1769aa" if item["role"] == "train" else "#d17b00")
+        else:
+            timing.annotate("no crossing", (index, 0), rotation=45, fontsize=6)
+    timing.axhline(0., color="#333333", linestyle=":")
+    timing.set(xlabel="Reference home (1–6 train; 7–10 held out)", ylabel="Candidate crossing minus raw stop (ms)")
+    for axis in axes:
+        axis.grid(alpha=.2)
+    _finish_layout(figure, "Candidate replay ends at the original raw trigger. Reference stops are commanded/plausible, not verified contact. "
+                   + str(plot_data.get("description", "")))
 
 
 def _number(value, significant=3):
@@ -1512,6 +1599,15 @@ def _plot_capture(figure, payload):
     if vector:
         axis.plot([row[0] for row in magnitude], [row[1] for row in magnitude],
                   linewidth=1.2, label="XYZ magnitude")
+    raw_trace = captured.get("raw_trace")
+    if raw_trace:
+        axis.plot([row[0] for row in raw_trace],
+                  [abs(row[mapping["source_axis"] + 1]) if mapping is not None else
+                   math.sqrt(sum(value * value for value in row[1:4])) for row in raw_trace],
+                  color="#777777", alpha=.55, linewidth=.7, label="Raw mapped-axis magnitude" if mapping is not None else "Raw XYZ magnitude")
+        settings = captured["signal_filter"]
+        axis.set_title("Causal notch %.6g Hz / Q %.6g / sample rate %.6g Hz" %
+                       (settings["frequency_hz"], settings["q"], settings["sample_rate_hz"]), fontsize=9)
     _threshold(axis, record, mapping=mapping, metric=metric)
     onset = record.get("onset_time_s", record.get("onset_time"))
     elapsed = None
@@ -1539,7 +1635,9 @@ def _plot_capture(figure, payload):
                             _number(peak_value))] + _range_observation_lines(range_summary))
     _absolute_limits(axis)
     axis.legend(loc="best", fontsize=8)
-    _finish_layout(figure, "Absolute components after stationary-baseline subtraction. Commanded travel is not physical stop accuracy.")
+    _finish_layout(figure, ("Notch components and magnitude after resting-offset subtraction; raw magnitude shown in gray. "
+                           if raw_trace else "Absolute components after stationary-baseline subtraction. ")
+                   + "Commanded travel is not physical stop accuracy.")
 
 
 def _plot_beta(figure, payload):
@@ -1722,6 +1820,10 @@ def _plot_accuracy(figure, payload):
         _threshold(axis, trials[0])
         axis.legend(fontsize=8, loc="best")
         _absolute_limits(axis)
+    settings = trials[0].get("signal_filter", {}) if trials else {}
+    if settings.get("type", "disabled") != "disabled":
+        travel.set_title("Causal notch %.6g Hz / Q %.6g; acceleration traces use independently filtered stream channels" %
+                         (settings["frequency_hz"], settings["q"]), fontsize=9)
     _finish_layout(figure, "Commanded travel only; not physical stop accuracy. Qualifier excluded. Population statistics.", payload.get("reason"))
 
 

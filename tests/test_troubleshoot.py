@@ -285,7 +285,14 @@ class TroubleshootTests(unittest.TestCase):
             rig = AccuracyRig({"charts_directory": directory})
             process = mock.Mock()
             process.poll.return_value = None
-            rig.reactor.on_pause = lambda: rig.workflow.cmd_CANCEL(GCmd())
+            cancelled = []
+            def cancel_renderer():
+                # Export can now yield while writing raw captures, before the
+                # renderer exists. Exercise one cancellation of the live child.
+                if process.poll.called and not cancelled:
+                    cancelled.append(True)
+                    rig.workflow.cmd_CANCEL(GCmd())
+            rig.reactor.on_pause = cancel_renderer
             with mock.patch.object(diagnostics.platform, "platform", return_value="simulated-platform"), \
                     mock.patch.object(diagnostics.subprocess, "Popen", return_value=process):
                 rig.workflow.cmd_TROUBLESHOOT(GCmd(AXIS="X", SAMPLES=2, CENTERED=1))

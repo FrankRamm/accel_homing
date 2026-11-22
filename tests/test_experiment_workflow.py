@@ -182,6 +182,9 @@ class ExperimentWorkflowTests(unittest.TestCase):
         return json.loads(Path(rig.workflow.last_result["artifacts"]["manifest"]).read_text(encoding="utf-8"))
 
     def test_invalid_parameters_and_unknown_initial_state_never_move(self):
+        def motion_effects(rig):
+            # Rejected commands now emit a separate passive diagnostic bundle.
+            return {key: value for key, value in rig.effects().items() if key not in ("result", "output")}
         cases = ({"AXIS": ""}, {"AXIS": "XY"}, {"AXIS": "Z"}, {"CENTERED": 0},
                  {"SAVE_CONFIG": 0}, {"SAVE_CONFIG": 1}, {"SAMPLES": 1}, {"SAMPLES": 41},
                  {"SPEED": 50}, {"SPEED": 0}, {"SPEED": float("nan")}, {"THRESHOLD": 4},
@@ -189,20 +192,20 @@ class ExperimentWorkflowTests(unittest.TestCase):
         for params in cases:
             with self.subTest(params=params):
                 rig = ExperimentRig()
-                before = rig.effects()
+                before = motion_effects(rig)
                 with self.assertRaises(CommandError):
                     self.run_command(rig, **params)
-                self.assertEqual(before, rig.effects())
+                self.assertEqual(before, motion_effects(rig))
         for setter in (lambda r: r.toolhead.kin.limits.__setitem__(0, (0., 300.)),
                        lambda r: setattr(r, "print_state", "printing"),
                        lambda r: r.objects.pop("homing"),
                        lambda r: delattr(r.reactor, "_check_gc")):
             rig = ExperimentRig()
             setter(rig)
-            before = rig.effects()
+            before = motion_effects(rig)
             with self.assertRaises(CommandError):
                 self.run_command(rig)
-            self.assertEqual(before, rig.effects())
+            self.assertEqual(before, motion_effects(rig))
 
     def test_frozen_fit_sequence_separate_statistics_and_archive(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -466,10 +469,11 @@ class ExperimentWorkflowTests(unittest.TestCase):
 
     def test_shadow_missing_helper_rejects_before_motion(self):
         rig = ExperimentRig()
-        before = rig.effects()
+        before = {key: value for key, value in rig.effects().items() if key not in ("result", "output")}
         with self.assertRaisesRegex(CommandError, "does not support MODE=SHADOW"):
             self.run_command(rig, MODE="SHADOW")
-        self.assertEqual(before, rig.effects())
+        self.assertEqual(before, {key: value for key, value in rig.effects().items() if key not in ("result", "output")})
+        self.assertEqual(rig.workflow.last_result["result"], "rejected")
 
     def test_bad_candidate_receipt_stops_without_return(self):
         changes = (lambda meta: meta.update(weights_xyz=[1., 1., 1.]),

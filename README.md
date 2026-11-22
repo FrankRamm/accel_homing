@@ -6,6 +6,10 @@ initial homing and calibration with an accessible emergency stop.
 
 ## Install
 
+To test this development branch on an existing printer, follow
+[Switch an existing tester installation to dev](docs/INSTALLATION.md#switch-an-existing-tester-installation-to-dev).
+The install block below selects the stable branch.
+
 Run in the Linux printer host's shell as the existing Klipper service user,
 with the printer idle:
 
@@ -88,7 +92,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Measure repeated commanded-travel variation and save an accuracy PNG; X, Y or XY, 2–50 samples per axis. |
 | `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Record repeated homes, packet/stop/return timing, raw samples and diagnostic plots in a shareable bundle; fixed active settings, no recalibration or save. |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=10` | Compare 10 alternating normal/shorter-delivery pairs using RAW throughout, plus 11 reference/discovery homes; evaluate a frozen shadow profile with noise margins and export a ZIP. Unsupported transports are labelled unavailable. See [experimental workflow](docs/EXPERIMENT.md); existing SHADOW/LIVE behavior and the LIVE default are unchanged. |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | On a saved mapped axis, run four homes in two normal/shorter-delivery pairs at the calibrated threshold and export a ZIP. The historical XYZ comparison has 11 additional reference/discovery homes. See [experimental workflow](docs/EXPERIMENT.md). |
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 
@@ -100,6 +104,12 @@ saves the selected axis's runtime threshold together with its model through
 `SAVE_CONFIG`, replacing its previous manual value. A shared threshold remains
 available to the other axis. Later manual overrides still take precedence. See
 [configuration](docs/CONFIGURATION.md#thresholds-and-saved-models).
+
+`NOTCH=AUTO` defaults to reporting only and tests the exact threshold it
+would save. To report a tester run, send the ZIP printed by each command
+(`MODE=COMPARE` and `NOTCH=AUTO`). Include the axis and how the individual
+homes felt. Each ZIP contains the available measurements, host log for that
+command, and diagnostic context. The report identifies missing evidence.
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.
@@ -139,6 +149,7 @@ rm -rf ~/accel_homing
 [Installation and migration](docs/INSTALLATION.md) ·
 [Supported sensors and limits](docs/COMPATIBILITY.md) ·
 [Configuration](docs/CONFIGURATION.md) ·
+[Notch filter (dev)](docs/NOTCH.md) ·
 [Console commands](docs/COMMANDS.md) ·
 [Calibration](docs/SIMPLE_CALIBRATION.md) ·
 [Accuracy](docs/ACCURACY.md) ·

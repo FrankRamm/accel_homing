@@ -109,6 +109,13 @@ preserves physical-axis orientation; taking the absolute value makes the
 trigger independent of polarity. Ordinary motion can also cross the
 threshold: it is not an independent classifier of mechanical contact.
 
+With the optional [notch filter](NOTCH.md) enabled for this homing axis, the
+mapped component is filtered after subtracting its stationary reference. Its
+absolute value is compared with the threshold. The first filtered crossing requests the stop, without
+an additional confirmation window. Raw samples are retained for diagnosis;
+filter settings are recorded with the qualified model. A different filter
+configuration requires a new calibration for affected saved thresholds.
+
 There is no acceleration-derived velocity integration, noise-envelope motion
 proof or startup-motion deadline in this detector. Missing valid deliveries,
 future/invalid timestamps, gapped/frozen streams and the full-move travel/time limit still stop with an
@@ -276,6 +283,13 @@ blocked carriage can make the estimated starting point wrong. Completion of
 the queued move does not measure physical arrival.
 
 ## Saving and ordinary homing
+
+The following saving/margin rules describe ordinary calibration without
+`NOTCH=AUTO`. The dev [automatic-notch mode](NOTCH.md#automatic-selection)
+first measures independent moving noise and unfiltered reference homes, selects
+a fixed filter/threshold, then requires new validation homes. AUTO defaults to
+report-only with no staged configuration and saves exactly the tested threshold
+only with explicit `SAVE_CONFIG=1`; it adds no untested post-validation margin.
 
 A clean cycle has one discovery impact plus ten endstop checks. `SAVE_CONFIG=1` is still
 the default: successful calibration stages the selected axis model and its

@@ -47,6 +47,15 @@ def _ah_compat_sibling_module(module_name, package, source_file):
         return module
 
 
+def load_companion_module(short_name):
+    """Allow Git-only updates with the older extras symlinks, without sys.path edits."""
+    return _ah_compat_sibling_module(short_name, __package__, __file__)
+
+
+def load_filter_module():
+    return load_companion_module("accel_homing_filter")
+
+
 GRAVITY = 9806.65
 CLOCK_FREQ = 1000000.0
 REPORT_TRAVEL_MIN = 0.1

@@ -237,21 +237,37 @@ class CalibrationConfigSave:
         self._original = original
 
     def register_threshold(self, axis, encoded_value):
-        """Return a rollback callback; registration never edits configuration files."""
-        if axis not in ("x", "y") or not isinstance(encoded_value, str):
-            raise ValueError("register one encoded calibrated X or Y threshold")
+        return self.register_settings(axis, [(self.section, axis + "_threshold", encoded_value)])
+
+    def register_settings(self, axis, entries, model_section=None):
+        """Register only the qualified axis and model; never write files here."""
+        allowed = {(self.section, axis + suffix) for suffix in
+                   ("_threshold", "_notch_frequency", "_notch_q")}
+        if model_section is not None:
+            if not model_section.startswith("accel_homing_model "):
+                raise ValueError("unsupported homing model section")
+            allowed.update((model_section, key) for key in
+                           ("version", axis + "_threshold", axis + "_successes", axis + "_metadata",
+                            ("y" if axis == "x" else "x") + "_metadata"))
+        if (axis not in ("x", "y") or not entries or any(
+                (section, option) not in allowed or not isinstance(value, str)
+                for section, option, value in entries)):
+            raise ValueError("register only qualified homing axis settings")
         self._install()
-        key = (self.section, axis + "_threshold")
-        previous = self._targets.get(key)
-        current = {"value": encoded_value}
-        self._targets[key] = current
+        previous, current = {}, {}
+        for section, option, value in entries:
+            key = (section, option)
+            previous[key] = self._targets.get(key)
+            current[key] = {"value": value}
+            self._targets[key] = current[key]
 
         def rollback():
-            if self._targets.get(key) is current:
-                if previous is None:
-                    self._targets.pop(key, None)
-                else:
-                    self._targets[key] = previous
+            for key, target in current.items():
+                if self._targets.get(key) is target:
+                    if previous[key] is None:
+                        self._targets.pop(key, None)
+                    else:
+                        self._targets[key] = previous[key]
         return rollback
 
     def _pending(self, targets):

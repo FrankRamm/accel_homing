@@ -30,6 +30,7 @@ for your machine and independent Z support. See the complete
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | Test normal and shorter report intervals over two pairs. With a saved mapped-axis calibration this means four homes using its channel, threshold and fixed filter. Exports a comparison ZIP. See [EXPERIMENT](EXPERIMENT.md). |
 | `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW` | One-axis diagnostic retest: discovery, ten reference homes, then raw homes with frozen-profile replay after motion. No shadow profile controls a home. Existing `MODE=LIVE` remains available. No save or restart. See [EXPERIMENT](EXPERIMENT.md). |
 | `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. |
@@ -45,6 +46,13 @@ selected-axis model; supply `THRESHOLD` or complete fresh calibration if the
 model's qualification is refused.
 
 No separate centering-confirmation command or popup prompt is required.
+The optional [notch filter](NOTCH.md) has independent X/Y configuration overrides.
+`NOTCH=AUTO` on CALIBRATE measures moving noise and selects a profile automatically.
+After either tester command, send the ZIP path printed in the console and
+identify the axis and any unusually hard homes. The ZIP includes available
+captures, the Klippy log interval, and the effective settings for that run.
+Beta calibration refuses an axis with an enabled notch before movement; use
+ordinary calibration for that axis.
 Only one workflow may own the sensor/motion session at a time. A new command
 during an active run is rejected; do not reissue it while automatic retries run.
 
@@ -88,6 +96,26 @@ other axis and any shared fallback remain unchanged. Later manual overrides
 still take precedence. Read the
 [complete calibration sequence](SIMPLE_CALIBRATION.md), including early-hit
 automatic returns and the ten-home, at-most-2-mm spread rule.
+
+### Automatic notch selection (dev)
+
+After manual preparation, to measure and report without staging or saving:
+
+```gcode
+ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0
+```
+
+AUTO performs three central noise strokes, unfiltered reference homes, offline
+selection and ten fresh validation homes after a fresh discovery. It may select
+a frequency/Q pair or recommend leaving the filter disabled. It tests the exact
+final threshold; the ordinary untested 0.5 g post-qualification margin does not
+apply to AUTO. Failed final validation aborts without raising the threshold.
+
+`SAVE_CONFIG=0` is AUTO's default and stages nothing. To apply the result, prepare
+XY again and run AUTO with explicit `SAVE_CONFIG=1`; this repeats the measurements,
+qualifies and saves the selected filter/model together, then restarts Klipper.
+Saving requires no selected-axis manual threshold override or unrelated pending
+configuration changes. See [automatic selection and evidence](NOTCH.md#automatic-selection).
 
 ## Accuracy and early-trigger recovery
 

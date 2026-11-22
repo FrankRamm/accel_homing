@@ -5,6 +5,10 @@ BETA is a separate supervised experiment. A successful proposal produces a
 console output. It does not stage/save a threshold or model, call SAVE_CONFIG
 or restart Klipper. Its suggestion is not hardware qualification.
 
+On `dev`, BETA refuses an axis with an enabled [notch filter](NOTCH.md) before
+movement. Use ordinary calibration for a filtered axis; BETA retains its
+existing raw-signal experiment when that axis's notch is disabled.
+
 ## Run
 
 Use the same [manual XY preparation](COMMANDS.md#prepare-every-moving-workflow)

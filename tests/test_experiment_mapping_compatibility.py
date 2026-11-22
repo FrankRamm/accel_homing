@@ -8,12 +8,26 @@ from harness import CommandError
 from test_experiment_workflow import ExperimentRig
 from test_mapped_detector import mapping
 from test_workflows import GCmd
+from accel_homing_filter import profile as filter_profile
 
 
 class ExperimentMappingCompatibilityTests(unittest.TestCase):
-    def test_loaded_pending_and_invalidated_directional_profiles_block_all_modes_before_effects(self):
+    def test_xyz_experiment_never_reinterprets_a_filtered_threshold(self):
+        for mode in ("LIVE", "SHADOW", "COMPARE"):
+            with self.subTest(mode=mode):
+                rig = ExperimentRig()
+                rig.owner.filter_settings = lambda axis: filter_profile(100., 3.)
+                with mock.patch.object(rig.workflow, "_preflight") as preflight, \
+                        mock.patch.object(rig.workflow, "_run_diagnostic") as run:
+                    with self.assertRaisesRegex(CommandError, "active notch"):
+                        rig.workflow.cmd_EXPERIMENT(GCmd(AXIS="X", CENTERED=1, MODE=mode))
+                preflight.assert_not_called()
+                run.assert_not_called()
+                self.assertEqual(rig.home_calls, [])
+
+    def test_loaded_pending_and_invalidated_directional_profiles_block_xyz_modes_before_effects(self):
         for axis in "xy":
-            for mode in ("LIVE", "SHADOW", "COMPARE"):
+            for mode in ("LIVE", "SHADOW"):
                 for state in ("loaded", "pending", "invalidated"):
                     for manual in (False, True):
                         with self.subTest(axis=axis, mode=mode, state=state, manual=manual):
