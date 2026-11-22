@@ -138,8 +138,6 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `x_back_off_dist`, `y_back_off_dist` | `back_off_dist` | Per-axis override of the release distance in mm; at least 0, no maximum, zero disables that axis. There is no Z back-off option. |
 | `min_home_dist` | `0` | Minimum G28 travel in mm before a home is trusted; a shorter home backs off this distance and homes again (up to 2 times, at homing_speed). 0 disables. Not used by calibration workflows. |
 | `x_min_home_dist`, `y_min_home_dist` | `min_home_dist` | Per-axis override. |
-
-The stepper-section `min_home_dist` stays disabled; this plugin option replaces it on Klipper and Kalico.
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |
 | `baseline_time` | `0.1` | Fresh reference duration in seconds; 0.05–1, with at least 50 contiguous samples. |
 | `baseline_batches` | `25` | Retained baseline batch capacity; integer 10–200. |
@@ -148,6 +146,8 @@ The stepper-section `min_home_dist` stays disabled; this plugin option replaces 
 | `travel_margin` | `1.1` | Full-move travel/time margin multiplier; 1–2. |
 | `watchdog_margin` | `0.15` | Additional full-move watchdog allowance in seconds; 0–2. |
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
+
+The stepper-section `min_home_dist` stays disabled; this plugin option replaces it on Klipper and Kalico.
 
 ## Experimental notch filter (dev)
 
