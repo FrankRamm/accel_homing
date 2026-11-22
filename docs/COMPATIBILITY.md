@@ -68,7 +68,14 @@ executed synthetic tests and physical validation.
 CALIBRATE, TEST, CHARTS, ACCURACY and BETA require:
 
 - Cartesian or CoreXY kinematics with Z independent of XY; no dual carriage.
-- Separate usable XY and Z enable lines, with the required kinematic limits APIs.
+- Usable XY enable controls and the required kinematic limits APIs. Shared XY/Z
+  hardware enable pins (for example Duet 2 TMC2660) and absent XY enable pins
+  are accepted only when each affected XY stepper has a verified live firmware
+  TMC virtual-enable callback and a valid saved TOFF value. Keep the board's
+  actual hardware enable pin configuration. This is detected automatically;
+  no opt-in config setting is required. Unknown callback APIs fail closed.
+  XY and Z must still have distinct per-stepper enable trackers. CoreXY
+  releases both XY motors even for an X-only workflow, while leaving Z alone.
 - Both XY axes initially unhomed and manually centered, with supported Z and
   nozzle/bed clearance established by the operator.
 - The requested axes using this plugin's endstops, single-pass

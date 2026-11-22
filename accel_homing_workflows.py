@@ -66,6 +66,11 @@ except ImportError:
 # homing-current helper on firmware versions that provide one.
 _PRINTER_G28 = getattr(_PrinterHoming, "cmd_G28", None)
 
+try:
+    from .tmc import TMCCommandHelper as _TMCCommandHelper
+except ImportError:
+    _TMCCommandHelper = None  # Standalone analysis has no firmware TMC API.
+
 AXES = {"x": 0, "y": 1}
 POLARITY_POLICY = "absolute_after_reference_subtraction_v1"
 SIGNAL_QUALITY_FIELDS = ("amplitude_limited", "excess_amplitude_unknown", "peak_semantics",
@@ -569,12 +574,35 @@ class AccelHomingWorkflows:
             if not empty or queued > estimated + 0.1:
                 raise self._error("queued motion is still active")
 
+    @staticmethod
+    def _has_tmc_virtual_enable(line, stepper_name):
+        # Check the live, connected helper, not a config section or an old log.
+        # Fail closed when firmware no longer exposes this callback contract.
+        if _TMCCommandHelper is None or not callable(
+                getattr(line, "has_dedicated_enable", None)) or line.has_dedicated_enable():
+            return False
+        for callback in getattr(line, "callbacks", ()):
+            helper = getattr(callback, "__self__", None)
+            if not isinstance(helper, _TMCCommandHelper):
+                continue
+            if getattr(callback, "__func__", None) is not getattr(
+                    _TMCCommandHelper, "_handle_stepper_enable", None):
+                continue
+            toff = getattr(helper, "toff", None)
+            manager = getattr(helper, "stepper_enable", None)
+            if (getattr(helper, "stepper_name", None) == stepper_name
+                    and type(toff) is int and 0 < toff <= 15
+                    and callable(getattr(manager, "lookup_enable", None))
+                    and manager.lookup_enable(stepper_name) is line):
+                return True
+        return False
+
     def _xy_enable_lines(self):
         toolhead = self.owner.toolhead
         manager = self.printer.lookup_object("stepper_enable", None)
         if toolhead is None or manager is None:
             raise self._error("stepper enable controls are unavailable")
-        lines, z_lines = [], []
+        lines, z_lines, xy_names = [], [], []
         for stepper in toolhead.get_kinematics().get_steppers():
             if not hasattr(stepper, "is_active_axis"):
                 raise self._error("cannot establish which steppers affect Z")
@@ -585,17 +613,24 @@ class AccelHomingWorkflows:
                 raise self._error("an XY stepper also drives Z; selective release is unsafe")
             if xy:
                 lines.append(line)
+                xy_names.append(stepper.get_name())
             if z:
                 z_lines.append(line)
         if not lines:
             raise self._error("no XY stepper enable lines were found")
-        if any(line is other or getattr(line, "enable", object()) is getattr(other, "enable", None)
-               for line in lines for other in z_lines):
-            raise self._error("XY and Z share an enable line; cannot release XY independently")
-        if any(hasattr(line, "has_dedicated_enable") and not line.has_dedicated_enable()
-               and getattr(getattr(line, "enable", None), "mcu_enable", True) is None
-               for line in lines):
-            raise self._error("an XY motor has no controllable enable pin")
+        for line, name in zip(lines, xy_names):
+            # Sharing the tracking object itself would disable Z logically too.
+            if any(line is other for other in z_lines):
+                raise self._error("XY and Z share an enable tracker; cannot release XY independently")
+            shared_with_z = any(getattr(line, "enable", object())
+                                is getattr(other, "enable", None) for other in z_lines)
+            no_pin = getattr(getattr(line, "enable", None), "mcu_enable", True) is None
+            if (shared_with_z or no_pin) and not self._has_tmc_virtual_enable(line, name):
+                if shared_with_z:
+                    raise self._error("XY and Z share an enable line; cannot release XY independently "
+                                      "without verified TMC virtual enable for %s" % name)
+                raise self._error("an XY motor has no controllable enable pin or verified "
+                                  "TMC virtual enable: %s" % name)
         return list(dict.fromkeys(lines))
 
     def _disable_xy(self):
@@ -623,6 +658,9 @@ class AccelHomingWorkflows:
                 or kin.limits[2] != z_limit:
             raise self._error("could not invalidate XY while retaining Z state")
         toolhead.wait_moves()
+
+        if hasattr(self.printer, "is_shutdown") and self.printer.is_shutdown():
+            raise self._error("printer shut down while releasing XY")
 
     def _geometry(self, axis):
         rail = self.owner.rails_by_axis[axis]
