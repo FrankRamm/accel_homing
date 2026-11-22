@@ -453,7 +453,7 @@ class Rig:
         self.owner.stop_noise_measurement = self.stop_noise
         self.owner.collect_noise_window = self.collect_noise
         for method in ("_retract_completed_home", "release_workflow_home", "_limit_accel",
-                       "_restore_accel", "_set_accel", "_check_back_off_range"):
+                       "_restore_accel", "_set_accel", "_check_back_off_range", "_rehome_short_axes"):
             setattr(self.owner, method, types.MethodType(getattr(plugin.BeaconAccelHoming, method), self.owner))
         self.workflow = AccelHomingWorkflows(self.owner, self.config)
         self.workflow.renderer = FakePNGRenderer()

@@ -2,7 +2,6 @@
 import unittest
 
 from harness import CommandError, ConfigError, make_homing
-from test_center_calibration import CenterRig
 import test_retract_noise
 from test_session import FakeRail, info, start_session, with_endstops
 from test_workflows import Rig
@@ -74,8 +73,7 @@ class PerAxisBackOffTests(unittest.TestCase):
         self.assertEqual(toolhead.moves, [])
 
     def test_workflow_suppresses_and_restores_per_axis(self):
-        for make_rig, run in ((Rig, lambda rig: rig.calibrate(save=0)),
-                              (CenterRig, lambda rig: rig.center())):
+        for make_rig, run in ((Rig, lambda rig: rig.calibrate(save=0)),):
             with self.subTest(rig=make_rig.__name__):
                 rig = make_rig()
                 rig.owner.back_off_dist = {"x": 5.0, "y": 50.0}

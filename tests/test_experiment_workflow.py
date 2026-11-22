@@ -170,7 +170,7 @@ class ExperimentWorkflowTests(unittest.TestCase):
         self.assertIsNone(rig.owner.troubleshoot)
         self.assertIs(rig.owner.experimental_profile, old_profile)
         self.assertEqual(rig.owner.threshold_g, {"x": 8., "y": 9.})
-        self.assertEqual(rig.owner.back_off_dist, 5.)
+        self.assertEqual(rig.owner.back_off_dist, {"x": 5., "y": 5.})
         self.assertFalse(rig.capture_active)
         self.assertFalse(rig.workflow.in_home)
         self.assertEqual(rig.configfile.saved, {})
