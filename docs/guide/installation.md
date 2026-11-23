@@ -2,28 +2,76 @@
 
 [← Documentation](../README.md)
 
-Run shell commands on the Linux printer host as the existing Klipper service
-user. Keep the printer idle and unpaused throughout installation, updating,
-uninstallation and service restarts. Installation does not request motion.
+> **What you'll do:** install the accel_homing plugin on the computer that runs
+> your printer (see [printer host](glossary.md#printer-host)), or update, switch
+> or remove it.
+>
+> **What you need:** a working Klipper or Kalico printer with a supported
+> [accelerometer](glossary.md#accelerometer) already set up, and a
+> [terminal](glossary.md#terminal) on your printer.
+>
+> **Time:** about 10 minutes.
+
+Keep the printer idle and unpaused throughout installation, updating,
+uninstallation and restarts of Klipper and [Moonraker](glossary.md#moonraker).
+Installation does not move the printer.
 
 ## Prerequisites
 
+Check each point before you start.
+
 - A working Klipper or Kalico installation, Bash, Git, and Python 3.8 or newer.
 - A configured, functioning accelerometer supported by the
-  [sensor adapter](compatibility.md). Configure its MCU, wiring, firmware and
+  [sensor adapter](compatibility.md). Set up its board, wiring, firmware and
   driver before installing this plugin.
-- Write access to the selected printer configuration and Klipper extras
-  directory. Use the normal service user; the installer requests sudo for
-  verified system service activation when needed.
+- Permission to change your printer configuration and the Klipper extras
+  directory (the folder where Klipper loads add-ons). Use the user that runs
+  Klipper (usually the one you normally log in with, often `pi`). The installer
+  asks for your Linux login password (the installer may use `sudo`) when it needs to restart Klipper and
+  Moonraker.
 - A native Git clone for Moonraker updates. A ZIP/archive, copied subtree or
   old MISC checkout is not the standalone update source.
 - Internet access for the clone and, when needed, binary plotting dependencies.
 
-The installer discovers the Klipper checkout, main configuration, API socket,
-service and configured sensor. Multiple possible instances or sensors require
-explicit selection. It does not infer electrical wiring or validate mechanics.
+The installer finds the Klipper checkout, main configuration, API socket,
+service and configured sensor. If it finds several possible instances or
+sensors, you must select one explicitly. It does not infer electrical wiring or
+validate mechanics.
+
+## Open a terminal on your printer
+
+The install commands below must be typed into a terminal on the computer that
+runs Klipper. You usually reach it over [SSH](glossary.md#ssh) from your own
+computer.
+
+1. Find your printer's address. Mainsail and Fluidd often show it in the
+   browser address bar when you open them. The printer's own screen may also
+   show it. It looks like `192.168.1.50` or `mainsail.local`.
+2. Open a command window on your own computer. On Windows, open Windows
+   Terminal or PowerShell. On macOS, open Terminal. On Linux, open your
+   terminal program.
+3. Type `ssh` followed by your user name, an `@` and the address, then press
+   Enter. For example:
+
+   ```bash
+   ssh pi@192.168.1.50
+   ```
+
+   The user name depends on how your printer was set up. `pi`, `biqu` and `mks`
+   are common examples, not promises. Use the one from your printer's
+   instructions.
+4. The first time, answer `yes` if asked whether to trust the printer. Then type
+   your Linux login password. Nothing appears while you type. This is normal.
+
+If `ssh` is refused, check that SSH is enabled for your printer's operating system image.
+
+When you see a prompt that ends in `$`, you are in the terminal on your printer.
 
 ## Install
+
+Log in as the user that runs Klipper (usually the one you normally log in with,
+often `pi`). Paste this whole block into
+the terminal, then press Enter:
 
 ```bash
 (
@@ -52,30 +100,19 @@ explicit selection. It does not infer electrical wiring or validate mechanics.
 ```
 
 Use the same block for a fresh installation or a reinstall. It updates an
-existing clean checkout to the published `main` before running its installer.
+existing clean checkout to the published `main` (the stable version) before
+running its installer.
 If Git reports an error, the block stops. Keep the checkout in place because
 the installed extras link to its Python modules.
 
-The managed source must be a complete clean `~/accel_homing` Git checkout.
-The stable branch tracks `origin/main`. The tester procedure below tracks
-`origin/dev`. Both use origin `https://github.com/FrankRamm/accel_homing.git`.
-The installer refuses conflicting source identity or ownership; it does not
-reset or stash local changes to make them disappear. One managed Klipper
-instance may use this per-user clone; a discovered second instance using its
-extras links is rejected. Do not share this clone across printer installations.
+## Switch to the test version
 
-To inspect a plan without writes or automatic restarts:
-
-```bash
-~/accel_homing/install.sh --dry-run
-```
-
-A dry run reports missing plotting dependencies but does not install them.
-
-### Switch an existing tester installation to dev
-
-With the printer idle, run these commands over SSH as the Klipper service user.
-The installer links the additional modules and reloads the host services.
+The test version has newer features that are not yet in the
+[stable version](glossary.md#stable-and-test-versions). It may have bugs. Use it
+only if you want to try those features. With the printer idle, run these
+commands in a [terminal](glossary.md#terminal) on your printer, as the user you
+normally log in with. The installer links the additional modules and reloads
+Klipper and Moonraker.
 
 ```bash
 (
@@ -106,7 +143,43 @@ included Moonraker configuration. Subsequent frontend updates follow dev.
 Verify the checkout with `git -C ~/accel_homing status -sb`; it should show
 `dev...origin/dev`.
 
-## What installation changes
+## If something goes wrong
+
+- Git prints an error and the install block stops: read the message. It
+  can mean the `~/accel_homing` folder has local changes or does not come from the
+  expected source. Do not force a reset. See
+  [troubleshooting](troubleshooting.md).
+- The installer asks for a password: type your Linux login password.
+- The installer reports a conflict, or several instances or sensors: see
+  [Options and explicit instance selection](#options-and-explicit-instance-selection)
+  under Details.
+- A plotting dependency check fails: the installer stops before changing your
+  printer configuration. Fix the reported problem, then run the same block
+  again. See [troubleshooting](troubleshooting.md).
+
+## Details
+
+The sections below are the full technical reference.
+
+### Managed source and dry run
+
+The managed source must be a complete clean `~/accel_homing` Git checkout.
+The stable branch tracks `origin/main`. The [test-version procedure](#switch-to-the-test-version) tracks
+`origin/dev`. Both use origin `https://github.com/FrankRamm/accel_homing.git`.
+The installer refuses conflicting source identity or ownership; it does not
+reset or stash local changes to make them disappear. One managed Klipper
+instance may use this per-user clone; a discovered second instance using its
+extras links is rejected. Do not share this clone across printer installations.
+
+To inspect a plan without writes or automatic restarts:
+
+```bash
+~/accel_homing/install.sh --dry-run
+```
+
+A dry run reports missing plotting dependencies but does not install them.
+
+### What installation changes
 
 Installation uses the current configuration and does not create or read
 installation backups. Existing `.accel_homing_backups/` directories are left
@@ -139,7 +212,7 @@ It reuses a working plotting stack or prepares binary wheels in the checkout's
 private, ignored `.plot-deps/` cache. It does not change global Python package
 pins. A dependency/preflight failure stops before printer configuration writes.
 
-## Service activation
+### Service activation
 
 Default installation/update restarts the exact verified Klipper systemd service
 and activates the correlated Moonraker service when required. It verifies the
@@ -182,7 +255,7 @@ and uninstall. Configuration-only edits and calibration's
 Restarting also discards unsaved configuration/model changes. Preserve any
 pending work before installing or updating.
 
-## Options and explicit instance selection
+### Options and explicit instance selection
 
 ```bash
 ~/accel_homing/install.sh --help
@@ -242,7 +315,7 @@ Development opt-outs are not a shared-instance migration mechanism. In
 particular, do not replace links in a shared Klipper checkout while another
 printer instance using them is active.
 
-## Moonraker updates
+### Moonraker updates
 
 Default installation registers the correlated Moonraker instance automatically.
 The source path is the complete per-user `~/accel_homing` checkout, such as
@@ -285,7 +358,7 @@ If Git or the installer reports local changes, preserve and review them. Do not
 use a forced reset to conceal an ownership or configuration conflict.
 `--no-update-manager` installs do not configure this native update flow.
 
-## Moonraker update manager
+### Moonraker update manager
 
 The default installer already adds this entry. **Do not add a duplicate** in
 `moonraker.conf` or its includes. For manual setup only, add this if missing:
@@ -308,7 +381,7 @@ matching plugin entry while preserving unrelated updater configuration.
 [Update details](#moonraker-updates) ·
 [Moonraker reference](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
 
-## Migrate from the MISC plugin
+### Migrate from the MISC plugin
 
 Run the normal standalone installer above while idle. Installations from
 `FrankRamm/MISC` or `Monolith3D/MISC` no longer require the old uninstaller or
@@ -330,7 +403,7 @@ Uninstall removes the current plugin setup; it does not restore the previous
 MISC installation or its original physical endstop settings. Installation does
 not test homing; supervise subsequent physical testing.
 
-## Uninstall
+### Uninstall
 
 Preview or perform the operation from the complete checkout:
 
@@ -373,7 +446,7 @@ or manual updater entries need this checkout, remove the source if desired:
 rm -rf ~/accel_homing
 ```
 
-## Backup deprecation and interrupted installation
+### Backup deprecation and interrupted installation
 
 Persistent installation backups and historical rollback are deprecated.
 `install.sh --rollback` exits without changing files. Installation, migration,

@@ -10,6 +10,7 @@ Start with the guide, in order. The advanced and development pages are for speci
 4. [Configuration](guide/configuration.md): read this when you need to change the installer-created settings.
 5. [Printer console commands](guide/commands.md): read this when you need the exact syntax of a console command.
 6. [Troubleshooting](guide/troubleshooting.md): read this when installation, calibration or homing misbehaves.
+7. [Glossary](guide/glossary.md): words used in these docs.
 
 ## Advanced
 

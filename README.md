@@ -45,8 +45,8 @@ for supported sensors and limits.
    )
    ```
 
-   To test the development branch on an existing printer, see
-   [Switch an existing tester installation to dev](docs/guide/installation.md#switch-an-existing-tester-installation-to-dev).
+   Want to try the test version? See
+   [switching to the test version](docs/guide/installation.md#switch-to-the-test-version).
    The block above selects the stable branch. The installer configures X/Y
    homing and Moonraker updates, restarts the verified services and may ask for
    your Linux sudo password. It does not home the printer. Existing MISC installations can run this installer directly; see [migrating from MISC](docs/guide/installation.md#migrate-from-the-misc-plugin).
