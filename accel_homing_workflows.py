@@ -776,6 +776,10 @@ class AccelHomingWorkflows:
 
     def check_filter_rate(self, axis, rate):
         if self.session and self.session.get("mode") == "calibration":
+            if self.session.get("gentle_frozen_candidate"):
+                expected = self.session["gentle_motion_noise"].get("detector_sample_rate_hz")
+                if not expected or abs(rate / expected - 1) > 0.02:
+                    raise self._error("gentle contact sample rate differs from the frozen motion controls")
             return
         self._check_filter_model(axis)
         if (self.model is None or axis not in self.model.thresholds
@@ -977,6 +981,35 @@ class AccelHomingWorkflows:
             raise self._error("Gentle homing on %s requires its saved threshold qualified at these "
                               "motion settings. Manually center XY and run ACCEL_HOMING_CALIBRATE "
                               "AXIS=%s CENTERED=1" % (axis.upper(), axis.upper()))
+        if self._uses_saved_gentle_phase_check(axis):
+            self._beta_extractor()
+
+    def _uses_saved_gentle_phase_check(self, axis):
+        return bool(self.gentle_homing and self.model and not (
+            self.session and self.session.get("mode") == "calibration")
+            and self.model.metadata.get(axis, {}).get("gentle_contact_phase_policy") == "prebrake_v1")
+
+    def observe_saved_gentle_seek(self, attempt, home_end):
+        """Read the native schedule before Klipper discards unexecuted motion."""
+        if not self._uses_saved_gentle_phase_check(attempt.axis) or attempt.reason != "impact":
+            return
+        record = attempt.record
+        try:
+            auto = _ah_compat_sibling_module("accel_homing_auto", __package__, __file__)
+            info = self.owner.rails_by_axis[attempt.axis].get_homing_info()
+            direction = 1. if info.positive_dir else -1.
+            segments = auto._contact_seek_segments(self._beta_extractor(), attempt.arm_time, home_end,
+                                                   attempt.axis, direction, self.reactor.NEVER)
+            planner = dict(verified_native_seek=True, axis=attempt.axis, pass_number=attempt.pass_no,
+                           arm_time_s=attempt.arm_time, native_home_end_time_s=home_end,
+                           clock_domain="main_mcu_print_time",
+                           segments=segments, brake_start_time_s=next((p["start_time_s"] for p in segments
+                                                                if p["phase"] == "braking"), None))
+            record["gentle_contact_phase"] = auto._contact_phase_receipt(planner, axis=attempt.axis,
+                pass_number=attempt.pass_no, arm_time=attempt.arm_time,
+                onset_time=record.get("onset_time_s"))
+        except Exception as exc:
+            record["gentle_contact_phase"] = {"accepted": False, "reason": str(exc)}
 
     def centered_gentle_home(self, homing):
         """Use the native single-rail homing routine with a bounded commanded seek."""
@@ -1050,6 +1083,11 @@ class AccelHomingWorkflows:
         # it does not force stock G28's all-motor fault cleanup for an early hit.
         if self.in_home and record.get("axis", "").lower() != self.home_axis:
             raise self._error("unexpected homing result axis")
+        if record.get("result") == "impact" and self._uses_saved_gentle_phase_check(record["axis"]):
+            receipt = record.get("gentle_contact_phase") or {}
+            if receipt.get("accepted") is not True:
+                raise self._error("gentle home could not verify a trigger before commanded braking: %s" %
+                                  receipt.get("reason", "missing native seek timing"))
         if self.gentle_homing and not self.in_home and record.get("result") == "impact":
             reason = self._gentle_halt_error(record["axis"], record)
             if reason:
@@ -1624,6 +1662,11 @@ class AccelHomingWorkflows:
                 mapping = session["axis_mapping"]
                 record.update(impact_metric="mapped_axis", axis_mapping=dict(mapping),
                               noise_axis_peak_g=record["noise_peak_g"]["xyz"[mapping["source_axis"]]])
+                if session.get("auto_notch") and self.gentle_homing:
+                    # Replay only after the moving controls select the profile.
+                    # Keep references to these three bounded acquisition windows.
+                    session.setdefault("_gentle_stationary_windows", []).append(
+                        (capture["samples"], capture["baseline_g"]))
             try:
                 paths = write_noise_capture(self.charts_directory, session["run_id"],
                                             iteration, capture, record, **self._chart_options(session))
@@ -1779,6 +1822,73 @@ class AccelHomingWorkflows:
                        for key in ("start_threshold_g", "candidate"))):
             raise self._error("gentle calibration threshold is below its measured moving-noise requirement")
 
+    def _gentle_freeze_candidate(self, session, result):
+        """Bind the held-out moving control and three stationary windows to the live detector."""
+        if __package__:
+            from .accel_homing_backends import load_companion_module
+        else:
+            from accel_homing_backends import load_companion_module
+        filters = load_companion_module("accel_homing_filter")
+        settings, threshold = result["profile"], result["threshold_g"]
+        evidence = session["gentle_motion_noise"]
+        selected = result["evidence"]["frozen_candidate"]
+        holdout = result["evidence"]["holdout"]
+        metrics = selected["training_metrics"] + holdout["metrics"]
+        captures = result["evidence"]["captures"]
+        windows = session.pop("_gentle_stationary_windows", [])
+        if (holdout.get("accepted") is not True or len(metrics) != NOISE_ITERATIONS
+                or len(captures) != NOISE_ITERATIONS or len(windows) != NOISE_ITERATIONS
+                or settings != self._filter_settings(session["axis"])
+                or result["axis_mapping"] != evidence["axis_mapping"]
+                or result["axis_mapping_context"] != evidence["sensor_context"]
+                or selected["profile"] != settings or selected["threshold_g"] != threshold):
+            raise self._error("gentle candidate lacks matching independent motion and stationary evidence")
+        channel = evidence["axis_mapping"]["source_axis"]
+        stationary_peaks, moving_peaks = [], []
+        for i, (metric, capture, window, raw) in enumerate(zip(
+                metrics, captures, windows, evidence["iterations"]), 1):
+            self._check_running(session)
+            identity = "%s:%s:motion:%d" % (session["run_id"], session["axis"], i)
+            if (metric["capture_id"] != identity or capture["capture_id"] != identity
+                    or not filters.same_rate(capture["sample_rate_hz"], raw["sample_rate_hz"])):
+                raise self._error("gentle candidate motion provenance changed")
+            samples, baseline = window
+            rate = (len(samples) - 1) / (samples[-1][0] - samples[0][0])
+            if not filters.same_rate(rate, capture["sample_rate_hz"]):
+                raise self._error("gentle stationary sample rate differs from moving controls")
+            notch = (None if settings == filters.DISABLED else filters.CausalNotch(settings, rate))
+            peak = 0.
+            for j, row in enumerate(samples):
+                if j % 2048 == 0:
+                    self._check_running(session)
+                if j and row[0] - samples[j - 1][0] > 5.0 / rate + .000003:
+                    raise self._error("gentle stationary control contains a sample gap")
+                signed = row[channel + 1] - baseline[channel]
+                level = abs(notch.process((signed,))[0] if notch else signed)
+                peak = max(peak, level)
+            stationary_peaks.append(peak)
+            moving_peaks.append(metric["noise_peak_g"])
+            raw.update(raw_mapped_peak_g=raw["mapped_peak_g"], raw_phase_peak_g=raw["phase_peak_g"],
+                       mapped_peak_g=metric["noise_peak_g"],
+                       phase_peak_g={p["phase"]: p["filtered_peak_g"] for p in metric["phases"] if p["scored"]},
+                       role=capture["role"])
+        peak = max(stationary_peaks + moving_peaks)
+        required = max(peak * 1.2, peak + 0.1)
+        if (not all(type(p) in (int, float) and math.isfinite(p) and p >= 0
+                    for p in stationary_peaks + moving_peaks) or threshold < required - 1e-12):
+            raise self._error("frozen gentle threshold %.6g g lacks margin over the measured "
+                              "filtered controls (required %.6g g); no contact attempted" % (threshold, required))
+        evidence.update(complete=True, signal_filter=dict(settings), motion_peak_g=max(moving_peaks),
+                        detector_sample_rate_hz=captures[0]["sample_rate_hz"],
+                        stationary_peak_g=max(stationary_peaks), stationary_window_peaks_g=stationary_peaks,
+                        seed_peak_g=peak, selected_threshold_g=threshold, required_threshold_g=min(threshold, required),
+                        source="precontact_mapped_controls", margin_factor=1.2, margin_g=0.1)
+        session["stationary_noise"].update(detector_window_peaks_g=stationary_peaks,
+                        detector_filter=dict(settings), start_threshold_g=threshold,
+                        initial_threshold_source="precontact_mapped_controls")
+        self._gentle_validate_motion_seed(session)
+        self._announce_calibration(session)
+
     def _calibration_noise_preflight(self, session):
         # _begin has validated CENTERED, the command parameters and the motion
         # policy without moving or changing motor state. Keep this exact active
@@ -1847,6 +1957,17 @@ class AccelHomingWorkflows:
             "acquisition_faults": list(noise_result["acquisition_faults"]),
             "summary_paths": {}}
         session["deferred_noise_result"] = noise_result
+        if gentle and session.get("auto_notch"):
+            # The raw moving maximum belongs to the unfiltered stream. A candidate
+            # must be tested against the moving controls in its own signal domain.
+            session["gentle_candidate_min_g"] = max(start, stationary_peak * 1.2, stationary_peak + 0.1)
+            session["recommendation"].update(calibration_axis=session["axis"], impact_metric="mapped_axis",
+                                             axis_mapping=dict(mapping), noise_axis_peak_g=stationary_peak)
+            self._check_running(session)
+            self._check_stopped_noise_context(session)
+            session.update(mode="calibration", state="running")
+            session.pop("sensor_token", None)
+            return
         if gentle:
             evidence = session["gentle_motion_noise"]
             if not explicit:
@@ -1950,6 +2071,11 @@ class AccelHomingWorkflows:
         if attempt_limit is not None and session["attempts"] >= attempt_limit:
             raise self._error("maximum homing attempts reached")
         self._check_running(session)
+        if session.get("gentle_frozen_candidate"):
+            self._gentle_validate_motion_seed(session)
+            session["auto_notch_controller"].check(session)
+            if threshold != session["gentle_frozen_candidate"]["threshold_g"]:
+                raise self._error("gentle contact requested with a different threshold")
         if threshold is not None:
             self._validate_calibration_threshold(threshold, "candidate")
         session["attempts"] += 1
@@ -1988,6 +2114,9 @@ class AccelHomingWorkflows:
                 # X/Y here, retaining public handlers and normal homing events.
                 # Recheck after capture setup and command creation can yield.
                 self._check_running(session)
+                if session.get("gentle_frozen_candidate"):
+                    session["auto_notch_controller"].check(session)
+                    self._gentle_validate_motion_seed(session)
                 with self._experimental_gc_scope(session):
                     self._native_g28()(gcmd)
                     self.owner.toolhead.wait_moves()
@@ -2909,8 +3038,8 @@ class AccelHomingWorkflows:
         notch = gcmd.get("NOTCH", None)
         if gcmd.get("CONTACT_ONLY", None) is not None and str(notch).strip().upper() != "AUTO":
             raise gcmd.error("CONTACT_ONLY requires NOTCH=AUTO to capture the diagnostic ZIP")
-        if notch is not None:
-            if str(notch).strip().upper() != "AUTO":
+        if notch is not None or (self.gentle_homing and self.session is None):
+            if notch is not None and str(notch).strip().upper() != "AUTO":
                 raise gcmd.error("NOTCH must be AUTO when specified")
             if __package__:
                 from .accel_homing_backends import load_companion_module

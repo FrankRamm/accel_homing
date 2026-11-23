@@ -204,7 +204,15 @@ def write_contact_timing_plot(path, rows, planner, signal, *, cooperate=None):
                      'stroke="%s" %s/>' % (x1, y1, x2, y2, color, extra))
 
     text_at(72, 32, "Single-contact signal and scheduled motion timing", 'font-size="21" font-weight="bold"')
-    text_at(72, 56, "Diagnostic causal notch replay: 200 Hz, Q=5. Absolute mapped-axis acceleration in g.")
+    settings = signal.get("filter") or {}
+    frequency, q = number(settings.get("frequency_hz")), number(settings.get("q"))
+    profile_label = ("Disabled filter (raw mapped component)" if settings.get("type") == "disabled" else
+                     "Notch %.6g Hz, Q=%.6g" % (frequency, q) if frequency is not None and q is not None else
+                     "Profile unavailable")
+    role = ("Recorded live detector replay" if signal.get("analysis_role") == "actual_candidate_replay" else
+            "Historical diagnostic replay" if signal.get("analysis_role") == "historical_fixed_200Hz_Q5_diagnostic_only" else
+            "Diagnostic replay")
+    text_at(72, 56, "%s: %s. Absolute mapped-axis acceleration in g." % (role, profile_label))
     if delta_ms is not None:
         text_at(72, 80, "Window filtered peak %.4g g; peak - scheduled brake = %+.3f ms." % (peak_g, delta_ms))
     else:
@@ -216,7 +224,7 @@ def write_contact_timing_plot(path, rows, planner, signal, *, cooperate=None):
     line(560, 105, 590, 105, "#7c8798", 'stroke-width="1.5"')
     text_at(598, 110, "Raw")
     line(670, 105, 700, 105, "#1758ba", 'stroke-width="1.6"')
-    text_at(708, 110, "Filtered 200 Hz / Q=5")
+    text_at(708, 110, profile_label)
     line(72, 132, 100, 132, "#9a4d00", 'stroke-width="2" stroke-dasharray="6 4"')
     text_at(108, 137, "Scheduled brake start")
     if stop is not None:

@@ -20,6 +20,7 @@ except ImportError:
 
 
 VERSION = "independent_mapped_motion_reference_stop_notch_v3"
+GENTLE_VERSION = "independent_mapped_free_motion_gentle_v1"
 MIN_USABLE_CRUISE_SECONDS = 0.25
 CRUISE_EDGE_SECONDS = 0.020
 MIN_CRUISE_SECONDS = MIN_USABLE_CRUISE_SECONDS + 2 * CRUISE_EDGE_SECONDS
@@ -177,7 +178,25 @@ def _home_eligibility(meta, first_time, arm_time, rate):
              "native first source sample is not the first eligible arm sample")
 
 
-def _contact_replay_input(capture, check_running):
+def _contact_profile(settings):
+    """Normalize explicit replay settings without accepting unknown filters."""
+    _require(isinstance(settings, dict), "contact replay profile must be an object")
+    if settings.get("type") == DISABLED["type"]:
+        _require(not any(key in settings for key in ("frequency_hz", "q", "coefficients")),
+                 "disabled contact replay profile has notch parameters")
+        return dict(DISABLED)
+    frequency, q = settings.get("frequency_hz"), settings.get("q")
+    _require(_finite(frequency) and frequency > 0 and _finite(q),
+             "invalid contact replay frequency or Q")
+    try:
+        normalized = profile(frequency, q)
+    except ValueError as exc:
+        raise InsufficientData(str(exc)) from exc
+    _require(settings.get("type") == normalized["type"], "unsupported contact replay filter type")
+    return normalized
+
+
+def _contact_replay_input(capture, check_running, settings=None):
     """Validate retained detector inputs without requiring a threshold crossing."""
     _require(isinstance(capture, dict), "missing retained raw capture")
     _require(not any(capture.get(key) for key in (
@@ -253,10 +272,19 @@ def _contact_replay_input(capture, check_running):
               "mean_rate_tolerance_fraction": RATE_TOLERANCE,
               "interval_guard_nominal_periods": [0.5, 1.5],
               "replay_sampling": "one filter update per original sample; no resampling"}
+    selected = profile(200.0, 5.0) if settings is None else _contact_profile(settings)
     try:
-        notch = CausalNotch(profile(200.0, 5.0), rate)
+        notch = None if selected == DISABLED else CausalNotch(selected, rate)
     except ValueError as exc:
         raise InsufficientData(str(exc)) from exc
+    if settings is not None:
+        if "sample_rate_hz" in settings:
+            _require(_finite(settings["sample_rate_hz"])
+                     and math.isclose(settings["sample_rate_hz"], rate, rel_tol=1e-12),
+                     "explicit replay sample rate differs from the armed reference")
+        if "coefficients" in settings:
+            _require(notch is not None and list(notch.coefficients) == settings["coefficients"],
+                     "explicit replay coefficient provenance mismatch")
     return rows, baseline, start, arm, mapping, notch, timing
 
 
@@ -329,20 +357,25 @@ def _contact_interval(rows, left, right, tolerance, check_running, *, closed=Fal
     return result
 
 
-def describe_contact_timing(capture, planner, check_running=None):
-    """Descriptive offline 200 Hz/Q5 replay, independent of the live detector.
+def describe_contact_timing(capture, planner, check_running=None, settings=None):
+    """Descriptive offline replay using an explicit profile or historical 200/Q5.
 
     Replay every retained sample from the unique first armed row through the
     tail. Scheduled braking and a nearby signal maximum are timing observations,
     not independently observed contact or proof of a different stop decision.
     A valid capture need not have triggered. Returned plot rows keep MCU
     print_time and contain absolute raw and filtered mapped components in g.
+    Explicit disabled settings retain baseline subtraction and exact arm/sample
+    validation. A profile is labelled live only when its recorded metadata agree.
     """
     _check(check_running)
     summary = {"status": "insufficient_data", "version": "offline_contact_timing_v1",
                "time_domain": "main_mcu_print_time", "offline_only": True,
                "physical_contact_verified": False,
-               "filter": profile(200.0, 5.0), "phases": [], "global_peak": None,
+               "filter": profile(200.0, 5.0) if settings is None else None,
+               "replay_profile_source": "historical_fixed_diagnostic" if settings is None else "explicit_profile",
+               "filter_label": "historical 200 Hz/Q5 diagnostic" if settings is None else "explicit-profile diagnostic",
+               "matches_recorded_live_filter": None, "phases": [], "global_peak": None,
                "brake_window": {"coverage": "unavailable", "half_width_s": 0.100,
                                 "filtered_peak_g": None, "filtered_peak_time_s": None,
                                 "peak_minus_brake_ms": None},
@@ -360,7 +393,7 @@ def describe_contact_timing(capture, planner, check_running=None):
         checking = False
 
     try:
-        rows, baseline, start, arm, mapping, notch, timing = _contact_replay_input(capture, checked)
+        rows, baseline, start, arm, mapping, notch, timing = _contact_replay_input(capture, checked, settings)
     except InsufficientData as exc:
         if checking:
             raise
@@ -376,16 +409,38 @@ def describe_contact_timing(capture, planner, check_running=None):
         row = rows[index]
         signed = tuple(row[axis + 1] - baseline[axis] for axis in range(3))
         try:
-            filtered = notch.process(signed)
+            _require(all(math.isfinite(value) for value in signed), "nonfinite baseline-subtracted sample")
+            filtered = signed if notch is None else notch.process(signed)
         except ValueError as exc:
             summary["reason"] = str(exc)
             return summary, []
         component = mapping["source_axis"]
         plot_rows.append((row[0], abs(signed[component] * mapping["sign"]),
                           abs(filtered[component] * mapping["sign"])))
-    tolerance = 1.02 / notch.rate
+    rate = timing["reference_sample_rate_hz"]
+    filter_metadata = (dict(DISABLED, sample_rate_hz=rate, initial_state="not_applicable_disabled")
+                       if notch is None else notch.metadata())
+    selected = dict(DISABLED) if notch is None else dict(notch.settings)
+    recorded = capture["detector"].get("signal_filter", capture.get("signal_filter"))
+    if recorded is not None:
+        try:
+            matched_filter = _contact_profile(recorded) == selected
+            if "sample_rate_hz" in recorded:
+                matched_filter = (matched_filter and _finite(recorded["sample_rate_hz"])
+                                  and math.isclose(recorded["sample_rate_hz"], rate, rel_tol=1e-12))
+            if "coefficients" in recorded:
+                matched_filter = (matched_filter and notch is not None
+                                  and recorded["coefficients"] == list(notch.coefficients))
+            if notch is not None and "initial_state" in recorded:
+                matched_filter = (matched_filter and recorded["initial_state"] == "zero_at_first_armed_sample")
+        except InsufficientData:
+            matched_filter = False
+        summary["matches_recorded_live_filter"] = matched_filter
+        if settings is not None and matched_filter:
+            summary["filter_label"] = "recorded live detector replay"
+    tolerance = 1.02 / rate
     segments, brake, planner_status, planner_reason = _contact_planner_labels(planner)
-    summary.update(status="ok", axis_mapping=mapping, filter=notch.metadata(), sampling=timing,
+    summary.update(status="ok", axis_mapping=mapping, filter=filter_metadata, sampling=timing,
                    sample_count=len(plot_rows), pre_arm_samples_excluded=start,
                    arm_time_s=arm, first_replayed_time_s=plot_rows[0][0],
                    last_replayed_time_s=plot_rows[-1][0],
@@ -666,6 +721,36 @@ def _spectral_peaks(frequencies, power, np):
     return sorted(peaks, key=lambda item: (-item["band_power_fraction"], item["frequency_hz"]))[:6]
 
 
+def _propose_frequencies(train, evidence, np, check_running):
+    """Propose only frequencies recurring in both fitting controls."""
+    spectral_peaks = []
+    for item in train[:2]:
+        _check(check_running)
+        frequencies, powers, length, count = _welch(
+            _mapped_signed(item, item["signed"][item["cruise_start"]:item["cruise_end"]]),
+            item["rate"], np)
+        peaks = _spectral_peaks(frequencies, powers, np)
+        item["welch_bin_width"] = float(frequencies[1])
+        spectral_peaks.append(peaks)
+        evidence["spectral"].append({"capture_id": item["id"], "role": "train",
+            "usable_cruise_duration_s": item["duration"], "welch_segment_samples": length,
+            "welch_segments": count, "peaks": peaks})
+    recurring = []
+    for peak in spectral_peaks[0]:
+        matches = [other for other in spectral_peaks[1]
+                   if abs(peak["frequency_hz"] - other["frequency_hz"]) <= max(
+                       peak["bin_width_hz"], other["bin_width_hz"], 0.03 * peak["frequency_hz"])]
+        if matches:
+            other = min(matches, key=lambda value: abs(value["frequency_hz"] - peak["frequency_hz"]))
+            frequency = (peak["frequency_hz"] + other["frequency_hz"]) / 2
+            if not any(abs(frequency - old) < peak["bin_width_hz"] for old in recurring):
+                recurring.append(frequency)
+        if len(recurring) == MAX_PEAKS:
+            break
+    evidence["recurring_frequency_hz"] = recurring
+    return recurring
+
+
 def digital_bandwidth(frequency, q, rate):
     """Exact full -3 dB bandwidth of this RBJ notch, in Hz.
 
@@ -819,6 +904,214 @@ def _plot(dataset, settings, threshold, np, check_running):
     return result
 
 
+def _gentle_metrics(data, settings, np, check_running):
+    # A live arm can precede acceleration. Score both retained startup flowing
+    # continuously into motion and a cold acceleration start. Neither replay
+    # claims the control has the exact arm lead time of a future physical home.
+    last = data["record"]["segments"][-1]["end_time_s"]
+    diagnostic_end = int(np.searchsorted(data["times"], last, side="left"))
+    full = _replay(dict(data, end=diagnostic_end), settings, np, check_running)
+    continuous = _replay(dict(data, start=0, end=diagnostic_end), settings, np, check_running)
+    # Magnitude envelope is for acceptance only, not a synthetic causal trace.
+    filtered = np.maximum(np.abs(full[:data["end"] - data["start"]]),
+                          np.abs(continuous[data["start"]:data["end"]]))
+    metrics, _ = _metrics(data, filtered, np)
+    source = data["axis_mapping"]["source_axis"]
+    phases = []
+    for segment in data["record"]["segments"]:
+        phase = segment["phase"]
+        left = int(np.searchsorted(data["times"], segment["start_time_s"], side="left"))
+        right = int(np.searchsorted(data["times"], segment["end_time_s"], side="left"))
+        _require(left < right, data["id"] + ": commanded phase contains no samples")
+        values = (continuous[left:right] if phase == "startup" else
+                  full[left - data["start"]:right - data["start"]])
+        _require(len(values) == right - left, data["id"] + ": incomplete causal phase replay")
+        cold_levels = np.abs(values[:, source])
+        continuous_levels = np.abs(continuous[left:right, source])
+        levels = np.maximum(cold_levels, continuous_levels)
+        peak_index = int(np.argmax(levels))
+        phases.append({"phase": phase, "scored": phase != "braking", "sample_count": right - left,
+                       "start_time_s": segment["start_time_s"], "end_time_s": segment["end_time_s"],
+                       "raw_peak_g": float(np.max(data["raw"][left:right])),
+                       "filtered_peak_g": float(levels[peak_index]),
+                       "acceleration_reset_peak_g": float(np.max(cold_levels)),
+                       "continuous_startup_peak_g": float(np.max(continuous_levels)),
+                       "filtered_peak_time_s": float(data["times"][left + peak_index]),
+                       "initial_state": ("zero_at_capture_cutoff" if phase == "startup" else
+                                         "worst_of_zero_at_capture_cutoff_and_zero_at_acceleration_start")})
+    scored = [item for item in phases if item["scored"]]
+    metrics.update(phases=phases,
+                   noise_peak_g=max(item["filtered_peak_g"] for item in scored),
+                   raw_noise_peak_g=max(item["raw_peak_g"] for item in scored))
+    return metrics
+
+
+def _gentle_acceptance(metrics, threshold, role, *, filtered):
+    reasons = []
+    for item in metrics:
+        prefix = item["capture_id"] + ": "
+        peak = item["noise_peak_g"]
+        required = max(1.2 * peak, peak + 0.1)
+        item.update(threshold_margin_g=threshold - peak, required_threshold_g=required)
+        if threshold + 1e-12 < required:
+            reasons.append(prefix + "frozen threshold lacks 20 percent or 0.1 g free-motion margin")
+        if filtered:
+            if item["cruise_peak_reduction"] < (TRAIN_REDUCTION if role == "train" else HOLDOUT_REDUCTION):
+                reasons.append(prefix + "insufficient cruise maximum reduction")
+            startup = [phase for phase in item["phases"] if phase["phase"] in ("startup", "acceleration")]
+            if max(phase["filtered_peak_g"] for phase in startup) > max(
+                    phase["raw_peak_g"] for phase in startup) + 1e-10:
+                reasons.append(prefix + "causal startup/acceleration peak increased")
+    return reasons
+
+
+def analyze_gentle(motions, *, threshold_min_g=0.5, threshold_max_g, check_running=None):
+    """Freeze a pre-contact detector using two controls, then veto on the third.
+
+    No contact capture is an input. The independent stationary-noise requirement
+    may raise threshold_min_g before fitting. A successful result establishes a
+    free-motion margin only: contact sensitivity and stopping behavior still
+    require fresh qualification with this exact profile and threshold.
+    """
+    _check(check_running)
+    preflight()
+    import numpy as np
+    policy = {"version": GENTLE_VERSION, "split": {"motion_train": 2, "motion_holdout": 1},
+              "caps": {"captures": 3, "samples_per_capture": MAX_CAPTURE_SAMPLES,
+                       "total_samples": MAX_TOTAL_SAMPLES, "spectral_peaks": MAX_PEAKS,
+                       "candidate_profiles": MAX_CANDIDATES + 1,
+                       "welch_segment_samples": MAX_WELCH_SEGMENT},
+              "q_grid": list(Q_GRID), "frequency_proposal": "recurring training-only signed mapped cruise Welch peaks",
+              "threshold_rule": "max(minimum, 1.25 * training_noise_peak, training_noise_peak + 0.125 g)",
+              "acceptance_margin": "threshold >= max(1.2 * each_control_peak, each_control_peak + 0.1 g)",
+              "selection": "lowest training whole-motion threshold, then worst cruise reduction, then highest Q",
+              "startup_state": "zero at capture cutoff and continued through acceleration, cruise and diagnostic braking",
+              "motion_state": "also replay cold at first acceleration sample; score maximum of both causal replays",
+              "arm_timing_limit": "controls cannot establish the exact arm lead time of a future physical home",
+              "scored_phases": ["startup", "acceleration", "cruise"], "diagnostic_only_phases": ["braking"],
+              "heldout_failure": "reject frozen choice; no retuning or fallback after holdout",
+              "disabled_control": "same training margin and held-out acceptance; selected only before holdout",
+              "stationary_evidence": "independent integration requirement supplied as minimum; no stationary spectrum inferred",
+              "motion_labels": "actual commanded trapq segments; no physical-position or contact proof",
+              "requires_fresh_full_homing_validation": True}
+    report = {"policy": policy, "status": "insufficient_data", "decision": None,
+              "profile": None, "threshold_g": None, "reasons": [],
+              "requires_full_homing_validation": True, "contact_sensitivity_verified": False,
+              "physical_position_verified": False,
+              "evidence": {"captures": [], "spectral": [], "candidates": [],
+                           "frozen_candidate": None, "holdout": None},
+              "plot": {"spectra": [], "traces": []}}
+    try:
+        _require(_finite(threshold_min_g) and _finite(threshold_max_g)
+                 and 0 < threshold_min_g <= threshold_max_g, "invalid candidate threshold bounds")
+        _require(isinstance(motions, (list, tuple)) and len(motions) == 3,
+                 "require three independent free-motion captures before contact")
+        _require(all(isinstance(item, dict) and isinstance(item.get("capture"), dict)
+                     and isinstance(item["capture"].get("samples"), (list, tuple)) for item in motions),
+                 "capture entries require complete raw sample lists")
+        _require(sum(len(item["capture"]["samples"]) for item in motions) <= MAX_TOTAL_SAMPLES,
+                 "total raw capture sample cap exceeded")
+        dataset = [_prepare(item, "motion", index, threshold_min_g, np, check_running)
+                   for index, item in enumerate(motions)]
+        _require(len({item["id"] for item in dataset}) == 3
+                 and len({item["fingerprint"] for item in dataset}) == 3,
+                 "reused or duplicate captures are not independent fitting/held-out evidence")
+        _require(all(right["times"][0] > left["times"][-1]
+                     and right["record"]["iteration"] > left["record"]["iteration"]
+                     for left, right in zip(dataset, dataset[1:])),
+                 "capture identities and times must increase without overlap")
+        first = dataset[0]
+        _require(all(item["run_id"] == first["run_id"] and item["axis"] == first["axis"]
+                     and item["axis_mapping"] == first["axis_mapping"]
+                     and item["axis_mapping_context"] == first["axis_mapping_context"] for item in dataset),
+                 "capture run, mapped axis or sensor context changed")
+        _require(all(abs(item["rate"] / first["rate"] - 1) <= RATE_TOLERANCE
+                     and math.isclose(item["speed"], first["speed"], rel_tol=1e-6)
+                     and math.isclose(item["accel"], first["accel"], rel_tol=1e-6) for item in dataset),
+                 "sample rate or commanded speed/acceleration changed between captures")
+        report.update(run_id=first["run_id"], axis=first["axis"],
+                      impact_metric="mapped_axis", axis_mapping=first["axis_mapping"],
+                      axis_mapping_context=first["axis_mapping_context"])
+        for item in dataset:
+            report["evidence"]["captures"].append({"capture_id": item["id"], "role": item["role"],
+                "sample_rate_hz": item["rate"], "sample_rate_source": "fresh_reference_timestamps",
+                "reference_sample_count": item["capture"]["baseline_sample_count"],
+                "reference_first_time_s": item["capture"]["baseline_first_sample_time_s"],
+                "reference_last_time_s": item["capture"]["baseline_last_sample_time_s"],
+                "baseline_g": list(item["capture"]["baseline_g"]),
+                "scored_signed_xyz_sha256": item["fingerprint"], "sample_count": len(item["times"]),
+                "first_sample_index": item["start"], "first_sample_time_s": float(item["times"][item["start"]]),
+                "arm_source": item["arm_source"], "initial_state": "zero_at_first_armed_sample",
+                "last_scored_sample_index": item["end"] - 1,
+                "last_scored_sample_time_s": float(item["times"][item["end"] - 1])})
+        train, heldout = dataset[:2], dataset[2:]
+        evidence = report["evidence"]
+        recurring = _propose_frequencies(train, evidence, np, check_running)
+
+        def fit(settings):
+            metrics = [_gentle_metrics(item, settings, np, check_running) for item in train]
+            peak = max(item["noise_peak_g"] for item in metrics)
+            threshold = max(threshold_min_g, 1.25 * peak, peak + 0.125)
+            reasons = _gentle_acceptance(metrics, threshold, "train", filtered=settings != DISABLED)
+            if threshold > threshold_max_g:
+                reasons.append("training noise margin exceeds threshold upper bound")
+            return {"profile": dict(settings), "threshold_g": threshold,
+                    "train_accepted": not reasons, "reasons": reasons, "metrics": metrics}
+
+        control = fit(DISABLED)
+        control["preregistered"] = True
+        evidence["disabled_control"] = control
+        passing = []
+        for frequency in recurring:
+            for q in Q_GRID:
+                _check(check_running)
+                settings = profile(frequency, q)
+                resolution = [_resolution(frequency, q, item["rate"], item["duration"], item["welch_bin_width"])
+                              for item in train]
+                if any(not item["resolved"] for item in resolution):
+                    candidate = {"profile": settings, "threshold_g": None, "train_accepted": False,
+                                 "metrics": [], "reasons": ["insufficient cycles or unresolved digital notch bandwidth"]}
+                else:
+                    candidate = fit(settings)
+                    if candidate["threshold_g"] > control["threshold_g"] + 1e-12:
+                        candidate["reasons"].append("notch increases required whole-motion threshold")
+                        candidate["train_accepted"] = False
+                candidate["resolution"] = resolution
+                evidence["candidates"].append(candidate)
+                if candidate["train_accepted"]:
+                    score = (-candidate["threshold_g"],
+                             min(item["cruise_peak_reduction"] for item in candidate["metrics"]), q)
+                    passing.append((score, candidate))
+        if passing:
+            winner = max(passing, key=lambda entry: entry[0])[1]
+        elif control["train_accepted"]:
+            winner = control
+        else:
+            report.update(status="rejected", reasons=["no trained notch or raw control has an admissible free-motion margin"])
+            return report
+        frozen = {"profile": dict(winner["profile"]), "threshold_g": winner["threshold_g"],
+                  "selection_data": "train_only", "retuned_after_holdout": False,
+                  "training_metrics": winner["metrics"]}
+        evidence["frozen_candidate"] = frozen
+        selected = frozen["profile"] != DISABLED
+        metrics = [_gentle_metrics(item, frozen["profile"], np, check_running) for item in heldout]
+        failures = _gentle_acceptance(metrics, frozen["threshold_g"], "holdout", filtered=selected)
+        evidence["holdout"] = {"accepted": not failures, "reasons": failures, "metrics": metrics}
+        if failures:
+            report.update(status="rejected", reasons=["frozen detector failed independent held-out acceptance"] + failures)
+        else:
+            report.update(status="selected" if selected else "no_benefit", decision="selected" if selected else "disabled",
+                          profile=frozen["profile"], threshold_g=frozen["threshold_g"],
+                          reasons=["frozen detector passes independent free-motion margins; contact sensitivity remains unverified"])
+        report["plot"] = _plot(dataset, frozen["profile"], frozen["threshold_g"], np, check_running)
+        report["plot"]["description"] = ("acceleration-reset traces; acceptance also scores continuous startup replay; "
+                                            "no contact evidence or braking samples scored")
+        _check(check_running)
+    except InsufficientData as exc:
+        report.update(status="insufficient_data", decision=None, profile=None, threshold_g=None, reasons=[str(exc)])
+    return report
+
+
 def analyze(motions, homes, *, raw_threshold_g, threshold_min_g=0.5,
             threshold_max_g, check_running=None):
     """Return JSON-ready evidence or an explicit insufficient_data rejection.
@@ -890,28 +1183,7 @@ def analyze(motions, homes, *, raw_threshold_g, threshold_min_g=0.5,
                                                   if item["kind"] == "home" else "actual_commanded_acceleration_start"),
                 "post_reference_stop_samples_scored": 0 if item["kind"] == "home" else None})
         train, heldout = ([item for item in dataset if item["role"] == role] for role in ("train", "holdout"))
-        spectral_peaks = []
-        for item in train[:2]:
-            frequencies, powers, length, count = _welch(_mapped_signed(item, item["signed"][item["cruise_start"]:item["cruise_end"]]), item["rate"], np)
-            peaks = _spectral_peaks(frequencies, powers, np)
-            item["welch_bin_width"] = float(frequencies[1])
-            spectral_peaks.append(peaks)
-            report["evidence"]["spectral"].append({"capture_id": item["id"], "role": "train",
-                "usable_cruise_duration_s": item["duration"], "welch_segment_samples": length,
-                "welch_segments": count, "peaks": peaks})
-        recurring = []
-        for peak in spectral_peaks[0]:
-            matches = [other for other in spectral_peaks[1]
-                       if abs(peak["frequency_hz"] - other["frequency_hz"]) <= max(
-                           peak["bin_width_hz"], other["bin_width_hz"], 0.03 * peak["frequency_hz"])]
-            if matches:
-                other = min(matches, key=lambda value: abs(value["frequency_hz"] - peak["frequency_hz"]))
-                frequency = (peak["frequency_hz"] + other["frequency_hz"]) / 2
-                if not any(abs(frequency - old) < peak["bin_width_hz"] for old in recurring):
-                    recurring.append(frequency)
-            if len(recurring) == MAX_PEAKS:
-                break
-        report["evidence"]["recurring_frequency_hz"] = recurring
+        recurring = _propose_frequencies(train, report["evidence"], np, check_running)
         control_train = _evaluate(train, DISABLED, raw_threshold_g, np, check_running)
         report["evidence"]["disabled_control"] = {"profile": dict(DISABLED), "threshold_g": raw_threshold_g,
             "preregistered": True, "train_metrics": control_train,

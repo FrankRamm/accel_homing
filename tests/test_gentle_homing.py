@@ -1,15 +1,19 @@
 """Gentle native dispatch, model guards and contact qualification; offline only."""
-import contextlib
 import itertools
 import json
+from pathlib import Path
+import sys
 import tempfile
 import types
 import unittest
 from unittest import mock
 
 from harness import CommandError, ConfigError, plugin
-from test_mapped_detector import mapping
-from test_workflows import GCmd, Rig
+import test_auto_notch_workflow as auto_tests
+from test_calibration_config import NativeShape
+from test_gentle_auto_workflow import GentleAutoRig
+from test_mapped_detector import deliver, mapping, prepared
+from test_workflows import AccelHomingModel, Config, GCmd, Rig, workflow_module
 
 
 class GentleHomingTests(unittest.TestCase):
@@ -37,17 +41,12 @@ class GentleHomingTests(unittest.TestCase):
         rig.workflow.model.metadata[axis] = metadata
         return metadata
 
-    @contextlib.contextmanager
-    def stationary_seed(self, rig):
-        # The independent gentle seed suite exercises actual central strokes.
-        # Keep real stationary seeding here, isolate only its moving input.
-        def motion_peak(session):
-            session["gentle_motion_noise"] = {"motion_peak_g": .01}
-            return .01
-        with mock.patch.object(rig.workflow, "_gentle_collect_motion_noise"), \
-                mock.patch.object(rig.workflow, "_gentle_motion_seed_peak", side_effect=motion_peak), \
-                mock.patch.object(rig.workflow, "_gentle_validate_motion_seed"):
-            yield
+    def observe_saved_seek(self, rig, attempt, home_end):
+        # The workflow fixture is loaded under an artificial Klipper package.
+        # Supply its real sibling module, without replacing planner validation.
+        name = workflow_module.__package__ + ".accel_homing_auto"
+        with mock.patch.dict(sys.modules, {name: auto_tests.auto}):
+            rig.workflow.observe_saved_gentle_seek(attempt, home_end)
 
     def test_native_centered_dispatch_bounds_both_axes_and_directions(self):
         for axis, positive, mode in itertools.product("xy", (False, True),
@@ -171,6 +170,146 @@ class GentleHomingTests(unittest.TestCase):
                         rig.workflow.check_home_result(record)
                 self.assertEqual(rig.toolhead.moves, [])
 
+    def test_saved_phase_policy_checks_original_onset_against_native_seek_clock(self):
+        for axis, positive, onset in itertools.product(
+                "xy", (False, True), (10.03, 10.1, 10.25, 10.27)):
+            # The first two onsets are acceleration/cruise; the exact brake
+            # boundary and a later braking onset must both be rejected.
+            accepted = onset < 10.25
+            with self.subTest(axis=axis, positive=positive, onset=onset):
+                rig = self.rig()
+                rail = rig.owner.rails_by_axis[axis]
+                rail.info.positive_dir = positive
+                rail.info.position_endstop = rail.bounds[1] if positive else rail.bounds[0]
+                metadata = self.qualified_model(rig, axis)
+                metadata["gentle_contact_phase_policy"] = "prebrake_v1"
+                vector = [0., 0., 0.]
+                vector["xy".index(axis)] = 1. if positive else -1.
+                moves = [types.SimpleNamespace(print_time=start, move_t=duration, start_v=speed,
+                                               accel=accel, x_r=vector[0], y_r=vector[1], z_r=vector[2])
+                         for start, duration, speed, accel in (
+                             (10.01, .04, 0., 1000.), (10.05, .2, 40., 0.), (10.25, .04, 40., -1000.))]
+                extractor = mock.Mock(return_value=(moves, []))
+                rig.objects["motion_report"] = types.SimpleNamespace(trapqs={
+                    "toolhead": types.SimpleNamespace(extract_trapq=extractor)})
+                rig.workflow.check_home_axes({axis: rail})
+                record = {"axis": axis, "result": "impact", "travel_mm": .1,
+                          "trigger_travel_mm_signed": .1, "halt_travel_mm_signed": .2,
+                          "onset_time_s": onset}
+                attempt = types.SimpleNamespace(axis=axis, pass_no=1, reason="impact", arm_time=10., record=record)
+                self.observe_saved_seek(rig, attempt, 10.3)
+                receipt = record["gentle_contact_phase"]
+                self.assertEqual(receipt["accepted"], accepted, receipt)
+                self.assertEqual(receipt["trigger_onset_time_s"], onset)
+                self.assertEqual(receipt["brake_start_time_s"], 10.25)
+                self.assertEqual(receipt["phase"], "acceleration" if onset < 10.05 else
+                                 "cruise" if onset < 10.25 else "braking")
+                self.assertFalse(receipt["physical_contact_verified"])
+                extractor.assert_called_once_with(10., rig.reactor.NEVER)
+                if accepted:
+                    rig.workflow.check_home_result(record)
+                else:
+                    with self.assertRaisesRegex(CommandError, "before commanded braking"):
+                        rig.workflow.check_home_result(record)
+                self.assertEqual(rig.toolhead.moves, [])
+
+    def test_saved_phase_policy_fails_closed_when_native_timing_is_unavailable(self):
+        for missing in (True, False):
+            with self.subTest(missing_extractor=missing):
+                rig = self.rig()
+                self.qualified_model(rig)["gentle_contact_phase_policy"] = "prebrake_v1"
+                extractor = mock.Mock(side_effect=ValueError("native schedule was discarded"))
+                if not missing:
+                    rig.objects["motion_report"] = types.SimpleNamespace(dtrapqs={
+                        "toolhead": types.SimpleNamespace(extract_trapq=extractor)})
+                else:
+                    with self.assertRaisesRegex(CommandError, "trapq extractor"):
+                        rig.workflow.check_home_axes({"x": rig.owner.rails_by_axis["x"]})
+                record = {"axis": "x", "result": "impact", "travel_mm": .1,
+                          "trigger_travel_mm_signed": .1, "halt_travel_mm_signed": .2,
+                          "onset_time_s": 10.1}
+                attempt = types.SimpleNamespace(axis="x", pass_no=1, reason="impact", arm_time=10., record=record)
+                self.observe_saved_seek(rig, attempt, 10.3)
+                self.assertFalse(record["gentle_contact_phase"]["accepted"])
+                with self.assertRaisesRegex(CommandError, "before commanded braking"):
+                    rig.workflow.check_home_result(record)
+                self.assertEqual(extractor.call_count, 0 if missing else 1)
+                self.assertEqual(rig.toolhead.moves, [])
+
+    def test_previous_saved_models_do_not_require_the_new_native_phase_receipt(self):
+        rig = self.rig()
+        self.qualified_model(rig)
+        extractor = mock.Mock(side_effect=AssertionError("legacy model must not acquire a new phase requirement"))
+        rig.objects["motion_report"] = types.SimpleNamespace(trapqs={
+            "toolhead": types.SimpleNamespace(extract_trapq=extractor)})
+        rig.workflow.check_home_axes({"x": rig.owner.rails_by_axis["x"]})
+        record = {"axis": "x", "result": "impact", "travel_mm": .1,
+                  "trigger_travel_mm_signed": .1, "halt_travel_mm_signed": .2,
+                  "onset_time_s": None}
+        attempt = types.SimpleNamespace(axis="x", pass_no=1, reason="impact", arm_time=10., record=record)
+        self.observe_saved_seek(rig, attempt, 10.3)
+        self.assertNotIn("gentle_contact_phase", record)
+        rig.workflow.check_home_result(record)
+        extractor.assert_not_called()
+
+    def test_saved_phase_policy_uses_real_core_record_and_does_not_reuse_a_previous_receipt(self):
+        rig = self.rig()
+        self.qualified_model(rig)["gentle_contact_phase_policy"] = "prebrake_v1"
+        core, attempt, _mapping = prepared()
+        deliver(core, attempt, [(.1, 0., 0.)] * 3 + [(1.25, 0., 0.)] * 5)
+        core.disarm()  # Exercise the actual runtime record constructor.
+        record = attempt.record
+        record.update(travel_mm=.1, trigger_travel_mm_signed=.1, halt_travel_mm_signed=.2)
+        self.assertNotIn("trigger_onset_time_s", record)
+        arm = attempt.arm_time
+        moves = [types.SimpleNamespace(print_time=arm + offset, move_t=duration, start_v=speed,
+                                       accel=accel, x_r=-1., y_r=0., z_r=0.)
+                 for offset, duration, speed, accel in (
+                     (0., .04, 0., 1000.), (.04, .2, 40., 0.), (.24, .04, 40., -1000.))]
+        extractor = mock.Mock(return_value=(moves, []))
+        rig.objects["motion_report"] = types.SimpleNamespace(trapqs={
+            "toolhead": types.SimpleNamespace(extract_trapq=extractor)})
+        self.observe_saved_seek(rig, attempt, arm + .1)
+        self.assertTrue(record["gentle_contact_phase"]["accepted"], record["gentle_contact_phase"])
+        self.assertEqual(record["gentle_contact_phase"]["trigger_onset_time_s"], record["onset_time_s"])
+        rig.workflow.check_home_result(record)
+
+        # A following home gets its own core record. The previous accepted
+        # receipt cannot qualify missing telemetry or a missing observation.
+        core, following, _mapping = prepared()
+        deliver(core, following, [(1.25, 0., 0.)] * 8)
+        core.disarm()
+        fresh = following.record
+        fresh.update(travel_mm=.1, trigger_travel_mm_signed=.1, halt_travel_mm_signed=.2)
+        self.assertNotIn("gentle_contact_phase", fresh)
+        with self.assertRaisesRegex(CommandError, "missing native seek timing"):
+            rig.workflow.check_home_result(fresh)
+        extractor.side_effect = ValueError("current seek unavailable")
+        self.observe_saved_seek(rig, following, following.arm_time + .1)
+        self.assertFalse(fresh["gentle_contact_phase"]["accepted"])
+        with self.assertRaisesRegex(CommandError, "current seek unavailable"):
+            rig.workflow.check_home_result(fresh)
+        self.assertTrue(record["gentle_contact_phase"]["accepted"])
+
+    def test_saved_phase_policy_reload_accepts_supported_or_absent_and_rejects_unknown_values(self):
+        for axis in "xy":
+            rig = self.rig()
+            original = self.qualified_model(rig, axis)
+            for policy in (None, "prebrake_v1"):
+                with self.subTest(axis=axis, valid_policy=policy):
+                    metadata = dict(original)
+                    if policy is not None:
+                        metadata["gentle_contact_phase_policy"] = policy
+                    model = AccelHomingModel(Config(None, {axis + "_threshold": original["tested_threshold_g"], axis + "_successes": 10,
+                        axis + "_metadata": json.dumps(metadata)}, "accel_homing_model test"))
+                    self.assertEqual(model.metadata[axis].get("gentle_contact_phase_policy"), policy)
+            for policy in ("prebrake_v2", "", None, False, 1, [], {}):
+                with self.subTest(axis=axis, invalid_policy=policy):
+                    metadata = dict(original, gentle_contact_phase_policy=policy)
+                    with self.assertRaisesRegex(ConfigError, "gentle_contact_phase_policy"):
+                        AccelHomingModel(Config(None, {axis + "_threshold": original["tested_threshold_g"], axis + "_successes": 10,
+                            axis + "_metadata": json.dumps(metadata)}, "accel_homing_model test"))
+
     def test_gentle_limits_reject_overrides_retraction_and_reduced_toolhead_caps(self):
         mutations = {
             "fast": lambda rig: setattr(rig.owner.rails_by_axis["x"].info, "speed", 40.001),
@@ -196,13 +335,16 @@ class GentleHomingTests(unittest.TestCase):
     def test_premature_trigger_aborts_without_retry_return_or_threshold_increase(self):
         for travel in (8., 80.):
             with self.subTest(travel=travel):
-                rig = self.rig()
+                rig = GentleAutoRig(self.directory.name)
                 rig.home_results.append({"travel_mm": travel})
                 initial = dict(rig.owner.threshold_g)
-                with self.stationary_seed(rig), self.assertRaises(CommandError):
-                    rig.calibrate("X", save=0, START_THRESHOLD=2.25)
+                moves_at_contact = []
+                rig.on_home = lambda _axis: moves_at_contact.append(list(rig.toolhead.moves))
+                with rig.helpers(), self.assertRaises(CommandError):
+                    rig.command(START_THRESHOLD=2.25)
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [2.25])
-                self.assertEqual(rig.toolhead.moves, [])
+                self.assertEqual(rig.toolhead.moves, moves_at_contact[0])
+                self.assertEqual(len([event for event in rig.beta_events if event[0] == "central_move"]), 6)
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertEqual(rig.owner.threshold_g, initial)
                 self.assertEqual(rig.workflow.last_result["restarts"], 0)
@@ -211,7 +353,7 @@ class GentleHomingTests(unittest.TestCase):
     def test_post_trigger_travel_boundary_aborts_before_another_home_or_recenter(self):
         for positive, overshoot in itertools.product((False, True), (.5, .5001, None)):
             with self.subTest(positive=positive, overshoot=overshoot):
-                rig = self.rig()
+                rig = GentleAutoRig(self.directory.name)
                 rail = rig.owner.rails_by_axis["x"]
                 rail.info.positive_dir = positive
                 rail.info.position_endstop = 300. if positive else 0.
@@ -219,23 +361,25 @@ class GentleHomingTests(unittest.TestCase):
                 rig.home_results.append({"travel_mm": 150., "trigger_travel_mm_signed": direction * 150.,
                                          "halt_travel_mm_signed": (None if overshoot is None else
                                                                     direction * (150. + overshoot))})
-                with self.stationary_seed(rig):
+                moves_at_contact = []
+                rig.on_home = lambda _axis: moves_at_contact.append(list(rig.toolhead.moves))
+                with rig.helpers():
                     if overshoot == .5:
-                        rig.calibrate("X", save=0, START_THRESHOLD=2.25)
+                        rig.command(START_THRESHOLD=2.25)
                         self.assertEqual(len(rig.home_calls), 11)
-                        self.assertEqual(rig.workflow.last_result["result"], "calibrated")
+                        self.assertEqual(rig.workflow.last_result["result"], "auto_notch_proposed")
                     else:
                         with self.assertRaises(CommandError):
-                            rig.calibrate("X", save=0, START_THRESHOLD=2.25)
+                            rig.command(START_THRESHOLD=2.25)
                         self.assertEqual(len(rig.home_calls), 1)
-                        self.assertEqual(rig.toolhead.moves, [])
+                        self.assertEqual(rig.toolhead.moves, moves_at_contact[0])
                         self.assertEqual(rig.configfile.saved, {})
                         self.assertEqual(rig.workflow.last_result["result"], "aborted")
 
     def test_recenter_and_final_release_use_gentle_caps_and_preserve_lower_retract_speed(self):
         for retract_speed in (20., 125.):
             with self.subTest(retract_speed=retract_speed):
-                rig = self.rig()
+                rig = GentleAutoRig(self.directory.name)
                 rig.owner.rails_by_axis["x"].info.retract_speed = retract_speed
                 observed = []
                 move = rig.toolhead.manual_move
@@ -245,8 +389,8 @@ class GentleHomingTests(unittest.TestCase):
                     move(coords, speed)
 
                 rig.toolhead.manual_move = observe
-                with self.stationary_seed(rig):
-                    rig.calibrate("X", save=0, START_THRESHOLD=2.25)
+                with rig.helpers():
+                    rig.command(START_THRESHOLD=2.25)
                 self.assertTrue(observed)
                 self.assertTrue(all(speed <= 40. and accel == 1000. for _, speed, accel in observed))
                 self.assertEqual(observed[-1], ([5., None, None], min(retract_speed, 40.), 1000.))
@@ -256,14 +400,15 @@ class GentleHomingTests(unittest.TestCase):
     def test_gentle_save_preserves_exact_threshold_qualified_by_all_eleven_homes(self):
         for axis, save in itertools.product("xy", (0, 1)):
             with self.subTest(axis=axis, save=save):
-                rig = self.rig()
-                with self.stationary_seed(rig):
-                    rig.calibrate(axis.upper(), save=save, START_THRESHOLD=2.25)
+                rig = GentleAutoRig(self.directory.name)
+                config = auto_tests.AutoNotchWorkflowTests().native_config(rig, Path(self.directory.name), NativeShape)
+                with rig.helpers():
+                    rig.command(axis=axis.upper(), bare=True, SAVE_CONFIG=save, START_THRESHOLD=2.25)
                 self.assertEqual([call["threshold"] for call in rig.home_calls], [2.25] * 11)
-                saved = rig.configfile.saved
-                self.assertEqual(float(saved[("accel_homing", axis + "_threshold")]), 2.25)
-                self.assertEqual(float(saved[("accel_homing_model default", axis + "_threshold")]), 2.25)
-                metadata = json.loads(saved[("accel_homing_model default", axis + "_metadata")])
+                saved = config.read_main_config().fileconfig if save else config.autosave.fileconfig
+                self.assertEqual(saved.getfloat("accel_homing", axis + "_threshold"), 2.25)
+                self.assertEqual(saved.getfloat("accel_homing_model default", axis + "_threshold"), 2.25)
+                metadata = json.loads(saved.get("accel_homing_model default", axis + "_metadata"))
                 self.assertTrue(metadata["gentle_homing"])
                 self.assertTrue(metadata["saved_threshold_tested"])
                 self.assertEqual(metadata["tested_threshold_g"], 2.25)
@@ -271,7 +416,11 @@ class GentleHomingTests(unittest.TestCase):
                 self.assertEqual(metadata["threshold_margin_g"], 0.)
                 self.assertEqual(metadata["homing_speed_mm_s"], 40.)
                 self.assertEqual(metadata["homing_accel_mm_s2"], 1000.)
-                self.assertEqual(rig.scripts.count("SAVE_CONFIG"), save)
+                self.assertEqual(metadata["signal_filter"], rig.home_profiles[0]["candidate"]["profile"])
+                self.assertTrue(metadata["auto_notch_selection"]["candidate_frozen_before_contact"])
+                self.assertEqual(rig.gcode.request_restart.call_count, save)
+                self.assertEqual(rig.workflow.last_result["persistence"],
+                                 "native_save_requested" if save else "staged_not_saved")
                 self.assertEqual(rig.toolhead.position[2:], [40., 6.])
 
 

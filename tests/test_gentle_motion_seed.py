@@ -6,20 +6,18 @@ from unittest import mock
 
 from harness import CommandError
 from test_beta_calibration import BetaRig
-from test_workflows import GCmd
+from test_gentle_auto_workflow import GentleAutoRig
 
 
-class GentleSeedRig(BetaRig):
+class GentleSeedRig(GentleAutoRig):
     def __init__(self, directory):
-        super().__init__({"charts_directory": directory})
-        self.workflow.gentle_homing = True
-        self.owner.homing_accel = 1000.
-        for rail in self.owner.rails_by_axis.values():
-            rail.info.speed = 40.
-        self.motion_mutator = None
+        super().__init__(directory)
 
     def stop_motion(self, token, check):
-        capture = super().stop_motion(token, check)
+        capture = BetaRig.stop_motion(self, token, check)
+        capture.update(baseline_sample_count=len(token["baseline_samples"]),
+                       baseline_first_sample_time_s=token["baseline_samples"][0][0],
+                       baseline_last_sample_time_s=token["baseline_samples"][-1][0])
         iteration = self.workflow.session["beta_current_motion"]["iteration"]
         source = self.workflow.session["axis_mapping"]["source_axis"]
         baseline = [.2, -.3, .8]
@@ -40,8 +38,10 @@ class GentleSeedRig(BetaRig):
         return capture
 
     def preflight(self, **params):
-        with self.beta_helpers(), mock.patch.object(self.workflow, "_calibrate_trials") as contact:
-            self.calibrate(save=0, **params)
+        # Exercise the public AUTO entry, real acquisition and real selector;
+        # stop immediately before its first contact attempt.
+        with self.helpers(), mock.patch.object(self.workflow, "_calibrate_trials") as contact:
+            self.command(**params)
             contact.assert_called_once_with()
         return self.workflow.session
 
@@ -63,7 +63,12 @@ class GentleMotionSeedTests(unittest.TestCase):
             self.assertTrue(evidence["complete"])
             self.assertEqual(evidence["motion_peak_g"], 3.)
             self.assertEqual(session["candidate"], 3.75)
-            self.assertEqual(evidence["required_threshold_g"], 3.6)
+            self.assertAlmostEqual(evidence["required_threshold_g"], 3.6)
+            self.assertEqual(evidence["source"], "precontact_mapped_controls")
+            self.assertEqual(evidence["signal_filter"], {"type": "disabled"})
+            self.assertEqual(session["gentle_frozen_candidate"]["threshold_g"], 3.75)
+            self.assertEqual(len(rig.analysis_seen), 1)
+            self.assertNotIn("homes", rig.analysis_seen[0])
             self.assertEqual(evidence["axis_mapping"]["source_axis"], 2)
             self.assertEqual(len(evidence["iterations"]), 3)
             self.assertEqual(len([event for event in rig.beta_events if event[0] == "central_move"]), 6)
@@ -73,22 +78,23 @@ class GentleMotionSeedTests(unittest.TestCase):
             self.assertEqual(rig.toolhead.kin.limits[:2], [(1., -1.), (1., -1.)])
             self.assertEqual(rig.toolhead.accel, original_accel)
 
-    def test_stationary_bound_and_explicit_start_use_same_margin(self):
-        for stationary, explicit, expected in ((4., None, 5.), (.01, 4., 4.)):
+    def test_stationary_bound_and_explicit_minimum_are_preserved_without_grid_rounding(self):
+        for stationary, explicit, expected in ((4., None, 4.8), (.01, 4., 4.)):
             with self.subTest(stationary=stationary), tempfile.TemporaryDirectory() as directory:
                 rig = GentleSeedRig(directory)
                 rig.amplitudes = (stationary, .005, .002)
                 session = rig.preflight(**({} if explicit is None else {"START_THRESHOLD": explicit}))
-                self.assertEqual(session["candidate"], expected)
+                self.assertAlmostEqual(session["candidate"], expected)
                 self.assertAlmostEqual(session["gentle_motion_noise"]["stationary_peak_g"], stationary)
+                self.assertEqual(session["candidate"], session["gentle_frozen_candidate"]["threshold_g"])
 
-    def test_explicit_low_threshold_is_rejected_before_any_contact(self):
+    def test_low_explicit_minimum_cannot_bypass_precontact_motion_margin(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = GentleSeedRig(directory)
-            with rig.beta_helpers(), mock.patch.object(rig.workflow, "_calibrate_trials") as contact:
-                with self.assertRaisesRegex(CommandError, "START_THRESHOLD.*moving-noise"):
-                    rig.calibrate(save=0, START_THRESHOLD=1.)
-                contact.assert_not_called()
+            session = rig.preflight(START_THRESHOLD=1.)
+            self.assertEqual(session["candidate"], 3.75)
+            self.assertGreaterEqual(session["candidate"], session["gentle_motion_noise"]["required_threshold_g"])
+            self.assertEqual(session["start_threshold_g"], session["candidate"])
             self.assertEqual(rig.home_calls, [])
             self.assertEqual(rig.configfile.saved, {})
 
@@ -112,9 +118,9 @@ class GentleMotionSeedTests(unittest.TestCase):
                         capture["samples"][20] = row
 
                 rig.motion_mutator = mutate
-                with rig.beta_helpers(), mock.patch.object(rig.workflow, "_calibrate_trials") as contact:
-                    with self.assertRaises(Exception):
-                        rig.calibrate(save=0)
+                with rig.helpers(), mock.patch.object(rig.workflow, "_calibrate_trials") as contact:
+                    with self.assertRaises(CommandError):
+                        rig.command()
                     contact.assert_not_called()
                 self.assertEqual(rig.home_calls, [])
                 self.assertEqual(rig.configfile.saved, {})
@@ -127,7 +133,7 @@ class GentleMotionSeedTests(unittest.TestCase):
             with mock.patch.object(rig.workflow, "_beta_motion_noise") as collect:
                 rig.workflow._gentle_collect_motion_noise(session)
                 collect.assert_not_called()
-            self.assertEqual(rig.workflow._gentle_motion_seed_peak(session), 3.)
+            self.assertEqual(session["gentle_motion_noise"]["motion_peak_g"], 3.)
             session["beta_motion_iterations"].pop()
             with self.assertRaisesRegex(CommandError, "three complete"):
                 rig.workflow._gentle_motion_seed_peak(session)
@@ -147,18 +153,26 @@ class GentleMotionSeedTests(unittest.TestCase):
                 with self.assertRaisesRegex(CommandError, "gentle calibration"):
                     rig.workflow._gentle_validate_motion_seed(session)
 
-    def test_fixed_filter_fails_before_free_strokes_and_legacy_path_is_unchanged(self):
+    def test_existing_filter_is_disabled_for_controls_and_restored_after_contact(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = GentleSeedRig(directory)
-            rig.owner.filter_settings = lambda axis: {"type": "fixed"}
-            with self.assertRaisesRegex(CommandError, "NOTCH=AUTO"):
-                rig.preflight()
-            self.assertEqual(rig.beta_events, [])
-            self.assertEqual(rig.home_calls, [])
+            original = rig.owner.notch_profiles["x"].copy()
+            observed = []
+            rig.motion_mutator = lambda *_: observed.append(rig.owner.filter_settings("x"))
+            with rig.helpers():
+                rig.command(CONTACT_ONLY=1)
+            self.assertEqual(observed, [{"type": "disabled"}] * 3)
+            self.assertEqual(rig.owner.notch_profiles["x"], original)
+            self.assertEqual([home["threshold"] for home in rig.home_calls], [3.75])
+            self.assertEqual(rig.configfile.saved, {})
+
+    def test_legacy_calibration_keeps_its_stationary_only_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
-            rig = GentleSeedRig(directory)
-            rig.workflow.gentle_homing = False
-            session = rig.preflight(START_THRESHOLD=.5)
+            rig = BetaRig({"charts_directory": directory})
+            with rig.beta_helpers(), mock.patch.object(rig.workflow, "_calibrate_trials") as contact:
+                rig.calibrate(save=0, START_THRESHOLD=.5)
+                contact.assert_called_once_with()
+            session = rig.workflow.session
             self.assertNotIn("gentle_motion_noise", session)
             self.assertEqual(session["candidate"], .5)
             self.assertEqual(rig.beta_events, [])

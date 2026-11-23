@@ -8,7 +8,7 @@ import zipfile
 
 from harness import CommandError, arm_axis, make_homing, plugin
 from accel_homing_auto import _contact_seek_segments
-from test_auto_notch_workflow import AutoRig
+from test_gentle_auto_workflow import GentleAutoRig as AutoRig
 from test_workflows import GCmd
 
 
@@ -30,7 +30,9 @@ class GentleContactProbeTests(unittest.TestCase):
                             rig.command(CONTACT_ONLY=1)
                 result = rig.workflow.last_result
                 self.assertEqual(len(rig.home_calls), 1)
-                self.assertEqual(rig.analysis_seen, [])
+                self.assertEqual(len(rig.analysis_seen), 1)
+                self.assertTrue(rig.analysis_seen[0]["gentle_candidate"])
+                self.assertNotIn("homes", rig.analysis_seen[0])
                 self.assertEqual(rig.owner.notch_profiles["x"], original)
                 self.assertEqual(rig.configfile.saved, {})
                 self.assertEqual(result["result"], "contact_check_complete" if accepted else "aborted")
@@ -40,12 +42,16 @@ class GentleContactProbeTests(unittest.TestCase):
                     self.assertEqual(len(report["retained_attempt_records"]), 1)
                     self.assertTrue(any("home" in item and item.endswith(".gz") for item in bundle.namelist()))
                     self.assertFalse(report["outcome"]["model_staged"])
+                    candidate = report["gentle_frozen_candidate"]
+                    self.assertEqual(rig.home_calls[0]["threshold"], candidate["threshold_g"])
+                    self.assertEqual(rig.home_profiles[0]["profile"], candidate["profile"])
 
     def test_no_trigger_keeps_contact_samples_when_native_home_exits_with_queue_busy(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = AutoRig(directory, {"gentle_homing": True})
             rig.owner.homing_accel = 1000.
             rig.owner.rails_by_axis["x"].info.speed = 40.
+            rig.observe_seek = False  # This test supplies the actual home_wait callback below.
             stock_home = rig.stock_home
             message = "No trigger on x after full movement"
             original_capture = rig.owner.stop_capture
@@ -101,6 +107,10 @@ class GentleContactProbeTests(unittest.TestCase):
                                   if item["file"] == path], [401])
                 self.assertEqual(receipt["errors"], [])
                 diagnostic = json.loads(bundle.read("contact-timing.json"))
+                self.assertEqual(diagnostic["signal"]["analysis_role"], "actual_candidate_replay")
+                self.assertTrue(diagnostic["signal"]["matches_recorded_live_filter"])
+                self.assertEqual(diagnostic["historical_signal"]["analysis_role"], "historical_fixed_200Hz_Q5_diagnostic_only")
+                self.assertEqual(diagnostic["active_detector"]["candidate"]["profile"], rig.home_profiles[0]["profile"])
                 self.assertTrue(diagnostic["capture_matches_plan"])
                 self.assertEqual(diagnostic["contact_result"], "no_trigger")
                 planner = diagnostic["planner"]
@@ -157,7 +167,7 @@ class GentleContactProbeTests(unittest.TestCase):
 
     def test_invalid_probe_options_fail_before_motion(self):
         with tempfile.TemporaryDirectory() as directory:
-            rig = AutoRig(directory)
+            rig = AutoRig(directory, {"gentle_homing": False})
             with self.assertRaisesRegex(CommandError, "requires gentle_homing"):
                 rig.command(CONTACT_ONLY=1)
             rig.workflow.gentle_homing = True

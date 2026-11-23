@@ -16,7 +16,9 @@ class ContactTimingPlotTests(unittest.TestCase):
                             {"phase": "acceleration", "start_time_s": 10., "end_time_s": 10.04},
                             {"phase": "cruise", "start_time_s": 10.04, "end_time_s": 14.9},
                             {"phase": "braking", "start_time_s": 14.9, "end_time_s": 14.94}]}
-        self.signal = {"brake_window": {"start_time_s": 14.8, "end_time_s": 15.,
+        self.signal = {"filter": {"type": "causal_xyz_notch_zero_at_arm_v1", "frequency_hz": 200., "q": 5.},
+                       "analysis_role": "historical_fixed_200Hz_Q5_diagnostic_only",
+                       "brake_window": {"start_time_s": 14.8, "end_time_s": 15.,
                                        "filtered_peak_time_s": 14.895,
                                        "filtered_peak_g": 2., "peak_minus_brake_ms": -5.}}
 
@@ -75,6 +77,8 @@ class ContactTimingPlotTests(unittest.TestCase):
         self.assertIn("timing unavailable", labels)
         self.assertIn("Brake zoom unavailable", labels)
         self.assertIn("No sensor samples", labels)
+        self.assertIn("Profile unavailable", labels)
+        self.assertNotIn("200 Hz", labels)
         self.assertFalse(any(item.get("class") in ("scheduled-brake", "window-filtered-peak")
                              for item in root.iter()))
 

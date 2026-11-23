@@ -43,6 +43,9 @@ class AccelHomingModel:
                     raise ValueError("metadata must be an object")
                 if not _finite_metadata(metadata):
                     raise ValueError("metadata numbers must be finite")
+                if ("gentle_contact_phase_policy" in metadata
+                        and metadata["gentle_contact_phase_policy"] != "prebrake_v1"):
+                    raise ValueError("unknown gentle_contact_phase_policy in saved model")
                 if metadata.get("impact_metric") == "mapped_axis":
                     metadata["axis_mapping"] = validate_axis_mapping(metadata.get("axis_mapping"), axis)
                     if not isinstance(metadata.get("axis_mapping_context"), dict):

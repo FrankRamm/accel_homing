@@ -140,9 +140,11 @@ With the tester at the printer, run the following in the printer console:
 ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1
 ```
 
-The command measures three free strokes and stationary noise on the mapped
-channel, derives an initial threshold, and makes at most one approach to the
-endstop. It prints a diagnostic ZIP and leaves the threshold and filter unsaved.
+The command uses two free strokes to select a mapped-axis filter and threshold.
+A third independent stroke and three stationary windows must clear the same
+threshold before the toolhead approaches the endstop. The detector can retain
+the unfiltered signal when a notch gives no benefit. It makes at most one
+contact attempt, prints a diagnostic ZIP and leaves the settings unsaved.
 After a smooth X contact, release XY and manually center again for the same
 command with `AXIS=Y`. If either axis hits hard, skips steps, or aborts, stop
 there and share that ZIP. It contains the motion captures, contact samples when
@@ -150,15 +152,16 @@ available, trigger and halt step positions, effective settings, and host log.
 
 The single-contact ZIP also has `contact-timing.json` and `contact-timing.svg`
 at its root. The SVG shows the full seek and a zoom around scheduled braking,
-with acceleration, cruise and braking shaded separately. Raw and diagnostic
-200 Hz / Q=5 causal-notch replay traces use absolute acceleration in g;
+with acceleration, cruise and braking shaded separately. The raw signal and
+the replay of the selected detector use absolute acceleration in g;
 timestamps use MCU `print_time` seconds. The JSON reports each phase's peak and
 the largest filtered sample within 100 ms on either side of scheduled braking.
 `peak_minus_brake_ms` is negative when the peak came before braking and positive
 when it came after. If the detector requested a stop, a second window compares
-the signal with the host time observed just after that request. The filter runs
-offline. These timings describe commands and sensor readings. Physical contact
-time remains unverified. The report identifies missing evidence on aborted runs.
+the signal with the host time observed just after that request. The fixed
+200 Hz / Q=5 replay is a separate historical comparison. These timings describe
+commands and sensor readings. The report identifies missing evidence on aborted
+runs. A soft contact can produce a signal below the selected threshold.
 
 Gentle supervised approaches command at most the midpoint-to-endstop distance
 plus 2 mm. An impact outside the midpoint tolerance, or more than 0.5 mm of
@@ -166,9 +169,13 @@ commanded travel from trigger to halt, aborts the sequence. Ordinary G28 also
 checks that trigger-to-halt distance. These distances come from step commands.
 The physical toolhead position and motor slip require observation.
 
-After each axis feels acceptable, run the ordinary calibration command above
-for that axis, starting from the same manually confirmed midpoint each time.
-The single-contact check alone does not qualify a model for G28.
+Full gentle calibration uses the same selection procedure. Starting with XY
+unhomed and physically centered, run `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1`
+for X or use `AXIS=Y` for Y. One discovery and ten repeat contacts must qualify
+with the exact selected filter and threshold before the command saves that
+axis. Each onset must precede commanded braking, fall within the center-travel
+tolerance and meet the trigger-to-halt limit. Ordinary G28 checks the saved
+model and the phase of its own trigger. A single-contact check qualifies no model.
 
 Read the [command reference](docs/COMMANDS.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.

@@ -553,6 +553,10 @@ class BeaconAccelEndstop:
                 observer(attempt, home_end_time)
             except Exception:
                 logging.exception("accel_homing: could not retain contact planner timing")
+        if attempt is not None:
+            workflows = getattr(self._owner, "workflows", None)
+            if workflows is not None and getattr(workflows, "gentle_homing", False):
+                workflows.observe_saved_gentle_seek(attempt, home_end_time)
         return self._owner.finish(self, attempt, result)
 
     def query_endstop(self, print_time):

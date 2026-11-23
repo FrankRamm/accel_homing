@@ -27,7 +27,9 @@ for your machine and independent Z support. See the complete
 | --- | --- |
 | `ACCEL_HOMING_STATUS` | Read-only workflow/model/settings, result and plot paths. |
 | `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. With `gentle_homing: True`, selects and freezes a profile before the first contact. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0` | Select and qualify an exact filter/threshold pair. Explicit AUTO defaults to report only; `SAVE_CONFIG=1` repeats the run and saves on success. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1` | Gentle mode only: three free-travel controls, stationary checks, then at most one contact with the selected profile. Exports a ZIP; never qualifies, stages or saves a model. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
 | `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | Test normal and shorter report intervals over two pairs. With a saved mapped-axis calibration this means four homes using its channel, threshold and fixed filter. Exports a comparison ZIP. See [EXPERIMENT](EXPERIMENT.md). |
@@ -48,13 +50,16 @@ model's qualification is refused.
 No separate centering-confirmation command or popup prompt is required.
 The optional [notch filter](NOTCH.md) has independent X/Y configuration overrides.
 `NOTCH=AUTO` on CALIBRATE measures moving noise and selects a profile automatically.
+Gentle calibration also selects a profile when `NOTCH` is omitted. Ordinary G28,
+ACCURACY, TEST and CHARTS use their existing detector; they do not select filters.
 After either tester command, send the ZIP path printed in the console and
 identify the axis and any unusually hard homes. The ZIP includes available
 captures, the Klippy log interval, and the effective settings for that run.
 Beta calibration refuses an axis with an enabled notch before movement; use
 ordinary calibration for that axis.
 Only one workflow may own the sensor/motion session at a time. A new command
-during an active run is rejected; do not reissue it while automatic retries run.
+during an active run is rejected; wait for completion or cancel it. Gentle
+calibration ends on the first rejected contact without an automatic retry.
 
 ## Calibration
 
@@ -69,19 +74,23 @@ preparation after that restart before calibrating Y:
 ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
 ```
 
-The saved threshold is the candidate that passed ten checks **plus 0.5 g**,
-applied once after qualification. Those checks test the candidate; they do not
-test the higher saved value. The other axis is unchanged.
+With gentle mode disabled and `NOTCH` omitted, the saved threshold is the
+candidate that passed ten checks **plus 0.5 g**, applied once after qualification.
+Those checks do not test the higher saved value. Gentle calibration and explicit
+AUTO instead save the **exact tested threshold and filter**, with no later margin.
+The other axis is unchanged.
 
 Both commands use an explicit `accel_axes_map` (Beacon) or `axes_map` from the
 selected sensor's configuration. Without that setting, they identify the
 selected physical axis with gentle bidirectional strokes around the manual
-center. Both paths then measure fresh stationary noise on the selected component
-and qualify its threshold. Ambiguous automatic mapping aborts before homing. The default start grid is
-1 g with 0.25 g steps. `START_THRESHOLD` explicitly chooses the first candidate
-but still performs the measurement; `STEP` alone changes grid spacing while
-retaining noise-based selection. Starts are finite and at least 0.5 g; step is
-finite 0.1–3 g; known-range headroom still applies.
+center. Both paths measure fresh stationary noise on the selected component.
+Ambiguous automatic mapping aborts before homing. For ordinary calibration, the
+default start grid is 1 g with 0.25 g steps. `START_THRESHOLD` chooses its first
+candidate while retaining the measurements; `STEP` changes grid spacing. In
+gentle calibration, `START_THRESHOLD` is a minimum for the pre-contact selection;
+the measured controls may require a higher value. `STEP` never permits an
+increase after that candidate is frozen. Starts are finite and at least 0.5 g;
+step is finite 0.1–3 g; known-range headroom still applies.
 
 To defer saving:
 
@@ -89,15 +98,17 @@ To defer saving:
 ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 SAVE_CONFIG=0
 ```
 
-This stages the model and selected-axis runtime threshold without writing or
+This stages the model and selected-axis runtime threshold, plus the selected
+filter in gentle mode, without writing or
 restarting; it does not activate them for ordinary homing. Issue `SAVE_CONFIG`
 to persist/reload both and comment the replaced selected-axis setting. The
 other axis and any shared fallback remain unchanged. Later manual overrides
 still take precedence. Read the
-[complete calibration sequence](SIMPLE_CALIBRATION.md), including early-hit
-automatic returns and the ten-home, at-most-2-mm spread rule.
+[complete calibration sequence](SIMPLE_CALIBRATION.md). Its early-hit automatic
+returns apply to ordinary calibration, not gentle mode. Both require ten
+validation homes with at most 2 mm of commanded travel spread after discovery.
 
-### Automatic notch selection (dev)
+### Automatic profile selection and gentle calibration (dev)
 
 After manual preparation, to measure and report without staging or saving:
 
@@ -105,17 +116,73 @@ After manual preparation, to measure and report without staging or saving:
 ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0
 ```
 
-AUTO performs three central noise strokes, unfiltered reference homes, offline
-selection and ten fresh validation homes after a fresh discovery. It may select
-a frequency/Q pair or recommend leaving the filter disabled. It tests the exact
-final threshold; the ordinary untested 0.5 g post-qualification margin does not
-apply to AUTO. Failed final validation aborts without raising the threshold.
+With `gentle_homing: True`, three independent central free-travel strokes and
+three stationary windows precede all contact attempts. Two moving controls
+select a frequency/Q pair or a disabled filter and threshold; the third can
+reject that frozen choice. Startup, acceleration and cruise are checked in the
+candidate's signal domain. Braking is retained as a diagnostic. A failed control
+does not cause a search for another profile or a higher threshold.
 
-`SAVE_CONFIG=0` is AUTO's default and stages nothing. To apply the result, prepare
-XY again and run AUTO with explicit `SAVE_CONFIG=1`; this repeats the measurements,
-qualifies and saves the selected filter/model together, then restarts Klipper.
-Saving requires no selected-axis manual threshold override or unrelated pending
-configuration changes. See [automatic selection and evidence](NOTCH.md#automatic-selection).
+The first home already uses the selected live detector. Full calibration needs
+one discovery and ten validation homes using that exact profile, mapped
+component and threshold. It does not require a previously successful raw trigger
+or eleven unfiltered reference approaches. Any rejected contact ends the run.
+When gentle mode is disabled, explicit AUTO retains its two-stage sequence:
+three central strokes, raw discovery plus ten reference homes, offline selection,
+then fresh discovery plus ten fixed-profile validation homes.
+
+The commands preserve the configured homing speed and acceleration. Gentle
+mode requires compatible settings at or below 40 mm/s and 1000 mm/s², and refuses
+incompatible geometry or limits; it does not lower them to obtain a passing
+result. The installer's `--gentle-homing` option prepares those configuration
+caps separately. Load the new modules using its printed host-service restart
+command if installation used `--no-restart`, then wait for Klipper to be ready
+and confirm `gentle_homing` in `ACCEL_HOMING_STATUS`.
+
+For a supervised first contact, prepare XY within 2 mm of its configured midpoint:
+
+```gcode
+ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1
+```
+
+This makes at most one approach and requires `SAVE_CONFIG=0` (the default for
+explicit AUTO). It saves a diagnostic ZIP, restores the previous runtime
+threshold/filter, and does not qualify a G28 model. After inspecting the result,
+manually prepare XY again for a full calibration. A centered gentle approach
+commands at most midpoint-to-endstop distance plus 2 mm. A trigger outside the
+center-travel tolerance or more than 0.5 mm of commanded trigger-to-halt travel
+ends the sequence. Ordinary gentle G28 also checks trigger-to-halt travel.
+Qualification also requires the original detector onset to fall within a
+matched native acceleration or cruise interval. A crossing during planned
+braking, outside a known approach interval, or without matching native motion
+evidence is rejected before another approach or saving.
+
+Saving behavior depends on whether `NOTCH=AUTO` was written explicitly:
+
+| Command form | Successful result |
+| --- | --- |
+| Bare CALIBRATE, `SAVE_CONFIG` omitted | Save the qualified model/settings and request a Klipper restart. |
+| Bare CALIBRATE, `SAVE_CONFIG=0` | Stage the model/settings for a later `SAVE_CONFIG`; restore the previous runtime settings. |
+| Explicit `NOTCH=AUTO`, `SAVE_CONFIG` omitted or `0` | Report only; stage and save nothing. |
+| Explicit `NOTCH=AUTO SAVE_CONFIG=1` | Repeat measurements and qualification, save the model/settings, then request a restart. |
+
+Gentle saving can replace the selected axis's explicit threshold. The other axis
+and shared fallback remain unchanged. Gentle/AUTO saving rejects unrelated pending
+configuration changes. With gentle mode disabled, explicit AUTO still requires
+removing the selected-axis/shared manual threshold override before saving.
+
+Raw samples remain in the ZIP. `contact-summary.json` lists each approach's
+threshold, recorded profile, and replayed peaks before, during and after planned
+braking, including failed no-trigger approaches. The main `contact-timing.json`
+and `.svg` replay the recorded candidate; full calibration writes numbered
+`contact-0001-timing` files for each approach. Historical 200 Hz/Q=5 replay is
+kept separately in `historical_signal` and an explicitly named historical SVG.
+Offline replays never select or control a home. A replay peak, scheduled braking time, or plausible
+step travel does not establish the instant of physical contact. A missing trigger
+does not establish that no physical contact occurred. Record the operator's
+observations separately: free-travel margins alone do not prove sensitivity to a
+soft stop, and step counts do not measure motor slip or physical toolhead position.
+See [automatic selection and evidence](NOTCH.md#automatic-selection).
 
 ## Accuracy and early-trigger recovery
 
@@ -123,8 +190,12 @@ configuration changes. See [automatic selection and evidence](NOTCH.md#automatic
 ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1
 ```
 
-This measures repeated commanded travel at the active threshold and speed.
-An early trigger with valid current capture/halt/center evidence reverses its
+This measures repeated commanded travel at the active threshold, filter and speed.
+In gentle mode, it requires a matching qualified model and stops on a rejected
+contact without raising the threshold or starting recovery calibration.
+
+With gentle mode disabled, an early trigger with valid current capture/halt/center
+evidence reverses its
 recorded commanded halt travel, reports failure in the console without an
 accuracy PNG and starts one
 normal calibration of the failing axis. Its first candidate is the actual
