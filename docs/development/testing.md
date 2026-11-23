@@ -38,6 +38,9 @@ PYTHONPATH=tests python3 -B -m unittest -v \
 # Installation/update transactions in disposable local directories.
 PYTHONPATH=tests python3 -B -m unittest -v \
   test_installer test_updater test_bootstrap_short
+
+# Axis limits wizard: simulated motion, native homing bookkeeping, saving.
+PYTHONPATH=tests python3 -B -m unittest -v \n  test_axis_limits_calibration test_axis_limits_native_integration
 ```
 
 Use the full discovery command above before reporting the integrated result.

@@ -54,6 +54,16 @@ CONFIGURED_MAPPING_METHOD = _axes_module.CONFIGURED_METHOD
 CalibrationConfigSave = _ah_compat_sibling_module(
     "accel_homing_config", __package__, __file__).CalibrationConfigSave
 
+# A source-only update of an older installation may precede creation of the
+# new extras symlink. Existing homing must keep loading during that interval.
+try:
+    from .accel_homing_axis_limits import AxisLimitsCalibration
+except ImportError:
+    try:
+        from accel_homing_axis_limits import AxisLimitsCalibration
+    except ImportError:
+        AxisLimitsCalibration = None
+
 try:
     from .homing import PrinterHoming as _PrinterHoming
 except ImportError:
@@ -382,6 +392,7 @@ class AccelHomingWorkflows:
         self.noise_seeds = {}
         self.in_home = False
         self.home_axis = None
+        self.axis_limits = AxisLimitsCalibration(self) if AxisLimitsCalibration is not None else None
         self.timer = self.reactor.register_timer(self._timeout)
         self.printer.register_event_handler("klippy:shutdown", self._shutdown)
         self.printer.register_event_handler("klippy:disconnect", self._disconnect)
@@ -392,6 +403,9 @@ class AccelHomingWorkflows:
                  "Calibrate one X or Y homing threshold with ten qualified homes"),
                 ("ACCEL_HOMING_BETA_CALIBRATE", self.cmd_BETA_CALIBRATE,
                  "Beta motion-noise experiment: PNG and threshold proposal only"),
+                ("ACCEL_HOMING_CALIBRATE_LIMITS",
+                 self.axis_limits.command if self.axis_limits is not None else self._axis_limits_unavailable,
+                 "Guided X/Y axis limits measurement, bed origin and coordinate save"),
                 ("ACCEL_HOMING_CALIBRATE_NOISE", self.cmd_NOISE,
                  "Measure three stationary one-second noise windows and suggest calibration starts"),
                 ("ACCEL_HOMING_CANCEL", self.cmd_CANCEL,
@@ -412,6 +426,10 @@ class AccelHomingWorkflows:
 
     def _error(self, message):
         return self.printer.command_error("accel_homing: " + message)
+
+    def _axis_limits_unavailable(self, gcmd):
+        raise gcmd.error("ACCEL_HOMING_CALIBRATE_LIMITS needs its new installed module; rerun the installer, "
+                         "then restart Klipper. Existing homing commands remain available.")
 
     def _info(self, message):
         self.gcode.respond_info("accel_homing: " + message)
@@ -851,6 +869,9 @@ class AccelHomingWorkflows:
 
     def _finish(self, result, release=False):
         session = self.session
+        if session is not None and session["mode"] == "axis_limits":
+            self.axis_limits.interrupt(result)
+            return
         if session is not None and session.get("finishing"):
             session["finish_interrupted"] = result.get("reason", "workflow interrupted during PNG export")
             if session.get("mode") == "troubleshoot":
@@ -952,6 +973,8 @@ class AccelHomingWorkflows:
             self._finish({"result": "aborted", "reason": "printer disconnected"})
 
     def _timeout(self, eventtime):
+        if self.session is not None and self.session["mode"] == "axis_limits":
+            return self.axis_limits.timeout(eventtime)
         if self.session is None or self.session.get("state") != "waiting":
             return self.reactor.NEVER
         if eventtime >= self.session["expires"]:
@@ -1034,6 +1057,8 @@ class AccelHomingWorkflows:
     def check_home_axes(self, axes):
         """Called by core before an accelerometer homing session can move."""
         if self.session is not None and (not self.in_home or set(axes) != {self.home_axis}):
+            if self.session["mode"] == "axis_limits":
+                self.axis_limits.interrupt({"result": "aborted", "reason": "external homing attempted"})
             raise self._error("a supervised workflow is active; resume calibration with its "
                               "command or use CANCEL")
         calibrating = bool(self.session and self.session.get("mode") == "calibration")
@@ -5486,7 +5511,13 @@ class AccelHomingWorkflows:
             key: session.get(key) for key in ("mode", "state", "axis", "candidate", "successes",
                                              "candidate_qualified", "attempts", "run_id", "expires",
                                              "repeatability_spread_mm")}
-        if session is not None and session["mode"] == "troubleshoot":
+        if session is not None and session["mode"] == "axis_limits":
+            active = {key: session.get(key) for key in ("mode", "state", "axis", "stage", "attempts", "run_id", "expires")}
+            active.update(accepted_axes=list(session["results"]), jog_speed_mm_s=session["jog_speed"],
+                          proposed_config=self.axis_limits._result(session)["proposed_config"],
+                          temporary_coordinate_mm=session.get("measurement", {}).get("coordinate"),
+                          physical_position_verified=False)
+        elif session is not None and session["mode"] == "troubleshoot":
             active = {key: session.get(key) for key in ("mode", "state", "axis", "attempts", "run_id",
                                                        "samples_requested", "sample_index")}
             active["completed_samples"] = {axis: len(item["trials"])

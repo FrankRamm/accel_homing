@@ -97,7 +97,8 @@ Start at the [documentation index](docs/README.md). Unfamiliar word? See the
 [configuration](docs/guide/configuration.md),
 [commands](docs/guide/commands.md),
 [calibration](docs/guide/calibration.md) and
-[troubleshooting](docs/guide/troubleshooting.md).
+[troubleshooting](docs/guide/troubleshooting.md). The experimental
+[axis limits wizard](docs/advanced/axis-limits.md) measures X/Y travel and bed origin.
 
 ## Get help
 

@@ -15,6 +15,7 @@ Start with the guide, in order. The advanced and development pages are for speci
 ## Advanced
 
 - [Accuracy workflow](advanced/accuracy.md): measure variation in commanded homing travel and recover from early triggers.
+- [Axis limits and bed origin](advanced/axis-limits.md): experimental wizard that measures X/Y endpoints and proposes `position_min`, `position_max` and `position_endstop`.
 - [Notch filter](advanced/notch.md): attenuate a narrow frequency band during homing, set manually or with `NOTCH=AUTO`.
 - [PNG plots and stationary noise](advanced/plots.md): generate and read the chart images.
 - [Per-home diagnostic capture](advanced/diagnostic-capture.md): record evidence for intermittent detection, delayed stopping or a changed return.

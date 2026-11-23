@@ -352,6 +352,11 @@ original six module links therefore support Git-only updates adding this
 diagnostic. A missing or broken diagnostic module produces an error only when
 that command is invoked; it does not prevent ordinary plugin startup.
 
+The [axis limits wizard](../advanced/axis-limits.md) loads from its own module,
+`accel_homing_axis_limits.py`. After a Git-only update of an older installation,
+rerun `install.sh` to link it and restart Klipper. Until then the wizard command
+reports the missing step and every other command keeps working.
+
 For a manual update, run the [install commands](#install) above.
 
 If Git or the installer reports local changes, preserve and review them. Do not
