@@ -1,0 +1,87 @@
+name: Bug report
+description: A confirmed bug in accel_homing
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for confirmed bugs only. For setup questions, calibration help or "is this normal?", please ask on Discord first.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen
+    validations:
+      required: true
+  - type: dropdown
+    id: firmware
+    attributes:
+      label: Firmware
+      options:
+        - Klipper
+        - Kalico
+    validations:
+      required: true
+  - type: input
+    id: firmware-version
+    attributes:
+      label: Firmware version
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: "Branch and commit, from `git -C ~/accel_homing log -1 --oneline`"
+    validations:
+      required: true
+  - type: dropdown
+    id: kinematics
+    attributes:
+      label: Kinematics
+      options:
+        - CoreXY
+        - Cartesian
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: sensor
+    attributes:
+      label: Sensor
+      description: "Beacon, Cartographer, ADXL345, ..."
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: Your [accel_homing] / sensor sections
+      render: ini
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Attach klippy.log - drag the file here
+    validations:
+      required: true
+  - type: textarea
+    id: console
+    attributes:
+      label: Console output
+    validations:
+      required: false
+  - type: textarea
+    id: plots
+    attributes:
+      label: Plots
+      description: Attach PNGs/ZIPs
+    validations:
+      required: false
