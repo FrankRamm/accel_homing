@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
 .plot-deps/
+
+# Working documents: plans, specs, AI agent scratch (see CONTRIBUTING.md)
+docs/superpowers/
+.superpowers/

@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a change to accel_homing
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should accel_homing do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: printer
+    attributes:
+      label: Printer
+      description: Printer, kinematics, sensor
+    validations:
+      required: false
