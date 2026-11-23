@@ -40,6 +40,10 @@ class GentleContactProbeTests(unittest.TestCase):
                 with zipfile.ZipFile(result["artifacts"]["archive"]) as bundle:
                     report = json.loads(bundle.read("report.json"))
                     latest = json.loads(bundle.read("contact-summary.json"))["last_attempt"]
+                    stats = json.loads(bundle.read("debug/context.json"))["host_transport"]
+                    self.assertEqual(stats["end_scope"], "before_archive_export")
+                    self.assertIsNotNone(stats["start"])
+                    self.assertIsNotNone(stats["end"])
                     self.assertIs(latest["qualification"]["accepted"], accepted)
                     self.assertEqual(json.loads(bundle.read("history/index.json"))["runs"], [])
                     self.assertTrue(report["gentle_motion_noise"]["complete"])

@@ -211,6 +211,7 @@ class AutoNotchCalibration:
         self.debug_session = None
         self.debug_context = {}
         self.log_cursor = None
+        self.host_transport_end = None
         self.contact_only = False
         self.stage_only = False
         self.contact_planner = None
@@ -812,6 +813,9 @@ class AutoNotchCalibration:
         reserved = False
         try:
             self._require_debug_idle(session)
+            diagnostics = load_companion_module("accel_homing_troubleshoot")
+            if self.host_transport_end is None:
+                self.host_transport_end = diagnostics.host_transport_snapshot(self.w.printer)
             owner = self.w.owner
             # Retain ownership while yielding during export. Another workflow
             # or ordinary home must not start midway through diagnostic I/O.
@@ -863,8 +867,8 @@ class AutoNotchCalibration:
                 motion_diagnostics=session.get("beta_current_motion"),
                 acquisition_faults=session.get("noise_acquisition_faults"),
                 sensor=getattr(owner, "sensor_name", None), sensor_fault=getattr(owner, "sensor_fault", None))
-            diagnostics = load_companion_module("accel_homing_troubleshoot")
-            result["debug_context"] = diagnostics.write_debug_context(self.folder, self.w.printer, details=details)
+            result["debug_context"] = diagnostics.write_debug_context(
+                self.folder, self.w.printer, details=details, host_transport_end=self.host_transport_end)
             if not self._write_debug_json(self.folder / "run.json", dict(self.debug_context,
                     schema="accel_homing_auto_debug/v1", phase=self.debug_phase,
                     exception=self.debug_failure, events=self.debug_events,

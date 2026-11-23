@@ -44,6 +44,21 @@ class RunDebugContextTests(unittest.TestCase):
             "accel_homing": {"x_threshold": 2.3}, "beacon": {"api_token": "<redacted>"}})
         self.assertEqual(len(context["installed_sha256"]["accel_homing_workflows.py"]), 64)
 
+    def test_host_and_can_snapshots_are_scoped_to_the_run(self):
+        host, bus = Mock(), Mock()
+        host.get_status.side_effect = [{"sysload": .4}, {"sysload": 1.2}]
+        bus.get_status.side_effect = [{"tx_retries": 31}, {"tx_retries": 57}]
+        self.printer.lookup_objects.return_value.extend([
+            ("system_stats", host), ("canbus_stats cartographer", bus)])
+        cursor = diagnostics.debug_log_cursor(self.printer)
+        with patch.object(diagnostics, "_host_board_model", return_value="Raspberry Pi 3 Model B"):
+            context = self.export(cursor)
+        start, end = (context["host_transport"][p] for p in ("start", "end"))
+        self.assertEqual([start["system_stats"]["sysload"], end["system_stats"]["sysload"]], [.4, 1.2])
+        self.assertEqual([p["canbus_stats"]["canbus_stats cartographer"]["tx_retries"]
+                          for p in (start, end)], [31, 57])
+        self.assertEqual(context["host"]["board_model"], "Raspberry Pi 3 Model B")
+
     def test_rotation_and_overflow_preserve_start_and_final_exception(self):
         cursor = diagnostics.debug_log_cursor(self.printer)
         with self.log.open("ab") as stream:

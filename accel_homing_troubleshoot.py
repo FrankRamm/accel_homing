@@ -1175,6 +1175,8 @@ class Recorder:
         self.context = environment(workflow)
         self.before = snapshot(workflow)
         self.log_start = self._log_position()
+        self.log_start["host_transport"] = host_transport_snapshot(self.workflow.printer)
+        self.host_transport_end = None
         self.folder = None
         self.timing = TimingTrace(self)
 
@@ -1300,6 +1302,7 @@ class Recorder:
                 return
             self.closed = True
             self.closed_at = self.workflow.reactor.monotonic()
+        self.host_transport_end = host_transport_snapshot(self.workflow.printer)
 
     def begin_home(self, axis, sample):
         previous = self.current_home
@@ -1577,7 +1580,8 @@ class Recorder:
         report["debug"] = write_debug_context(folder, self.workflow.printer, details={
             "command": command, "run_id": self.session["run_id"], "phase": "after_cleanup",
             "ending": clean(ending), "experiment": clean(experimental),
-            "log_cursor": self.log_start, "retained_homes": len(homes), "bounds": report["bounds"]})
+            "log_cursor": self.log_start, "retained_homes": len(homes), "bounds": report["bounds"]},
+            host_transport_end=self.host_transport_end)
         write_json(folder / "manifest.json", report)
         (folder / "README.txt").write_text(
             command + " evidence\n\n"
@@ -1796,9 +1800,37 @@ def append_gentle_history(bundle, root, axis, current_id, cooperate=None):
     return index
 
 
+def host_transport_snapshot(printer):
+    """Read Klipper's published host and CAN status outside contact moves."""
+    result = {"system_stats": None, "canbus_stats": {}}
+    try:
+        now = printer.get_reactor().monotonic()
+        result["host_monotonic_s"] = now
+        for name, obj in printer.lookup_objects():
+            if name == "system_stats":
+                result["system_stats"] = _observe(obj, "get_status", now)
+            elif name == "canbus_stats" or name.startswith("canbus_stats "):
+                result["canbus_stats"][name] = _observe(obj, "get_status", now)
+    except Exception as exc:
+        result["unavailable"] = str(exc)[:512]
+    return result
+
+
+def _host_board_model():
+    for path in ("/proc/device-tree/model", "/sys/firmware/devicetree/base/model"):
+        try:
+            with Path(path).open("rb") as source:
+                model = source.read(256).rstrip(b"\x00\r\n ").decode("utf-8", "replace")
+            if model:
+                return model
+        except OSError:
+            continue
+    return None
+
+
 def debug_log_cursor(printer):
     cursor = {"started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "host_monotonic_s": time.monotonic()}
+              "host_monotonic_s": time.monotonic(), "host_transport": host_transport_snapshot(printer)}
     try:
         path = Path(printer.get_start_args()["log_file"])
         info = path.stat()
@@ -1894,22 +1926,27 @@ def _find_log_by_identity(siblings, basename, identity):
     return None
 
 
-def write_debug_context(directory, printer, details=None):
+def write_debug_context(directory, printer, details=None, *, host_transport_end=None):
     """Write passive diagnostic evidence after cleanup, including on partial runs."""
     folder = Path(directory) / "debug"
     result = {"files": [], "errors": {}}
     try:
         folder.mkdir(exist_ok=True)
         info = dict(details or {})
-        cursor = info.pop("log_cursor", {}) or {}
+        cursor = dict(info.pop("log_cursor", {}) or {})
+        host_transport = {"start": cursor.pop("host_transport", None), "end": host_transport_end,
+                          "end_scope": "before_archive_export" if host_transport_end is not None else "context_export"}
+        if host_transport_end is None:
+            host_transport["end"] = host_transport_snapshot(printer)
         payload = {"schema": "accel_homing_run_debug_v1", "run": clean(info),
                    "started": clean(cursor), "finished_host_monotonic_s": time.monotonic(),
                    "exported_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                   "python": sys.version, "platform": sys.platform,
+                   "python": sys.version, "platform": sys.platform, "host_transport": host_transport,
+                   "host": {"board_model": _host_board_model(), "logical_cpu_count": os.cpu_count()},
                    "printer_state": _observe(printer, "get_state_message"), "errors": result["errors"]}
         try:
             args = printer.get_start_args()
-            payload["host"] = clean({k: args.get(k) for k in ("software_version", "git_version", "cpu_info")})
+            payload["host"].update(clean({k: args.get(k) for k in ("software_version", "git_version", "cpu_info")}))
             log = _debug_run_log(folder, args, cursor)
             if log.get("file"):
                 result["files"].append(log["file"])

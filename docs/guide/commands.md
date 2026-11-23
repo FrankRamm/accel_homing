@@ -217,6 +217,11 @@ sample to the last sample of its batch, from that sample to the adapter's host
 timestamp after row validation, and from there to the host's stop-request
 timestamp. These last two timestamps are estimates in the main MCU print-time
 clock. Hardware stop receipt and physical stopping distance remain unmeasured.
+For host and bus context, `debug/context.json` includes the board model when
+Linux exposes it, the logical CPU count, and available Klipper system and CAN
+statistics at the start and end of the run. The archived Klippy log contains
+periodic statistics when logging is enabled. Short scheduling delays can occur
+between observations.
 The main `contact-timing.json`
 and `.svg` replay the recorded candidate; full calibration writes numbered
 `contact-0001-timing` files for each approach. Historical 200 Hz/Q=5 replay is
