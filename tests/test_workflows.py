@@ -2539,9 +2539,14 @@ class ModelTests(unittest.TestCase):
         speed.workflow._validate_model_connection()
         with self.assertRaisesRegex(CommandError, "homing_speed_mm_s.*regular \[accel_homing\]"):
             speed.workflow.check_home_axes(["x"])
-        # A manual threshold does not bypass the saved axis mapping after a sensor change.
+        # A manual threshold does not bypass the saved axis mapping after an axes_map change.
         manual = Rig({"x_threshold": 8.0}, sections=sections)
-        manual.owner.sensor_name = "other_sensor"
+        manual.owner.helper = axes_map
+        # The rig's fake noise_sensor_context is static; like the real one it must follow the driver axes_map.
+        fake_context = manual.owner.noise_sensor_context
+        manual.owner.noise_sensor_context = lambda: dict(
+            fake_context(), capture_axes_map=manual.owner.helper.config.axes_map,
+            sensor_axes_map=manual.owner.helper.config.axes_map)
         manual.workflow._validate_model_connection()
         with self.assertRaisesRegex(CommandError, "axis mapping sensor context changed; manually center XY and "
                                     "run ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 \(a manual threshold does not "
