@@ -571,7 +571,17 @@ class BeaconAccelEndstop:
             workflows = getattr(self._owner, "workflows", None)
             if workflows is not None and getattr(workflows, "gentle_homing", False):
                 workflows.observe_saved_gentle_seek(attempt, home_end_time)
-        return self._owner.finish(self, attempt, result)
+        trigger_time = self._owner.finish(self, attempt, result)
+        if (not trigger_time and observer is not None and attempt is not None
+                and getattr(attempt, "reason", None) is None):
+            session = getattr(workflows, "session", None) or {}
+            controller = session.get("auto_notch_controller")
+            if controller is not None and session.get("gentle_frozen_candidate"):
+                try:
+                    controller.collect_missed_contact_tail(attempt, home_end_time)
+                except Exception:
+                    logging.exception("accel_homing: could not retain missed-contact tail")
+        return trigger_time
 
     def query_endstop(self, print_time):
         return 0
@@ -1989,6 +1999,11 @@ class BeaconAccelHoming:
         self.reactor.update_timer(self.watchdog, self.reactor.NEVER)
         self.last_activity = self.reactor.monotonic()
         if attempt is not None:
+            if attempt.reason is None and getattr(self, "contact_timing_observer", None) is not None:
+                try:
+                    attempt.last_capture_time_at_disarm = self.last_captured_sample_time(attempt)
+                except Exception:
+                    logging.exception("accel_homing: could not timestamp the final armed batch")
             self._record(attempt)
             self.pending_move = attempt
             if attempt.onset_batch is not None:
@@ -3910,6 +3925,17 @@ class BeaconAccelHoming:
                     if not failed:
                         raise
                     logging.exception("accel_homing: beta home stream cleanup failed")
+
+    def last_captured_sample_time(self, attempt):
+        """Latest retained print time for this disarmed seek, without decoding rows."""
+        with self.lock:
+            if (self.capture_attempt is not attempt or self.attempt is not None
+                    or not self.capture_batches or not self.stream_on):
+                return None
+            start, delta = self.capture_batches[-1][:2]
+            if self.backend is not None and self.capture_decode_contexts[-1] is not None:
+                return self.capture_decode_contexts[-1][1]
+        return self.clock_to_time(start + delta)
 
     def _stop_capture_data(self):
         """Convert captured batches to configured-sensor-stream g off the trigger path.

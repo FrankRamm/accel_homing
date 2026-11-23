@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import stat as stat_mode
 import subprocess
 import sys
@@ -1671,7 +1672,7 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def write_run_archive(folder, archive, cooperate=None, prefix=None):
+def write_run_archive(folder, archive, cooperate=None, prefix=None, append=None):
     """Package a finished run incrementally; publish a new ZIP only on success."""
     folder, archive = Path(folder), Path(archive)
     # The temporary file is outside the run directory and on the target filesystem.
@@ -1699,12 +1700,100 @@ def write_run_archive(folder, archive, cooperate=None, prefix=None):
                         if not data:
                             break
                         dst.write(data)
+            if append is not None:
+                append(bundle)
         if cooperate is not None:
             cooperate()
         os.replace(temporary, archive)
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+_GENTLE_MEMBER = re.compile(
+    r"(?:run\.json|report\.json|contact-summary\.json|contact(?:-\d+)?-timing"
+    r"(?:-historical-200Hz-Q5)?\.(?:svg|json)|debug/(?:context\.json|klippy\.log)"
+    r"|raw/(?:home|motion|stationary|mapping)(?:-partial)?-\d+\.json\.gz"
+    r"|motion-\d+\.json\.gz|worker-[\w-]+/worker\.(?:json|log))")
+
+
+def append_gentle_history(bundle, root, axis, current_id, cooperate=None):
+    """Copy original evidence from the newest same-axis runs, including misses."""
+    index = {"schema": "accel_homing_gentle_history/v1", "axis": axis,
+             "current_run_at_archive_root": current_id, "runs": [], "omissions": []}
+    budget = 256 * 1024 * 1024  # Original member sizes, before ZIP compression.
+    sources = []
+    for path in root.glob("*.zip"):
+        if (path.stem != current_id and re.fullmatch(r"[0-9a-f]{32}", path.stem)
+                and not path.is_symlink() and path.is_file()):
+            try:
+                sources.append((path.stat().st_mtime_ns, path))
+            except FileNotFoundError:
+                continue
+    for _, path in sorted(sources, reverse=True):
+        if cooperate:
+            cooperate()
+        if len(index["runs"]) >= (4 if current_id else 5):
+            break
+        run_id = path.stem
+        yielding = False
+        try:
+            with zipfile.ZipFile(path) as source:
+                try:
+                    summary_info = source.getinfo("contact-summary.json")
+                except KeyError:
+                    continue
+                if summary_info.file_size > 2 * 1024 * 1024:
+                    raise ValueError("oversized contact summary")
+                summary = json.loads(source.read(summary_info))
+                if not isinstance(summary, dict) or summary.get("run_id") != run_id:
+                    raise ValueError("invalid run identity")
+                if summary.get("axis") != axis:
+                    continue
+                last = summary.get("last_attempt") or {}
+                if not isinstance(last, dict):
+                    raise ValueError("invalid contact attempt")
+                outcome = {}
+                if "run.json" in source.namelist() and source.getinfo("run.json").file_size <= 2 * 1024 * 1024:
+                    receipt = json.loads(source.read("run.json"))
+                    if isinstance(receipt, dict) and isinstance(receipt.get("outcome"), dict):
+                        outcome = receipt["outcome"]
+                members = [entry for entry in source.infolist() if _GENTLE_MEMBER.fullmatch(entry.filename)]
+                size = sum(entry.file_size for entry in members)
+                if size > budget:
+                    raise ValueError("history size limit")
+                if len({entry.filename for entry in members}) != len(members):
+                    raise ValueError("duplicate source member")
+                budget -= size
+                prefix = "history/%s/" % run_id
+                for entry in members:
+                    target = zipfile.ZipInfo(prefix + entry.filename)
+                    target.compress_type = (zipfile.ZIP_STORED if entry.filename.endswith(".gz")
+                                            else zipfile.ZIP_DEFLATED)
+                    with source.open(entry) as src, bundle.open(target, "w", force_zip64=True) as dst:
+                        while True:
+                            block = src.read(256 * 1024)
+                            if not block:
+                                break
+                            dst.write(block)
+                            if cooperate:
+                                yielding = True
+                                cooperate()
+                                yielding = False
+                index["runs"].append({"run_id": run_id, "directory": prefix,
+                                      "outcome": outcome.get("result"), "reason": outcome.get("reason"),
+                                      "contact_result": last.get("contact_result"),
+                                      "qualification": last.get("qualification"),
+                                      "members": len(members)})
+        except (OSError, zipfile.BadZipFile, ValueError, RuntimeError, EOFError) as exc:
+            if yielding:
+                raise
+            index["omissions"].append({"run_id": run_id, "reason": str(exc)})
+    if current_id is None and not index["runs"]:
+        raise ValueError("no readable gentle %s contact archives in %s (%d omissions)" %
+                         (axis.upper(), root, len(index["omissions"])))
+    bundle.writestr("history/index.json", json.dumps(index, indent=2))
+    return index
 
 
 def debug_log_cursor(printer):

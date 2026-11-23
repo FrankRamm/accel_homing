@@ -1,5 +1,6 @@
 import gzip
 import json
+from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -38,6 +39,9 @@ class GentleContactProbeTests(unittest.TestCase):
                 self.assertEqual(result["result"], "contact_check_complete" if accepted else "aborted")
                 with zipfile.ZipFile(result["artifacts"]["archive"]) as bundle:
                     report = json.loads(bundle.read("report.json"))
+                    latest = json.loads(bundle.read("contact-summary.json"))["last_attempt"]
+                    self.assertIs(latest["qualification"]["accepted"], accepted)
+                    self.assertEqual(json.loads(bundle.read("history/index.json"))["runs"], [])
                     self.assertTrue(report["gentle_motion_noise"]["complete"])
                     self.assertEqual(len(report["retained_attempt_records"]), 1)
                     self.assertTrue(any("home" in item and item.endswith(".gz") for item in bundle.namelist()))
@@ -77,7 +81,11 @@ class GentleContactProbeTests(unittest.TestCase):
                                            accel=accel, x_r=direction, y_r=0., z_r=0.)
                 rig.profile = [move(.01, .04, 0., 1000.), move(.05, .2, 40., 0.),
                                move(.25, .04, 40., -1000.)]
-                attempt = SimpleNamespace(axis="x", pass_no=1, arm_time=arm, request_time=None, reason=None)
+                attempt = SimpleNamespace(axis="x", pass_no=1, arm_time=arm, request_time=None, reason=None,
+                                          last_capture_time_at_disarm=arm + .24)
+                times = iter([arm + .24, arm + .43])
+                rig.owner.last_captured_sample_time = lambda event: next(times)
+                rig.owner.sensor_fault = None
                 rig.owner.disarm = lambda: attempt
                 rig.owner.finish = lambda endstop, observed, result: 0.
                 es = plugin.BeaconAccelEndstop(rig.owner, "x")
@@ -117,12 +125,53 @@ class GentleContactProbeTests(unittest.TestCase):
                 self.assertEqual(planner["status"], "complete")
                 self.assertEqual([s["phase"] for s in planner["segments"]], ["acceleration", "cruise", "braking"])
                 self.assertIsNone(planner["stop_request_observed_time_s"])
+                self.assertTrue(planner["missed_contact_tail"]["complete"])
+                self.assertAlmostEqual(planner["missed_contact_tail"]["target_time_s"], planner["arm_time_s"] + .42)
                 self.assertAlmostEqual(planner["brake_start_time_s"], planner["arm_time_s"] + .25)
                 signal = diagnostic["signal"]
+                self.assertAlmostEqual(signal["through_last_sample_at_disarm"]["filtered_peak_g"], 0.)
+                self.assertGreater(signal["delivered_after_disarm"]["filtered_peak_g"], 0.)
                 self.assertEqual(signal["status"], "ok", signal)
                 self.assertAlmostEqual(signal["brake_window"]["peak_minus_brake_ms"], -5.)
                 self.assertIn("contact-timing.svg", bundle.namelist())
             self.assertFalse(hasattr(rig.owner, "contact_timing_observer"))
+
+    def test_report_collects_existing_misses_and_rejections_without_motion_or_recursive_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rig = AutoRig(directory)
+            root = Path(rig.workflow.charts_directory) / "notch-auto"
+            root.mkdir(parents=True, exist_ok=True)
+
+            def previous(run_id, axis, result):
+                with zipfile.ZipFile(root / (run_id + ".zip"), "w") as z:
+                    z.writestr("contact-summary.json", json.dumps({"axis": axis, "run_id": run_id,
+                        "last_attempt": {"contact_result": result}}))
+                    z.writestr("run.json", json.dumps({"outcome": {"result": "aborted", "reason": result}}))
+                    z.writestr("raw/home-0001.json.gz", gzip.compress(run_id.encode()))
+                    z.writestr("history/old/raw/home-0001.json.gz", b"older cached report")
+            miss, early, other = ("1" * 32, "2" * 32, "3" * 32)
+            previous(miss, "x", "no_trigger")
+            previous(early, "x", "impact")
+            previous(other, "y", "impact")
+            with rig.helpers():
+                rig.workflow.cmd_REPORT(GCmd(AXIS="X"))
+            self.assertEqual(rig.home_calls, [])
+            self.assertIsNone(rig.workflow.session)
+            with zipfile.ZipFile(root / "gentle-X-report.zip") as report:
+                index = json.loads(report.read("history/index.json"))
+                self.assertEqual({r["run_id"]: r["contact_result"] for r in index["runs"]},
+                                 {miss: "no_trigger", early: "impact"})
+                for run_id in (miss, early):
+                    self.assertEqual(gzip.decompress(report.read("history/" + run_id + "/raw/home-0001.json.gz")),
+                                     run_id.encode())
+                self.assertFalse(any("/history/" in name or other in name for name in report.namelist()))
+            with rig.helpers(), self.assertRaisesRegex(CommandError, "outside"):
+                rig.home_results.append({"travel_mm": 50.0375})
+                rig.command(CONTACT_ONLY=1)
+            with zipfile.ZipFile(rig.workflow.last_result["artifacts"]["archive"]) as report:
+                index = json.loads(report.read("history/index.json"))
+                self.assertEqual({r["run_id"] for r in index["runs"]}, {miss, early})
+                self.assertIn("raw/home-0001.json.gz", report.namelist())
 
     def test_native_schedule_can_extend_past_trigger_and_rejects_unrelated_motion(self):
         def move(start, duration, speed, accel, direction=-1.):

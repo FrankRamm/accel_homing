@@ -578,6 +578,39 @@ class AutoNotchCalibration:
         if self.previous_contact_observer is not None:
             self.previous_contact_observer(attempt, home_end)
 
+    def collect_missed_contact_tail(self, attempt, home_end):
+        """After native stop/disarm, retain pending batches through the end of a missed seek."""
+        session = self.debug_session
+        plan = self.contact_plans.get(session["attempts"])
+        owner = self.w.owner
+        if (not plan or plan["arm_time_s"] != attempt.arm_time or plan["axis"] != attempt.axis
+                or not math.isfinite(home_end)):
+            return
+        target = home_end + .100
+        tail = plan["missed_contact_tail"] = {"target_time_s": target, "complete": False,
+            "last_sample_at_disarm_s": getattr(attempt, "last_capture_time_at_disarm", None),
+            "boundary": "native_home_end", "used_for_detection": False}
+        generation = owner.operation_generation
+        deadline = self.w.reactor.monotonic() + .250
+        while True:
+            self.w._check_running(session)
+            if owner.operation_generation != generation or owner.sensor_fault:
+                tail["reason"] = "sensor context changed"
+                return
+            last = owner.last_captured_sample_time(attempt)
+            tail["last_sample_time_s"] = last
+            if last is None:
+                tail["reason"] = "capture unavailable"
+                return
+            if last >= target:
+                tail["complete"] = True
+                return
+            now = self.w.reactor.monotonic()
+            if now >= deadline:
+                tail["reason"] = "capture deadline reached"
+                return
+            self.w.reactor.pause(min(deadline, now + .005))
+
     def validate_contact(self, session, record, capture):
         """Reject braking-correlated qualification before any return or saving."""
         number = record.get("workflow_attempt")
@@ -630,8 +663,27 @@ class AutoNotchCalibration:
         def phase_peak(names):
             values = [item.get("filtered_peak_g") for item in phases if item.get("phase") in names]
             return max((value for value in values if type(value) in (int, float) and math.isfinite(value)), default=None)
+        record = source.get("record") or {}
+        contact_result = record.get("result") if number is not None else self.contact_result
+        native_error = (source.get("error") or {}).get("message")
+        missed = "no trigger on %s after full movement" % session["axis"]
+        if contact_result is None and native_error and missed in native_error.lower():
+            contact_result = "no_trigger"
+        qualification = copy.deepcopy(planner.get("qualification"))
+        if qualification is None:
+            reason = None
+            rejection = session.get("axis_only_cleanup")
+            if contact_result == "no_trigger":
+                reason = "native seek ended without a detector trigger"
+            elif isinstance(rejection, dict) and rejection.get("attempt") == number:
+                reason = rejection.get("reason")
+            if reason:
+                qualification = {"accepted": False, "reason": reason}
         attempt_summary = {"workflow_attempt": number if number is not None else session.get("attempts"),
-            "contact_result": (source.get("record") or {}).get("result") if number is not None else self.contact_result,
+            "contact_result": contact_result, "native_error": native_error,
+            "commanded_trigger_travel_mm_signed": record.get("trigger_travel_mm_signed"),
+            "commanded_halt_travel_mm_signed": record.get("halt_travel_mm_signed"),
+            "detector_onset_g": detector.get("onset_g"),
             "threshold_g": detector.get("threshold_g"), "profile": copy.deepcopy(candidate.get("profile")),
             "replay_status": signal.get("status"), "replay_matches_live_filter": signal.get("matches_recorded_live_filter"),
             "planner_status": planner.get("status"), "capture_matches_plan": matched,
@@ -640,20 +692,24 @@ class AutoNotchCalibration:
             "peak_before_braking_g": phase_peak(("armed_before_motion", "acceleration", "cruise")),
             "peak_during_braking_g": phase_peak(("braking",)),
             "peak_from_braking_through_tail_g": phase_peak(("braking", "tail")),
-            "phases": copy.deepcopy(phases), "qualification": copy.deepcopy(planner.get("qualification")),
+            "stop_request_observed_time_s": alignment.get("stop_request_observed_time_s"),
+            "peak_before_stop_request_g": (signal.get("before_stop_request") or {}).get("filtered_peak_g"),
+            "peak_at_or_after_stop_request_g": (signal.get("after_stop_request") or {}).get("filtered_peak_g"),
+            "peak_before_braking_basis": "scheduled planner phases",
+            "phases": copy.deepcopy(phases), "qualification": qualification,
             "physical_contact_verified": False}
         self.contact_summaries[attempt_summary["workflow_attempt"]] = attempt_summary
         payload = dict(schema="accel_homing_contact_timing/v2", run_id=session["run_id"], axis=session["axis"],
                        workflow_attempt=number if number is not None else session.get("attempts"),
                        clock_domain="main_mcu_print_time", capture_matches_plan=matched,
-                       contact_result=(source.get("record") or {}).get("result") if number is not None else self.contact_result,
+                       contact_result=contact_result,
                        detector_threshold_g=detector.get("threshold_g"), detector_onset_time_s=detector.get("onset_time_s"),
                        original_trigger_onset_time_s=detector.get("trigger_onset_time_s"),
                        active_detector={"profile": detector.get("signal_filter"),
                                         "threshold_g": detector.get("threshold_g"),
                                         "candidate": session.get("gentle_frozen_candidate"),
                                         "source": "recorded_live_detector"},
-                       planner=planner, qualification=planner.get("qualification"),
+                       planner=planner, qualification=qualification,
                        summary=attempt_summary, signal=signal, historical_signal=historical, physical_position_verified=False)
         stem = "contact-timing" if self.contact_only else "contact-%04d-timing" % number
         paths = {}
@@ -698,7 +754,7 @@ class AutoNotchCalibration:
                 self.contact_capture = capture
                 self.contact_result = (record or {}).get("result")
             if session.get("gentle_frozen_candidate") and kind == "home":
-                self.contact_data[number] = {"capture": capture, "record": record}
+                self.contact_data[number] = {"capture": capture, "record": record, "error": error}
             if self.debug_raw_bytes >= MAX_DEBUG_RAW_BYTES:
                 raise ValueError("raw diagnostic budget exhausted (1 GiB compressed per run)")
             path.parent.mkdir(exist_ok=True)
@@ -802,7 +858,12 @@ class AutoNotchCalibration:
                     noise_acquisition_faults=session.get("noise_acquisition_faults"),
                     outcome=result), cooperate):
                 raise ValueError("could not write the diagnostic run receipt")
-            diagnostics.write_run_archive(self.folder, archive, cooperate=cooperate)
+            if self.w.gentle_homing and session.get("axis") in ("x", "y"):
+                diagnostics.write_run_archive(self.folder, archive, cooperate=cooperate,
+                    append=lambda bundle: diagnostics.append_gentle_history(
+                        bundle, self.folder.parent, session["axis"], session["run_id"], cooperate))
+            else:
+                diagnostics.write_run_archive(self.folder, archive, cooperate=cooperate)
             self.w._info("AUTO diagnostic ZIP: %s" % archive)
             return True
         except Exception as exc:

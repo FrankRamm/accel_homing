@@ -391,6 +391,26 @@ the signal with the host time observed just after that request. The fixed
 commands and sensor readings. The report identifies missing evidence on aborted
 runs. A soft contact can produce a signal below the selected threshold.
 
+Each new gentle diagnostic ZIP includes its own run at the root. Under
+`history/` it also includes original captures, per-run Klippy logs, reports and
+plots from up to four recent same-axis contact archives, including failed runs.
+`history/index.json` identifies the source runs and any read or size omissions.
+The limit for included history is 256 MiB of original ZIP member data.
+
+To collect up to five existing X runs into a single ZIP **without moving the
+printer or repeating calibration**, update the plugin and run:
+
+```text
+ACCEL_HOMING_REPORT AXIS=X
+```
+
+Use `AXIS=Y` for Y. The console prints the report path. Existing runs retain
+the evidence recorded by the installed version at the time. On new missed
+seeks, the collector tries to retain samples through 100 ms past the native
+move end, for up to 250 ms after the dispatcher stops. The timing JSON records
+the last retained sample at disarm, tail coverage and the threshold crossing
+separately from peaks after a stop request. Tail samples are diagnostic only.
+
 Gentle supervised approaches command at most the midpoint-to-endstop distance
 plus 2 mm. An impact outside the midpoint tolerance, or more than 0.5 mm of
 commanded travel from trigger to halt, aborts the sequence. Ordinary G28 also

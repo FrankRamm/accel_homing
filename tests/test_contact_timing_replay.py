@@ -177,6 +177,10 @@ class ContactTimingReplayTests(unittest.TestCase):
         self.assertEqual(stop["coverage"], "complete")
         self.assertEqual(stop["filtered_peak_time_s"], 10.39)
         self.assertAlmostEqual(stop["peak_minus_stop_request_ms"], -5.0)
+        before, after = summary["before_stop_request"], summary["after_stop_request"]
+        self.assertLess(before["filtered_peak_time_s"], 10.395)
+        self.assertGreaterEqual(after["filtered_peak_time_s"], 10.395)
+        self.assertEqual(before["sample_count"] + after["sample_count"], len(_rows))
         self.assertEqual(summary["brake_window"]["coverage"], "unavailable")
         planner["arm_time_s"] += 1.0
         summary, _rows = auto.describe_contact_timing(capture, planner)

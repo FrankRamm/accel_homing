@@ -390,6 +390,8 @@ class AccelHomingWorkflows:
         for name, callback, description in (
                 ("ACCEL_HOMING_CALIBRATE", self.cmd_CALIBRATE,
                  "Calibrate one X or Y homing threshold with ten qualified homes"),
+                ("ACCEL_HOMING_REPORT", self.cmd_REPORT,
+                 "Bundle recent gentle calibration captures for one axis without moving"),
                 ("ACCEL_HOMING_BETA_CALIBRATE", self.cmd_BETA_CALIBRATE,
                  "Beta motion-noise experiment: PNG and threshold proposal only"),
                 ("ACCEL_HOMING_CALIBRATE_NOISE", self.cmd_NOISE,
@@ -1131,7 +1133,7 @@ class AccelHomingWorkflows:
                    "start a new ACCEL_HOMING_CALIBRATE command with CENTERED=1")
         announce = not session.get("axis_only_cleanup", False)
         session["axis_only_cleanup"] = {"source": source_record, "attempt": session["attempts"],
-                                        "generation": session["home_generation"]}
+                                        "generation": session["home_generation"], "reason": reason}
         if announce:
             # Retain this instruction even if later capture/stream cleanup fails.
             self._info(message)
@@ -2586,7 +2588,7 @@ class AccelHomingWorkflows:
     def _gentle_contact_error(self, axis, record, travel):
         expected = self._geometry(axis)[1]
         if abs(travel - expected) > GENTLE_CENTER_TOLERANCE_MM:
-            return ("gentle %s contact at %.4f mm is outside %.4f +/- %.1f mm of commanded "
+            return ("gentle %s detector trigger at %.4f mm is outside %.4f +/- %.1f mm of commanded "
                     "center travel" % (axis.upper(), travel, expected, GENTLE_CENTER_TOLERANCE_MM))
         return self._gentle_halt_error(axis, record)
 
@@ -5597,3 +5599,29 @@ class AccelHomingWorkflows:
     def cmd_STATUS(self, gcmd):
         self.owner.cmd_STATUS(gcmd)
         gcmd.respond_info(json.dumps(self.get_status(self.reactor.monotonic()), sort_keys=True))
+
+    def cmd_REPORT(self, gcmd):
+        axis = gcmd.get("AXIS", "").lower()
+        if axis not in AXES:
+            raise gcmd.error("AXIS must be X or Y")
+        def check_idle():
+            if not self._experiment_export_idle():
+                raise ValueError("report requires an idle printer")
+        def cooperate():
+            check_idle()
+            self.reactor.pause(self.reactor.monotonic() + .001)
+            check_idle()
+        root = Path(self.charts_directory).expanduser().resolve() / "notch-auto"
+        archive = root / ("gentle-%s-report.zip" % axis.upper())
+        try:
+            check_idle()
+            diagnostics = _load_troubleshoot_module()
+            if not root.is_dir():
+                raise ValueError("no gentle calibration archives in %s" % root)
+            with tempfile.TemporaryDirectory(dir=str(root)) as empty:
+                diagnostics.write_run_archive(empty, archive, cooperate=cooperate,
+                    append=lambda bundle: diagnostics.append_gentle_history(
+                        bundle, root, axis, None, cooperate))
+        except (OSError, ValueError) as exc:
+            raise gcmd.error("Cannot export gentle calibration report: %s" % exc)
+        self._info("Gentle %s diagnostic ZIP: %s" % (axis.upper(), archive))

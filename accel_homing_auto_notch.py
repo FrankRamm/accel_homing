@@ -483,6 +483,16 @@ def describe_contact_timing(capture, planner, check_running=None, settings=None)
                and planner.get("clock_domain", planner.get("time_domain", "main_mcu_print_time"))
                == "main_mcu_print_time")
     stop = planner.get("stop_request_observed_time_s") if matched else None
+    missed_tail = (planner.get("missed_contact_tail") or {}) if matched else {}
+    last_live = missed_tail.get("last_sample_at_disarm_s")
+    if _finite(last_live):
+        summary["through_last_sample_at_disarm"] = _contact_interval(
+            plot_rows, arm, last_live, tolerance, check_running, closed=True)
+        # Source timestamps are strictly ordered. Exclude the last live sample.
+        late_start = next((row[0] for row in plot_rows if row[0] > last_live), None)
+        if late_start is not None:
+            summary["delivered_after_disarm"] = _contact_interval(
+                plot_rows, late_start, plot_rows[-1][0], tolerance, check_running, closed=True)
     stop_window.update(stop_request_observed_time_s=stop if _finite(stop) else None,
                        capture_matches_plan=matched,
                        candidate_definition="maximum absolute filtered mapped component",
@@ -491,6 +501,10 @@ def describe_contact_timing(capture, planner, check_running=None, settings=None)
     if not _finite(stop):
         stop_window["reason"] = "matched observed stop-request time is unavailable"
     else:
+        summary["before_stop_request"] = _contact_interval(
+            plot_rows, arm, stop, tolerance, check_running)
+        summary["after_stop_request"] = _contact_interval(
+            plot_rows, stop, max(stop, plot_rows[-1][0]), tolerance, check_running, closed=True)
         stop_window.update(_contact_interval(plot_rows, stop - 0.100, stop + 0.100,
                                              tolerance, check_running, closed=True))
         if stop_window["filtered_peak_time_s"] is not None:
