@@ -2,6 +2,26 @@
 
 [← Documentation](../README.md)
 
+> **What this page tells you:** whether your sensor, firmware and printer type work with this plugin, and what the plugin cannot promise.
+>
+> **What you need:** to know which accelerometer is on your printer and whether it is Cartesian or CoreXY.
+>
+> **Time:** 5 minutes to check, longer to read everything.
+
+## Quick check
+
+- **Status:** experimental. Supervise the first homes and keep an emergency stop in reach.
+- **Sensors:** Beacon, ADXL345, LIS2DW / LIS3DH, MPU9250, ICM20948, Cartographer (through its separate ADXL345 or LIS2DW sensor), or another compatible sensor you describe yourself. See [Sensors](#sensors).
+- **Klipper or Kalico (a Klipper fork):** the plugin checks what your firmware offers instead of going by its name. It was written against the pinned Klipper and Kalico versions listed under [Host contracts and evidence](#host-contracts-and-evidence). Newer versions are not guaranteed.
+- **Printer type (kinematics, the way the printer's axes move):** Cartesian or CoreXY, with Z independent of XY and no dual carriage. See [Workflow restrictions](#workflow-restrictions).
+- **Printer state:** idle, with both XY axes not yet [homed](glossary.md#homing).
+
+These are not the only conditions; see [Workflow restrictions](#workflow-restrictions).
+
+In plain words: this plugin is an experimental way to home using an [accelerometer](glossary.md#accelerometer) instead of an [endstop](glossary.md#endstop) switch. Check the list above before you install. The rest of this page is the detail behind it.
+
+## Experimental status
+
 This is an experimental host-side impact endstop. Driver/API compatibility and
 synthetic test results do not establish physical contact detection, repeatability
 or stopping distance for your printer. Supervise first homes and workflows.
@@ -9,6 +29,8 @@ Historical reports from the original Beacon plugin do not validate every adapter
 or workflow added here.
 
 ## Sensors
+
+This section lists which accelerometers work and how the plugin reads them.
 
 The sensor must be firmly mounted and move with **each axis being tested**.
 A toolhead sensor on a moving-bed Cartesian printer does not measure Y bed-stop
@@ -44,6 +66,8 @@ Recalibrate after sensor-context changes;
 
 ## Host contracts and evidence
 
+This section says what your Klipper or Kalico setup must provide, and which versions it was checked against. "MCU" below means the printer's control board.
+
 The plugin needs endstop chip registration, normal homing events, MCU
 `TriggerDispatch`/trsync support and a supported accelerometer delivery contract.
 It checks capabilities rather than declaring support from a checkout name.
@@ -66,6 +90,8 @@ See [offline testing](../development/testing.md) for the boundary between source
 executed synthetic tests and physical validation.
 
 ## Workflow restrictions
+
+These are the conditions your printer must meet before the commands that move the printer (called workflows below) will run.
 
 CALIBRATE, TEST, CHARTS, ACCURACY and BETA require:
 
@@ -106,6 +132,8 @@ refusal. Workflow preflight does not intercept ordinary G28 or alter Z/probe
 configuration.
 
 ## Detection and transport limits
+
+This section explains what the plugin cannot guarantee, such as exact stopping distance. Read it before you use the plugin, and supervise your first homes.
 
 Simple calibration and its newly saved mapped-axis models use a fresh resting offset
 and only the selected physical-axis component. They do not use a quietness gate or an

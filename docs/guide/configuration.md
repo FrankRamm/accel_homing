@@ -2,11 +2,30 @@
 
 [← Documentation](../README.md)
 
+> **What this page tells you:** every setting of the plugin in your `printer.cfg`, what it does and which values are accepted.
+>
+> **What you need:** the installer already finished, and a way to edit [printer.cfg](glossary.md#printercfg) (Mainsail/Fluidd can open it).
+>
+> **Time:** 2 minutes for the basics, longer for the full list.
+
+## Most people only need
+
+The installer writes the settings for you. In most cases you only need the plugin section and the stepper entries shown under [Sensor and endstops](#sensor-and-endstops). The plugin section is:
+
+```ini
+[accel_homing]
+accel_chip: auto
+```
+
+In the existing `[stepper_x]` you need `endstop_pin: accel_homing:x` and `homing_retract_dist: 0`. In the existing `[stepper_y]` you need `endstop_pin: accel_homing:y` and `homing_retract_dist: 0`. The [threshold](glossary.md#threshold) is normally set for you by [calibration](glossary.md#calibration). The rest of this page is reference for when you want to change something.
+
 Use the installer-created configuration as your starting point. Do not paste a
 second `[accel_homing]` section or duplicate stepper sections. The annotated
 [complete example](../../examples/accel_homing.cfg) lists the same options.
 
 ## Sensor and endstops
+
+This section tells the plugin which accelerometer to use and connects it to your X and Y endstops.
 
 A minimal plugin section is:
 
@@ -45,6 +64,8 @@ geometry or current. Workflows also require `min_home_dist` absent/zero.
 Installation preserves speed unless `--homing-speed` explicitly changes it.
 
 ## Thresholds and saved models
+
+The threshold is how hard a hit must be before the plugin treats it as the end of the rail. Calibration finds it and saves it for you. You can also set it by hand.
 
 Threshold units are **g**. For each axis, restart-time precedence is:
 
@@ -125,6 +146,8 @@ discards unsaved staged values. See [calibration](calibration.md).
 
 ## Common plugin options
 
+These are the everyday settings with their defaults. You only need to list one in your config to change it.
+
 Defaults and bounds below describe the runtime. All numeric values must be
 finite. Sensor timing options do not make host-delivered stopping real time.
 
@@ -153,6 +176,8 @@ The Kalico stepper-section `min_home_dist` stays disabled; this plugin option pr
 
 ## Experimental notch filter (dev)
 
+This optional filter removes one vibration frequency from the sensor signal. It is part of the test version. It is optional.
+
 | Option | Default | Meaning and accepted range |
 | --- | --- | --- |
 | `notch_frequency` | `0` | Shared notch frequency in Hz. Finite, nonnegative; zero disables. Enabled frequency must be below half the sensor sample rate. |
@@ -170,6 +195,8 @@ calibration: changing them requires requalification of affected saved models.
 See [configuration, calibration and comparison](../advanced/notch.md).
 
 ## Compatibility and release settings
+
+This section covers old compatibility options and how far the toolhead backs away after homing.
 
 The compatibility sign options do not select detector polarity. An
 `IMPACT_SIGN`-only SET changes the retained setting but does not register an
@@ -189,6 +216,8 @@ the plugin's printer object) is a per-axis dict such as
 
 ## Calibration options
 
+These settings change how calibration searches for a threshold. Calibration uses these defaults unless you change them.
+
 | Option | Default | Meaning and accepted range |
 | --- | --- | --- |
 | `calibration_start_threshold` | `1.0` | Noise-selection grid origin in g; at least 0.5. |
@@ -207,6 +236,8 @@ headroom and finite representation checks still apply. Calibration/model
 thresholds have a 0.5 g minimum.
 
 ## Generic sensor options
+
+These settings tune how the plugin reads standard accelerometers.
 
 These apply to configured batch accelerometers rather than the native Beacon
 raw adapter. Known standard driver ranges are listed in
@@ -248,15 +279,17 @@ command travel before a host request, not physical stopping distance. See
 
 ## Historical Beacon names
 
+Older Beacon-based configurations used different names. They still work.
+
 `[beacon_accel_homing]`, `beacon: beacon`, `beacon_accel:x/y`,
 `BEACON_ACCEL_HOMING_STATUS` and `SET_BEACON_ACCEL_HOMING` remain supported.
 Load only one of `[accel_homing]` and `[beacon_accel_homing]`.
 The [legacy example](../../examples/beacon_accel_homing.cfg) is for an existing
 configuration, not an additional section to paste beside a new installation.
 
-Next: [Printer console commands](commands.md)
-
 ## Gentle homing (dev)
+
+This is a slower, softer way of homing in the test version.
 
 The workflow and console commands are in [Gentle homing (dev)](commands.md#gentle-homing-dev).
 
@@ -276,3 +309,5 @@ from gentle central strokes. Sensor configuration is preserved and its map is
 applied only once. Ambiguous automatic mappings abort before threshold qualification. Older
 XYZ-magnitude models require per-axis recalibration; their thresholds are not
 silently reused as mapped-axis thresholds.
+
+Next: [Printer console commands](commands.md)

@@ -2,20 +2,78 @@
 
 [← Documentation](../README.md)
 
-The existing command syntax is unchanged:
+> **What you'll do:** let the plugin learn the right [threshold](glossary.md#threshold) for each axis, one axis at a time, while you watch the printer.
+>
+> **What you need:** the plugin installed and set up (see [Configuration](configuration.md)), the [accelerometer](glossary.md#accelerometer) set up, Z supported, the printer idle, and your hand on the [emergency stop](glossary.md#emergency-stop).
+>
+> **Time:** about 10 minutes per axis (rough guide; it depends on how many tries the plugin needs).
 
-```gcode
-ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1
-ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
-```
+[Calibration](glossary.md#calibration) is how the plugin finds the threshold. The threshold is the strength of knock at which the [accelerometer](glossary.md#accelerometer) tells the printer it hit the [endstop](glossary.md#endstop). You stay at the printer the whole time.
+
+## Steps
 
 Use one axis per invocation. `AXIS` selects the printer direction to move,
-not an accelerometer channel. Physically center XY, leave both axes unhomed,
-keep Z supported/clear, and supervise with an accessible emergency stop.
-`CENTERED=1` authorizes automatic mapping strokes when needed, as well as
-subsequent homing.
+not an accelerometer channel. The commands are shown in the steps below.
 
-## Automatic physical-axis mapping
+Prepare the printer first. Skipping this can crash the toolhead. The full
+checklist is in [commands](commands.md#prepare-every-moving-workflow).
+
+1. **Keep the printer idle and unpaused**, with no queued motion or other
+   active homing workflow. (Nothing is printing, nothing is waiting to move,
+   and no other homing command from this plugin is running.)
+2. **Support Z and establish nozzle/bed clearance for the complete XY travel.**
+   (Make sure the nozzle cannot hit the bed anywhere the toolhead can go in X
+   and Y, and that the bed or gantry cannot drop.) Do not assume a motor-off
+   command affects only XY; use independent Z support.
+3. **Leave both X and Y unhomed.** Use your printer's controls to unhome X and Y in the way that suits your machine. Read the warning about motor-off commands first (see the [checklist](commands.md#prepare-every-moving-workflow)). Then move the toolhead to the middle by hand.
+4. **Prepare XY currents/enables yourself if your G28 override normally does
+   this.** These commands skip that override and its Z hops. (If your homing
+   macro normally switches motor current or enables the motors, do that first.)
+   Supervise with an accessible [emergency stop](glossary.md#emergency-stop).
+5. **Calibrate X.** Type this into the Console in Mainsail or Fluidd and send it:
+
+   ```gcode
+   ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1
+   ```
+
+   `CENTERED=1` authorizes automatic mapping strokes when needed, as well as
+   subsequent homing. Automatic mapping strokes are gentle, short movements
+   (at most 15 mm each) that let the plugin work out which sensor channel
+   matches this axis. Only add `CENTERED=1` when steps 1 to 4 are done.
+6. **Watch what happens.** The plugin may first make small mapping strokes
+   (at most 15 mm; see Details). Then the axis makes a discovery approach into
+   its stop, followed by ten validation trips. When it succeeds, it saves the
+   result and restarts Klipper (this is the default).
+7. **Repeat the preparation (steps 1 to 4) after that restart**, including
+   centering the toolhead by hand again. Then calibrate Y:
+
+   ```gcode
+   ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
+   ```
+8. **Test homing.** Repeat the preparation (steps 1 to 4) first. A restart
+   only happens with the default saving, so wait for Klipper to be ready if it
+   restarted. Then run:
+
+   ```gcode
+   ACCEL_HOMING_TEST CENTERED=1
+   ```
+
+   This tests X then Y with the active thresholds. It does not calibrate or
+   save. See the [command reference](commands.md).
+
+## If something goes wrong
+
+- **Stop immediately** with the emergency stop if the toolhead does anything unexpected.
+- Calibration stopped with an error message: see [Troubleshooting](troubleshooting.md).
+- After an abort, physically center XY again, then run the command again (see "Travel plausibility before midpoint returns" under Details).
+
+## Details
+
+The sections below are the full technical description.
+
+### Automatic physical-axis mapping
+
+The plugin has to know which accelerometer channel matches which printer direction.
 
 Calibration first checks the **selected sensor's loaded configuration**,
 including included files and named sensor sections. An explicit Beacon
@@ -56,7 +114,9 @@ remain pending; run `SAVE_CONFIG` and restart before ordinary homing. Successive
 per-axis calibrations consult the pending pair so the second calibration does
 not overwrite the first one's newly qualified mapping.
 
-## Stationary noise after mapping
+### Stationary noise after mapping
+
+The plugin first listens to the resting printer to measure its background vibration.
 
 After mapping and settling, the command acquires three disjoint one-second
 stationary-noise windows. This runs once before the
@@ -96,7 +156,9 @@ impact threshold or a certified minimum. Stationary measurements do not cover
 motion, motor enabling, hold-to-run current changes or first-step transients.
 See the [noise-selection policy and limits](../advanced/plots.md#stationary-noise).
 
-## Detector
+### Detector
+
+The detector is the part that decides when the accelerometer has felt an impact.
 
 Each move acquires a fresh resting XYZ offset (normally 100 ms, at least
 50 contiguous samples), separate from the initial three noise windows.
@@ -127,7 +189,9 @@ after measurement. Its reference and moving detector use receipt liveness,
 while cutoffs exclude earlier windows/pre-arm impacts. Native Beacon's age
 policy is unchanged. See [timing details](../advanced/technical-reference.md#timing-and-optional-travel-policies).
 
-## Threshold validity and homing attempts
+### Threshold validity and homing attempts
+
+This section lists the allowed threshold values and what happens with repeated attempts.
 
 Calibration starts and saved model thresholds must be finite and at least
 0.5 g. `STEP` remains a finite value from 0.1 to 3 g. Calibration has no
@@ -161,7 +225,9 @@ and invalid thresholds still stop the workflow. There is no recovery-count
 cap or accumulated recovery-distance budget. The separate bounded stationary
 sensor acquisition retries are unchanged.
 
-## Impact discovery and validation
+### Impact discovery and validation
+
+The plugin finds a first impact, then confirms it ten times.
 
 1. Home the selected printer axis toward its mechanical endstop, watching
    acceleration throughout. **Reaching 20 mm alone does not stop the move or
@@ -211,7 +277,9 @@ are unchanged. No return command changes the other XY coordinate or Z.
 Cancellation/failure restores settings; native homing's fatal error handling may
 turn off all motors, including Z. Keep Z supported as for ordinary homing faults.
 
-## Travel plausibility before midpoint returns
+### Travel plausibility before midpoint returns
+
+The plugin checks that each impact happened about as far from the center as expected.
 
 To qualify, discovery and every validation impact beyond 20 mm must agree with the
 configured midpoint-to-endstop distance. Let `expected` be the absolute
@@ -247,7 +315,9 @@ This is a commanded-travel plausibility check, not a measurement of the manual
 starting position or proof of contact with the intended stop. Skipped steps,
 slip or an obstruction can still produce plausible recorded travel.
 
-## Automatic early-impact returns
+### Automatic early-impact returns
+
+If an impact comes too early, the plugin moves the axis back and tries again with a higher threshold.
 
 For a premature impact, take the selected axis's current coordinate after native
 homing and subtract its recorded signed start-to-halt displacement. Command one
@@ -284,10 +354,12 @@ These are commanded steps, not encoder measurements. Skipped steps, slip or a
 blocked carriage can make the estimated starting point wrong. Completion of
 the queued move does not measure physical arrival.
 
-## Saving and ordinary homing
+### Saving and ordinary homing
+
+This section explains what is saved after a successful calibration and how normal homing uses it.
 
 The following saving/margin rules describe ordinary calibration without
-`NOTCH=AUTO`. The dev [automatic-notch mode](../advanced/notch.md#automatic-selection)
+`NOTCH=AUTO`. The test-version [automatic-notch mode](../advanced/notch.md#automatic-selection)
 first measures independent moving noise and unfiltered reference homes, selects
 a fixed filter/threshold, then requires new validation homes. AUTO defaults to
 report-only with no staged configuration and saves exactly the tested threshold
@@ -373,7 +445,9 @@ total, retained and omitted capture counts and their actual attempt ranges.
 Attempt labels retain their original numbers. Ordinary calibration keeps its
 existing trial history.
 
-## Limits of this method
+### Limits of this method
+
+This section lists what the method cannot check.
 
 The operator supplies the initial physical center. There is no encoder feedback:
 step travel measures issued motor movement, not confirmed carriage movement.

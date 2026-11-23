@@ -9,15 +9,18 @@ for supported sensors and limits.
 
 > [!WARNING]
 > This plugin is experimental and deliberately contacts mechanical stops.
-> Supervise the first homing and every calibration, and keep an emergency stop
-> within reach.
+> Supervise the first homing and every calibration, and keep an [emergency stop](docs/guide/glossary.md#emergency-stop) within reach (the `M112` command or the red emergency-stop button in Mainsail or Fluidd).
 
 ## Quick start
 
 1. **Check compatibility.** Confirm your printer and accelerometer in
    [compatibility](docs/guide/compatibility.md).
-2. **Install.** Run in the Linux printer host's shell as the existing Klipper
-   service user, with the printer idle:
+2. **Install.** Open a [terminal](docs/guide/glossary.md#terminal) on your
+   printer (usually over [SSH](docs/guide/glossary.md#ssh); see
+   [how](docs/guide/installation.md#open-a-terminal-on-your-printer)) as the
+   user that runs Klipper (usually the one you normally log in with, often
+   `pi`). Paste this whole block, then press Enter. The
+   printer must be idle:
 
    ```bash
    (
@@ -45,20 +48,31 @@ for supported sensors and limits.
    )
    ```
 
-   To test the development branch on an existing printer, see
-   [Switch an existing tester installation to dev](docs/guide/installation.md#switch-an-existing-tester-installation-to-dev).
-   The block above selects the stable branch. The installer configures X/Y
-   homing and Moonraker updates, restarts the verified services and may ask for
-   your Linux sudo password. It does not home the printer. Existing MISC installations can run this installer directly; see [migrating from MISC](docs/guide/installation.md#migrate-from-the-misc-plugin).
-3. **Calibrate before first homing.** Follow the
+   Want to try the test version (newer features, may have bugs)? See
+   [switching to the test version](docs/guide/installation.md#switch-to-the-test-version).
+   The block above installs the [stable version](docs/guide/glossary.md#stable-and-test-versions).
+   The installer sets up X/Y [homing](docs/guide/glossary.md#homing) and
+   [Moonraker](docs/guide/glossary.md#moonraker) updates, then restarts Klipper
+   (and Moonraker if needed). Klipper and Moonraker are the programs behind
+   Mainsail/Fluidd. It may ask for your Linux login password, and it does not
+   home the printer.
+
+   Existing MISC installations (the older Monolith3D plugin this one replaces)
+   can run this installer directly. See
+   [migrating from MISC](docs/guide/installation.md#migrate-from-the-misc-plugin).
+3. **Calibrate before first homing.** First do the safety preparation in the
+   [calibration guide](docs/guide/calibration.md#steps): printer idle (not
+   printing or moving), Z supported with nozzle/bed clearance, X and Y unhomed,
+   toolhead centered by hand. Follow the
    [calibration instructions](docs/guide/calibration.md) before moving the
-   printer. `ACCEL_HOMING_CALIBRATE` moves the axis into its stop, then saves and restarts Klipper on success. Calibrate X, then Y; re-center XY by hand and keep both axes unhomed before each one.
+   printer. [Calibration](docs/guide/glossary.md#calibration) teaches the plugin what an impact looks like on your printer. `ACCEL_HOMING_CALIBRATE` moves the axis into its stop, then saves and restarts Klipper on success. Type the command in the Mainsail or Fluidd console. Calibrate X, then Y; re-center XY by hand and keep both axes unhomed before each one.
 
 Updating: use **accel_homing → Update** in Mainsail or Fluidd while idle.
 
 ## Everyday commands
 
-Enter these in the Mainsail/Fluidd printer console, not the host shell.
+Type these into the console in Mainsail or Fluidd, not into the terminal you
+used to install.
 
 | Command | What it does |
 | --- | --- |
@@ -76,7 +90,8 @@ See the [command reference](docs/guide/commands.md) for all commands and options
 
 ## Documentation
 
-Start at the [documentation index](docs/README.md). The guide pages are
+Start at the [documentation index](docs/README.md). Unfamiliar word? See the
+[glossary](docs/guide/glossary.md). The guide pages are
 [installation](docs/guide/installation.md),
 [compatibility](docs/guide/compatibility.md),
 [configuration](docs/guide/configuration.md),

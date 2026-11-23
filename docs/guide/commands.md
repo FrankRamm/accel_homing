@@ -2,22 +2,46 @@
 
 [← Documentation](../README.md)
 
+> **What you'll do:** look up a command and what it does, then run it in the
+> printer console.
+>
+> **What you need:** the plugin installed and set up (see
+> [installation](installation.md)). For commands that move the printer, you
+> also need to be at the printer.
+>
+> **Time:** a few minutes to read. Calibration itself takes longer.
+
 Enter these commands in the Mainsail/Fluidd **printer console**. Installation
-commands belong in the Linux host shell instead.
+commands belong in [a terminal on your printer](glossary.md#terminal) instead
+(the Linux host shell, usually reached over [SSH](glossary.md#ssh)).
 
 ## Prepare every moving workflow
 
-Before CALIBRATE, TEST, CHARTS, ACCURACY, TROUBLESHOOT, EXPERIMENT or BETA:
+Some commands make the printer move on its own. Do these steps first, every
+time. Skipping them can crash the toolhead.
+
+Before CALIBRATE, TEST, CHARTS, ACCURACY, TROUBLESHOOT, EXPERIMENT or BETA
+(in plain words: before any command below that homes or moves the printer):
 
 1. Keep the printer idle and unpaused, with no queued motion or other active
-   homing workflow.
+   homing workflow. (Nothing is printing, nothing is waiting to move, and no
+   other homing command from this plugin is running.)
 2. Support Z and establish nozzle/bed clearance for the complete XY travel.
+   (Make sure the nozzle cannot hit the bed anywhere the toolhead can go in X
+   and Y, and that the bed or gantry cannot drop.)
 3. Use your printer's appropriate controls to leave **both X and Y unhomed**,
    then physically center XY by hand.
+   (Unhome X and Y in the way that suits your machine. Read the warning below
+   about motor-off commands first. Then move the toolhead to the middle by
+   hand.)
 4. Prepare suitable XY currents/enables separately if your normal G28 override
-   does this. Workflow homes skip that override and its Z hops.
-5. Supervise with an accessible emergency stop. `CENTERED=1` confirms the
-   preparation and authorizes movement without a second confirmation.
+   does this. Workflow homes skip that override and its Z hops. (If your
+   homing macro normally switches motor current or enables the motors, do that
+   yourself first, because these commands do not run that macro.)
+5. Supervise with an accessible [emergency stop](glossary.md#emergency-stop).
+   `CENTERED=1` confirms the preparation and authorizes movement without a
+   second confirmation. (Adding `CENTERED=1` tells the plugin you finished
+   steps 1 to 4. Only add it when that is true.)
 
 Do not assume a motor-off command affects only XY; use a procedure appropriate
 for your machine and independent Z support. See the complete
@@ -25,24 +49,28 @@ for your machine and independent Z support. See the complete
 
 ## Command reference
 
-| Command | Options and behavior |
-| --- | --- |
-| `ACCEL_HOMING_STATUS` | Read-only workflow/model/settings, result and plot paths. |
-| `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. With `gentle_homing: True`, selects and freezes a profile before the first contact. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0` | Select and qualify an exact filter/threshold pair. Explicit AUTO defaults to report only; `SAVE_CONFIG=1` repeats the run and saves on success. |
-| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1` | Gentle mode only: three free-travel controls, stationary checks, then at most one contact with the selected profile. Exports a ZIP; never qualifies, stages or saves a model. |
-| `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. |
-| `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | Test normal and shorter report intervals over two pairs. With a saved mapped-axis calibration this means four homes using its channel, threshold and fixed filter. Exports a comparison ZIP. See [EXPERIMENT](../advanced/experiment.md). |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW` | One-axis diagnostic retest: discovery, ten reference homes, then raw homes with frozen-profile replay after motion. No shadow profile controls a home. Existing `MODE=LIVE` remains available. No save or restart. See [EXPERIMENT](../advanced/experiment.md). |
-| `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |
-| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. |
-| `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Per-home diagnostic capture. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 50. Keeps active homing settings; no calibration, save or restart. Preserves available evidence on failure. |
-| `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal for X or Y. Optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0`; rejects `SAVE_CONFIG=1`. |
-| `ACCEL_HOMING_CANCEL` | Cancel owned workflow/pending preparation and restore temporary settings when handled. Not an emergency stop. |
-| `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Temporary threshold for X or Y; optional compatibility `IMPACT_SIGN` accepts `-1`, `0`, `1`; until restart. |
-| `SET_BEACON_ACCEL_HOMING AXIS=X THRESHOLD=1` | Retained alias of `SET_ACCEL_HOMING`. |
+This table lists every command. The first column is what you type. The last
+column says in plain words what it is for. Commands marked as read-only do
+not move anything.
+
+| Command | Options and behavior | What it's for |
+| --- | --- | --- |
+| `ACCEL_HOMING_STATUS` | Read-only workflow/model/settings, result and plot paths. | Shows the plugin's current state. Read-only: it does not move anything. |
+| `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. | Same idea for the sensor, kept under its old name. Read-only: it does not move anything. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. With `gentle_homing: True`, selects and freezes a profile before the first contact. | Finds the [threshold](glossary.md#threshold) for one axis (the main [calibration](glossary.md#calibration) command). |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0` | Select and qualify an exact filter/threshold pair. Explicit AUTO defaults to report only; `SAVE_CONFIG=1` repeats the run and saves on success. | Calibrates and lets the plugin pick a noise filter too, without saving anything. |
+| `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1` | Gentle mode only: three free-travel controls, stationary checks, then at most one contact with the selected profile. Exports a ZIP; never qualifies, stages or saves a model. | A careful first test: at most one gentle touch of the [endstop](glossary.md#endstop), nothing saved. |
+| `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. | Measures how much the sensor picks up while the printer sits still. The printer does not move. |
+| `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. | Checks that homing works with the current settings, X then Y. |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | Test normal and shorter report intervals over two pairs. With a saved mapped-axis calibration this means four homes using its channel, threshold and fixed filter. Exports a comparison ZIP. See [EXPERIMENT](../advanced/experiment.md). | Diagnostic runs; the tester ZIP can be sent to the developers. |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW` | One-axis diagnostic retest: discovery, ten reference homes, then raw homes with frozen-profile replay after motion. No shadow profile controls a home. Existing `MODE=LIVE` remains available. No save or restart. See [EXPERIMENT](../advanced/experiment.md). | Diagnostic runs; the tester ZIP can be sent to the developers. |
+| `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. | Homes and draws charts of what the sensor saw. |
+| `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. | Checks how repeatable your homing is. |
+| `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Per-home diagnostic capture. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 50. Keeps active homing settings; no calibration, save or restart. Preserves available evidence on failure. | Records detailed data about each home, to find out why homing misbehaves. |
+| `ACCEL_HOMING_BETA_CALIBRATE AXIS=X CENTERED=1` | Experimental moving-noise calibration proposal for X or Y. Optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0`; rejects `SAVE_CONFIG=1`. | Experimental calibration. |
+| `ACCEL_HOMING_CANCEL` | Cancel owned workflow/pending preparation and restore temporary settings when handled. Not an emergency stop. | Stops a running plugin command. It is not an emergency stop. |
+| `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Temporary threshold for X or Y; optional compatibility `IMPACT_SIGN` accepts `-1`, `0`, `1`; until restart. | Tries a different threshold until the next restart, without saving it. |
+| `SET_BEACON_ACCEL_HOMING AXIS=X THRESHOLD=1` | Retained alias of `SET_ACCEL_HOMING`. | Another name for the command above. |
 
 `IMPACT_SIGN` does not select RAW detector polarity. A SET containing only
 `IMPACT_SIGN` does not create an explicit manual threshold or requalify an old
@@ -64,6 +92,10 @@ during an active run is rejected; wait for completion or cancel it. Gentle
 calibration ends on the first rejected contact without an automatic retry.
 
 ## Calibration
+
+Calibration teaches the plugin how strongly the sensor must feel a bump
+before it counts as the endstop being reached. Do it for each axis you use, and again after changing the sensor setup. Start
+with the checklist above, then run:
 
 ```gcode
 ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1
@@ -111,6 +143,10 @@ returns apply to ordinary calibration, not gentle mode. Both require ten
 validation homes with at most 2 mm of commanded travel spread after discovery.
 
 ### Automatic profile selection and gentle calibration (dev)
+
+This part is only in the [test version](glossary.md#stable-and-test-versions)
+(newer features, may have bugs). It lets the plugin choose a noise filter for
+you and touch the endstop more gently.
 
 After manual preparation, to measure and report without staging or saving:
 
@@ -188,6 +224,11 @@ See [automatic selection and evidence](../advanced/notch.md#automatic-selection)
 
 ## Accuracy and early-trigger recovery
 
+This checks how repeatable your [homing](glossary.md#homing) is by homing
+many times and measuring the differences. If the printer stops too early,
+recovery can start a calibration that saves a new threshold and restarts
+Klipper (see below). Run accuracy after calibrating:
+
 ```gcode
 ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1
 ```
@@ -212,6 +253,9 @@ Read [accuracy and its recovery limits](../advanced/accuracy.md) before running 
 
 ## Per-home diagnostic capture
 
+Use this when homing misbehaves and you want to record what happens on each
+home, for example to send to the developers:
+
 ```gcode
 ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1
 ```
@@ -231,6 +275,10 @@ See [diagnostic contents and interpretation](../advanced/diagnostic-capture.md).
 
 ## Stationary noise and charts
 
+Noise measurement checks how much the [accelerometer](glossary.md#accelerometer)
+picks up while the printer sits still. Charts draw what the sensor saw while
+homing.
+
 ```gcode
 ACCEL_HOMING_CALIBRATE_NOISE
 ```
@@ -249,6 +297,9 @@ detector/threshold and does not calibrate them. See [plot output](../advanced/pl
 
 ## Temporary threshold changes
 
+Use this to try a different [threshold](glossary.md#threshold) without
+changing your saved settings. It is forgotten when Klipper restarts.
+
 ```gcode
 SET_ACCEL_HOMING AXIS=X THRESHOLD=1
 ```
@@ -264,6 +315,9 @@ For persistent manual changes, edit the existing plugin section and issue
 
 ## Cancellation and failures
 
+If a plugin command is running and you want it to stop, you can cancel it.
+Cancelling is not instant, so it is not a substitute for the emergency stop.
+
 `ACCEL_HOMING_CANCEL` is a normal console command. Frontend/console scheduling
 can delay it while another command is executing. Use the accessible emergency
 stop for movement that must stop immediately.
@@ -275,6 +329,10 @@ or stock homing fault handling can turn off motors, including Z.
 
 ## Gentle homing (dev)
 
+Gentle homing is a feature of the [test version](glossary.md#stable-and-test-versions)
+(newer features, may have bugs). It makes the printer touch the endstop with
+less force. Stay at the printer for the whole test.
+
 Settings and axes-map behavior are in [Gentle homing (dev)](configuration.md#gentle-homing-dev).
 
 `NOTCH=AUTO` defaults to reporting only and tests the exact threshold it
@@ -284,7 +342,7 @@ homes felt. Each ZIP contains the available measurements, host log for that
 command, and diagnostic context. The report identifies missing evidence.
 
 For a printer already using this plugin for its selected XY endstops, run this
-in the printer's SSH terminal while idle:
+in the printer's SSH terminal (see [how to open a terminal on your printer](installation.md#open-a-terminal-on-your-printer)) while idle:
 
 ```bash
 cd ~/accel_homing && git fetch origin dev && git switch dev && git merge --ff-only origin/dev && bash ./install.sh --gentle-homing
