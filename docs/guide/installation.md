@@ -285,6 +285,29 @@ If Git or the installer reports local changes, preserve and review them. Do not
 use a forced reset to conceal an ownership or configuration conflict.
 `--no-update-manager` installs do not configure this native update flow.
 
+## Moonraker update manager
+
+The default installer already adds this entry. **Do not add a duplicate** in
+`moonraker.conf` or its includes. For manual setup only, add this if missing:
+
+```ini
+[update_manager accel_homing]
+type: git_repo
+channel: dev
+path: ~/accel_homing
+origin: https://github.com/FrankRamm/accel_homing.git
+primary_branch: main
+is_system_service: False
+managed_services: klipper
+```
+
+Add the base `[update_manager]` section once if absent. After manual edits,
+restart the matching Moonraker service while idle. `~` is Moonraker's service
+user's home; use the printed absolute path if needed. Uninstall removes the
+matching plugin entry while preserving unrelated updater configuration.
+[Update details](#moonraker-updates) ·
+[Moonraker reference](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
+
 ## Migrate from the MISC plugin
 
 Run the normal standalone installer above while idle. Installations from
@@ -342,6 +365,13 @@ No new backup or undo command is created. Only remove the source after uninstall
 succeeds, the configuration is ready, services have restarted and no remaining
 links or updater entries reference that checkout. Do not delete the checkout
 to work around a failed uninstall.
+
+Only after those restarts, and after checking that no remaining plugin links
+or manual updater entries need this checkout, remove the source if desired:
+
+```bash
+rm -rf ~/accel_homing
+```
 
 ## Backup deprecation and interrupted installation
 

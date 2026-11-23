@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SKIP_DIRS = {".git", "validation", "__pycache__"}
 LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
-HEADING_RE = re.compile(r"^#{1,6}\s+(.*?)\s*#*\s*$")
+HEADING_RE = re.compile(r"^#{1,6}\s+(.*?)(?:\s+#+)?\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
@@ -82,7 +82,7 @@ class DocsLinksTest(unittest.TestCase):
         self.assertEqual([], failures)
 
     def test_no_legacy_uppercase_doc_paths(self):
-        pattern = re.compile(r"docs/[A-Z_]+\.md|\]\((?:\.\./)?TESTING\.md")
+        pattern = re.compile(r"docs/(?!README\.md)[A-Z_]+\.md|\]\((?:\.\./)?TESTING\.md")
         failures = []
         files = markdown_files() + sorted((ROOT / "examples").glob("*.cfg"))
         for path in files:

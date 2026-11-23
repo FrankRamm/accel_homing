@@ -273,4 +273,74 @@ centered, that a model was saved or that a final release occurred. Correct the
 reported fault and manually prepare XY before a new moving command. Shutdown
 or stock homing fault handling can turn off motors, including Z.
 
+## Gentle homing (dev)
+
+Settings and axes-map behavior are in [Gentle homing (dev)](configuration.md#gentle-homing-dev).
+
+`NOTCH=AUTO` defaults to reporting only and tests the exact threshold it
+would save. To report a tester run, send the ZIP printed by each command
+(`MODE=COMPARE` and `NOTCH=AUTO`). Include the axis and how the individual
+homes felt. Each ZIP contains the available measurements, host log for that
+command, and diagnostic context. The report identifies missing evidence.
+
+For a printer already using this plugin for its selected XY endstops, run this
+in the printer's SSH terminal while idle:
+
+```bash
+cd ~/accel_homing && git fetch origin dev && git switch dev && git merge --ff-only origin/dev && bash ./install.sh --gentle-homing
+```
+
+Wait for Klipper to report ready. Run `ACCEL_HOMING_STATUS` in the printer
+console and confirm `"gentle_homing": true` before the first contact. If
+installation used `--no-restart`, first run the host service restart command
+printed by the installer to load the updated Python modules.
+
+**First test one contact.** Leave both axes unhomed, support Z, and use a ruler
+or a center mark to place the toolhead within 2 mm of the configured XY midpoint.
+With the tester at the printer, run the following in the printer console:
+
+```text
+ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1
+```
+
+The command uses two free strokes to select a mapped-axis filter and threshold.
+A third independent stroke and three stationary windows must clear the same
+threshold before the toolhead approaches the endstop. The detector can retain
+the unfiltered signal when a notch gives no benefit. It makes at most one
+contact attempt, prints a diagnostic ZIP and leaves the settings unsaved.
+After a smooth X contact, release XY and manually center again for the same
+command with `AXIS=Y`. If either axis hits hard, skips steps, or aborts, stop
+there and share that ZIP. It contains the motion captures, contact samples when
+available, trigger and halt step positions, effective settings, and host log.
+
+The single-contact ZIP also has `contact-timing.json` and `contact-timing.svg`
+at its root. The SVG shows the full seek and a zoom around scheduled braking,
+with acceleration, cruise and braking shaded separately. The raw signal and
+the replay of the selected detector use absolute acceleration in g;
+timestamps use MCU `print_time` seconds. The JSON reports each phase's peak and
+the largest filtered sample within 100 ms on either side of scheduled braking.
+`peak_minus_brake_ms` is negative when the peak came before braking and positive
+when it came after. If the detector requested a stop, a second window compares
+the signal with the host time observed just after that request. The fixed
+200 Hz / Q=5 replay is a separate historical comparison. These timings describe
+commands and sensor readings. The report identifies missing evidence on aborted
+runs. A soft contact can produce a signal below the selected threshold.
+
+Gentle supervised approaches command at most the midpoint-to-endstop distance
+plus 2 mm. An impact outside the midpoint tolerance, or more than 0.5 mm of
+commanded travel from trigger to halt, aborts the sequence. Ordinary G28 also
+checks that trigger-to-halt distance. These distances come from step commands.
+The physical toolhead position and motor slip require observation.
+
+Full gentle calibration uses the same selection procedure. Starting with XY
+unhomed and physically centered, run `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1`
+for X or use `AXIS=Y` for Y. One discovery and ten repeat contacts must qualify
+with the exact selected filter and threshold before the command saves that
+axis. Each onset must precede commanded braking, fall within the center-travel
+tolerance and meet the trigger-to-halt limit. Ordinary G28 checks the saved
+model and the phase of its own trigger. A single-contact check qualifies no model.
+
+Read the [command reference](#command-reference) for options and restrictions.
+After physically validating both axes, use the printer's normal homing controls.
+
 Next: [Troubleshooting](troubleshooting.md)
