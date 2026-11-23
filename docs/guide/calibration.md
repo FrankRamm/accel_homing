@@ -417,7 +417,8 @@ value; that calibration learns its axis and measures fresh mapped-axis noise.
 `ACCEL_HOMING_STATUS` reports the discovery/validation phase, threshold,
 restart count and current ten-check spread. Its `stationary_noise` summary
 identifies the fresh measurement, mapped-axis peak, initial-value source and PNG.
-The XYZ-magnitude noise peak is retained as diagnostic evidence.
+Gentle calibration reports the peak on the selected physical axis. The
+standalone stationary diagnostic also reports the XYZ-magnitude peak.
 The nested `recovery` object in active calibration status, the final result and
 new saved model metadata contains only completed-return telemetry:
 

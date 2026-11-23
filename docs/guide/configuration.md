@@ -126,8 +126,9 @@ omitted identity defaults are not. Without an explicit declaration, automatic
 mapping uses `bidirectional_velocity_v1` with measured confidence and diagnostics.
 Its coordinate frame is the configured sensor stream, after the driver's map.
 The plugin does not edit or apply that setting twice. X/Y homing
-uses only its own selected physical component; raw XYZ remain available for
-diagnosis. A changed sensor/orientation/axes map requires recalibration.
+uses only its own selected physical component. Gentle homing records that
+component once mapping is known. A changed sensor/orientation/axes map
+requires recalibration.
 Changed context can prevent a model from being accepted; recalibrate after
 reviewing the reported mismatch rather than editing generated metadata.
 

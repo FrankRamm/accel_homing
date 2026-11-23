@@ -58,6 +58,16 @@ def validate_mapped_comparison_capture(capture, record, frozen, *, max_age_s):
             or newest > oldest + 1e-9 or oldest > max_age_s):
         raise ValueError("mapped home lacks a valid within-limit detector-processing age envelope")
     rows, baseline = capture["samples"], capture["baseline_g"]
+    compact = capture.get("sample_layout") == "mapped_axis_v1"
+    if compact:
+        if capture.get("sample_columns") != ["time_s", "mapped_axis_g"] or not _number(baseline):
+            raise ValueError("invalid signed mapped-axis capture or baseline")
+        channel, width, reference = 0, 2, baseline
+    else:
+        if (capture.get("sample_layout") is not None or not isinstance(baseline, (list, tuple))
+                or len(baseline) != 3 or not _number(baseline[channel])):
+            raise ValueError("invalid retained sensor-stream baseline")
+        width, reference = 4, baseline[channel]
     index = detector.get("onset_sample_index")
     arm = detector.get("capture_arm_time_s", detector.get("arm_time_s"))
     if (type(index) is not int or not 0 <= index < len(rows)
@@ -75,11 +85,13 @@ def validate_mapped_comparison_capture(capture, record, frozen, *, max_age_s):
         samples = []
         for position in range(first, index + 1):
             row = values[position - first]
-            if len(row) != 4 or row[0] != rows[position][0]:
+            if len(row) != width or len(rows[position]) != width or row[0] != rows[position][0]:
                 raise ValueError("mapped filtered sample does not match its retained raw row")
             samples.append((position, abs(row[channel + 1])))
     else:
-        samples = [(position, abs(row[channel + 1] - baseline[channel]))
+        if any(len(row) != width for row in rows[:index + 1]):
+            raise ValueError("mapped raw sample does not match its capture layout")
+        samples = [(position, abs(row[channel + 1] - reference))
                    for position, row in enumerate(rows[:index + 1]) if row[0] >= arm]
     tolerance = max(1e-9, threshold * 1e-8)
     if (not samples or samples[-1][0] != index

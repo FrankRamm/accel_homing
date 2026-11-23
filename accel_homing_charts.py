@@ -71,6 +71,17 @@ def _mapped_label(mapping):
         "XYZ"[mapping["source_axis"]])
 
 
+def _sample_axes(capture, record):
+    layout = capture.get("sample_layout")
+    if layout is None:
+        return "xyz"
+    _, mapping = _detector_context(record, capture)
+    if (layout != "mapped_axis_v1" or mapping is None or
+            capture.get("sample_columns") != ["time_s", "mapped_axis_g"]):
+        raise ValueError("Invalid mapped-axis sample layout or detector context")
+    return mapping["axis"]
+
+
 class CapturePaths(dict):
     """Optional public paths plus a private immutable provenance receipt."""
     __slots__ = ("_receipt",)
@@ -537,14 +548,14 @@ def _envelope(samples, buckets=512, max_points=None):
                  _MAX_CAPTURE_TRACE_POINTS if max_points is None else max_points)
     if len(samples) <= budget:
         return tuple(tuple(row) for row in samples)
-    # Two endpoints and three selections per XYZ component fit in 11 rows.
-    buckets = max(1, budget // 11)
+    channels = range(1, len(samples[0]))
+    buckets = max(1, budget // (2 + 3 * len(channels)))
     stride = max(1, int(math.ceil(len(samples) / float(buckets))))
     result = []
     for offset in range(0, len(samples), stride):
         bucket = samples[offset:offset + stride]
         chosen = {0, len(bucket) - 1}
-        for channel in (1, 2, 3):
+        for channel in channels:
             chosen.update((min(range(len(bucket)), key=lambda i: bucket[i][channel]),
                            max(range(len(bucket)), key=lambda i: bucket[i][channel]),
                            min(range(len(bucket)), key=lambda i: abs(bucket[i][channel]))))
@@ -555,7 +566,7 @@ def _envelope(samples, buckets=512, max_points=None):
 _RANGE_FIELDS = ("amplitude_limited", "excess_amplitude_unknown", "peak_semantics",
                  "native_clip_decode", "range_limit_axis_values", "clipped_axis_values",
                  "range_limit_axis_counts", "clipped_axis_counts", "range_limit_axis_values_xyz",
-                 "signal_scope")
+                 "signal_scope", "selected_sensor_axis")
 
 
 def _range_metadata(capture, record, scope="capture"):
@@ -677,9 +688,11 @@ def _capture_data(capture, record):
     samples = capture.get("samples", ())
     if not isinstance(samples, (tuple, list)) or not 2 <= len(samples) <= _MAX_SAMPLES:
         raise ValueError("No bounded accelerometer capture for this home")
+    axes = _sample_axes(capture, record)
+    width = len(axes) + 1
     previous = None
     for sample in samples:
-        if not isinstance(sample, (tuple, list)) or len(sample) != 4 \
+        if not isinstance(sample, (tuple, list)) or len(sample) != width \
                 or not all(_finite(value) for value in sample) \
                 or (previous is not None and sample[0] <= previous):
             raise ValueError("Invalid or non-increasing accelerometer sample")
@@ -690,11 +703,13 @@ def _capture_data(capture, record):
         quiet = [row for row in samples if row[0] < arm]
         if not quiet:
             raise ValueError("No pre-arm baseline for measured acceleration")
-        baseline = tuple(math.fsum(row[index] for row in quiet) / len(quiet) for index in (1, 2, 3))
-    if not isinstance(baseline, (tuple, list)) or len(baseline) != 3 \
+        baseline = tuple(math.fsum(row[index] for row in quiet) / len(quiet) for index in range(1, width))
+    elif len(axes) == 1:
+        baseline = (baseline,)
+    if not isinstance(baseline, (tuple, list)) or len(baseline) != len(axes) \
             or not all(_finite(value) for value in baseline):
         raise ValueError("Invalid accelerometer baseline")
-    delta = [(row[0] - samples[0][0],) + tuple(row[i + 1] - baseline[i] for i in range(3))
+    delta = [(row[0] - samples[0][0],) + tuple(value - offset for value, offset in zip(row[1:], baseline))
              for row in samples]
     filter_metadata = capture.get("signal_filter", {"type": "disabled"})
     extra = {}
@@ -705,21 +720,25 @@ def _capture_data(capture, record):
                 or filter_metadata.get("first_sample_matches") != 1
                 or not isinstance(filtered, (tuple, list)) or len(filtered) != len(samples) - start_index
                 or not filtered
-                or any(len(row) != 4 or not all(_finite(value) for value in row)
+                or any(len(row) != width or not all(_finite(value) for value in row)
                        or row[0] != samples[start_index + index][0] for index, row in enumerate(filtered))):
             raise ValueError("Notch chart lacks its complete filtered capture and start identity")
         origin = filtered[0][0]
-        raw_delta = [(row[0] - origin,) + tuple(row[i + 1] - baseline[i] for i in range(3))
+        raw_delta = [(row[0] - origin,) + tuple(value - offset for value, offset in zip(row[1:], baseline))
                      for row in samples]
         extra = {"signal_filter": filter_metadata, "raw_sample_count": len(samples),
                  "raw_first_sample_time_s": samples[0][0], "raw_trace": _envelope(raw_delta, 64),
-                 "trace_metric": "independent causal stream-channel notches after baseline subtraction; begins at first armed sample"}
+                 "trace_metric": ("causal mapped-axis notch after baseline subtraction" if len(axes) == 1 else
+                                  "independent causal stream-channel notches after baseline subtraction; begins at first armed sample")}
         samples = filtered
         delta = [(row[0] - origin,) + tuple(row[1:]) for row in filtered]
     metadata = {"sample_count": len(samples), "baseline_g": list(baseline),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "absolute_peak_g": {axis: max(abs(row[index]) for row in delta)
-                                    for index, axis in enumerate("xyz", 1)}}
+                                    for index, axis in enumerate(axes, 1)}}
+    if len(axes) == 1:
+        metadata.update(sample_layout=capture["sample_layout"], sample_columns=capture["sample_columns"],
+                        baseline_g=baseline[0])
     metric, mapping = _detector_context(record, capture)
     if metric is not None:
         metadata["impact_metric"] = metric
@@ -860,25 +879,28 @@ def _prepared_capture(prepared):
             or record.get("workflow_attempt") != receipt.iteration):
         raise ValueError("Deferred capture metadata does not match its receipt")
     trace = receipt.trace
+    axes = _sample_axes(metadata, record)
     filtered = metadata.get("signal_filter", {}).get("type", "disabled") != "disabled"
     if (not isinstance(trace, tuple) or not (1 if filtered else 2) <= len(trace) <= _MAX_CAPTURE_TRACE_POINTS
-            or any(not isinstance(row, tuple) or len(row) != 4
+            or any(not isinstance(row, tuple) or len(row) != 1 + len(axes)
                    or not all(_finite(value) for value in row) for row in trace)
             or any(first[0] >= second[0] for first, second in zip(trace, trace[1:]))
             or trace[0][0] != 0.0):
         raise ValueError("Invalid deferred capture display trace")
     count = metadata.get("sample_count")
     baseline, peaks = metadata.get("baseline_g"), metadata.get("absolute_peak_g")
+    if len(axes) == 1:
+        baseline = [baseline]
     first, last = metadata.get("first_sample_time_s"), metadata.get("last_sample_time_s")
     if (type(count) is not int or not len(trace) <= count <= _MAX_SAMPLES
-            or not isinstance(baseline, list) or len(baseline) != 3
+            or not isinstance(baseline, list) or len(baseline) != len(axes)
             or not all(_finite(value) for value in baseline)
             or not _finite(first) or not _finite(last) or last < first or (last == first and not filtered)
             or not math.isclose(trace[-1][0], last - first, rel_tol=1e-12, abs_tol=1e-9)
-            or not isinstance(peaks, dict) or set(peaks) != set("xyz")
+            or not isinstance(peaks, dict) or set(peaks) != set(axes)
             or any(not _finite(peaks[axis]) or not math.isclose(
                 peaks[axis], max(abs(row[index]) for row in trace), rel_tol=1e-12, abs_tol=1e-12)
-                   for index, axis in enumerate("xyz", 1))):
+                   for index, axis in enumerate(axes, 1))):
         raise ValueError("Deferred capture measurements do not match its trace")
     _detector_context(record, metadata, receipt.axis)
     return receipt, record, metadata
@@ -1027,6 +1049,9 @@ def write_noise_capture(directory, run_id, iteration, capture, record, simulated
     samples, baseline, delta = _validate_noise_capture(run_id, iteration, capture, record)
     elapsed = [(row[0] - samples[0][0], *row[1:]) for row in delta]
     metadata = {"sample_count": len(samples), "baseline_g": list(baseline)}
+    if capture.get("sample_layout") == "mapped_axis_v1":
+        metadata.update(sample_layout=capture["sample_layout"], sample_columns=capture["sample_columns"],
+                        impact_metric="mapped_axis", axis_mapping=capture["axis_mapping"], baseline_g=baseline[0])
     metadata.update(_range_metadata(capture, record, "noise_window"))
     receipt = _Receipt("noise", run_id, None, iteration, _json(record), _json(metadata),
                        _envelope(elapsed), None, None, bool(simulated))
@@ -1070,7 +1095,8 @@ def prepare_noise(run_id, iterations, recommendation, result, reason=None, simul
             raise ValueError("Stationary noise windows overlap or repeat earlier samples")
         previous_end = record["last_sample_time_s"]
         current = _json({key: record.get(key) for key in
-                         ("sensor", "backend", "axis_context", "full_scale_g", "sensor_context")})
+                         ("sensor", "backend", "axis_context", "full_scale_g", "sensor_context",
+                          "noise_metric", "axis_mapping")})
         if context is not None and current != context:
             raise ValueError("Stationary noise sensor context changed between windows")
         context = current
@@ -1118,8 +1144,13 @@ def beta_motion_statistics(capture, record):
     segments = record.get("segments")
     if not isinstance(segments, (tuple, list)) or not segments:
         raise ValueError("Beta moving noise requires actual planner segments")
-    delta = [tuple(row[index + 1] - baseline[index] for index in range(3)) for row in samples]
-    magnitude = [math.sqrt(sum(value * value for value in row)) for row in delta]
+    axes = _sample_axes(capture, record)
+    component = len(axes) == 1
+    baseline = (baseline,) if component else baseline
+    delta = [tuple(value - offset for value, offset in zip(row[1:], baseline)) for row in samples]
+    magnitude = ([abs(row[0]) for row in delta] if component else
+                 [math.sqrt(sum(value * value for value in row)) for row in delta])
+    peak_key = "axis_peak_g" if component else "magnitude_peak_g"
     if not all(_finite(value) for value in magnitude):
         raise ValueError("Beta moving magnitudes must be finite")
     seed_indices, phase_indices, phases, previous_end = set(), set(), [], None
@@ -1140,11 +1171,11 @@ def beta_motion_statistics(capture, record):
             seed_indices.update(indices)
         peak = max(indices, key=lambda index: magnitude[index]) if indices else None
         phases.append({**segment, "seed_eligible": eligible, "sample_count": len(indices),
-                       "magnitude_peak_g": None if peak is None else magnitude[peak],
+                       peak_key: None if peak is None else magnitude[peak],
                        "peak_time_s": None if peak is None else samples[peak][0],
                        "axis_absolute_peak_g": None if not indices else
                            {axis: max(abs(delta[index][channel]) for index in indices)
-                            for channel, axis in enumerate("xyz")}})
+                            for channel, axis in enumerate(axes)}})
     if not seed_indices:
         raise ValueError("Beta moving capture has no startup/acceleration/cruise samples")
     peak = max(seed_indices, key=lambda index: magnitude[index])
@@ -1153,11 +1184,13 @@ def beta_motion_statistics(capture, record):
               "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
               "seed_phases": ["startup", "acceleration", "cruise"],
               "excluded_seed_phases": ["braking", "return"],
-              "seed_sample_count": len(seed_indices), "seed_magnitude_peak_g": magnitude[peak],
+              "seed_sample_count": len(seed_indices), "seed_" + peak_key: magnitude[peak],
               "seed_peak_time_s": samples[peak][0],
-              "all_phase_magnitude_peak_g": max(magnitude[index] for index in phase_indices),
+              "all_phase_" + peak_key: magnitude[phase_peak],
               "all_phase_peak_time_s": samples[phase_peak][0],
-              "capture_magnitude_peak_g": max(magnitude), "phases": phases}
+              "capture_" + peak_key: max(magnitude), "phases": phases}
+    if component:
+        result.update(axis=axes, impact_metric="mapped_axis")
     _json(result)
     return result
 
@@ -1404,8 +1437,8 @@ def _noise_identity(run_id, iteration):
         raise ValueError("Invalid stationary noise iteration")
     return "accel_homing_noise_%s_i%02d" % (run_id, iteration)
 
-def _noise_vector(value, label):
-    if not isinstance(value, dict) or set(value) != set("xyz") \
+def _noise_vector(value, label, axes="xyz"):
+    if not isinstance(value, dict) or set(value) != set(axes) \
             or not all(_finite(number) for number in value.values()):
         raise ValueError("Invalid stationary noise %s" % label)
     return value
@@ -1426,16 +1459,20 @@ def _check_noise_record(run_id, iteration, record):
             or not _same_noise_number(record["duration_s"],
                                       record["last_sample_time_s"] - record["first_sample_time_s"]):
         raise ValueError("Stationary noise record is not a complete current-run window")
+    metric, mapping = _detector_context(record)
+    scalar = record.get("noise_metric") == "raw_mapped_axis_starting_heuristic"
+    if scalar and (mapping is None or "noise_magnitude_peak_g" in record):
+        raise ValueError("Mapped noise needs a selected axis and component statistics")
+    axes = mapping["axis"] if scalar else "xyz"
     for key in ("baseline_g", "noise_peak_g", "noise_peak_to_peak_g", "noise_rms_g"):
-        vector = _noise_vector(record.get(key), key)
+        vector = _noise_vector(record.get(key), key, axes)
         if key != "baseline_g" and any(value < 0 for value in vector.values()):
             raise ValueError("Stationary noise magnitudes must not be negative")
     if "noise_magnitude_peak_g" in record and (
             not _finite(record["noise_magnitude_peak_g"]) or record["noise_magnitude_peak_g"] < 0):
         raise ValueError("Invalid stationary XYZ-magnitude noise peak")
-    metric, mapping = _detector_context(record)
     if mapping is not None and not _same_noise_number(
-            record.get("noise_axis_peak_g"), record["noise_peak_g"]["xyz"[mapping["source_axis"]]]):
+            record.get("noise_axis_peak_g"), record["noise_peak_g"][axes if scalar else "xyz"[mapping["source_axis"]]]):
         raise ValueError("Mapped-axis noise peak does not match the selected source component")
     for key in ("sensor", "backend", "axis_context"):
         if not isinstance(record.get(key), str) or not record[key] or len(record[key]) > 400:
@@ -1453,9 +1490,12 @@ def _validate_noise_capture(run_id, iteration, capture, record):
     samples = capture.get("samples", ())
     if not isinstance(samples, (list, tuple)) or len(samples) != record["sample_count"]:
         raise ValueError("Stationary noise capture count does not match its record")
+    axes = _sample_axes(capture, record)
+    if set(axes) != set(record["baseline_g"]):
+        raise ValueError("Stationary noise capture axes do not match its statistics")
     previous = None
     for sample in samples:
-        if not isinstance(sample, (list, tuple)) or len(sample) != 4 \
+        if not isinstance(sample, (list, tuple)) or len(sample) != len(axes) + 1 \
                 or not all(_finite(value) for value in sample) \
                 or (previous is not None and sample[0] <= previous):
             raise ValueError("Invalid stationary noise accelerometer samples")
@@ -1464,15 +1504,17 @@ def _validate_noise_capture(run_id, iteration, capture, record):
             or not _same_noise_number(samples[-1][0], record["last_sample_time_s"]):
         raise ValueError("Stationary noise sample times do not match their record")
     baseline = tuple(math.fsum(sample[index] for sample in samples) / len(samples)
-                     for index in (1, 2, 3))
+                     for index in range(1, len(axes) + 1))
     supplied = capture.get("baseline_g")
-    if not isinstance(supplied, (list, tuple)) or len(supplied) != 3 \
+    if len(axes) == 1:
+        supplied = (supplied,)
+    if not isinstance(supplied, (list, tuple)) or len(supplied) != len(axes) \
             or not all(_same_noise_number(value, supplied[index])
                        for index, value in enumerate(baseline)):
         raise ValueError("Stationary noise capture must use its full-window mean")
-    delta = [(sample[0],) + tuple(sample[index + 1] - baseline[index] for index in range(3))
+    delta = [(sample[0],) + tuple(value - offset for value, offset in zip(sample[1:], baseline))
              for sample in samples]
-    for index, axis in enumerate("xyz", 1):
+    for index, axis in enumerate(axes, 1):
         values = [sample[index] for sample in delta]
         computed = {"baseline_g": baseline[index - 1],
                     "noise_peak_g": max(abs(value) for value in values),
@@ -1499,24 +1541,29 @@ def _validate_noise_recommendation(recommendation, iterations):
     limit = recommendation.get("threshold_limit_g")
     if limit is not None and (not _finite(limit) or limit <= 0):
         raise ValueError("Invalid stationary noise candidate ceiling")
-    observed = _noise_vector(recommendation.get("noise_peak_g"), "maximum peak")
+    first = iterations[0]["record"]
+    axes = "".join(first["noise_peak_g"]) if len(first["noise_peak_g"]) == 1 else "xyz"
+    candidate_axes = axes if len(axes) == 1 else "xy"
+    if len(axes) == 1 and _detector_context(recommendation) != _detector_context(first):
+        raise ValueError("Stationary noise recommendation does not match the measured axis")
+    observed = _noise_vector(recommendation.get("noise_peak_g"), "maximum peak", axes)
     candidates = recommendation.get("start_threshold_g")
-    if not isinstance(candidates, dict) or set(candidates) != set("xy"):
+    if not isinstance(candidates, dict) or set(candidates) != set(candidate_axes):
         raise ValueError("Invalid stationary noise axis candidates")
-    for axis in "xyz":
+    for axis in axes:
         if not _same_noise_number(observed[axis], max(item["record"]["noise_peak_g"][axis]
                                                      for item in iterations)):
             raise ValueError("Stationary noise recommendation peak does not match its windows")
     if limit is None:
         if any(item["record"]["full_scale_g"] is not None for item in iterations) \
-                or candidates != {"x": None, "y": None} \
-                or recommendation.get("unavailable_axes") != ["x", "y"]:
+                or candidates != dict.fromkeys(candidate_axes) \
+                or recommendation.get("unavailable_axes") != list(candidate_axes):
             raise ValueError("Unknown sensor range cannot supply a stationary noise calibration candidate")
         json.dumps(recommendation, allow_nan=False)
         return
     unavailable = []
     start, step = recommendation["configured_start_g"], recommendation["candidate_step_g"]
-    for axis in "xy":
+    for axis in candidate_axes:
         minimum = max(start, observed[axis] * 1.2, observed[axis] + 0.1)
         candidate = start + max(0, math.ceil((minimum - start) / step)) * step
         if not _finite(candidate) or candidate > limit:
@@ -1762,6 +1809,11 @@ def _absolute_limits(axis):
 
 
 def _traces(axis, trace, alpha=1.0, labels=True, mapping=None):
+    if mapping is not None and trace and len(trace[0]) == 2:
+        axis.plot([row[0] for row in trace], [abs(row[1]) for row in trace],
+                  color={"x": "red", "y": "green"}[mapping["axis"]], linewidth=1.2,
+                  alpha=alpha, label=_mapped_label(mapping) if labels else None)
+        return
     for index, (letter, color) in enumerate(zip("XYZ", ("red", "green", "blue")), 1):
         selected = mapping is not None and index == mapping["source_axis"] + 1
         name = (_mapped_label(mapping) if selected else "Stream %s (diagnostic)" % letter) \
@@ -1791,14 +1843,17 @@ def _plot_capture(figure, payload):
     _axes_style(axis)
     _traces(axis, trace, mapping=mapping)
     vector = metric == "xyz_magnitude"
-    magnitude = [(row[0], math.sqrt(sum(value * value for value in row[1:4]))) for row in trace]
     if vector:
+        magnitude = [(row[0], math.sqrt(sum(value * value for value in row[1:4]))) for row in trace]
         axis.plot([row[0] for row in magnitude], [row[1] for row in magnitude],
                   linewidth=1.2, label="XYZ magnitude")
     raw_trace = captured.get("raw_trace")
+    scalar = captured.get("sample_layout") == "mapped_axis_v1"
+    channel = (1 if scalar else mapping["source_axis"] + 1 if mapping is not None else
+               {"x": 1, "y": 2}[payload["axis"]])
     if raw_trace:
         axis.plot([row[0] for row in raw_trace],
-                  [abs(row[mapping["source_axis"] + 1]) if mapping is not None else
+                  [abs(row[channel]) if mapping is not None else
                    math.sqrt(sum(value * value for value in row[1:4])) for row in raw_trace],
                   color="#777777", alpha=.55, linewidth=.7, label="Raw mapped-axis magnitude" if mapping is not None else "Raw XYZ magnitude")
         settings = captured["signal_filter"]
@@ -1813,7 +1868,6 @@ def _plot_capture(figure, payload):
             axis.axvline(elapsed, color="#5e4c77", linestyle=":", linewidth=1.1, label="Detected onset")
         else:
             elapsed = None
-    channel = mapping["source_axis"] + 1 if mapping is not None else {"x": 1, "y": 2}[payload["axis"]]
     peak = (max(magnitude, key=lambda row: row[1]) if vector else
             max(trace, key=lambda row: abs(row[channel])))
     peak_value = peak[1] if vector else abs(peak[channel])
@@ -1831,7 +1885,8 @@ def _plot_capture(figure, payload):
                             _number(peak_value))] + _range_observation_lines(range_summary))
     _absolute_limits(axis)
     axis.legend(loc="best", fontsize=8)
-    _finish_layout(figure, ("Notch components and magnitude after resting-offset subtraction; raw magnitude shown in gray. "
+    _finish_layout(figure, ("Mapped-axis acceleration after resting-offset subtraction. " if scalar else
+                            "Notch components and magnitude after resting-offset subtraction; raw magnitude shown in gray. "
                            if raw_trace else "Absolute components after stationary-baseline subtraction. ")
                    + "Commanded travel is not physical stop accuracy.")
 
@@ -1978,7 +2033,13 @@ def _plot_accuracy(figure, payload):
         raise ValueError("Accuracy detector metric or axis mapping changed during the measured run")
     metric, mapping = contexts[0] if contexts else (None, None)
     vector = metric == "xyz_magnitude"
-    axes = figure.subplots(5 if vector else 4, 1)
+    layouts = {capture.get("sample_layout") for capture in payload.get("captures", [])}
+    if len(layouts) > 1:
+        raise ValueError("Accuracy sample layout changed during the measured run")
+    scalar = layouts == {"mapped_axis_v1"}
+    letters = payload["axis"].upper() if scalar else "XYZ"
+    colors = {"X": "red", "Y": "green", "Z": "blue"}
+    axes = figure.subplots(1 + len(letters) + int(vector), 1)
     travel = axes[0]
     _axes_style(travel, "Travel (mm)", zero=False)
     travel.set_xlabel("Accepted measured home")
@@ -1990,9 +2051,9 @@ def _plot_accuracy(figure, payload):
     else:
         travel.text(.5, .5, "No accepted measured homes", ha="center", transform=travel.transAxes)
     _axes_summary(travel, summary)
-    for channel, (axis, color, letter) in enumerate(zip(axes[1:],
-                    ("red", "green", "blue"), "XYZ"), 1):
-        selected = mapping is not None and channel == mapping["source_axis"] + 1
+    for channel, (axis, letter) in enumerate(zip(axes[1:], letters), 1):
+        color = colors[letter]
+        selected = mapping is not None and (scalar or channel == mapping["source_axis"] + 1)
         name = (_mapped_label(mapping) if selected else "Stream %s (diagnostic)" % letter) \
             if mapping is not None else "|%s|" % letter
         _axes_style(axis, name + " acceleration (g)")
@@ -2029,9 +2090,8 @@ def _plot_noise(figure, payload):
     if recommendation:
         candidates = recommendation["start_threshold_g"]
         fmt = lambda value: "unavailable" if value is None else "%s g" % _number(value, 4)
-        note = "Configured-stream diagnostic hints: X %s; Y %s (not saved thresholds)." % (
-            fmt(candidates["x"]), fmt(candidates["y"]),
-            )
+        note = "Starting candidates: " + ", ".join("%s %s" % (axis.upper(), fmt(value))
+                                                   for axis, value in candidates.items()) + "."
         metric, mapping = _detector_context(recommendation)
         if mapping is not None:
             note = "Calibration uses %s. " % _mapped_label(mapping) + note
@@ -2049,10 +2109,12 @@ def _plot_noise(figure, payload):
         record = records[index]
         metric, mapping = _detector_context(record)
         _traces(axis, traces[index], mapping=mapping)
-        summary = ["Window %d (%s s)  |  Peak XYZ: %s g" % (
-                                index + 1, _number(record["duration_s"]),
-                                " / ".join(_number(record["noise_peak_g"][key]) for key in "xyz")),
-                   "RMS XYZ: %s g" % " / ".join(_number(record["noise_rms_g"][key]) for key in "xyz")]
+        keys = (mapping["axis"] if record.get("noise_metric") == "raw_mapped_axis_starting_heuristic"
+                else "xyz")
+        summary = ["Window %d (%s s)  |  Peak %s: %s g" % (
+                                index + 1, _number(record["duration_s"]), keys.upper(),
+                                " / ".join(_number(record["noise_peak_g"][key]) for key in keys)),
+                   "RMS %s: %s g" % (keys.upper(), " / ".join(_number(record["noise_rms_g"][key]) for key in keys))]
         if mapping is not None:
             summary.append("Physical %s noise peak: %s g (calibration metric)" % (
                 mapping["axis"].upper(), _number(record.get("noise_axis_peak_g"), 4)))

@@ -552,7 +552,7 @@ class Rig:
                 "capture_axes_map": [[0, 1], [1, 1], [2, 1]],
                 "sensor_axes_map": [[0, 1], [1, 1], [2, 1]], "sensor_rate_hz": 1000.0}
 
-    def start_noise(self):
+    def start_noise(self, axis_mapping=None):
         self.noise_calls.append("start")
         self.noise_window_count = 0
         self.owner.noise_session = object()

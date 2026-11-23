@@ -101,8 +101,9 @@ class GentleDetectorTests(unittest.TestCase):
                 if brake["start_time_s"] <= row[0] < brake["end_time_s"]:
                     rows[index] = (row[0], row[1] + 10., row[2], row[3])
         after = analyze(items)
-        self.assertEqual(before["profile"], after["profile"])
-        self.assertEqual(before["threshold_g"], after["threshold_g"])
+        for key in ("status", "profile", "threshold_g"):
+            self.assertEqual(before[key], after[key])
+        self.assertEqual(before["evidence"]["captures"], after["evidence"]["captures"])
         for item in after["evidence"]["frozen_candidate"]["training_metrics"]:
             brake = next(phase for phase in item["phases"] if phase["phase"] == "braking")
             self.assertFalse(brake["scored"])
@@ -115,8 +116,14 @@ class GentleDetectorTests(unittest.TestCase):
             item["capture"]["samples"] = [(row[0], row[1], 100. * math.sin(row[0]), row[3])
                                           for row in item["capture"]["samples"]]
         after = analyze(items)
-        self.assertEqual(before["profile"], after["profile"])
-        self.assertEqual(before["threshold_g"], after["threshold_g"])
+        self.assertEqual(before, after)
+        for item in items:
+            item["capture"] = auto.mapped_axis_capture(item["capture"], item["record"]["axis_mapping"])
+        self.assertEqual(after, analyze(items))
+        for receipt in after["evidence"]["captures"]:
+            self.assertEqual(receipt["sample_layout"], "mapped_axis_v1")
+            self.assertIsInstance(receipt["baseline_g"], float)
+            self.assertIn("scored_signed_mapped_axis_sha256", receipt)
 
     def test_phase_peaks_cover_both_exact_causal_initial_states(self):
         item = synthetic_item("motion", 0)

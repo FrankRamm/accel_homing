@@ -52,6 +52,23 @@ def retained_capture():
 
 
 class ContactTimingReplayTests(unittest.TestCase):
+    def test_signed_scalar_capture_replays_like_legacy_xyz_and_preserves_sample_identity(self):
+        capture, planner = retained_capture()
+        capture["filtered_samples"] = [(10.2, 100., 200., -3.)]
+        compact = auto.mapped_axis_capture(capture, MAPPING)
+        self.assertEqual(compact["sample_columns"], ["time_s", "mapped_axis_g"])
+        self.assertEqual(compact["baseline_g"], -BASELINE[2])
+        self.assertEqual(compact["samples"], [(row[0], -row[3]) for row in capture["samples"]])
+        self.assertEqual(compact["filtered_samples"], [(10.2, 3.)])
+        self.assertEqual(compact["auto_notch_replay"], capture["auto_notch_replay"])
+        self.assertEqual(auto.mapped_axis_capture(compact, MAPPING), compact)
+        self.assertEqual(auto.describe_contact_timing(compact, planner),
+                         auto.describe_contact_timing(capture, planner))
+        for corrupt in (dict(compact, samples=capture["samples"]),
+                        dict(compact, sample_columns=["time_s", "x_g"]),
+                        dict(compact, axis_mapping=None)):
+            self.assertEqual(auto.describe_contact_timing(corrupt, planner)[0]["status"], "insufficient_data")
+
     def test_fixed_causal_signed_replay_mapping_baseline_and_no_trigger(self):
         capture, planner = retained_capture()
         # Arbitrary live filter metadata and retained live output are irrelevant.

@@ -77,8 +77,9 @@ back to the already-tested disabled control; if that control also fails, the
 run is rejected without selecting or saving a profile.
 
 Analysis uses the signed mapped sensor component for spectra and its absolute
-value for thresholds, matching the live detector. The raw XYZ channels remain
-available as diagnostic evidence; orthogonal vibration does not select the notch.
+value for thresholds, matching the live detector. In gentle mode, post-mapping
+captures retain time and signed acceleration for that machine axis. The ZIP
+records the source sensor channel and sign so the trace can be replayed.
 All recordings must have the same validated mapping and sensor context. It excludes braking from the noise score
 and retains acceleration/startup checks so filtering cannot hide a new early
 trigger. Reference-home replay ends at the original raw trigger sample;
@@ -204,11 +205,12 @@ repair missing samples or delayed packet delivery.
 
 ## Detector semantics
 
-Processing is: subtract the fixed resting XYZ reference, apply three identical
-causal second-order notch filters, select the current mapped component, then
-compare its absolute value to the active threshold. The filter operates on signed
-components, before absolute value. Legacy diagnostic XYZ detectors retain their
-original metric; AUTO calibration never trains those detectors. It has bounded per-home state, retained across packets and reset for
+In gentle mode the detector selects the mapped component, subtracts its resting
+reference, applies the selected causal notch if enabled, and compares the
+absolute result to that axis's threshold. Before a map is known, free mapping
+strokes read the configured sensor channels to identify the requested axis.
+Explicit XYZ diagnostics use their own detector. The filter has bounded
+per-home state, retained across packets and reset for
 the next home. State starts at zero at the first eligible armed sample; there
 is no hidden warmup or interval in which initial impacts are ignored.
 Coefficients use the measured resting-reference sensor cadence, not host report

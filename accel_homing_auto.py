@@ -674,15 +674,17 @@ class AutoNotchCalibration:
         else:
             result["artifacts"].setdefault("contact_timings", {})[str(number)] = paths
 
+    def _export_capture(self, session, kind, capture, cooperate):
+        if (not capture or not getattr(self.w, "gentle_homing", False)
+                or kind in ("mapping", "mapping-partial")):
+            return capture
+        project = load_companion_module("accel_homing_axes").mapped_axis_capture
+        return project(capture, session.get("axis_mapping"), cooperate)
+
     def retain_debug_capture(self, session, kind, number, capture, record=None, error=None):
         """Persist stopped acquisitions independently from the accepted training set."""
         if self.folder is None:
             return
-        if self.contact_only and kind == "home":
-            self.contact_capture = capture
-            self.contact_result = (record or {}).get("result")
-        if session.get("gentle_frozen_candidate") and kind == "home":
-            self.contact_data[number] = {"capture": capture, "record": record}
         name = "raw/%s-%04d.json.gz" % (kind, number)
         path = self.folder / name
         if path.exists():
@@ -691,6 +693,12 @@ class AutoNotchCalibration:
         try:
             self._require_debug_idle(session)
             cooperate = lambda: self._debug_cooperate(session)
+            capture = self._export_capture(session, kind, capture, cooperate)
+            if self.contact_only and kind == "home":
+                self.contact_capture = capture
+                self.contact_result = (record or {}).get("result")
+            if session.get("gentle_frozen_candidate") and kind == "home":
+                self.contact_data[number] = {"capture": capture, "record": record}
             if self.debug_raw_bytes >= MAX_DEBUG_RAW_BYTES:
                 raise ValueError("raw diagnostic budget exhausted (1 GiB compressed per run)")
             path.parent.mkdir(exist_ok=True)
@@ -699,6 +707,8 @@ class AutoNotchCalibration:
                        "axis": session.get("axis"), "candidate_g": session.get("candidate"),
                        "native_seek": self.contact_plans.get(number) if kind == "home" else None,
                        "record": record, "capture": capture, "error": error}
+            if kind in ("mapping", "mapping-partial"):
+                payload["acquisition_purpose"] = "axis_identification"
             with gzip.open(temporary, "wt", encoding="utf-8") as stream:
                 _write_json(stream, self._debug_clean(payload, cooperate=cooperate), cooperate, MAX_ANALYSIS_INPUT)
             size = temporary.stat().st_size
@@ -1075,8 +1085,9 @@ class AutoNotchCalibration:
                 if self.exported_sources.get(name) != id(item):
                     temporary = self.folder / ("." + name + ".tmp")
                     try:
+                        capture = self._export_capture(session, kind, item["capture"], cooperate)
                         with gzip.open(temporary, "wt", encoding="utf-8") as stream:
-                            _write_json(stream, item, cooperate, MAX_ANALYSIS_INPUT)
+                            _write_json(stream, dict(item, capture=capture), cooperate, MAX_ANALYSIS_INPUT)
                         temporary.replace(self.folder / name)
                         self.exported_sources[name] = id(item)
                     finally:

@@ -777,10 +777,22 @@ def diagnose_saturation(public, raw, profile, stop_time, cooperate=None):
         return
     record, capture = public.get("record") or {}, public.get("capture") or {}
     arm, onset = record.get("arm_time_s"), record.get("onset_time_s")
-    phases = {key: dict.fromkeys("xyz", 0) for key in
+    channels = [(axis, pair[1]) for axis, pair in zip("xyz", profile["axes_map"])]
+    if capture.get("sample_layout") == "mapped_axis_v1":
+        mapping = capture.get("axis_mapping") or {}
+        axis, index, sign = (mapping.get(key) for key in ("axis", "source_axis", "sign"))
+        if axis not in ("x", "y") or index not in (0, 1, 2) or sign not in (-1, 1):
+            public["saturation_diagnostic"] = {"available": False, "reason": "missing captured axis mapping"}
+            return
+        channels = [(axis, channels[index][1] * sign)]
+        endpoints = profile["axis_endpoints_g"]["xyz"[index]]
+        profile = dict(profile, axis_endpoints_g={axis: sorted(value * sign for value in endpoints)},
+                       axis_mapping=mapping)
+    names = [name for name, scale in channels]
+    phases = {key: dict.fromkeys(names, 0) for key in
               ("before_arm", "armed_before_onset", "after_onset_before_stop", "after_stop", "unattributed")}
-    counts, first, last = dict.fromkeys("xyz", 0), None, None
-    for offset in range(0, len(raw), 4):
+    counts, first, last = dict.fromkeys(names, 0), None, None
+    for offset in range(0, len(raw), 1 + len(channels)):
         if cooperate is not None and offset % 1024 == 0:
             cooperate()
         when = raw[offset]
@@ -789,11 +801,11 @@ def diagnose_saturation(public, raw, profile, stop_time, cooperate=None):
                  "after_stop" if finite(stop_time) and when >= stop_time else
                  "after_onset_before_stop" if finite(onset) and when >= onset else
                  "armed_before_onset" if finite(arm) and when >= arm else "unattributed")
-        for index, (axis, mapping) in enumerate(zip("xyz", profile["axes_map"])):
+        for index, (axis, scale) in enumerate(channels):
             value = raw[offset + index + 1]
             if not finite(value):
                 continue
-            native = value * 9806.65 / mapping[1]
+            native = value * 9806.65 / scale
             if (native <= profile["native_min_count"] + profile["count_tolerance"] or
                     native >= profile["native_max_count"] - profile["count_tolerance"]):
                 counts[axis] += 1
@@ -1312,6 +1324,8 @@ class Recorder:
             return
         try:
             samples = capture.get("samples", ())
+            compact = capture.get("sample_layout") == "mapped_axis_v1"
+            width = 2 if compact else 4
             expected_homes = self.session["attempt_limit"]
             share, remainder = divmod(MAX_RAW_ROWS, expected_homes)
             budget = min(MAX_HOME_ROWS, share + int(home["home_id"] <= remainder))
@@ -1324,13 +1338,13 @@ class Recorder:
             raw, invalid = home["raw"], 0
             for first, end in ranges:
                 for row in samples[first:end]:
-                    if not isinstance(row, (tuple, list)) or len(row) != 4:
+                    if not isinstance(row, (tuple, list)) or len(row) != width:
                         invalid += 1
-                        raw.extend((float("nan"),) * 4)
+                        raw.extend((float("nan"),) * width)
                     else:
                         invalid += int(not all(finite(value) for value in row))
                         raw.extend(value if finite(value) else float("nan") for value in row)
-            retained = len(raw) // 4
+            retained = len(raw) // width
             metadata = capture.get("signal_filter", {})
             filtered = capture.get("filtered_samples", ())
             start = metadata.get("first_sample_index")
@@ -1338,7 +1352,8 @@ class Recorder:
                 for first, end in ranges:
                     for index in range(first, end):
                         row = filtered[index - start] if start <= index < start + len(filtered) else None
-                        home["filtered"].extend(row[1:] if row is not None else (float("nan"),) * 3)
+                        home["filtered"].extend(row[1:] if row is not None and len(row) == width
+                                                else (float("nan"),) * (width - 1))
             self.raw_rows += retained
             home["capture"] = clean({key: value for key, value in capture.items()
                                      if key not in ("samples", "filtered_samples", "_record")})
@@ -1348,12 +1363,13 @@ class Recorder:
                                    reserved_home_row_budget=budget,
                                    retained_sample_ranges=clean(ranges),
                                    omitted_sample_ranges=([[prefix, len(samples) - maximum + prefix]] if len(samples) > maximum else []),
-                                   raw_units="print_time seconds, configured sensor-stream XYZ g including gravity/bias",
+                                   raw_units=("print_time seconds, signed mapped machine-axis g including gravity/bias"
+                                              if compact else "print_time seconds, configured sensor-stream XYZ g including gravity/bias"),
                                    coordinate_frame="configured_sensor_stream",
                                    source="owner.stop_capture before workflow validation",
                                    truncation=bool(len(samples) > retained or capture.get("dropped")))
             if filtered:
-                home["capture"].update(filtered_rows_retained=len(home["filtered"]) // 3,
+                home["capture"].update(filtered_rows_retained=len(home["filtered"]) // (width - 1),
                                        filtered_retention="same original indices as raw; blank before first armed sample",
                                        filtered_replay_complete=not bool(len(samples) > retained or capture.get("dropped")))
         except Exception as exc:
@@ -1469,9 +1485,12 @@ class Recorder:
             with gzip.open(folder / name, "wt", encoding="utf-8", newline="") as stream:
                 writer = csv.writer(stream)
                 filtered = home.get("filtered", ())
-                columns = ("sample_index", "print_time_s", "x_g", "y_g", "z_g")
+                compact = home["capture"].get("sample_layout") == "mapped_axis_v1"
+                width = 2 if compact else 4
+                columns = ("sample_index", "print_time_s") + (("mapped_axis_g",) if compact else ("x_g", "y_g", "z_g"))
                 if filtered:
-                    columns += ("filtered_x_g", "filtered_y_g", "filtered_z_g", "filtered_magnitude_g")
+                    columns += (("filtered_mapped_axis_g",) if compact else
+                                ("filtered_x_g", "filtered_y_g", "filtered_z_g", "filtered_magnitude_g"))
                 writer.writerow(columns)
                 raw = home["raw"]
                 offset = 0
@@ -1479,13 +1498,16 @@ class Recorder:
                     for original_index in range(first, end):
                         if original_index % 256 == 0:
                             cooperate_export()
-                        row = [original_index] + [value if finite(value) else "" for value in raw[offset:offset + 4]]
+                        row = [original_index] + [value if finite(value) else "" for value in raw[offset:offset + width]]
                         if filtered:
-                            xyz = filtered[(offset // 4) * 3:(offset // 4) * 3 + 3]
-                            row += ([*xyz, math.sqrt(sum(value * value for value in xyz))]
-                                    if all(finite(value) for value in xyz) else [""] * 4)
+                            index = (offset // width) * (width - 1)
+                            values = filtered[index:index + width - 1]
+                            row += [value if finite(value) else "" for value in values]
+                            if not compact:
+                                row.append(math.sqrt(sum(value * value for value in values))
+                                           if all(finite(value) for value in values) else "")
                         writer.writerow(row)
-                        offset += 4
+                        offset += width
             homes.append(public)
         export_delivery(folder, homes)
         with gzip.open(folder / "packets.jsonl.gz", "wt", encoding="utf-8") as stream:
@@ -1559,7 +1581,8 @@ class Recorder:
         (folder / "README.txt").write_text(
             command + " evidence\n\n"
             "Share the entire folder or ZIP. Read manifest.json first.\n"
-            "home-*.csv.gz: every retained raw decoded XYZ sample before graph reduction, in g including gravity/bias.\n"
+            "home-*.csv.gz: retained raw decoded samples before graph reduction, in g including gravity/bias. "
+            "Mapped gentle homes store the signed machine-axis component; XYZ captures store three channels.\n"
             "Optional filtered_* columns: causal notch after resting-offset subtraction; blank before arm. Coefficients/rate/start identity are in manifest.json.\n"
             "packets.jsonl.gz: bounded callback timing, pending/filtered packet context.\n"
             "timing.jsonl.gz: MCU host receive, driver/query/decode, detector/observer, reactor and GC timing. See manifest timing hook availability and omissions.\n"
@@ -2162,6 +2185,9 @@ def _worker(folder, dependencies):
         for home in homes:
             record, capture = home.get("record") or {}, home["capture"]
             metric, mapping = charts._detector_context(record, capture, home["axis"])
+            compact = charts._sample_axes(capture, record) != "xyz"
+            raw_columns = ("mapped_axis_g",) if compact else ("x_g", "y_g", "z_g")
+            filter_columns = tuple("filtered_" + name for name in raw_columns)
             shadow = home.get("shadow") or {}
             onset = record.get("onset_time_s")
             if not finite(onset):
@@ -2171,15 +2197,18 @@ def _worker(folder, dependencies):
                 and event["kind"] == "stop_request"), None)
             anchor = onset if finite(onset) else dispatch
             baseline = capture.get("baseline_g")
-            has_baseline = isinstance(baseline, list) and len(baseline) == 3 and all(finite(v) for v in baseline)
-            baseline = baseline if has_baseline else [0, 0, 0]
+            if compact:
+                baseline = [baseline]
+            has_baseline = (isinstance(baseline, list) and len(baseline) == len(raw_columns)
+                            and all(finite(v) for v in baseline))
+            baseline = baseline if has_baseline else [0] * len(raw_columns)
             rows = []
             with gzip.open(folder / home["raw_file"], "rt", encoding="utf-8") as stream:
                 for row_index, row in enumerate(csv.DictReader(stream)):
                     if row_index >= MAX_HOME_ROWS:
                         raise ValueError("raw capture plot input exceeds per-home bound")
                     try:
-                        sample = [float(row[key]) for key in ("print_time_s", "x_g", "y_g", "z_g")]
+                        sample = [float(row[key]) for key in ("print_time_s", *raw_columns)]
                     except ValueError:
                         continue
                     before = .025 if finite(onset) else .125
@@ -2189,17 +2218,17 @@ def _worker(folder, dependencies):
                         first = min(first, evidence - .005)
                     if not finite(anchor) or first <= sample[0] <= anchor + .100:
                         try:
-                            sample += [float(row[key]) for key in ("filtered_x_g", "filtered_y_g", "filtered_z_g")]
+                            sample += [float(row[key]) for key in filter_columns]
                         except (KeyError, ValueError):
-                            sample += [float("nan")] * 3
+                            sample += [float("nan")] * len(filter_columns)
                         rows.append(sample)
             # Window retains all samples/outliers. Bound unknown-onset plots by
             # displaying a prefix explicitly; raw files remain unchanged.
             omitted = max(0, len(rows) - 20000)
             # Preserve both the early shadow evidence and the original onset
             # when a wide replay span exceeds the plot-only bound.
-            rows = rows[:10000] + [[math.nan] * 7] + rows[-10000:] if omitted else rows
-            wide_shadow = finite(onset) and finite(shadow.get("evidence_time_s")) and shadow["evidence_time_s"] < onset - .025
+            rows = rows[:10000] + [[math.nan] * (1 + 2 * len(raw_columns))] + rows[-10000:] if omitted else rows
+            wide_shadow = not compact and finite(onset) and finite(shadow.get("evidence_time_s")) and shadow["evidence_time_s"] < onset - .025
             figure = Figure(figsize=(11, 9 if wide_shadow else 5), dpi=110)
             FigureCanvasAgg(figure)
             if wide_shadow:
@@ -2208,12 +2237,14 @@ def _worker(folder, dependencies):
                 plot, overview = figure.subplots(), None
             origin = anchor if finite(anchor) else rows[0][0] if rows else 0
             times = [(row[0] - origin) * 1000 for row in rows]
-            has_filtered = any(all(finite(value) for value in row[4:7]) for row in rows)
-            for index, label in enumerate("XYZ"):
-                plot.plot(times, [row[index + 1] - baseline[index] for row in rows],
-                          label="Stream " + label if mapping is not None else label, linewidth=.8)
+            filter_offset = 1 + len(raw_columns)
+            has_filtered = any(all(finite(value) for value in row[filter_offset:]) for row in rows)
+            if not compact:
+                for index, label in enumerate("XYZ"):
+                    plot.plot(times, [row[index + 1] - baseline[index] for row in rows],
+                              label="Stream " + label if mapping is not None else label, linewidth=.8)
             if mapping is not None:
-                channel, sign = mapping["source_axis"], mapping["sign"]
+                channel, sign = (0, 1) if compact else (mapping["source_axis"], mapping["sign"])
                 mapped = [sign * (row[channel + 1] - baseline[channel]) for row in rows]
                 plot.plot(times, mapped, label=charts._mapped_label(mapping) + " signed", linewidth=1)
                 plot.plot(times, [abs(value) for value in mapped],
@@ -2224,7 +2255,7 @@ def _worker(folder, dependencies):
             experimental = (capture.get("detector") or {}).get("experimental") or {}
             profile = home.get("shadow_profile") or ((report.get("experiment") or {}).get("fit") or {}).get("profile") or {}
             weights = profile.get("weights_xyz")
-            if (home["phase"] == "candidate" or shadow) and has_baseline and isinstance(weights, list) and len(weights) == 3 \
+            if not compact and (home["phase"] == "candidate" or shadow) and has_baseline and isinstance(weights, list) and len(weights) == 3 \
                     and all(finite(value) and value >= 0 for value in weights):
                 plot.plot(times, [math.sqrt(sum(weights[index] * (row[index + 1] - baseline[index]) ** 2
                                                  for index in range(3))) for row in rows],
@@ -2248,17 +2279,18 @@ def _worker(folder, dependencies):
                                    "Raw bypass threshold" if home["phase"] == "candidate" else "Active detector threshold")
             quality = home.get("saturation_diagnostic", {})
             if quality.get("available"):
-                for index, axis in enumerate("xyz"):
+                for index, axis in enumerate(mapping["axis"] if compact else "xyz"):
                     lower, upper = quality["axis_endpoints_g"][axis]
-                    tolerance = abs(quality["axes_map"][index][1]) / 9806.65 * quality["count_tolerance"]
+                    source = mapping["source_axis"] if compact else index
+                    tolerance = abs(quality["axes_map"][source][1]) / 9806.65 * quality["count_tolerance"]
                     limited = [(t, row[index + 1] - baseline[index]) for t, row in zip(times, rows)
                                if row[index + 1] <= lower + tolerance or row[index + 1] >= upper - tolerance]
                     if limited:
                         plot.scatter([t for t, _ in limited], [v for _, v in limited], marker="x", s=20,
                                      label=axis.upper() + " native range limit", zorder=5)
             if has_filtered:
-                plot.plot(times, [abs(row[4 + mapping["source_axis"]]) if mapping is not None else
-                           math.sqrt(sum(value * value for value in row[4:7])) for row in rows],
+                plot.plot(times, [abs(row[filter_offset + channel]) if mapping is not None else
+                           math.sqrt(sum(value * value for value in row[filter_offset:])) for row in rows],
                           label="Filtered mapped-axis magnitude" if mapping is not None else "Filtered XYZ magnitude", color="#d17b00", linewidth=1.2)
                 threshold = record.get("threshold_g")
                 if finite(threshold) and mapping is None:

@@ -64,6 +64,19 @@ class SaturationDiagnosticsTests(unittest.TestCase):
                 diagnostics.diagnose_saturation(public, raw, profile, None)
                 self.assertEqual(public["saturation_diagnostic"]["amplitude_limited"], expected)
 
+    def test_signed_mapped_rows_use_only_the_native_range_of_the_selected_source(self):
+        profile = diagnostics.adxl_saturation_profile(adxl_context())
+        public = self.home()
+        mapping = {"axis": "y", "source_axis": 0, "sign": -1}
+        public["capture"].update(sample_layout="mapped_axis_v1", axis_mapping=mapping)
+        scale = -profile["axes_map"][0][1] / 9806.65
+        raw = array("d", [1.5, 4094 * scale, 2.1, -4094 * scale])
+        diagnostics.diagnose_saturation(public, raw, profile, 2.05)
+        quality = public["saturation_diagnostic"]
+        self.assertEqual(quality["range_limit_axis_counts"], {"y": 1})
+        self.assertEqual(quality["phases"]["armed_before_onset"], {"y": 1})
+        self.assertEqual(quality["axis_endpoints_g"]["y"], sorted([-4096 * scale, 4094 * scale]))
+
     def test_unknown_sensor_range_or_mapping_never_guesses_limits(self):
         for modify in (lambda s: s.update(configured_sensor_class="extras.lis2dw.LIS2DW"),
                        lambda s: s["cached_backend"].update(full_scale=8.),

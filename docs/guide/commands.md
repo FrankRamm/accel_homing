@@ -335,6 +335,13 @@ less force. Stay at the printer for the whole test.
 
 Settings and axes-map behavior are in [Gentle homing (dev)](configuration.md#gentle-homing-dev).
 
+After mapping, a gentle X run records and filters only physical X. A Y run
+does the same for physical Y. The resting reference, moving-noise threshold,
+contact trigger and ZIP traces all use that one component. For example, if
+the console reports X mapped to sensor +Y, the X run reads sensor Y. Without
+an explicit sensor map, the initial free strokes compare the three sensor
+channels to identify the requested axis. These strokes move only in XY.
+
 `NOTCH=AUTO` defaults to reporting only and tests the exact threshold it
 would save. To report a tester run, send the ZIP printed by each command
 (`MODE=COMPARE` and `NOTCH=AUTO`). Include the axis and how the individual

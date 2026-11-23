@@ -66,6 +66,26 @@ class MappedAxisChartTests(unittest.TestCase):
         raw["axis_mapping"]["source_axis"] = 0
         self.assertEqual(charts._prepared_capture(prepared)[2]["axis_mapping"], mapping())
 
+    def test_gentle_capture_and_accuracy_plot_the_single_signed_machine_channel(self):
+        data, raw = payload("y", 2, -1)
+        raw.update(sample_layout="mapped_axis_v1", sample_columns=["time_s", "mapped_axis_g"],
+                   samples=[(2., -3.), (2.01, 0.)], baseline_g=-3.)
+        prepared = charts.prepare_capture("gentle", "y", raw, data["record"])
+        receipt, _, metadata = charts._prepared_capture(prepared)
+        self.assertEqual(metadata["absolute_peak_g"], {"y": 3.})
+        self.assertEqual(metadata["baseline_g"], -3.)
+        data.update(trace=receipt.trace, capture=metadata)
+        figure, (axis,) = figure_mock()
+        charts._plot_capture(figure, data)
+        self.assertEqual(axis.plot.call_count, 2)  # Selected trace and its peak.
+        self.assertEqual(axis.plot.call_args_list[0].args[1], [0., 3.])
+        figure, (_, panel) = figure_mock(2)
+        charts._plot_accuracy(figure, dict(data, trials=[data["record"]], traces=[receipt.trace],
+                                           captures=[metadata], requested=1))
+        figure.subplots.assert_called_once_with(2, 1)
+        self.assertEqual(panel.axhline.call_args.args[0], 1.5)
+        self.assertIn("Physical Y (= -stream Z)", panel.set_ylabel.call_args.args[0])
+
     def test_missing_wrong_frame_wrong_axis_and_conflicting_maps_are_rejected(self):
         data, raw = payload()
         for change in ({"source_axis": 3}, {"sign": 0}, {"axis": "y"},

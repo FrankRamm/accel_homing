@@ -47,6 +47,45 @@ class GentleSeedRig(GentleAutoRig):
 
 
 class GentleMotionSeedTests(unittest.TestCase):
+    def test_swapped_signed_axis_is_the_only_noise_measurement_for_each_calibration(self):
+        for axis, source in (("x", 1), ("y", 0)):
+            with self.subTest(axis=axis), tempfile.TemporaryDirectory() as directory:
+                rig = GentleSeedRig(directory)
+                rig.amplitudes = [10., 10., 10.]
+                rig.amplitudes[source] = .25
+
+                def qualify(session):
+                    rig.qualify_axis_mapping(session)
+                    session["axis_mapping"].update(source_axis=source, sign=-1)
+
+                rig.workflow._calibration_axis_mapping = qualify
+                with mock.patch.object(rig.owner, "start_noise_measurement",
+                                       wraps=rig.owner.start_noise_measurement) as stationary, \
+                     mock.patch.object(rig.owner, "start_beta_motion_capture",
+                                       wraps=rig.owner.start_beta_motion_capture) as moving:
+                    session = rig.preflight(axis=axis.upper())
+                mapping = session["axis_mapping"]
+                stationary.assert_called_once_with(axis_mapping=mapping)
+                self.assertEqual([call.kwargs["axis_mapping"] for call in moving.call_args_list], [mapping] * 3)
+                self.assertEqual(session["recommendation"]["noise_peak_g"], {axis: .25})
+                self.assertEqual(set(session["recommendation"]["start_threshold_g"]), {axis})
+                self.assertEqual(session["candidate"], 3.75)
+                self.assertNotIn("noise_magnitude_peak_g", session["stationary_noise"])
+                for iteration, item in enumerate(session["iterations"], 1):
+                    record = item["record"]
+                    expected_baseline = -(.25, -.2)[source] * iteration
+                    self.assertAlmostEqual(record["baseline_g"][axis], expected_baseline)
+                    for key in ("baseline_g", "noise_peak_g", "noise_peak_to_peak_g", "noise_rms_g"):
+                        self.assertEqual(set(record[key]), {axis})
+                    self.assertNotIn("noise_magnitude_peak_g", record)
+                    self.assertEqual(record["axis_mapping"], mapping)
+                for item in session["beta_motion_iterations"]:
+                    capture = item["capture"]
+                    self.assertEqual(capture["sample_layout"], "mapped_axis_v1")
+                    self.assertEqual(capture["axis_mapping"], mapping)
+                    self.assertAlmostEqual(capture["baseline_g"], -(.2, -.3)[source])
+                    self.assertTrue(all(len(row) == 2 for row in capture["samples"]))
+
     def test_three_actual_strokes_seed_only_mapped_startup_accel_cruise(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = GentleSeedRig(directory)

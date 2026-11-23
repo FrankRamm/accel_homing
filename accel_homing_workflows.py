@@ -1528,10 +1528,18 @@ class AccelHomingWorkflows:
                 or self._noise_context() != session["context"]):
             raise self._error("stationary context was interrupted or changed during PNG export")
 
+    def _mapped_noise_capture(self, capture, mapping, check_running=None):
+        try:
+            return _axes_module.mapped_axis_capture(capture, mapping, check_running)
+        except _axes_module.MappedCaptureError as exc:
+            raise self._error("invalid mapped noise capture: %s" % exc) from exc
+
     def _noise_record(self, session, iteration, capture):
         samples = capture.get("samples", ())
         context = session["context"]["sensor"]
         cutoff = capture.get("cutoff_time_s")
+        mapped = capture.get("sample_layout") == "mapped_axis_v1"
+        axes = session["axis"] if mapped else "xyz"
         if (capture.get("dropped", 0) or capture.get("fault") or capture.get("error")
                 or capture.pop("_noise_context", None) != context
                 or not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff)
@@ -1539,7 +1547,7 @@ class AccelHomingWorkflows:
             raise self._error("stationary noise capture is incomplete or lacks current sensor provenance")
         previous = None
         for sample in samples:
-            if (not isinstance(sample, (tuple, list)) or len(sample) != 4
+            if (not isinstance(sample, (tuple, list)) or len(sample) != len(axes) + 1
                     or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
                                and math.isfinite(value) for value in sample)
                     or sample[0] <= cutoff or (previous is not None and sample[0] <= previous)):
@@ -1550,30 +1558,37 @@ class AccelHomingWorkflows:
                     samples[0][0] <= session["iterations"][-1]["record"]["last_sample_time_s"])):
             raise self._error("stationary noise windows must be disjoint and span one second each")
         baseline = {axis: math.fsum(row[index + 1] for row in samples) / len(samples)
-                    for index, axis in enumerate("xyz")}
+                    for index, axis in enumerate(axes)}
         peaks, rms, spread = {}, {}, {}
-        for index, axis in enumerate("xyz", 1):
+        for index, axis in enumerate(axes, 1):
             values = [row[index] for row in samples]
             deltas = [value - baseline[axis] for value in values]
             peaks[axis] = max(abs(value) for value in deltas)
             rms[axis] = math.sqrt(math.fsum(value * value for value in deltas) / len(deltas))
             spread[axis] = max(values) - min(values)
-        capture["baseline_g"] = tuple(baseline[axis] for axis in "xyz")
-        magnitude_peak = max(math.sqrt(math.fsum((row[index] - baseline[axis]) ** 2
-                                                for index, axis in enumerate("xyz", 1)))
-                             for row in samples)
-        return {"run_id": session["run_id"], "noise_iteration": iteration,
-                "noise_metric": "raw_xyz_magnitude_starting_heuristic",
-                "signal_filter": {axis: self._filter_settings(axis) for axis in AXES},
+        if mapped:
+            capture["baseline_g"] = baseline[axes]
+            capture["sensor_context"] = context
+            measurement = {"sample_layout": "mapped_axis_v1", "axis": axes,
+                           "axis_mapping": dict(capture["axis_mapping"]), "impact_metric": "mapped_axis",
+                           "noise_axis_peak_g": peaks[axes], "noise_metric": "raw_mapped_axis_starting_heuristic",
+                           "axis_context": "signed mapped machine axis"}
+        else:
+            capture["baseline_g"] = tuple(baseline[axis] for axis in "xyz")
+            magnitude_peak = max(math.sqrt(math.fsum((row[index] - baseline[axis]) ** 2
+                                     for index, axis in enumerate("xyz", 1))) for row in samples)
+            measurement = {"noise_magnitude_peak_g": magnitude_peak,
+                           "noise_metric": "raw_xyz_magnitude_starting_heuristic",
+                           "axis_context": "configured sensor-stream XYZ; learned machine-axis mapping is separate"}
+        return {"run_id": session["run_id"], "noise_iteration": iteration, **measurement,
+                "signal_filter": {axis: self._filter_settings(axis) for axis in (axes if mapped else AXES)},
                 **self._signal_metadata(capture),
                 "duration_s": samples[-1][0] - samples[0][0], "sample_count": len(samples),
                 "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
                 "baseline_g": baseline, "noise_peak_g": peaks,
-                "noise_magnitude_peak_g": magnitude_peak,
                 "noise_peak_to_peak_g": spread, "noise_rms_g": rms,
                 "sensor": context["sensor"], "backend": context["backend"],
                 "full_scale_g": context["full_scale_g"],
-                "axis_context": "configured sensor-stream XYZ; learned machine-axis mapping is separate",
                 "sensor_context": context,
                 "acquisition_attempts": capture.get("acquisition_attempts", 1),
                 "acquisition_faults": list(capture.get("acquisition_faults", ()))}
@@ -1586,16 +1601,20 @@ class AccelHomingWorkflows:
         return self.start_threshold + steps * self.threshold_step
 
     def _noise_recommend(self, session):
+        mapped = session["iterations"][0]["record"].get("sample_layout") == "mapped_axis_v1"
         peaks = {axis: max(item["record"]["noise_peak_g"][axis]
-                           for item in session["iterations"]) for axis in "xyz"}
+                           for item in session["iterations"]) for axis in (session["axis"] if mapped else "xyz")}
         full_scale = session["context"]["sensor"]["full_scale_g"]
         limit = 0.8 * full_scale if full_scale else None
-        starts = {axis: self._noise_candidate(peaks[axis]) for axis in AXES}
+        starts = {axis: self._noise_candidate(peaks[axis]) for axis in (session["axis"] if mapped else AXES)}
         unavailable = [axis for axis, value in starts.items()
                        if limit is None or not math.isfinite(value) or value > limit or value <= peaks[axis]]
         for axis in unavailable:
             starts[axis] = None
-        return {"source": "stationary_noise", "method": "initial_candidate_heuristic",
+        measurement = ({"noise_metric": "raw_mapped_axis_starting_heuristic", "impact_metric": "mapped_axis",
+                        "calibration_axis": session["axis"], "axis_mapping": dict(session["axis_mapping"])}
+                       if mapped else {})
+        return {"source": "stationary_noise", "method": "initial_candidate_heuristic", **measurement,
                 "noise_peak_g": peaks, "start_threshold_g": starts,
                 "margin_factor": 1.2, "margin_g": 0.1,
                 "candidate_step_g": self.threshold_step,
@@ -1646,9 +1665,13 @@ class AccelHomingWorkflows:
     def _measure_noise(self, session):
         self._check_running(session)
         self._check_stopped_noise_context(session)
+        mapping = None
+        if session.get("calibration_preflight") and self.gentle_homing:
+            mapping = self._validate_current_axis_mapping(session["axis_mapping"], session["axis"])
         session["sensor_stopped"] = False
         session["sensor_started"] = True
-        if self.owner.start_noise_measurement() != session["context"]["sensor"]:
+        options = {"axis_mapping": mapping} if mapping is not None else {}
+        if self.owner.start_noise_measurement(**options) != session["context"]["sensor"]:
             raise self._error("sensor context changed before stationary noise measurement")
         session["sensor_token"] = self.owner.noise_session
         self._info("Recording three stationary one-second windows with the current motor/fan state. "
@@ -1675,19 +1698,22 @@ class AccelHomingWorkflows:
             capture = self.owner.collect_noise_window(lambda: self._check_noise_running(session),
                                                       NOISE_DURATION, recover_transient=True,
                                                       on_acquisition_fault=acquisition_fault)
-            if session.get("auto_notch"):
-                session["auto_notch_controller"].retain_debug_capture(session, "stationary", iteration, capture)
-            self._check_noise_running(session)
-            record = self._noise_record(session, iteration, capture)
-            if session.get("axis_mapping") is not None:
-                mapping = session["axis_mapping"]
-                record.update(impact_metric="mapped_axis", axis_mapping=dict(mapping),
-                              noise_axis_peak_g=record["noise_peak_g"]["xyz"[mapping["source_axis"]]])
-                if session.get("auto_notch") and self.gentle_homing:
-                    # Replay only after the moving controls select the profile.
-                    # Keep references to these three bounded acquisition windows.
-                    session.setdefault("_gentle_stationary_windows", []).append(
-                        (capture["samples"], capture["baseline_g"]))
+            if mapping is not None:
+                capture = self._mapped_noise_capture(capture, mapping, lambda: self._check_noise_running(session))
+            try:
+                self._check_noise_running(session)
+                record = self._noise_record(session, iteration, capture)
+            finally:
+                if session.get("auto_notch"):
+                    session["auto_notch_controller"].retain_debug_capture(session, "stationary", iteration, capture)
+            if mapping is not None and session.get("auto_notch"):
+                # Replay the mapped stationary data after the moving controls select a profile.
+                session.setdefault("_gentle_stationary_windows", []).append(
+                    (capture["samples"], capture["baseline_g"]))
+            elif mapping is None and session.get("axis_mapping") is not None:
+                axis_mapping = session["axis_mapping"]
+                record.update(impact_metric="mapped_axis", axis_mapping=dict(axis_mapping),
+                              noise_axis_peak_g=record["noise_peak_g"]["xyz"[axis_mapping["source_axis"]]])
             try:
                 paths = write_noise_capture(self.charts_directory, session["run_id"],
                                             iteration, capture, record, **self._chart_options(session))
@@ -1695,10 +1721,15 @@ class AccelHomingWorkflows:
                 del capture
             session["iterations"].append({"record": record, "capture_paths": paths})
             self._check_noise_running(session)
-            self._info("Stationary noise window %d/3 complete: X %.6g g, Y %.6g g, Z %.6g g; "
-                       "XYZ magnitude %.6g g after subtracting this window's mean" % (
-                           iteration, *(record["noise_peak_g"][axis] for axis in "xyz"),
-                           record["noise_magnitude_peak_g"]))
+            if mapping is not None:
+                self._info("Stationary noise window %d/3 complete: mapped %s peak %.6g g "
+                           "after subtracting this window's mean" % (
+                               iteration, session["axis"].upper(), record["noise_axis_peak_g"]))
+            else:
+                self._info("Stationary noise window %d/3 complete: X %.6g g, Y %.6g g, Z %.6g g; "
+                           "XYZ magnitude %.6g g after subtracting this window's mean" % (
+                               iteration, *(record["noise_peak_g"][axis] for axis in "xyz"),
+                               record["noise_magnitude_peak_g"]))
         session["recommendation"] = self._noise_recommend(session)
         self._check_noise_running(session)
 
@@ -1769,7 +1800,8 @@ class AccelHomingWorkflows:
                     or record.get("iteration") != iteration
                     or record.get("phase_time_source") != "actual_commanded_trapq"
                     or capture.get("sensor_context") != evidence["sensor_context"]
-                    or len(baseline) != 3 or not all(finite(value) for value in baseline)
+                    or capture.get("sample_layout") != "mapped_axis_v1"
+                    or capture.get("axis_mapping") != mapping or not finite(baseline)
                     or not finite(rate) or rate <= 0 or len(rows) < 2
                     or not segments):
                 raise self._error("gentle moving-noise capture %d is incomplete or invalid" % iteration)
@@ -1797,7 +1829,7 @@ class AccelHomingWorkflows:
             for index, row in enumerate(rows):
                 if index % 2048 == 0:
                     self._check_running(session)
-                if len(row) != 4 or not all(finite(value) for value in row):
+                if len(row) != 2 or not all(finite(value) for value in row):
                     raise self._error("gentle moving-noise capture contains invalid samples")
                 when = row[0]
                 if last_time is not None and not 0 < when - last_time <= 5.0 / rate + .000003:
@@ -1806,7 +1838,7 @@ class AccelHomingWorkflows:
                 for segment in segments:
                     phase = segment["phase"]
                     if phase in phase_peaks and segment["start_time_s"] <= when < segment["end_time_s"]:
-                        level = abs(row[mapping["source_axis"] + 1] - baseline[mapping["source_axis"]])
+                        level = abs(row[1] - baseline)
                         phase_peaks[phase] = max(phase_peaks[phase], level)
                         phase_counts[phase] += 1
             if (rows[0][0] > segments[0]["start_time_s"] + 2.0 / rate
@@ -1864,7 +1896,6 @@ class AccelHomingWorkflows:
                 or result["axis_mapping_context"] != evidence["sensor_context"]
                 or selected["profile"] != settings or selected["threshold_g"] != threshold):
             raise self._error("gentle candidate lacks matching independent motion and stationary evidence")
-        channel = evidence["axis_mapping"]["source_axis"]
         stationary_peaks, moving_peaks = [], []
         for i, (metric, capture, window, raw) in enumerate(zip(
                 metrics, captures, windows, evidence["iterations"]), 1):
@@ -1884,8 +1915,8 @@ class AccelHomingWorkflows:
                     self._check_running(session)
                 if j and row[0] - samples[j - 1][0] > 5.0 / rate + .000003:
                     raise self._error("gentle stationary control contains a sample gap")
-                signed = row[channel + 1] - baseline[channel]
-                level = abs(notch.process((signed,))[0] if notch else signed)
+                signed = row[1] - baseline
+                level = abs(notch.process_axis(signed, 0) if notch else signed)
                 peak = max(peak, level)
             stationary_peaks.append(peak)
             moving_peaks.append(metric["noise_peak_g"])
@@ -1943,17 +1974,16 @@ class AccelHomingWorkflows:
             mapping = self._validate_current_axis_mapping(session["axis_mapping"], session["axis"])
         except (TypeError, ValueError) as exc:
             raise self._error("axis mapping changed during stationary noise measurement: %s" % exc) from exc
-        source_axis = "xyz"[mapping["source_axis"]]
+        gentle = getattr(self, "gentle_homing", False)
+        source_axis = session["axis"] if gentle else "xyz"[mapping["source_axis"]]
         peaks = [item["record"]["noise_peak_g"].get(source_axis) for item in session["iterations"]]
         if (len(peaks) != NOISE_ITERATIONS or any(
                 not isinstance(peak, (int, float)) or isinstance(peak, bool)
                 or not math.isfinite(peak) or peak < 0.0 for peak in peaks)):
             raise self._error("calibration requires three measured mapped-axis noise peaks")
         peak = stationary_peak = max(peaks)
-        gentle = getattr(self, "gentle_homing", False)
         if gentle:
             peak = max(peak, self._gentle_motion_seed_peak(session))
-        magnitude_peak = max(item["record"]["noise_magnitude_peak_g"] for item in session["iterations"])
         start, step = session["start_threshold_g"], session["threshold_step_g"]
         # Decimal avoids an extra grid step from binary roundoff at an exact
         # boundary. A noisy candidate must never be rounded or clamped downward.
@@ -1972,11 +2002,14 @@ class AccelHomingWorkflows:
             "noise_metric": "raw_mapped_axis_starting_heuristic",
             "signal_filter": self._filter_settings(session["axis"]),
             "impact_metric": "mapped_axis", "axis_mapping": dict(mapping),
-            "noise_axis_peak_g": stationary_peak, "noise_magnitude_peak_g": magnitude_peak,
+            "noise_axis_peak_g": stationary_peak,
             "initial_threshold_source": "explicit_start_threshold" if explicit else "stationary_noise",
             "start_threshold_g": start if explicit else candidate,
             "acquisition_faults": list(noise_result["acquisition_faults"]),
             "summary_paths": {}}
+        if not gentle:
+            session["stationary_noise"]["noise_magnitude_peak_g"] = max(
+                item["record"]["noise_magnitude_peak_g"] for item in session["iterations"])
         session["deferred_noise_result"] = noise_result
         if gentle and session.get("auto_notch"):
             # The raw moving maximum belongs to the unfiltered stream. A candidate
@@ -2014,12 +2047,13 @@ class AccelHomingWorkflows:
                 "noise_metric": "raw_mapped_axis_starting_heuristic",
                 "signal_filter": self._filter_settings(session["axis"]),
                 "impact_metric": "mapped_axis", "axis_mapping": dict(mapping),
-                "noise_axis_peak_g": peak, "noise_magnitude_peak_g": magnitude_peak,
+                "noise_axis_peak_g": peak,
                 "required_threshold_g": required, "start_threshold_g": candidate,
                 "configured_start_g": start, "candidate_step_g": step, "threshold_limit_g": limit,
                 "margin_factor": 1.2, "margin_g": 0.1}
             session.update(start_threshold_g=candidate, candidate=candidate)
             if not gentle:
+                session["noise_seed"]["noise_magnitude_peak_g"] = session["stationary_noise"]["noise_magnitude_peak_g"]
                 self._info("Fresh stationary mapped-axis peak %.6g g selects initial candidate %.6g g; "
                            "ten-home qualification remains required" % (peak, candidate))
         elif not gentle:
@@ -2201,9 +2235,10 @@ class AccelHomingWorkflows:
             raise self._error("sensor fault during calibration capture: %s" % capture["fault"])
         if len(capture.get("samples", ())) < 2 or capture.get("dropped", 0):
             raise self._error("homing capture is empty or incomplete; sensor data is not usable")
+        sample_width = 2 if capture.get("sample_layout") == "mapped_axis_v1" else 4
         previous = None
         for sample in capture["samples"]:
-            if len(sample) != 4 or not all(isinstance(v, (int, float)) and math.isfinite(v)
+            if len(sample) != sample_width or not all(type(v) in (int, float) and math.isfinite(v)
                                            for v in sample) \
                     or (previous is not None and sample[0] <= previous):
                 raise self._error("homing capture has invalid or stale sensor samples")
@@ -2307,11 +2342,15 @@ class AccelHomingWorkflows:
                                 and math.isfinite(value))
         if expected_threshold is None:
             expected_threshold = session["saved_thresholds"][axis]
+        if capture.get("sample_layout") == "mapped_axis_v1":
+            baseline_valid = self.gentle_homing and record.get("impact_metric") == "mapped_axis" and finite(baseline)
+        else:
+            baseline_valid = (isinstance(baseline, (tuple, list)) and len(baseline) == 3
+                              and all(finite(value) for value in baseline))
         if (detector_record is not source_record or not isinstance(detector, dict)
                 or capture.get("fault") or capture.get("error")
                 or detector.get("axis") != axis or detector.get("attempt_count") != 1
-                or not isinstance(baseline, (tuple, list)) or len(baseline) != 3
-                or not all(finite(value) for value in baseline)
+                or not baseline_valid
                 or not finite(arm) or detector.get("arm_time_s") != arm
                 or not finite(detector.get("threshold_g")) or detector["threshold_g"] <= 0
                 or detector.get("direction") not in (-1, 0, 1)
@@ -3668,6 +3707,9 @@ class AccelHomingWorkflows:
         return segments
 
     def _beta_motion_noise(self, session, plan):
+        mapping = (self._validate_current_axis_mapping(session["axis_mapping"], session["axis"])
+                   if self.gentle_homing else None)
+        capture_options = {"axis_mapping": mapping} if mapping is not None else {}
         toolhead = self.owner.toolhead
         kin = toolhead.get_kinematics()
         index = AXES[session["axis"]]
@@ -3707,7 +3749,7 @@ class AccelHomingWorkflows:
                 capture = None
                 capture_failure = None
                 try:
-                    token = self.owner.start_beta_motion_capture(lambda: self._beta_check(session))
+                    token = self.owner.start_beta_motion_capture(lambda: self._beta_check(session), **capture_options)
                     self._beta_check(session)
                     rate = token.get("sample_rate_hz")
                     baseline = token.get("baseline_samples", ())
@@ -3736,6 +3778,8 @@ class AccelHomingWorkflows:
                     closing_token = token
                     token = None
                     capture = self.owner.stop_beta_motion_capture(closing_token, lambda: self._beta_check(session))
+                    if mapping is not None:
+                        capture = self._mapped_noise_capture(capture, mapping, lambda: self._beta_check(session))
                     if session.get("auto_notch"):
                         session["auto_notch_controller"].retain_debug_capture(
                             session, "motion", iteration, capture, record=session.get("beta_current_motion"))
@@ -3748,6 +3792,9 @@ class AccelHomingWorkflows:
                         raise self._error("Beta capture does not cover the complete forward motion interval")
                     record = {key: value for key, value in plan.items() if key not in ("extractor", "current_helper")}
                     record.update(self._signal_metadata(capture))
+                    if mapping is not None:
+                        record.update(axis_mapping=dict(mapping), sample_layout="mapped_axis_v1",
+                                      impact_metric="mapped_axis")
                     record.update(run_id=session["run_id"], beta=True, iteration=iteration,
                                   segments=segments, phase_time_source="actual_commanded_trapq",
                                   motor_settle_complete_time_s=session["beta_motor_settle_complete_time_s"])
@@ -3766,6 +3813,8 @@ class AccelHomingWorkflows:
                         try:
                             partial_capture = self.owner.stop_beta_motion_capture(token, lambda: self._beta_check(session))
                             if session.get("auto_notch"):
+                                if mapping is not None:
+                                    partial_capture = self._mapped_noise_capture(partial_capture, mapping)
                                 session["auto_notch_controller"].retain_debug_capture(
                                     session, "motion-partial", iteration, partial_capture,
                                     record=session.get("beta_current_motion"))

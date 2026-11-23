@@ -93,6 +93,68 @@ def validate_axis_mapping(mapping, axis=None):
     return copy.deepcopy(mapping)
 
 
+class MappedCaptureError(ValueError):
+    """The retained measurements cannot be attributed to the requested axis."""
+
+
+def mapped_axis_capture(capture, mapping, check_running=None):
+    """Retain the signed machine-axis component in g, before baseline subtraction.
+
+    Filtered samples, when present, are already baseline-subtracted. A compact
+    capture already includes the mapping sign and must never be mapped again.
+    """
+    try:
+        mapping = validate_axis_mapping(mapping)
+    except ValueError as exc:
+        raise MappedCaptureError(str(exc)) from exc
+    if not isinstance(capture, dict) or capture.get("axis_mapping", mapping) != mapping:
+        raise MappedCaptureError("Capture axis mapping differs from the selected axis")
+    if capture.get("coordinate_frame", FRAME) != FRAME:
+        raise MappedCaptureError("Unexpected capture coordinate frame")
+    layout = capture.get("sample_layout")
+    compact = layout == "mapped_axis_v1"
+    columns = ["time_s", "mapped_axis_g"]
+    if layout is not None and not compact:
+        raise MappedCaptureError("Unknown accelerometer sample layout")
+    if compact and (capture.get("axis_mapping") != mapping
+                    or list(capture.get("sample_columns") or ()) != columns):
+        raise MappedCaptureError("Incomplete mapped capture provenance")
+    source, sign = mapping["source_axis"], mapping["sign"]
+    if capture.get("impact_metric", "mapped_axis") != "mapped_axis":
+        raise MappedCaptureError("Capture uses a different detector metric")
+    result = dict(capture, impact_metric="mapped_axis", axis_mapping=mapping, coordinate_frame=FRAME,
+                  sample_layout="mapped_axis_v1", sample_columns=columns)
+    baseline = capture.get("baseline_g")
+    if baseline is not None:
+        if compact:
+            if not _number(baseline):
+                raise MappedCaptureError("Missing exact signed mapped-axis baseline")
+        elif (not isinstance(baseline, (list, tuple)) or len(baseline) != 3
+              or not _number(baseline[source])):
+            raise MappedCaptureError("Missing exact signed mapped-axis baseline")
+        else:
+            result["baseline_g"] = sign * baseline[source]
+    for field in ("samples", "filtered_samples"):
+        if field not in capture:
+            continue
+        rows = capture[field]
+        if not isinstance(rows, (list, tuple)):
+            raise MappedCaptureError("Malformed accelerometer sample list")
+        selected = [] if not compact else None
+        width, channel = (2, 1) if compact else (4, source + 1)
+        for index, row in enumerate(rows):
+            if index % 2048 == 0 and check_running is not None:
+                check_running()
+            if (not isinstance(row, (list, tuple)) or len(row) != width
+                    or not _number(row[0]) or not _number(row[channel])):
+                raise MappedCaptureError("Malformed or nonfinite mapped-axis samples")
+            if not compact:
+                selected.append((row[0], sign * row[channel]))
+        if not compact:
+            result[field] = selected
+    return result
+
+
 def _interpolate(times, values, time):
     index = bisect.bisect_left(times, time)
     if index < len(times) and times[index] == time:

@@ -52,18 +52,19 @@ class CausalNotch:
         self.coefficients = coefficients(settings, rate)
         self.state = [[0.0, 0.0] for _ in range(3)]
 
-    def process(self, xyz):
+    def process_axis(self, value, index=0):
         b0, b1, b2, a1, a2 = self.coefficients
-        result = []
-        for value, state in zip(xyz, self.state):
-            output = b0 * value + state[0]
-            first = b1 * value - a1 * output + state[1]
-            second = b2 * value - a2 * output
-            if not all(math.isfinite(v) for v in (output, first, second)):
-                raise ValueError("non-finite notch state")
-            state[:] = first, second
-            result.append(output)
-        return tuple(result)
+        state = self.state[index]
+        output = b0 * value + state[0]
+        first = b1 * value - a1 * output + state[1]
+        second = b2 * value - a2 * output
+        if not all(math.isfinite(v) for v in (output, first, second)):
+            raise ValueError("non-finite notch state")
+        state[:] = first, second
+        return output
+
+    def process(self, xyz):
+        return tuple(self.process_axis(value, index) for index, value in enumerate(xyz))
 
     def metadata(self):
         return dict(self.settings, sample_rate_hz=self.rate,
@@ -75,5 +76,7 @@ def replay(samples, baseline, metadata, start_index):
     filt = CausalNotch(metadata, metadata["sample_rate_hz"])
     if list(filt.coefficients) != metadata.get("coefficients"):
         raise ValueError("notch coefficient provenance mismatch")
+    if isinstance(baseline, (int, float)):
+        return [(row[0], filt.process_axis(row[1] - baseline)) for row in samples[start_index:]]
     return [(row[0],) + filt.process(tuple(row[i + 1] - baseline[i] for i in range(3)))
             for row in samples[start_index:]]

@@ -1,6 +1,8 @@
 """Mapped delivery comparison through the real workflow/backend/capture checks."""
 import copy
+import csv
 import gc
+import gzip
 import json
 from pathlib import Path
 import tempfile
@@ -16,6 +18,7 @@ from test_mapped_detector import deliver, mapping
 from test_session import FakeRail, info, with_endstops
 from test_workflows import GCmd, workflow_module
 import accel_homing_experiment as experiment_module
+from accel_homing_axes import mapped_axis_capture
 import accel_homing_filter as signal_filter
 import accel_homing_troubleshoot as diagnostics
 
@@ -159,6 +162,32 @@ class MappedComparisonTests(unittest.TestCase):
                      "signal_filter": obj.filter_settings("y")}, max_age_s=.020)
                 self.assertTrue(receipt["verified"])
                 obj._end_session()
+
+    def test_compact_capture_reproduces_mapped_crossing_and_exports_only_its_signal(self):
+        for filtered in (False, True):
+            with self.subTest(filtered=filtered), tempfile.TemporaryDirectory() as directory:
+                rig = MappedCompareRig(directory, filtered)
+                rig.workflow.gentle_homing = True
+                rig.owner.rails_by_axis["x"].info.speed = 40.
+                rig.owner.homing_accel = 1000.
+                rig.workflow.model.metadata["x"].update(rig.workflow._model_context("x"),
+                    gentle_homing=True, saved_threshold_tested=True, saved_threshold_g=8., tested_threshold_g=8.)
+                rig.capture_change = lambda capture: capture.update(mapped_axis_capture(capture, rig.mapping))
+                self.run_compare(rig)
+                report = self.report(rig)
+                home = report["homes"][0]
+                self.assertTrue(home["mapped_comparison_receipt"]["verified"])
+                self.assertEqual(home["capture"]["invalid_rows"], 0)
+                folder = Path(rig.workflow.last_result["artifacts"]["folder"])
+                with gzip.open(folder / home["raw_file"], "rt") as stream:
+                    reader = csv.DictReader(stream)
+                    self.assertEqual(reader.fieldnames, ["sample_index", "print_time_s", "mapped_axis_g"]
+                                     + (["filtered_mapped_axis_g"] if filtered else []))
+                    rows = list(reader)
+                    self.assertEqual(len(rows), home["capture"]["raw_rows_retained"])
+                    self.assertTrue(all(row["mapped_axis_g"] != "" for row in rows))
+                    if filtered:
+                        self.assertTrue(any(row["filtered_mapped_axis_g"] != "" for row in rows))
 
     def test_four_homes_keep_actual_mapping_threshold_and_fixed_notch_and_export_zip(self):
         for filtered in (False, True):

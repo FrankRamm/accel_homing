@@ -217,7 +217,7 @@ def noise_flow(obj, mode="valid"):
         values = []
         for number in range(size):
             delta = 0.0 if mode == "frozen" else (0.02 if (emitted[0] * size + number) % 2 else -0.02)
-            x = 16.0 if mode == "clip" else 0.25 + delta
+            x = 16.0 if mode in ("clip", "orthogonal_clip") else 0.25 + delta
             values.append((x, -0.1 - delta, 1.0 + delta))
         if mode == "map":
             if obj.backend is None:
@@ -230,6 +230,9 @@ def noise_flow(obj, mode="valid"):
                            receive_time=obj.reactor.monotonic(), delta_clock=size - 1)
             if mode == "clip":
                 fields["data"] = plugin.SAMPLE.pack(plugin.CLIPPED, 0, counts(1.0)) * size
+            elif mode == "orthogonal_clip":
+                fields["data"] = b"".join(plugin.SAMPLE.pack(plugin.CLIPPED, counts(y), counts(z))
+                                          for _, y, z in values)
             if mode == "error":
                 fields["errors"] = 1
             obj._inspect(fields)
@@ -265,6 +268,30 @@ class NoiseAcquisitionTests(unittest.TestCase):
                 self.assertEqual(obj.toolhead.dwells, [])
                 self.assertFalse(obj.stream_on)
                 self.assertIsNone(obj.noise_session)
+
+    def test_mapped_stationary_and_moving_capture_read_one_signed_channel(self):
+        for decoded in (False, True):
+            with self.subTest(decoded=decoded):
+                obj = self.machine(decoded)
+                # Beacon packets are native. Generic driver packets are already mapped.
+                if not decoded:
+                    obj.helper.config.axes_map = [(1, -1), (0, 1), (2, 1)]
+                source = 1 if decoded else 0
+                mapping = {"version": 1, "axis": "y", "source_axis": source, "sign": -1,
+                           "method": "bidirectional_velocity_v1", "coordinate_frame": "configured_sensor_stream"}
+                noise_flow(obj, mode="orthogonal_clip")
+                token = obj.start_beta_motion_capture(lambda: None, axis_mapping=mapping)
+                self.assertTrue(all(len(row) == 2 for row in token["baseline_samples"]))
+                for _ in range(18):
+                    obj.reactor.pause(obj.reactor.monotonic() + .005)
+                capture = obj.stop_beta_motion_capture(token, lambda: None)
+                self.assertEqual(capture["sample_layout"], "mapped_axis_v1")
+                self.assertEqual(capture["axis_mapping"], mapping)
+                self.assertFalse(capture["amplitude_limited"])
+                self.assertEqual(capture["beta_capture_diagnostics"]["saturation_axis_values"], 0)
+                self.assertAlmostEqual(capture["baseline_g"], .1 if decoded else -.1, delta=.003)
+                self.assertTrue(all(len(row) == 2 and abs(row[1] - capture["baseline_g"]) < .024
+                                    for row in capture["samples"]))
 
     def test_missing_stale_future_duplicate_gap_clip_error_frozen_and_map_fail_without_motion(self):
         for decoded in (False, True):

@@ -76,7 +76,7 @@ class BetaRig(Rig):
                 self.lines[stepper.name].enabled = True
         self.toolhead.dwell(.1)
 
-    def start_motion(self, check):
+    def start_motion(self, check, axis_mapping=None):
         check()
         self.beta_events.append(("baseline", self.workflow.session["axis"]))
         if self.fail_at == "baseline":

@@ -50,6 +50,21 @@ class GentleContactPhaseTests(unittest.TestCase):
                 self.assertEqual(metadata["gentle_contact_phase_policy"], "prebrake_v1")
                 self.assertEqual(len(metadata["gentle_contact_timing"]), 11)
                 self.assertEqual(len(report["gentle_contact_plans"]), 11)
+                for filename in (name for name in bundle.namelist() if name.endswith(".json.gz")):
+                    payload = json.loads(gzip.decompress(bundle.read(filename)))
+                    capture = payload.get("capture")
+                    if not capture or "samples" not in capture:
+                        continue
+                    if payload.get("kind") in ("mapping", "mapping-partial"):
+                        self.assertEqual(payload["acquisition_purpose"], "axis_identification")
+                        self.assertTrue(all(len(row) == 4 for row in capture["samples"]))
+                        continue
+                    self.assertEqual(capture["sample_layout"], "mapped_axis_v1", filename)
+                    self.assertEqual(capture["sample_columns"], ["time_s", "mapped_axis_g"], filename)
+                    self.assertTrue(all(len(row) == 2 for row in capture["samples"]), filename)
+                    self.assertTrue(all(len(row) == 2 for row in capture.get("filtered_samples", ())), filename)
+                    if capture.get("baseline_g") is not None:
+                        self.assertIsInstance(capture["baseline_g"], (int, float), filename)
                 for number in range(1, 12):
                     receipt = json.loads(bundle.read("contact-%04d-timing.json" % number))
                     self.assertEqual(receipt["workflow_attempt"], number)

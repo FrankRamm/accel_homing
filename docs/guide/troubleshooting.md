@@ -263,8 +263,8 @@ and mount. New calibration uses an explicit sensor map or, if absent, learns
 physical Y from gentle motion in both directions. It does not select the largest
 endstop-impact peak. Subsequent Y homing compares only that mapped component
 with its threshold. X does the same
-with its own mapping. Other channels remain in diagnostics but cannot trigger
-the mapped-axis detector. A large channel labelled X in a raw stream does not,
+with its own mapping. A gentle run retains only the mapped channel after
+the mapping step. A large channel labelled X in a raw stream does not,
 by itself, establish a physical X response or an `axes_map` error.
 
 If mapping is ambiguous, check mounting, sensor configuration and the motion
@@ -272,13 +272,13 @@ response before recalibrating. Changing the sensor or axes map invalidates its
 saved context. Older XYZ-magnitude models require a fresh calibration; do not
 copy their threshold into a mapped model.
 
-Compare raw XYZ during startup, steady travel and the impact in a complete
-troubleshooting bundle from the affected axis. Stationary noise alone cannot
+Compare the mapped signal during startup, steady travel and the impact in
+the troubleshooting bundle from the affected axis. Stationary noise alone cannot
 characterize vibration while moving. Keep speed, acceleration, sensor settings
 and threshold recorded with the comparison. A filter or component weighting
 changes the detector: it can attenuate an impact or delay the threshold crossing,
 and the existing calibrated threshold would need qualification again. There is
-currently no configurable filter for the ordinary mapped-axis detector.
+a configurable [per-axis notch](../advanced/notch.md) on the test branch.
 
 ## Accuracy recovery and save errors
 

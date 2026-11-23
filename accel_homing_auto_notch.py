@@ -13,10 +13,10 @@ import math
 
 try:
     from .accel_homing_filter import CausalNotch, DISABLED, RATE_TOLERANCE, profile
-    from .accel_homing_axes import validate_axis_mapping
+    from .accel_homing_axes import MappedCaptureError, mapped_axis_capture, validate_axis_mapping
 except ImportError:
     from accel_homing_filter import CausalNotch, DISABLED, RATE_TOLERANCE, profile
-    from accel_homing_axes import validate_axis_mapping
+    from accel_homing_axes import MappedCaptureError, mapped_axis_capture, validate_axis_mapping
 
 
 VERSION = "independent_mapped_motion_reference_stop_notch_v3"
@@ -227,16 +227,15 @@ def _contact_replay_input(capture, check_running, settings=None):
              "missing single-attempt mapped sensor provenance")
     _require(capture.get("sample_time_domain", "main_mcu_print_time") == "main_mcu_print_time",
              "raw samples are not in MCU print_time")
-    rows, baseline = capture.get("samples"), capture.get("baseline_g")
+    rows = capture.get("samples")
     _require(isinstance(rows, (list, tuple)) and 2 <= len(rows) <= MAX_CAPTURE_SAMPLES,
-             "missing, short or oversized complete raw XYZ capture")
-    _require(isinstance(baseline, (list, tuple)) and len(baseline) == 3
-             and all(_finite(value) for value in baseline), "missing exact signed XYZ baseline")
-    for offset in range(0, len(rows), 2048):
-        _check(check_running)
-        _require(all(isinstance(row, (list, tuple)) and len(row) == 4
-                     and all(_finite(value) for value in row) for row in rows[offset:offset + 2048]),
-                 "malformed or nonfinite raw XYZ samples")
+             "missing, short or oversized complete raw capture")
+    try:
+        capture = mapped_axis_capture(capture, mapping, check_running)
+    except MappedCaptureError as exc:
+        raise InsufficientData(str(exc)) from exc
+    rows, baseline = capture["samples"], capture.get("baseline_g")
+    _require(_finite(baseline), "missing exact signed mapped-axis baseline")
     start, arm = meta.get("first_sample_index"), detector.get("arm_time_s")
     _require(type(start) is int and 0 <= start < len(rows) - 1
              and type(meta.get("first_sample_matches")) is int and meta["first_sample_matches"] == 1
@@ -407,16 +406,14 @@ def describe_contact_timing(capture, planner, check_running=None, settings=None)
         if (index - start) % 2048 == 0:
             _check(check_running)
         row = rows[index]
-        signed = tuple(row[axis + 1] - baseline[axis] for axis in range(3))
+        signed = row[1] - baseline
         try:
-            _require(all(math.isfinite(value) for value in signed), "nonfinite baseline-subtracted sample")
-            filtered = signed if notch is None else notch.process(signed)
+            _require(math.isfinite(signed), "nonfinite baseline-subtracted sample")
+            filtered = signed if notch is None else notch.process_axis(signed, mapping["source_axis"])
         except ValueError as exc:
             summary["reason"] = str(exc)
             return summary, []
-        component = mapping["source_axis"]
-        plot_rows.append((row[0], abs(signed[component] * mapping["sign"]),
-                          abs(filtered[component] * mapping["sign"])))
+        plot_rows.append((row[0], abs(signed), abs(filtered)))
     rate = timing["reference_sample_rate_hz"]
     filter_metadata = (dict(DISABLED, sample_rate_hz=rate, initial_state="not_applicable_disabled")
                        if notch is None else notch.metadata())
@@ -502,7 +499,7 @@ def describe_contact_timing(capture, planner, check_running=None, settings=None)
     return summary, plot_rows
 
 
-def _prepare(item, kind, index, raw_threshold, np, check_running):
+def _prepare(item, kind, index, raw_threshold, np, check_running, *, gentle=False):
     _check(check_running)
     _require(isinstance(item, dict) and isinstance(item.get("record"), dict)
              and isinstance(item.get("capture"), dict), "capture entry requires record and capture")
@@ -540,23 +537,33 @@ def _prepare(item, kind, index, raw_threshold, np, check_running):
              capture_id + ": native marker amplitudes cannot train a filter")
     rows, baseline = capture.get("samples"), capture.get("baseline_g")
     _require(isinstance(rows, (list, tuple)) and 128 <= len(rows) <= MAX_CAPTURE_SAMPLES,
-             capture_id + ": missing, short or oversized complete raw XYZ capture")
-    _require(isinstance(baseline, (tuple, list)) and len(baseline) == 3
-             and all(_finite(value) for value in baseline), capture_id + ": missing exact signed XYZ baseline")
-    for offset in range(0, len(rows), 2048):
-        _check(check_running)
-        _require(all(isinstance(row, (list, tuple)) and len(row) == 4
-                     and all(_finite(value) for value in row) for row in rows[offset:offset + 2048]),
-                 capture_id + ": malformed or nonfinite raw XYZ samples")
+             capture_id + ": missing, short or oversized complete raw capture")
+    if gentle or capture.get("sample_layout") is not None:
+        try:
+            capture = mapped_axis_capture(capture, mapping, check_running)
+        except MappedCaptureError as exc:
+            raise InsufficientData(capture_id + ": " + str(exc)) from exc
+        rows, baseline = capture["samples"], capture.get("baseline_g")
+        _require(_finite(baseline), capture_id + ": missing exact signed mapped-axis baseline")
+        component, sign = 0, 1
+    else:
+        _require(isinstance(baseline, (tuple, list)) and len(baseline) == 3
+                 and all(_finite(value) for value in baseline), capture_id + ": missing exact signed XYZ baseline")
+        for offset in range(0, len(rows), 2048):
+            _check(check_running)
+            _require(all(isinstance(row, (list, tuple)) and len(row) == 4
+                         and all(_finite(value) for value in row) for row in rows[offset:offset + 2048]),
+                     capture_id + ": malformed or nonfinite raw XYZ samples")
+        component, sign = mapping["source_axis"], mapping["sign"]
     array = np.asarray(rows, dtype=float)
     with np.errstate(over="ignore", invalid="ignore"):
         times, signed = array[:, 0], array[:, 1:] - np.asarray(baseline)
-        raw_levels = np.abs(signed[:, mapping["source_axis"]])
+        raw_levels = np.abs(signed[:, component])
     _require(bool(np.all(np.isfinite(raw_levels))), capture_id + ": nonfinite baseline-subtracted magnitudes")
     _require(bool(np.all(np.diff(times) > 0)), capture_id + ": non-increasing sample times")
     result = {"id": capture_id, "kind": kind, "role": role, "axis": axis, "run_id": run_id,
               "record": record, "capture": capture, "times": times, "signed": signed,
-              "axis_mapping": mapping, "axis_mapping_context": context}
+              "axis_mapping": mapping, "axis_mapping_context": context, "component": component, "sign": sign}
     if kind == "motion":
         _require(capture.get("raw_samples_validated") is True
                  and record.get("phase_time_source") == "actual_commanded_trapq",
@@ -635,7 +642,7 @@ def _prepare(item, kind, index, raw_threshold, np, check_running):
         _home_eligibility(meta, times[start], arm, rate)
         _require(capture.get("signal_filter", DISABLED) == DISABLED,
                  capture_id + ": reference homes must use the disabled detector")
-        levels = np.abs(signed[start:onset + 1, mapping["source_axis"]])
+        levels = np.abs(signed[start:onset + 1, component])
         _require(float(levels[-1]) >= raw_threshold * (1 - 1e-12)
                  and bool(np.all(levels[:-1] < raw_threshold * (1 + 1e-12))),
                  capture_id + ": recorded onset is not the first raw threshold crossing")
@@ -665,8 +672,8 @@ def _prepare(item, kind, index, raw_threshold, np, check_running):
 
 
 def _mapped_signed(data, signed):
-    mapping = data["axis_mapping"]
-    return signed[:, mapping["source_axis"]:mapping["source_axis"] + 1] * mapping["sign"]
+    component = data["component"]
+    return signed[:, component:component + 1] * data["sign"]
 
 
 def _welch(signed, rate, np):
@@ -773,16 +780,19 @@ def _replay(data, settings, np, check_running):
     if settings == DISABLED:
         return data["signed"][start:end].copy()
     filt = CausalNotch(settings, data["rate"])
-    result = np.empty((end - start, 3))
+    result = np.empty_like(data["signed"][start:end])
     for offset, row in enumerate(data["signed"][start:end]):
         if offset % 1024 == 0:
             _check(check_running)
-        result[offset] = filt.process(row)
+        if result.shape[1] == 1:
+            result[offset, 0] = filt.process_axis(row[0], data["axis_mapping"]["source_axis"])
+        else:
+            result[offset] = filt.process(row)
     return result
 
 
 def _metrics(data, filtered, np):
-    levels = np.abs(filtered[:, data["axis_mapping"]["source_axis"]])
+    levels = np.abs(filtered[:, data["component"]])
     raw = data["raw"][data["start"]:data["end"]]
     result = {"capture_id": data["id"], "kind": data["kind"], "role": data["role"]}
     if data["kind"] == "motion":
@@ -880,7 +890,7 @@ def _plot(dataset, settings, threshold, np, check_running):
     for data in dataset:
         filtered = _replay(data, settings, np, check_running)
         raw = data["raw"][data["start"]:data["end"]]
-        levels = np.abs(filtered[:, data["axis_mapping"]["source_axis"]])
+        levels = np.abs(filtered[:, data["component"]])
         indices = _trace_indices(raw, levels, MAX_TRACE_POINTS, np)
         times = data["times"][data["start"]:data["end"]]
         trace = {"capture_id": data["id"], "kind": data["kind"], "role": data["role"],
@@ -916,7 +926,7 @@ def _gentle_metrics(data, settings, np, check_running):
     filtered = np.maximum(np.abs(full[:data["end"] - data["start"]]),
                           np.abs(continuous[data["start"]:data["end"]]))
     metrics, _ = _metrics(data, filtered, np)
-    source = data["axis_mapping"]["source_axis"]
+    source = data["component"]
     phases = []
     for segment in data["record"]["segments"]:
         phase = segment["phase"]
@@ -1011,7 +1021,7 @@ def analyze_gentle(motions, *, threshold_min_g=0.5, threshold_max_g, check_runni
                  "capture entries require complete raw sample lists")
         _require(sum(len(item["capture"]["samples"]) for item in motions) <= MAX_TOTAL_SAMPLES,
                  "total raw capture sample cap exceeded")
-        dataset = [_prepare(item, "motion", index, threshold_min_g, np, check_running)
+        dataset = [_prepare(item, "motion", index, threshold_min_g, np, check_running, gentle=True)
                    for index, item in enumerate(motions)]
         _require(len({item["id"] for item in dataset}) == 3
                  and len({item["fingerprint"] for item in dataset}) == 3,
@@ -1038,8 +1048,8 @@ def analyze_gentle(motions, *, threshold_min_g=0.5, threshold_max_g, check_runni
                 "reference_sample_count": item["capture"]["baseline_sample_count"],
                 "reference_first_time_s": item["capture"]["baseline_first_sample_time_s"],
                 "reference_last_time_s": item["capture"]["baseline_last_sample_time_s"],
-                "baseline_g": list(item["capture"]["baseline_g"]),
-                "scored_signed_xyz_sha256": item["fingerprint"], "sample_count": len(item["times"]),
+                "sample_layout": "mapped_axis_v1", "baseline_g": item["capture"]["baseline_g"],
+                "scored_signed_mapped_axis_sha256": item["fingerprint"], "sample_count": len(item["times"]),
                 "first_sample_index": item["start"], "first_sample_time_s": float(item["times"][item["start"]]),
                 "arm_source": item["arm_source"], "initial_state": "zero_at_first_armed_sample",
                 "last_scored_sample_index": item["end"] - 1,
@@ -1168,15 +1178,17 @@ def analyze(motions, homes, *, raw_threshold_g, threshold_min_g=0.5,
                      and math.isclose(item["accel"], first["accel"], rel_tol=1e-6) for item in dataset),
                  "sample rate or commanded speed/acceleration changed between captures")
         for item in dataset:
+            fingerprint_key = ("scored_signed_mapped_axis_sha256" if item["capture"].get("sample_layout")
+                               else "scored_signed_xyz_sha256")
             report["evidence"]["captures"].append({
                 "capture_id": item["id"], "kind": item["kind"], "role": item["role"],
-                "scored_signed_xyz_sha256": item["fingerprint"], "sample_rate_hz": item["rate"],
+                fingerprint_key: item["fingerprint"], "sample_rate_hz": item["rate"],
                 "sample_count": len(item["times"]), "first_sample_index": item["start"],
                 "first_sample_time_s": float(item["times"][item["start"]]),
                 "last_scored_sample_index": item["end"] - 1,
                 "last_scored_sample_time_s": float(item["times"][item["end"] - 1]),
                 "arm_source": item["arm_source"], "initial_state": "zero_at_first_eligible_sample",
-                "baseline_g": list(item["capture"]["baseline_g"]),
+                "baseline_g": item["capture"]["baseline_g"],
                 "source_first_sample_identity": ((item["capture"].get("auto_notch_replay") or {}).get("first_sample")
                                                  if item["kind"] == "home" else None),
                 "source_arm_eligibility_domain": ((item["capture"].get("auto_notch_replay") or {}).get("eligibility_source")
