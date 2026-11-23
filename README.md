@@ -148,6 +148,18 @@ command with `AXIS=Y`. If either axis hits hard, skips steps, or aborts, stop
 there and share that ZIP. It contains the motion captures, contact samples when
 available, trigger and halt step positions, effective settings, and host log.
 
+The single-contact ZIP also has `contact-timing.json` and `contact-timing.svg`
+at its root. The SVG shows the full seek and a zoom around scheduled braking,
+with acceleration, cruise and braking shaded separately. Raw and diagnostic
+200 Hz / Q=5 causal-notch replay traces use absolute acceleration in g;
+timestamps use MCU `print_time` seconds. The JSON reports each phase's peak and
+the largest filtered sample within 100 ms on either side of scheduled braking.
+`peak_minus_brake_ms` is negative when the peak came before braking and positive
+when it came after. If the detector requested a stop, a second window compares
+the signal with the host time observed just after that request. The filter runs
+offline. These timings describe commands and sensor readings. Physical contact
+time remains unverified. The report identifies missing evidence on aborted runs.
+
 Gentle supervised approaches command at most the midpoint-to-endstop distance
 plus 2 mm. An impact outside the midpoint tolerance, or more than 0.5 mm of
 commanded travel from trigger to halt, aborts the sequence. Ordinary G28 also

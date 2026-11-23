@@ -115,6 +115,41 @@ def run_analysis(payload, renderer, check_running, debug_directory=None):
                         logging.exception("accel_homing AUTO worker diagnostic export failed")
 
 
+def _contact_seek_segments(extractor, arm, home_end, axis, direction, horizon):
+    """Read one native seek before set_position can trim its scheduled tail."""
+    if not (math.isfinite(arm) and math.isfinite(home_end) and arm < home_end):
+        raise ValueError("invalid native homing time interval")
+    # On a trigger Klipper can retire the unexecuted remainder to history.
+    # Keep the original schedule, including ramps beyond home_end, while no
+    # subsequent move has been queued. home_end is not a physical halt time.
+    moves, backing = extractor(arm, horizon)
+    segments = []
+    for move in moves:
+        start, duration = move.print_time, move.move_t
+        velocity, accel = move.start_v, move.accel
+        vector = (move.x_r, move.y_r, move.z_r)
+        if not all(math.isfinite(v) for v in (start, duration, velocity, accel) + vector) or duration < 0:
+            raise ValueError("nonfinite or invalid trapq segment")
+        if not duration or (not velocity and not accel) or start + duration <= arm:
+            continue
+        if (start < arm - 1e-6 or any(abs(v - expected) > 1e-8 for v, expected in
+                zip(vector, (direction, 0., 0.) if axis == "x" else (0., direction, 0.)))):
+            raise ValueError("trapq motion does not belong to this directional seek")
+        phase = "acceleration" if accel > 0 else "braking" if accel < 0 else "cruise"
+        segments.append(dict(phase=phase, start_time_s=start, end_time_s=start + duration,
+                             start_velocity_mm_s=velocity, acceleration_mm_s2=accel))
+    del backing  # move structs reference these CFFI allocations
+    segments.sort(key=lambda item: item["start_time_s"])
+    if not segments or segments[0]["start_time_s"] > home_end:
+        raise ValueError("no matching trapq seek in the native homing interval")
+    order = ["acceleration", "cruise", "braking"]
+    if (len(segments) > 3 or any(order.index(left["phase"]) >= order.index(right["phase"])
+            or abs(left["end_time_s"] - right["start_time_s"]) > 1e-6
+            for left, right in zip(segments, segments[1:]))):
+        raise ValueError("ambiguous or discontinuous native seek profile")
+    return segments
+
+
 class AutoNotchCalibration:
     def __init__(self, workflows):
         self.w = workflows
@@ -131,6 +166,10 @@ class AutoNotchCalibration:
         self.debug_session = None
         self.debug_context = {}
         self.log_cursor = None
+        self.contact_only = False
+        self.contact_planner = None
+        self.contact_capture = None
+        self.contact_result = None
 
     def error(self, text):
         return self.w._error("AUTO notch: " + text)
@@ -247,6 +286,7 @@ class AutoNotchCalibration:
             raise self.error("cancel the active workflow before starting a new AUTO run")
         save = bool(gcmd.get_int("SAVE_CONFIG", 0, minval=0, maxval=1))
         contact_only = bool(gcmd.get_int("CONTACT_ONLY", 0, minval=0, maxval=1))
+        self.contact_only = contact_only
         if contact_only and (not w.gentle_homing or save):
             raise self.error("CONTACT_ONLY=1 requires gentle_homing and SAVE_CONFIG=0")
         if save and axis in w.manual_axes:
@@ -325,7 +365,11 @@ class AutoNotchCalibration:
             self.check(session)
             if contact_only:
                 self.event("single_contact", session)
-                record, _capture = w._home(axis, session["candidate"])
+                w.owner.contact_timing_observer = self._observe_contact_plan
+                try:
+                    record, _capture = w._home(axis, session["candidate"])
+                finally:
+                    del w.owner.contact_timing_observer
                 quality, reason = w._quality(axis, record)
                 if quality == "implausible":
                     reason = w._mark_implausible_calibration(axis, session["terminal_home"][2], reason)
@@ -407,10 +451,65 @@ class AutoNotchCalibration:
             except OSError:
                 pass
 
+    def _observe_contact_plan(self, attempt, home_end):
+        session = self.debug_session
+        if self.w.session is not session or attempt.axis != session["axis"]:
+            return
+        plan = session["beta_motion_plan"]
+        observed = self.contact_planner = dict(
+            source="motion_report.toolhead.extract_trapq", clock_domain="main_mcu_print_time",
+            axis=attempt.axis, pass_number=attempt.pass_no, arm_time_s=attempt.arm_time,
+            native_home_end_time_s=home_end, segments=[], brake_start_time_s=None,
+            stop_request_observed_time_s=attempt.request_time, stop_request_reason=attempt.reason,
+            stop_request_time_source="host main-MCU print-time estimate immediately after trigger dispatch",
+            status="unavailable")
+        try:
+            direction = 1. if plan["selected_endstop_mm"] > plan["center_mm"] else -1.
+            segments = _contact_seek_segments(self.w._beta_extractor(), attempt.arm_time, home_end,
+                                              attempt.axis, direction, self.w.reactor.NEVER)
+        except Exception as exc:
+            observed["reason"] = str(exc)
+            return
+        observed["segments"] = segments
+        brake = next((s["start_time_s"] for s in segments if s["phase"] == "braking"), None)
+        observed.update(brake_start_time_s=brake,
+                        status="complete" if segments[0]["phase"] == "acceleration" and brake is not None else "partial")
+        if brake is not None and attempt.request_time is not None:
+            observed["stop_request_minus_brake_ms"] = (attempt.request_time - brake) * 1000.
+
+    def _export_contact_timing(self, session, result, cooperate):
+        capture = self.contact_capture or {}
+        detector = capture.get("detector") or {}
+        planner = self.contact_planner or dict(status="unavailable", segments=[], brake_start_time_s=None,
+                                              reason="no native contact seek was observed")
+        matched = bool(self.contact_planner and detector.get("axis") == planner["axis"]
+                       and detector.get("arm_time_s") == planner["arm_time_s"]
+                       and detector.get("attempt_count") == 1)
+        # Preserve independent evidence even if the capture cannot be paired.
+        alignment = planner if matched else {"status": "unavailable", "segments": [], "brake_start_time_s": None}
+        if capture:
+            signal, rows = self.analysis.describe_contact_timing(capture, alignment, check_running=cooperate)
+        else:
+            signal, rows = {"status": "insufficient_data", "reason": "no retained contact acquisition"}, []
+        payload = dict(schema="accel_homing_contact_timing/v1", run_id=session["run_id"], axis=session["axis"],
+                       clock_domain="main_mcu_print_time", capture_matches_plan=matched,
+                       contact_result=self.contact_result,
+                       detector_threshold_g=detector.get("threshold_g"), detector_onset_time_s=detector.get("onset_time_s"),
+                       planner=planner, signal=signal, physical_position_verified=False)
+        if self._write_debug_json(self.folder / "contact-timing.json", payload, cooperate):
+            result["artifacts"]["contact_timing"] = str(self.folder / "contact-timing.json")
+        path = self.folder / "contact-timing.svg"
+        load_companion_module("accel_homing_charts").write_contact_timing_plot(
+            path, rows, alignment if rows else planner, signal, cooperate=cooperate)
+        result["artifacts"]["contact_timing_plot"] = str(path)
+
     def retain_debug_capture(self, session, kind, number, capture, record=None, error=None):
         """Persist stopped acquisitions independently from the accepted training set."""
         if self.folder is None:
             return
+        if self.contact_only and kind == "home":
+            self.contact_capture = capture
+            self.contact_result = (record or {}).get("result")
         name = "raw/%s-%04d.json.gz" % (kind, number)
         path = self.folder / name
         if path.exists():
@@ -470,6 +569,13 @@ class AutoNotchCalibration:
             result.setdefault("artifacts", {}).update(directory=str(self.folder),
                 report=str(self.folder / "report.json"), archive=str(archive),
                 archive_snapshot=self.debug_phase)
+            if self.contact_only:
+                try:
+                    self._export_contact_timing(session, result, cooperate)
+                except Exception as exc:
+                    self.debug_errors.append("contact timing: " + str(exc))
+                finally:
+                    self.contact_capture = None
             self.debug_finalizing = True
             try:
                 self._write_report(session, result)

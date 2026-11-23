@@ -177,6 +177,276 @@ def _home_eligibility(meta, first_time, arm_time, rate):
              "native first source sample is not the first eligible arm sample")
 
 
+def _contact_replay_input(capture, check_running):
+    """Validate retained detector inputs without requiring a threshold crossing."""
+    _require(isinstance(capture, dict), "missing retained raw capture")
+    _require(not any(capture.get(key) for key in (
+        "dropped", "fault", "error", "amplitude_limited", "excess_amplitude_unknown",
+        "clipped_axis_values", "range_limit_axis_values", "saturation_axis_values")),
+        "incomplete, faulty or amplitude-limited raw capture")
+    quality = capture.get("reference_signal_quality") or {}
+    decoding = capture.get("native_clip_decode") or {}
+    _require(isinstance(quality, dict) and not any(quality.get(key) for key in (
+        "amplitude_limited", "excess_amplitude_unknown", "clipped_axis_values",
+        "range_limit_axis_values", "saturation_axis_values"))
+        and isinstance(decoding, dict) and not decoding.get("marker_axis_values"),
+        "amplitude-limited reference or decoded native markers")
+    meta, detector = capture.get("auto_notch_replay"), capture.get("detector")
+    _require(isinstance(meta, dict) and isinstance(detector, dict),
+             "missing exact arm/reference provenance")
+    try:
+        mapping = validate_axis_mapping(capture.get("axis_mapping"), detector.get("axis"))
+        _require(validate_axis_mapping(detector.get("axis_mapping"), detector.get("axis")) == mapping,
+                 "capture mapping differs from the armed detector")
+    except (ValueError, TypeError) as exc:
+        raise InsufficientData("invalid mapped-axis identity: " + str(exc)) from exc
+    _require(detector.get("axis") in ("x", "y")
+             and detector.get("impact_metric") == "mapped_axis"
+             and type(detector.get("attempt_count")) is int and detector["attempt_count"] == 1
+             and capture.get("coordinate_frame") == "configured_sensor_stream"
+             and isinstance(capture.get("sensor_context"), dict) and capture["sensor_context"],
+             "missing single-attempt mapped sensor provenance")
+    _require(capture.get("sample_time_domain", "main_mcu_print_time") == "main_mcu_print_time",
+             "raw samples are not in MCU print_time")
+    rows, baseline = capture.get("samples"), capture.get("baseline_g")
+    _require(isinstance(rows, (list, tuple)) and 2 <= len(rows) <= MAX_CAPTURE_SAMPLES,
+             "missing, short or oversized complete raw XYZ capture")
+    _require(isinstance(baseline, (list, tuple)) and len(baseline) == 3
+             and all(_finite(value) for value in baseline), "missing exact signed XYZ baseline")
+    for offset in range(0, len(rows), 2048):
+        _check(check_running)
+        _require(all(isinstance(row, (list, tuple)) and len(row) == 4
+                     and all(_finite(value) for value in row) for row in rows[offset:offset + 2048]),
+                 "malformed or nonfinite raw XYZ samples")
+    start, arm = meta.get("first_sample_index"), detector.get("arm_time_s")
+    _require(type(start) is int and 0 <= start < len(rows) - 1
+             and type(meta.get("first_sample_matches")) is int and meta["first_sample_matches"] == 1
+             and meta.get("first_sample_time_s") == rows[start][0]
+             and meta.get("initial_state") == "zero_at_first_armed_sample"
+             and meta.get("complete") is True and _finite(arm),
+             "incomplete or ambiguous first armed sample identity")
+    rate = _reference_rate(meta, rows[start][0], motion=False, arm_time=arm)
+    _home_eligibility(meta, rows[start][0], arm, rate)
+    shortest, longest = float("inf"), 0.0
+    for index in range(1, len(rows)):
+        if index % 2048 == 0:
+            _check(check_running)
+        delta = rows[index][0] - rows[index - 1][0]
+        _require(delta > 0, "non-increasing sample times")
+        # Prearm capture includes unrelated acquisition and scheduled lookahead.
+        # Its reference has separate measured-rate/freshness provenance. None of
+        # those discarded rows, or their gaps, enter the zero-state replay.
+        if index <= start:
+            continue
+        shortest, longest = min(shortest, delta), max(longest, delta)
+        # Packet-derived timestamps may jitter while the complete sample
+        # sequence remains intact. The causal filter advances once per row;
+        # a roughly doubled interval instead indicates a missing sample.
+        _require(0.5 - 1e-8 <= delta * rate <= 1.5 + 1e-8,
+                 "missing samples or gross timestamp discontinuity in the armed replay")
+    measured = (len(rows) - start - 1) / (rows[-1][0] - rows[start][0])
+    _require(abs(measured / rate - 1) <= RATE_TOLERANCE + 1e-8,
+             "armed mean sample rate differs from the measured reference")
+    timing = {"reference_sample_rate_hz": rate, "armed_mean_sample_rate_hz": measured,
+              "minimum_interval_s": shortest, "maximum_interval_s": longest,
+              "maximum_interval_deviation_fraction": max(abs(shortest * rate - 1), abs(longest * rate - 1)),
+              "mean_rate_tolerance_fraction": RATE_TOLERANCE,
+              "interval_guard_nominal_periods": [0.5, 1.5],
+              "replay_sampling": "one filter update per original sample; no resampling"}
+    try:
+        notch = CausalNotch(profile(200.0, 5.0), rate)
+    except ValueError as exc:
+        raise InsufficientData(str(exc)) from exc
+    return rows, baseline, start, arm, mapping, notch, timing
+
+
+def _contact_planner_labels(planner):
+    """Incomplete planner evidence must not invent a move end or a tail."""
+    if not isinstance(planner, dict):
+        return [], None, "unavailable", "missing scheduled planner phases"
+    segments = planner.get("segments") or []
+    status = planner.get("status")
+    try:
+        _require(planner.get("clock_domain", planner.get("time_domain", "main_mcu_print_time"))
+                 == "main_mcu_print_time",
+                 "planner phases are not in MCU print_time")
+        _require(isinstance(segments, (tuple, list)) and len(segments) <= 3,
+                 "invalid scheduled phase list")
+        previous, previous_phase = None, -1
+        for segment in segments:
+            _require(isinstance(segment, dict), "invalid scheduled phase")
+            phase, left, right = (segment.get(key) for key in ("phase", "start_time_s", "end_time_s"))
+            _require(phase in ("acceleration", "cruise", "braking")
+                     and _finite(left) and _finite(right) and left < right,
+                     "invalid scheduled phase bounds")
+            phase_index = ("acceleration", "cruise", "braking").index(phase)
+            _require(phase_index > previous_phase
+                     and (previous is None or abs(left - previous) <= 1e-6),
+                     "unordered or discontinuous scheduled phases")
+            previous, previous_phase = right, phase_index
+        brake = planner.get("brake_start_time_s")
+        _require(brake is None or _finite(brake), "invalid scheduled brake time")
+        braking = next((item for item in segments if item["phase"] == "braking"), None)
+        _require(braking is None or brake is None or abs(brake - braking["start_time_s"]) <= 1e-6,
+                 "scheduled brake marker differs from the braking phase")
+        # A phase alone is insufficient to assert a complete scheduled move.
+        if not segments:
+            status = "unavailable"
+        elif status != "complete":
+            status = ("complete" if status is None and segments[0]["phase"] == "acceleration"
+                      and segments[-1]["phase"] == "braking" else "partial")
+        elif segments[0]["phase"] != "acceleration" or segments[-1]["phase"] != "braking":
+            status = "partial"
+        return segments, brake, status, None
+    except InsufficientData as exc:
+        return [], None, "unavailable", str(exc)
+
+
+def _contact_interval(rows, left, right, tolerance, check_running, *, closed=False):
+    """Report maxima at original sample times; equal maxima choose the first."""
+    result = {"start_time_s": left, "end_time_s": right,
+              "interval": "closed" if closed else "left_closed_right_open",
+              "sample_count": 0, "coverage": "none",
+              "covered_start_time_s": None, "covered_end_time_s": None,
+              "raw_peak_g": None, "raw_peak_time_s": None,
+              "filtered_peak_g": None, "filtered_peak_time_s": None}
+    for index, row in enumerate(rows):
+        if index % 2048 == 0:
+            _check(check_running)
+        if row[0] < left or (row[0] > right if closed else row[0] >= right):
+            continue
+        result["sample_count"] += 1
+        if result["covered_start_time_s"] is None:
+            result["covered_start_time_s"] = row[0]
+        result["covered_end_time_s"] = row[0]
+        if result["raw_peak_g"] is None or row[1] > result["raw_peak_g"]:
+            result.update(raw_peak_g=row[1], raw_peak_time_s=row[0])
+        if result["filtered_peak_g"] is None or row[2] > result["filtered_peak_g"]:
+            result.update(filtered_peak_g=row[2], filtered_peak_time_s=row[0])
+    if result["sample_count"]:
+        result["coverage"] = ("complete" if rows[0][0] <= left + tolerance
+                              and rows[-1][0] >= right - tolerance else "partial")
+    return result
+
+
+def describe_contact_timing(capture, planner, check_running=None):
+    """Descriptive offline 200 Hz/Q5 replay, independent of the live detector.
+
+    Replay every retained sample from the unique first armed row through the
+    tail. Scheduled braking and a nearby signal maximum are timing observations,
+    not independently observed contact or proof of a different stop decision.
+    A valid capture need not have triggered. Returned plot rows keep MCU
+    print_time and contain absolute raw and filtered mapped components in g.
+    """
+    _check(check_running)
+    summary = {"status": "insufficient_data", "version": "offline_contact_timing_v1",
+               "time_domain": "main_mcu_print_time", "offline_only": True,
+               "physical_contact_verified": False,
+               "filter": profile(200.0, 5.0), "phases": [], "global_peak": None,
+               "brake_window": {"coverage": "unavailable", "half_width_s": 0.100,
+                                "filtered_peak_g": None, "filtered_peak_time_s": None,
+                                "peak_minus_brake_ms": None},
+               "stop_request_window": {"coverage": "unavailable", "half_width_s": 0.100,
+                                       "filtered_peak_g": None, "filtered_peak_time_s": None,
+                                       "peak_minus_stop_request_ms": None}}
+    checking = False
+
+    def checked():
+        nonlocal checking
+        # Retain this flag when the caller raises: even InsufficientData used
+        # for cancellation must propagate instead of becoming a data warning.
+        checking = True
+        _check(check_running)
+        checking = False
+
+    try:
+        rows, baseline, start, arm, mapping, notch, timing = _contact_replay_input(capture, checked)
+    except InsufficientData as exc:
+        if checking:
+            raise
+        summary["reason"] = str(exc)
+        return summary, []
+    # Keep cancellation checks outside data-error handlers, including when a
+    # caller uses ValueError or InsufficientData as its cancellation exception.
+    _check(check_running)
+    plot_rows = []
+    for index in range(start, len(rows)):
+        if (index - start) % 2048 == 0:
+            _check(check_running)
+        row = rows[index]
+        signed = tuple(row[axis + 1] - baseline[axis] for axis in range(3))
+        try:
+            filtered = notch.process(signed)
+        except ValueError as exc:
+            summary["reason"] = str(exc)
+            return summary, []
+        component = mapping["source_axis"]
+        plot_rows.append((row[0], abs(signed[component] * mapping["sign"]),
+                          abs(filtered[component] * mapping["sign"])))
+    tolerance = 1.02 / notch.rate
+    segments, brake, planner_status, planner_reason = _contact_planner_labels(planner)
+    summary.update(status="ok", axis_mapping=mapping, filter=notch.metadata(), sampling=timing,
+                   sample_count=len(plot_rows), pre_arm_samples_excluded=start,
+                   arm_time_s=arm, first_replayed_time_s=plot_rows[0][0],
+                   last_replayed_time_s=plot_rows[-1][0],
+                   coverage_tolerance_s=tolerance, planner_status=planner_status,
+                   phase_source="scheduled_planner_segments",
+                   global_peak=_contact_interval(plot_rows, plot_rows[0][0], plot_rows[-1][0],
+                                                 tolerance, check_running, closed=True))
+    if planner_reason:
+        summary["planner_reason"] = planner_reason
+    intervals = []
+    if segments:
+        motion_start, motion_end = segments[0]["start_time_s"], segments[-1]["end_time_s"]
+        if plot_rows[0][0] < motion_start:
+            phase = "armed_before_motion" if segments[0]["phase"] == "acceleration" else "unclassified_before_planner"
+            intervals.append((phase, min(arm, plot_rows[0][0]), motion_start, False))
+        intervals.extend((item["phase"], item["start_time_s"], item["end_time_s"], False)
+                         for item in segments)
+        if plot_rows[-1][0] >= motion_end:
+            phase = "tail" if planner_status == "complete" else "unclassified_after_planner"
+            intervals.append((phase, motion_end, plot_rows[-1][0], True))
+    else:
+        intervals.append(("unclassified", plot_rows[0][0], plot_rows[-1][0], True))
+    for phase, left, right, closed in intervals:
+        _check(check_running)
+        summary["phases"].append(dict(_contact_interval(plot_rows, left, right, tolerance,
+                                                        check_running, closed=closed), phase=phase))
+    window = summary["brake_window"]
+    window.update(brake_start_time_s=brake, candidate_definition="maximum absolute filtered mapped component",
+                  interpretation="timing candidate only; not confirmed physical contact",
+                  delta_definition="filtered_peak_time_s minus scheduled brake_start_time_s")
+    if brake is None:
+        window["reason"] = "scheduled brake start is unavailable"
+    else:
+        window.update(_contact_interval(plot_rows, brake - 0.100, brake + 0.100,
+                                        tolerance, check_running, closed=True))
+        if window["filtered_peak_time_s"] is not None:
+            window["peak_minus_brake_ms"] = 1000.0 * (window["filtered_peak_time_s"] - brake)
+    # Detection can stop a move before its scheduled deceleration. Keep the
+    # observed request estimate separate and require the same captured attempt.
+    stop_window = summary["stop_request_window"]
+    matched = (isinstance(planner, dict) and planner.get("axis") == capture["detector"]["axis"]
+               and planner.get("arm_time_s") == arm
+               and planner.get("clock_domain", planner.get("time_domain", "main_mcu_print_time"))
+               == "main_mcu_print_time")
+    stop = planner.get("stop_request_observed_time_s") if matched else None
+    stop_window.update(stop_request_observed_time_s=stop if _finite(stop) else None,
+                       capture_matches_plan=matched,
+                       candidate_definition="maximum absolute filtered mapped component",
+                       interpretation="timing candidate relative to observed request estimate; not confirmed physical contact",
+                       delta_definition="filtered_peak_time_s minus stop_request_observed_time_s")
+    if not _finite(stop):
+        stop_window["reason"] = "matched observed stop-request time is unavailable"
+    else:
+        stop_window.update(_contact_interval(plot_rows, stop - 0.100, stop + 0.100,
+                                             tolerance, check_running, closed=True))
+        if stop_window["filtered_peak_time_s"] is not None:
+            stop_window["peak_minus_stop_request_ms"] = 1000.0 * (stop_window["filtered_peak_time_s"] - stop)
+    _check(check_running)
+    return summary, plot_rows
+
+
 def _prepare(item, kind, index, raw_threshold, np, check_running):
     _check(check_running)
     _require(isinstance(item, dict) and isinstance(item.get("record"), dict)

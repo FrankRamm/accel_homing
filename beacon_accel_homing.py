@@ -545,6 +545,14 @@ class BeaconAccelEndstop:
         finally:
             attempt = self._owner.disarm()
         result = self._dispatch.stop()
+        # The dispatcher is already stopped. Native homing may rewrite the
+        # toolhead position (and trim its trapq history) as soon as we return.
+        observer = getattr(self._owner, "contact_timing_observer", None)
+        if observer is not None and attempt is not None:
+            try:
+                observer(attempt, home_end_time)
+            except Exception:
+                logging.exception("accel_homing: could not retain contact planner timing")
         return self._owner.finish(self, attempt, result)
 
     def query_endstop(self, print_time):
@@ -2250,7 +2258,8 @@ class BeaconAccelHoming:
                         returned = True
                     finally:
                         diagnostic = (before, self._troubleshoot_now(), returned)
-            if attempt.motion_deadline is not None or self.backend is not None:
+            if (attempt.motion_deadline is not None or self.backend is not None
+                    or getattr(self, "contact_timing_observer", None) is not None):
                 # Preserve the existing observation before the optional sink.
                 try:
                     attempt.request_time = self.main_mcu.estimated_print_time(self.reactor.monotonic())

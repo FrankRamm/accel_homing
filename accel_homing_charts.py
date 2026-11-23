@@ -102,6 +102,194 @@ def _check_running(check_running):
         check_running()
 
 
+def _contact_timing_envelope(rows, start, end, cooperate, buckets=512):
+    """Bound a time-window trace while retaining both channels' extrema."""
+    selected = {}
+    span = max(end - start, 1.e-9)
+    for index, row in enumerate(rows):
+        if index % 1024 == 0:
+            _check_running(cooperate)
+        if not start <= row[0] <= end:
+            continue
+        bucket = min(buckets - 1, int((row[0] - start) / span * buckets))
+        item = selected.get(bucket)
+        if item is None:
+            # First, last, raw min/max and filtered min/max, in source order.
+            selected[bucket] = [index] * 6
+            continue
+        item[1] = index
+        for low, high, channel in ((2, 3, 1), (4, 5, 2)):
+            if row[channel] < rows[item[low]][channel]:
+                item[low] = index
+            if row[channel] > rows[item[high]][channel]:
+                item[high] = index
+    indices = sorted({index for item in selected.values() for index in item})
+    return [rows[index] for index in indices]
+
+
+def write_contact_timing_plot(path, rows, planner, signal, *, cooperate=None):
+    """Write a dependency-free diagnostic SVG from ordered absolute-g rows.
+
+    ``rows`` is a bounded sequence of (MCU print_time_s, abs raw g,
+    abs filtered g); filtering and timing analysis are performed by the caller.
+    Each panel retains at most 3072 source rows, independently, so a narrow
+    peak near braking is not lost to a full-seek display reduction.
+    """
+    _check_running(cooperate)
+    if len(rows) > _MAX_SAMPLES:
+        raise ValueError("Contact timing plot exceeds the sample limit")
+    previous = -math.inf
+    for index, row in enumerate(rows):
+        if index % 1024 == 0:
+            _check_running(cooperate)
+        if len(row) != 3 or not all(isinstance(value, (int, float))
+                                    and math.isfinite(value) for value in row) \
+                or row[0] < previous or min(row[1:]) < 0:
+            raise ValueError("Contact timing plot requires ordered finite absolute-g rows")
+        previous = row[0]
+
+    def number(value):
+        return float(value) if isinstance(value, (int, float)) \
+            and not isinstance(value, bool) and math.isfinite(value) else None
+
+    planner, signal = planner or {}, signal or {}
+    brake = number(planner.get("brake_start_time_s"))
+    stop = number(planner.get("stop_request_observed_time_s"))
+    window = signal.get("brake_window") or {}
+    peak_time = number(window.get("filtered_peak_time_s"))
+    peak_g = number(window.get("filtered_peak_g"))
+    delta_ms = number(window.get("peak_minus_brake_ms"))
+    peak_available = peak_time is not None and peak_g is not None and peak_g >= 0
+    if brake is None or not peak_available:
+        delta_ms = None
+    phases = {"acceleration": "#dbeafe", "cruise": "#dcfce7", "braking": "#ffedd5"}
+    segments = []
+    for segment in planner.get("segments") or []:
+        start, end = number(segment.get("start_time_s")), number(segment.get("end_time_s"))
+        if segment.get("phase") in phases and start is not None and end is not None and end >= start:
+            segments.append((segment["phase"], start, end))
+    bounds = [value for _, start, end in segments for value in (start, end)]
+    if rows:
+        bounds.extend((rows[0][0], rows[-1][0]))
+    bounds.extend(value for value in (brake, stop) if value is not None)
+    if peak_available:
+        bounds.append(peak_time)
+    full_start, full_end = (min(bounds), max(bounds)) if bounds else (0., 1.)
+    if full_end <= full_start:
+        full_start, full_end = full_start - .001, full_end + .001
+    zoom_start, zoom_end = number(window.get("start_time_s")), number(window.get("end_time_s"))
+    if brake is not None:
+        if zoom_start is None or zoom_end is None or not zoom_start < zoom_end:
+            zoom_start, zoom_end = brake - .1, brake + .1
+        zoom_start, zoom_end = min(zoom_start, brake), max(zoom_end, brake)
+        if peak_available:
+            zoom_start, zoom_end = min(zoom_start, peak_time - .005), max(zoom_end, peak_time + .005)
+    else:
+        zoom_start, zoom_end = full_start, full_end
+
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="830" '
+             'viewBox="0 0 1100 830" role="img">',
+             '<title>Single-contact signal and scheduled motion timing</title>',
+             '<desc>Absolute mapped-axis acceleration, full seek and brake-window zoom. '
+             'Scheduled deceleration, stop request and physical contact are distinct.</desc>',
+             '<rect width="1100" height="830" fill="white"/>',
+             '<g font-family="sans-serif" font-size="13" fill="#172033">']
+
+    def text_at(x, y, text, extra=""):
+        # All labels are fixed text or numeric values; no caller-provided XML.
+        parts.append('<text x="%.2f" y="%.2f" %s>%s</text>' % (x, y, extra, text))
+
+    def line(x1, y1, x2, y2, color, extra=""):
+        parts.append('<line x1="%.2f" y1="%.2f" x2="%.2f" y2="%.2f" '
+                     'stroke="%s" %s/>' % (x1, y1, x2, y2, color, extra))
+
+    text_at(72, 32, "Single-contact signal and scheduled motion timing", 'font-size="21" font-weight="bold"')
+    text_at(72, 56, "Diagnostic causal notch replay: 200 Hz, Q=5. Absolute mapped-axis acceleration in g.")
+    if delta_ms is not None:
+        text_at(72, 80, "Window filtered peak %.4g g; peak - scheduled brake = %+.3f ms." % (peak_g, delta_ms))
+    else:
+        text_at(72, 80, "Peak-to-scheduled-brake timing unavailable; see contact-timing.json for missing evidence.")
+    for index, (phase, color) in enumerate(phases.items()):
+        x = 72 + index * 155
+        parts.append('<rect x="%d" y="98" width="14" height="14" fill="%s"/>' % (x, color))
+        text_at(x + 20, 110, phase.capitalize())
+    line(560, 105, 590, 105, "#7c8798", 'stroke-width="1.5"')
+    text_at(598, 110, "Raw")
+    line(670, 105, 700, 105, "#1758ba", 'stroke-width="1.6"')
+    text_at(708, 110, "Filtered 200 Hz / Q=5")
+    line(72, 132, 100, 132, "#9a4d00", 'stroke-width="2" stroke-dasharray="6 4"')
+    text_at(108, 137, "Scheduled brake start")
+    if stop is not None:
+        line(340, 132, 368, 132, "#b42330", 'stroke-width="2" stroke-dasharray="3 4"')
+        text_at(376, 137, "Stop request observed after dispatch")
+
+    for panel, (title, start, end, top) in enumerate((
+            ("Full scheduled seek and capture", full_start, full_end, 190),
+            ("Zoom near scheduled brake" if brake is not None else "Brake zoom unavailable",
+             zoom_start, zoom_end, 480))):
+        _check_running(cooperate)
+        trace = _contact_timing_envelope(rows, start, end, cooperate)
+        width, height, left = 950., 190., 84.
+        bottom = top + height
+        ymax = max((max(row[1:]) for row in trace), default=.001)
+        if peak_available and start <= peak_time <= end:
+            ymax = max(ymax, peak_g)
+        ymax = max(.001, ymax) * 1.1
+        xcoord = lambda value: left + (value - start) / (end - start) * width
+        ycoord = lambda value: bottom - value / ymax * height
+        text_at(left, top - 15, title, 'font-size="16" font-weight="bold"')
+        for phase, phase_start, phase_end in segments:
+            lo, hi = max(start, phase_start), min(end, phase_end)
+            if hi > lo:
+                parts.append('<rect class="phase-%s" x="%.2f" y="%d" width="%.2f" height="%d" '
+                             'fill="%s"/>' % (phase, xcoord(lo), top, xcoord(hi) - xcoord(lo), height, phases[phase]))
+        for tick in range(5):
+            value = ymax * tick / 4
+            line(left, ycoord(value), left + width, ycoord(value), "#d5dbe4")
+            text_at(left - 10, ycoord(value) + 4, "%.3g" % value, 'text-anchor="end"')
+        for tick in range(6):
+            value = start + (end - start) * tick / 5
+            display = (value - brake) * 1000 if panel and brake is not None else value
+            text_at(xcoord(value), bottom + 22, "%+.1f" % display if panel and brake is not None
+                    else "%.4f" % display, 'text-anchor="middle"')
+        line(left, top, left, bottom, "#6b7280")
+        line(left, bottom, left + width, bottom, "#6b7280")
+        text_at(left - 38, top - 15, "g")
+        text_at(left + width / 2, bottom + 46,
+                "Time relative to scheduled brake start (ms)" if panel and brake is not None
+                else "MCU print_time (s)", 'text-anchor="middle"')
+        for channel, color, name in ((1, "#7c8798", "raw"), (2, "#1758ba", "filtered")):
+            points = []
+            for index, row in enumerate(trace):
+                if index % 512 == 0:
+                    _check_running(cooperate)
+                points.append("%.3f,%.3f" % (xcoord(row[0]), ycoord(row[channel])))
+            if points:
+                parts.append('<polyline class="%s-signal" points="%s" fill="none" stroke="%s" '
+                             'stroke-width="1.3"/>' % (name, " ".join(points), color))
+            if len(points) == 1:
+                parts.append('<circle cx="%.3f" cy="%.3f" r="2" fill="%s"/>' %
+                             (xcoord(trace[0][0]), ycoord(trace[0][channel]), color))
+        for value, name, color, pattern in ((brake, "scheduled-brake", "#9a4d00", "6 4"),
+                                             (stop, "stop-request-observed", "#b42330", "3 4")):
+            if value is not None and start <= value <= end:
+                line(xcoord(value), top, xcoord(value), bottom, color,
+                     'class="%s" stroke-width="2" stroke-dasharray="%s"' % (name, pattern))
+        if peak_available and start <= peak_time <= end:
+            parts.append('<circle class="window-filtered-peak" cx="%.3f" cy="%.3f" r="4" '
+                         'fill="#1758ba" stroke="white"/>' % (xcoord(peak_time), ycoord(peak_g)))
+        if not trace:
+            text_at(left + width / 2, top + height / 2, "No sensor samples in this interval",
+                    'text-anchor="middle"')
+    text_at(72, 753, "Phase shading and the brake marker describe the scheduled trajectory, not a measured mechanical stop.")
+    text_at(72, 775, "A stop-request marker is observed after dispatch. A signal peak alone does not verify physical contact.")
+    text_at(72, 797, "Each view preserves raw and filtered extrema during display reduction; full samples remain in the diagnostic ZIP.")
+    parts.append("</g></svg>")
+    _check_running(cooperate)
+    Path(path).write_text("\n".join(parts), encoding="utf-8")
+    return str(path)
+
+
 def _check_png(data, decode_pixels=True):
     """Check complete bounded, noninterlaced PNG bytes without importing Pillow."""
     if not isinstance(data, bytes) or not 45 <= len(data) <= _MAX_PNG_BYTES \
