@@ -513,6 +513,40 @@ def describe_contact_timing(capture, planner, check_running=None, settings=None)
     return summary, plot_rows
 
 
+def _gentle_batch_timing(capture, capture_id, periods, rate, np):
+    """Validate decoded batch timestamps before fitting a gentle motion control."""
+    tolerance = RATE_TOLERANCE + 1e-8
+    deviations = np.abs(periods - 1.)
+    outliers = np.flatnonzero(deviations > tolerance)
+    mean_rate = rate / float(periods.mean())
+    timing = {"mean_rate_hz": mean_rate, "reference_rate_hz": rate,
+              "minimum_interval_s": float(periods.min()) / rate,
+              "maximum_interval_s": float(periods.max()) / rate,
+              "isolated_jitter_intervals": int(outliers.size)}
+    _require(abs(mean_rate / rate - 1.) <= tolerance,
+             "%s: mean sample rate %.3f Hz differs from reference %.3f Hz" %
+             (capture_id, mean_rate, rate))
+    if not outliers.size:
+        return timing
+    # A small isolated shift of a batch timestamp can move one interval
+    # outside the rate tolerance. Require intact acquisition and agreement
+    # with the reference over both adjacent two-period spans.
+    receipt = capture.get("beta_capture_diagnostics") or {}
+    index = int(np.argmax(deviations))
+    message = ("%s: sample-rate drift or missing/nonuniform samples at interval %d "
+               "(%.3f us; reference %.3f us)" %
+               (capture_id, index, 1e6 * periods[index] / rate, 1e6 / rate))
+    _require(isinstance(receipt, dict) and receipt.get("gap_observations") == 0
+             and receipt.get("capture_dropped") == 0 and not receipt.get("fault")
+             and receipt.get("sample_count") == len(periods) + 1, message)
+    _require(outliers[0] > 0 and outliers[-1] < len(periods) - 1
+             and np.all(np.diff(outliers) > 1) and deviations[index] <= 2 * tolerance, message)
+    for neighbor in (-1, 1):
+        local = (periods[outliers] + periods[outliers + neighbor]) / 2
+        _require(np.all(np.abs(local - 1.) <= tolerance), message)
+    return timing
+
+
 def _prepare(item, kind, index, raw_threshold, np, check_running, *, gentle=False):
     _check(check_running)
     _require(isinstance(item, dict) and isinstance(item.get("record"), dict)
@@ -666,15 +700,17 @@ def _prepare(item, kind, index, raw_threshold, np, check_running, *, gentle=Fals
         result.update(start=start, end=onset + 1, onset=onset, speed=float(speed), accel=float(accel),
                       arm=arm, arm_source="recorded_live_first_eligible_sample",
                       lead_limit=min(2.0 / rate, 0.25 / speed))
-    regular = np.abs(np.diff(times) * rate - 1) <= RATE_TOLERANCE + 1e-8
-    if kind == "home" and start > 0 and "reference_validation" in meta:
-        # The reference stream may stop while the homing move is scheduled.
-        # The detector starts from zero at `start`; no filter state crosses
-        # this one boundary. Every other gap (including armed data) rejects.
-        if abs(times[start - 1] - meta["reference_last_time_s"]) <= 1e-9:
-            regular[start - 1] = True
-    _require(bool(np.all(regular)),
-             capture_id + ": sample-rate drift or missing/nonuniform samples")
+    periods = np.diff(times) * rate
+    if gentle and kind == "motion" and context.get("backend") == "klipper_batch":
+        result["sample_timing"] = _gentle_batch_timing(capture, capture_id, periods, rate, np)
+    else:
+        regular = np.abs(periods - 1) <= RATE_TOLERANCE + 1e-8
+        if kind == "home" and start > 0 and "reference_validation" in meta:
+            # The filter is cold across the scheduling gap after reference acquisition.
+            if abs(times[start - 1] - meta["reference_last_time_s"]) <= 1e-9:
+                regular[start - 1] = True
+        _require(bool(np.all(regular)),
+                 capture_id + ": sample-rate drift or missing/nonuniform samples")
     result["rate"] = rate
     result["raw"] = raw_levels
     # A new ID or time translation must not make the same capture independent.
@@ -978,7 +1014,9 @@ def _gentle_acceptance(metrics, threshold, role, *, filtered):
         required = max(1.2 * peak, peak + 0.1)
         item.update(threshold_margin_g=threshold - peak, required_threshold_g=required)
         if threshold + 1e-12 < required:
-            reasons.append(prefix + "frozen threshold lacks 20 percent or 0.1 g free-motion margin")
+            reasons.append(prefix + "frozen threshold lacks 20 percent or 0.1 g free-motion margin "
+                           "(threshold %.4g g, measured peak %.4g g, required %.4g g)" %
+                           (threshold, peak, required))
         if filtered:
             if item["cruise_peak_reduction"] < (TRAIN_REDUCTION if role == "train" else HOLDOUT_REDUCTION):
                 reasons.append(prefix + "insufficient cruise maximum reduction")
@@ -1060,6 +1098,7 @@ def analyze_gentle(motions, *, threshold_min_g=0.5, threshold_max_g, check_runni
             report["evidence"]["captures"].append({"capture_id": item["id"], "role": item["role"],
                 "sample_rate_hz": item["rate"], "sample_rate_source": "fresh_reference_timestamps",
                 "reference_sample_count": item["capture"]["baseline_sample_count"],
+                "sample_timing": item.get("sample_timing"),
                 "reference_first_time_s": item["capture"]["baseline_first_sample_time_s"],
                 "reference_last_time_s": item["capture"]["baseline_last_sample_time_s"],
                 "sample_layout": "mapped_axis_v1", "baseline_g": item["capture"]["baseline_g"],

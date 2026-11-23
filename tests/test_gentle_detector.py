@@ -20,6 +20,48 @@ def analyze(items, **options):
 
 
 class GentleDetectorTests(unittest.TestCase):
+    def test_decoded_batch_jitter_needs_intact_receipt_and_local_rate(self):
+        items = motions()
+        for item in items:
+            item["record"]["axis_mapping_context"]["backend"] = "klipper_batch"
+            cap = item["capture"]
+            cap["sensor_context"]["backend"] = "klipper_batch"
+            cap["beta_capture_diagnostics"] = {"sample_count": len(cap["samples"]),
+                                               "capture_dropped": 0, "gap_observations": 0}
+        original = analyze(items)
+        self.assertEqual(original["status"], "selected")
+        for case in ("isolated", "missing_sample", "sustained", "missing_receipt", "reported_gap"):
+            with self.subTest(case=case):
+                trial = copy.deepcopy(items)
+                cap = trial[0]["capture"]
+                # The tester had one 609 us interval at a nominal 622.82 us,
+                # followed by normal spacing. Keep the original signal values.
+                shift = .0222 / cap["sample_rate_hz"]
+                times = np.array([row[0] for row in cap["samples"]])
+                times[12:] -= shift
+                if case == "sustained":
+                    times[13:] -= shift
+                cap["samples"] = [(t, *row[1:]) for t, row in zip(times.tolist(), cap["samples"])]
+                if case == "missing_sample":
+                    cap["samples"].pop(20)
+                    cap["beta_capture_diagnostics"]["sample_count"] -= 1
+                elif case == "missing_receipt":
+                    del cap["beta_capture_diagnostics"]
+                elif case == "reported_gap":
+                    cap["beta_capture_diagnostics"]["gap_observations"] = 1
+                result = analyze(trial)
+                if case == "isolated":
+                    self.assertEqual(result["status"], "selected", result["reasons"])
+                    self.assertEqual(result["profile"]["type"], original["profile"]["type"])
+                    self.assertEqual(result["profile"]["q"], original["profile"]["q"])
+                    self.assertAlmostEqual(result["profile"]["frequency_hz"], original["profile"]["frequency_hz"], places=4)
+                    self.assertAlmostEqual(result["threshold_g"], original["threshold_g"], places=5)
+                    timing = result["evidence"]["captures"][0]["sample_timing"]
+                    self.assertEqual(timing["isolated_jitter_intervals"], 1)
+                else:
+                    self.assertEqual(result["status"], "insufficient_data")
+                    self.assertIn("missing/nonuniform samples at interval", result["reasons"][0])
+
     def test_training_only_frequency_generalizes_and_report_is_json(self):
         for frequency in (80., 330.):
             with self.subTest(frequency=frequency):
