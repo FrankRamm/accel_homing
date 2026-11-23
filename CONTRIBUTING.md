@@ -58,3 +58,8 @@ Write the summary line in the imperative, for example:
 
 One topic per pull request. Fill in the pull request template. Update the
 docs when behaviour or commands change.
+
+Do not commit plans, design specs, AI session notes or other working
+documents. They go stale and mislead later readers. Put the reasoning a
+reviewer needs in the pull request description and commit messages.
+`docs/superpowers/` and `.superpowers/` are ignored for this reason.
