@@ -52,8 +52,8 @@ The wizard does not calibrate a threshold; set that up first with
 ACCEL_HOMING_CALIBRATE_LIMITS
 ```
 
-Mainsail and Fluidd show one dialog that stays open and updates in place at each step; everything also
-appears in the console. `PROMPT=0` turns the dialog off. Closing it does not
+Mainsail and Fluidd show one dialog that stays open and updates in place at
+each step; everything also appears in the console. `PROMPT=0` turns the dialog off. Closing it does not
 cancel. Run the bare command again, or `ACTION=STATUS`, to reopen the current
 step without moving.
 
@@ -145,9 +145,10 @@ using the printer.
 
 ## Cancel and invalidation
 
-Use the dialog's **Cancel** (**Abort** while aligning) button or `ACCEL_HOMING_CANCEL`. This is not an
-emergency stop. Klipper may run it only after the current command returns, and
-a jog in progress finishes its segment (at most 10 mm). Use the printer's
+Use the dialog's **Cancel** (**Abort** while aligning) button or
+`ACCEL_HOMING_CANCEL`. This is not an emergency stop. Klipper may run it only
+after the current command returns, so it takes effect after the current jog
+move finishes (up to 100 mm, at `JOG_SPEED`, at most 20 mm/s). Use the printer's
 emergency stop for immediate danger.
 
 The wait expires after `calibration_confirm_timeout` (default 300 seconds).

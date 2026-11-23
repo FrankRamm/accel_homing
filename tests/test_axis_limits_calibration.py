@@ -158,6 +158,11 @@ class AxisLimitsCalibrationTests(unittest.TestCase):
         self.assertIsNotNone(rig.workflow.session)
         self.assertFalse(any("action:prompt_end" in text for text in rig.prompts))
         self.assertGreaterEqual(sum("prompt_begin" in text for text in rig.prompts), 2)
+        begins = sum("prompt_begin" in text for text in rig.prompts)
+        rig.command("JOG", DISTANCE=-10)
+        self.assertIsNotNone(rig.workflow.session)
+        self.assertFalse(any("action:prompt_end" in text for text in rig.prompts))
+        self.assertGreater(sum("prompt_begin" in text for text in rig.prompts), begins)
 
     def test_session_end_closes_dialog(self):
         rig = AxisLimitsRig()
