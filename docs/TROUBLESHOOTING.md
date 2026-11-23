@@ -52,6 +52,7 @@ missing file. See [service activation and instance selection](INSTALLATION.md).
 | Invalid geometry/insufficient travel | Correct the actual rail limits, endstop position/direction and midpoint distance. Calibration needs more than 20 mm from configured midpoint to stop. |
 | Threshold exceeds range/headroom | Check actual configured/active sensor range. Use a justified value within the 80% software policy. Native clients can change the stream range. |
 | Saved model mismatch or unexpected active threshold | Inspect selected sensor/model and manual X/Y/shared threshold precedence. Comment manual values to use a calibrated model; do not edit generated model metadata. |
+| Saved model is stale after changing `axes_map`, geometry or homing speed | Klipper still starts, but homing that axis is refused (`does not match current ...`) until it is recalibrated with `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1`, or an explicit `x_threshold` is set in the regular `[accel_homing]` section. A threshold that calibration wrote to the SAVE_CONFIG block does not count as an override. The stale axes are listed as `stale_model_axes` in `ACCEL_HOMING_STATUS`. |
 | Printing/paused/busy or competing sensor client | Finish or cancel the competing operation normally and wait for a genuinely idle, stationary machine. Do not bypass the check. |
 
 ## Data and homing faults
