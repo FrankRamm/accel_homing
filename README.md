@@ -1,5 +1,7 @@
 # Accelerometer Homing
 
+[![tests](https://github.com/FrankRamm/accel_homing/actions/workflows/tests.yml/badge.svg?branch=dev)](https://github.com/FrankRamm/accel_homing/actions/workflows/tests.yml)
+
 Use a configured accelerometer as an X/Y impact endstop in Klipper or Kalico.
 It replaces physical endstop switches for X and Y by detecting the toolhead's
 impact on the mechanical stop. See [compatibility](docs/guide/compatibility.md)
