@@ -1,5 +1,7 @@
 # Offline verification
 
+[← Documentation](../README.md)
+
 Run checks from the standalone repository root on a development machine.
 The suite uses synthetic sensor/motion/service objects and temporary fixture
 directories; it is not a request to operate a printer.
@@ -179,9 +181,9 @@ position, skipped-step absence or end-to-end stopping latency.
 
 ## Historical evidence
 
-[Historical verification notes](docs/HISTORICAL_TESTING.md) preserve the earlier
-dated narrative. The immutable [validation report](validation/VALIDATION.json)
-and [test log](validation/tests.txt) describe an older package snapshot:
+[Historical verification notes](historical-testing.md) preserve the earlier
+dated narrative. The immutable [validation report](../../validation/VALIDATION.json)
+and [test log](../../validation/tests.txt) describe an older package snapshot:
 2026-10-27 UTC, Windows/CPython 3.13.5, 558 tests with one symlink-permission
 skip. The report explicitly has `final_validation: false`.
 

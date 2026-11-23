@@ -7,7 +7,7 @@ initial homing and calibration with an accessible emergency stop.
 ## Install
 
 To test this development branch on an existing printer, follow
-[Switch an existing tester installation to dev](docs/INSTALLATION.md#switch-an-existing-tester-installation-to-dev).
+[Switch an existing tester installation to dev](docs/guide/installation.md#switch-an-existing-tester-installation-to-dev).
 The install block below selects the stable branch.
 
 Run in the Linux printer host's shell as the existing Klipper service user,
@@ -44,10 +44,10 @@ configuration, without creating or checking installation backups. It restarts
 the verified services and may ask for your Linux sudo password. It does not
 home the printer.
 
-Read the [first calibration instructions](docs/SIMPLE_CALIBRATION.md) before
+Read the [first calibration instructions](docs/guide/calibration.md) before
 moving the printer. Existing MISC installations can run this installer directly;
 the old uninstaller is not required. See the
-[migration details](docs/INSTALLATION.md#migrate-from-the-misc-plugin).
+[migration details](docs/guide/installation.md#migrate-from-the-misc-plugin).
 
 For later updates, use **accel_homing → Update** in Mainsail or Fluidd while idle.
 
@@ -71,7 +71,7 @@ Add the base `[update_manager]` section once if absent. After manual edits,
 restart the matching Moonraker service while idle. `~` is Moonraker's service
 user's home; use the printed absolute path if needed. Uninstall removes the
 matching plugin entry while preserving unrelated updater configuration.
-[Update details](docs/INSTALLATION.md#moonraker-updates) ·
+[Update details](docs/guide/installation.md#moonraker-updates) ·
 [Moonraker reference](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
 
 ## Printer console commands
@@ -92,7 +92,7 @@ center the toolhead.** Workflows skip safe Z hops and G28 override scripts.
 | `ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1` | Home/chart X; use `AXIS=Y` or omit AXIS for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Measure repeated commanded-travel variation and save an accuracy PNG; X, Y or XY, 2–50 samples per axis. |
 | `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Record repeated homes, packet/stop/return timing, raw samples and diagnostic plots in a shareable bundle; fixed active settings, no recalibration or save. |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | On a saved mapped axis, run four homes in two normal/shorter-delivery pairs at the calibrated threshold and export a ZIP. The historical XYZ comparison has 11 additional reference/discovery homes. See [experimental workflow](docs/EXPERIMENT.md). |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | On a saved mapped axis, run four homes in two normal/shorter-delivery pairs at the calibrated threshold and export a ZIP. The historical XYZ comparison has 11 additional reference/discovery homes. See [experimental workflow](docs/advanced/experiment.md). |
 | `ACCEL_HOMING_CANCEL` | Cancel workflow work when handled and restore temporary settings; **not an emergency stop**. |
 | `SET_ACCEL_HOMING AXIS=X THRESHOLD=1` | Set X's threshold in g until restart; use `AXIS=Y` for Y. Does not save a model. |
 
@@ -103,7 +103,7 @@ XY again after restart before calibrating the other axis. Successful calibration
 saves the selected axis's runtime threshold together with its model through
 `SAVE_CONFIG`, replacing its previous manual value. A shared threshold remains
 available to the other axis. Later manual overrides still take precedence. See
-[configuration](docs/CONFIGURATION.md#thresholds-and-saved-models).
+[configuration](docs/guide/configuration.md#thresholds-and-saved-models).
 
 `NOTCH=AUTO` defaults to reporting only and tests the exact threshold it
 would save. To report a tester run, send the ZIP printed by each command
@@ -177,7 +177,7 @@ axis. Each onset must precede commanded braking, fall within the center-travel
 tolerance and meet the trigger-to-halt limit. Ordinary G28 checks the saved
 model and the phase of its own trigger. A single-contact check qualifies no model.
 
-Read the [command reference](docs/COMMANDS.md) for options and restrictions.
+Read the [command reference](docs/guide/commands.md) for options and restrictions.
 After physically validating both axes, use the printer's normal homing controls.
 
 New calibration uses the selected sensor's explicit `accel_axes_map` (Beacon)
@@ -208,24 +208,24 @@ or manual updater entries need this checkout, remove the source if desired:
 rm -rf ~/accel_homing
 ```
 
-[Uninstall and recovery details](docs/INSTALLATION.md#uninstall).
+[Uninstall and recovery details](docs/guide/installation.md#uninstall).
 
 ## Documentation
 
-[Installation and migration](docs/INSTALLATION.md) ·
-[Supported sensors and limits](docs/COMPATIBILITY.md) ·
-[Configuration](docs/CONFIGURATION.md) ·
-[Notch filter (dev)](docs/NOTCH.md) ·
-[Console commands](docs/COMMANDS.md) ·
-[Calibration](docs/SIMPLE_CALIBRATION.md) ·
-[Accuracy](docs/ACCURACY.md) ·
-[Per-home diagnostic capture](docs/TROUBLESHOOT_CAPTURE.md) ·
-[Experimental detector comparison](docs/EXPERIMENT.md) ·
-[Plots](docs/PLOTS.md) ·
-[Beta experiment](docs/BETA.md) ·
-[Troubleshooting](docs/TROUBLESHOOTING.md) ·
-[Technical reference](docs/DETAILS.md) ·
-[Offline tests](TESTING.md).
+[Installation and migration](docs/guide/installation.md) ·
+[Supported sensors and limits](docs/guide/compatibility.md) ·
+[Configuration](docs/guide/configuration.md) ·
+[Notch filter (dev)](docs/advanced/notch.md) ·
+[Console commands](docs/guide/commands.md) ·
+[Calibration](docs/guide/calibration.md) ·
+[Accuracy](docs/advanced/accuracy.md) ·
+[Per-home diagnostic capture](docs/advanced/diagnostic-capture.md) ·
+[Experimental detector comparison](docs/advanced/experiment.md) ·
+[Plots](docs/advanced/plots.md) ·
+[Beta experiment](docs/advanced/beta.md) ·
+[Troubleshooting](docs/guide/troubleshooting.md) ·
+[Technical reference](docs/advanced/technical-reference.md) ·
+[Offline tests](docs/development/testing.md).
 
 ## Credits and thanks
 

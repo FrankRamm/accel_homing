@@ -1,15 +1,17 @@
 # Historical verification notes
 
+[← Documentation](../README.md)
+
 This archive preserves the pre-standalone testing narrative and its original
 dates, counts and limitations. Statements such as "current" below refer to
 their original revisions. Old directory names and bootstrap commands are
 historical examples, not installation or test instructions for this repository.
 Do not use their passing counts to validate the standalone revision.
 
-Use [current testing instructions](../TESTING.md), [current calibration](SIMPLE_CALIBRATION.md)
-and [current installation](INSTALLATION.md) for this checkout.
-The immutable older [report](../validation/VALIDATION.json) and
-[log](../validation/tests.txt) remain unchanged.
+Use [current testing instructions](testing.md), [current calibration](../guide/calibration.md)
+and [current installation](../guide/installation.md) for this checkout.
+The immutable older [report](../../validation/VALIDATION.json) and
+[log](../../validation/tests.txt) remain unchanged.
 
 ---
 
@@ -88,7 +90,7 @@ Faults, a missing current home record, missing impacts and firmware movement
 errors still abort without a threshold increase. These source cases do not
 establish physical return, correct endstop contact or hardware performance.
 There is no encoder feedback or automatic binding diagnosis. See the [current
-sequence, exact limits and metadata](SIMPLE_CALIBRATION.md).
+sequence, exact limits and metadata](../guide/calibration.md).
 
 ## Running spread, travel plausibility and shared returns — 2026-10-28
 
@@ -121,7 +123,7 @@ TEST/CHARTS returns remain unchanged. Fresh three-window stationary-noise
 preflight and summary export remain mandatory before calibration movement.
 Earlier descriptions of the 1.5 mm rule, waiting for complete windows and capped
 midpoint returns describe historical revisions, not current calibration.
-Current behavior is documented in [SIMPLE_CALIBRATION.md](SIMPLE_CALIBRATION.md).
+Current behavior is documented in [calibration guide](../guide/calibration.md).
 
 ## Stationary-noise preflight before calibration — 2026-10-28
 
@@ -257,7 +259,7 @@ The local run completed in 16.091 seconds with no failures, errors or skips.
 measurement fixtures are synthetic; these results do not certify mechanical
 endstop contact, physical travel, repeatability or stopping latency.
 
-The current workflow is documented in [SIMPLE_CALIBRATION.md](SIMPLE_CALIBRATION.md).
+The current workflow is documented in [calibration guide](../guide/calibration.md).
 It replaces calibration discovery collisions with a bounded 20 mm screening
 move, keeps all ten validation impacts separate, accepts an exactly 2 mm spread,
 and retries a failed complete set at the next candidate with a new screen and
@@ -638,7 +640,7 @@ integration run was performed here.
 
 The need for a full host-process restart follows inspected upstream
 import/restart source, documented in
-[current activation reference](INSTALLATION.md#service-activation).
+[current activation reference](../guide/installation.md#service-activation).
 Installer activation fixtures use mocked systemd/process/privilege operations.
 They cover default install/update restart, `--no-restart`, selected-unit and
 live-process identity checks, a fresh idle/pause check before activation,
@@ -652,8 +654,8 @@ The restart coverage includes **15 `test_installer.RestartFixture` tests**.
 The final combined offline verification run discovered **558 tests: 557 passed,
 zero failures/errors, and the same one Windows symlink skip**. The portable
 machine-readable report and complete referenced log are together under
-[`validation/VALIDATION.json`](../validation/VALIDATION.json) and
-[`validation/tests.txt`](../validation/tests.txt).
+[`validation/VALIDATION.json`](../../validation/VALIDATION.json) and
+[`validation/tests.txt`](../../validation/tests.txt).
 
 Historical executed installer fixtures cover main/include discovery,
 stopped/running/multiple instances, process command and service parsing, configured sensor selection,

@@ -1,5 +1,7 @@
 # Installation, updates and recovery
 
+[← Documentation](../README.md)
+
 Run shell commands on the Linux printer host as the existing Klipper service
 user. Keep the printer idle and unpaused throughout installation, updating,
 uninstallation and service restarts. Installation does not request motion.
@@ -8,7 +10,7 @@ uninstallation and service restarts. Installation does not request motion.
 
 - A working Klipper or Kalico installation, Bash, Git, and Python 3.8 or newer.
 - A configured, functioning accelerometer supported by the
-  [sensor adapter](COMPATIBILITY.md). Configure its MCU, wiring, firmware and
+  [sensor adapter](compatibility.md). Configure its MCU, wiring, firmware and
   driver before installing this plugin.
 - Write access to the selected printer configuration and Klipper extras
   directory. Use the normal service user; the installer requests sudo for
@@ -226,7 +228,7 @@ For example, replace every path/service below with the actual instance:
 Generic travel flags are optional and rejected for native Beacon. Absent flags
 preserve existing explicit limits or leave them disabled. They do not raise
 acceleration or automatically choose a slower speed. See
-[timing and optional travel policies](DETAILS.md#timing-and-optional-travel-policies).
+[timing and optional travel policies](../advanced/technical-reference.md#timing-and-optional-travel-policies).
 
 Built-in `[safe_z_home]` or `[homing_override]` needs no acknowledgement flag.
 The plugin preserves their ordinary G28 behavior. Custom G28 macros still need
@@ -234,7 +236,7 @@ The plugin preserves their ordinary G28 behavior. Custom G28 macros still need
 homing sequence. Workflows use native selected-axis homing and bypass public
 G28 wrappers/macros, so prepare XY currents/enables and clearance independently.
 See
-[workflow restrictions](COMPATIBILITY.md#workflow-restrictions).
+[workflow restrictions](compatibility.md#workflow-restrictions).
 
 Development opt-outs are not a shared-instance migration mechanism. In
 particular, do not replace links in a shared Klipper checkout while another
@@ -356,4 +358,6 @@ and source metadata, not copies of configuration contents.
 
 A terminated process or power loss has no persistent automatic restore point.
 Inspect the current files and rerun the installer after resolving any partial
-write or current ownership conflict. See [troubleshooting](TROUBLESHOOTING.md).
+write or current ownership conflict. See [troubleshooting](troubleshooting.md).
+
+Next: [Simple supervised calibration](calibration.md)

@@ -36,7 +36,7 @@ python3 -B -m unittest discover -s tests -v
 git diff --check
 ```
 
-See [TESTING.md](TESTING.md) for focused checks and details.
+See [docs/development/testing.md](docs/development/testing.md) for focused checks and details.
 `validation/VALIDATION.json` is a historical record; its paths and hashes are
 not kept current.
 

@@ -1,5 +1,7 @@
 # Troubleshooting
 
+[← Documentation](../README.md)
+
 Start with the exact console/installer error, the selected instance and
 `ACCEL_HOMING_STATUS`. Keep the printer idle while fixing installation or
 configuration. A failed workflow does not establish that the toolhead remains
@@ -11,7 +13,7 @@ centered or that SAVE_CONFIG succeeded.
 | --- | --- |
 | More than one Klipper instance/sensor found | Use the reported full paths and `--config`, `--service`, `--klippy-socket`, `--klipper-path` and/or `--accel-chip`. Explicit selections must describe the same instance. |
 | Source/origin/branch/upstream rejected | Use the complete clean `~/accel_homing` native clone with canonical HTTPS origin, `main` and `origin/main`. Review local changes; do not force-reset them away. |
-| Old backup section changes or changed Moonraker lines block installation | Update to the current standalone installer and run it directly. Installation backups are deprecated and ignored; existing backup folders remain untouched. The old MISC uninstaller is not required. See [migration](INSTALLATION.md#migrate-from-the-misc-plugin). |
+| Old backup section changes or changed Moonraker lines block installation | Update to the current standalone installer and run it directly. Installation backups are deprecated and ignored; existing backup folders remain untouched. The old MISC uninstaller is not required. See [migration](installation.md#migrate-from-the-misc-plugin). |
 | Shared checkout/consumer conflict | Keep the source and every affected instance intact. Do not replace shared links while another instance uses them; use a supported dedicated installation. |
 | Service restart cannot be verified | Review the exact unit, checkout, config and socket. For an unsupported manager use `--no-restart`, then activate the selected processes manually while idle. |
 | Install succeeded but old code seems loaded | A full Klipper host-process restart is needed after source/link changes; console RESTART alone does not reload imported modules. |
@@ -40,7 +42,7 @@ If the complete source checkout or an original module link is actually missing,
 preserve the full traceback and inspect that separate installation problem.
 The installer refuses writes while a running Klipper reports an error state;
 `--no-restart` does not bypass that check. Do not disable the guard to repair a
-missing file. See [service activation and instance selection](INSTALLATION.md).
+missing file. See [service activation and instance selection](installation.md).
 
 ## Configuration and workflow admission
 
@@ -240,7 +242,7 @@ accuracy command. Recovery never reruns accuracy automatically.
 
 No inline preview does not necessarily mean no PNG: read the saved path.
 Use formatted Mainsail output or the frontend file browser. Remote/header-only
-authentication may not authorize a browser image GET. See [plot access](PLOTS.md).
+authentication may not authorize a browser image GET. See [plot access](../advanced/plots.md).
 
 Standard chart workflows save no partial PNG on failure, rejection or cancellation. Preserve the
 console/status diagnostics, including the failed window, retries and cleanup
@@ -267,12 +269,12 @@ retrying. Do not delete source checkouts to silence a link-ownership error.
 
 Uninstall removes plugin virtual endstop options without restoring original
 pins or homing settings. Configure physical X/Y endstops and review their
-settings before restarting Klipper. See [uninstall](INSTALLATION.md#uninstall).
+settings before restarting Klipper. See [uninstall](installation.md#uninstall).
 
 ## Reporting a problem
 
 For intermittent homing or repeatability problems, use the supervised
-[`ACCEL_HOMING_TROUBLESHOOT`](TROUBLESHOOT_CAPTURE.md) command after the usual
+[`ACCEL_HOMING_TROUBLESHOOT`](../advanced/diagnostic-capture.md) command after the usual
 manual preparation. It collects per-home timing, position/return metadata,
 raw acceleration, environment information and graphs into one bundle. Preserve
 the complete bundle even if a home fails or a graph cannot render. Diagnostic
@@ -284,3 +286,5 @@ removed, exact command/error and STATUS output. For BETA, include the same
 command's complete `Beta diagnostic` output and PNG. State what you physically
 observed and whether a run was cancelled or interrupted; firmware step counts
 alone do not prove carriage movement.
+
+Back to [Documentation](../README.md)

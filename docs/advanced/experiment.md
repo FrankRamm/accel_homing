@@ -1,5 +1,7 @@
 # Experimental homing comparison
 
+[← Documentation](../README.md)
+
 `ACCEL_HOMING_EXPERIMENT MODE=COMPARE` compares normal and shorter batch-delivery
 intervals using the calibrated detector for the selected axis. A loaded
 `mapped_axis` calibration uses its saved channel, threshold and any fixed notch
@@ -24,12 +26,12 @@ after calibration before comparison. Beta's separate XYZ proposal remains isolat
 ## Run
 
 Update the selected installation with the normal Moonraker updater or
-the [installation procedure](INSTALLATION.md), then restart the selected
+the [installation procedure](../guide/installation.md), then restart the selected
 Klipper/Kalico **host service** to reload Python. A console RESTART alone does
 not reload imported modules. The optional experiment module supports existing
 symlink installations by loading its exact sibling in the resolved checkout.
 
-Follow [moving-workflow preparation](COMMANDS.md#prepare-every-moving-workflow):
+Follow [moving-workflow preparation](../guide/commands.md#prepare-every-moving-workflow):
 printer idle, both XY axes unhomed and manually centered, supported Z and clear
 nozzle, appropriate motor state and operator supervision. `CENTERED=1` confirms
 that preparation; it does not measure position or automatically center the head.
@@ -234,7 +236,7 @@ baseline and saturation details, commanded trigger/halt/return positions,
 effective settings, source/firmware identity and available host/MCU statistics.
 It also reports the fitted profile, train/holdout evidence, reference versus
 experimental phases, GC guard state and partial failures. See
-[diagnostic capture](TROUBLESHOOT_CAPTURE.md) for file formats, clock domains,
+[diagnostic capture](diagnostic-capture.md) for file formats, clock domains,
 bounded retention, plots and export limitations.
 Results are written below `charts_directory/experiment/<run_id>/`, including
 `experiment.json`, the manifest and plots. The console reports the ZIP path.

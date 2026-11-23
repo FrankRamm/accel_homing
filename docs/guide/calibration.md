@@ -1,5 +1,7 @@
 # Simple supervised calibration
 
+[← Documentation](../README.md)
+
 The existing command syntax is unchanged:
 
 ```gcode
@@ -67,14 +69,14 @@ an exclusive sensor stream. It leaves motor enable/current and fan state as
 they are. A failed measurement, changed context or sensor fault aborts calibration
 before threshold qualification; it does not fall back to a default threshold. Transient sample
 gaps and fresh-data/acquisition timeouts permit only the bounded complete-window retries described in
-[the noise policy](PLOTS.md#stationary-noise).
+[the noise policy](../advanced/plots.md#stationary-noise).
 
 The noise summary stays in memory until the calibration qualifies. Rendering
 must succeed before the model is staged/saved, and the PNG is published only
 after required cleanup and saving succeed. An aborted calibration does not
 publish that qualified noise PNG. A mapping inference rejection instead exports
 its own diagnostic JSON/PNG/ZIP after successful cleanup; see
-[mapping failure evidence](TROUBLESHOOTING.md#automatic-mapping-interruption).
+[mapping failure evidence](troubleshooting.md#automatic-mapping-interruption).
 
 Without an explicit `START_THRESHOLD`, fresh noise selects the initial
 candidate using the same baseline-subtracted mapped component as the detector.
@@ -92,7 +94,7 @@ This still performs the fresh noise measurement, but starts at the supplied
 run. The noise-selected threshold is an initial candidate, not a calibrated
 impact threshold or a certified minimum. Stationary measurements do not cover
 motion, motor enabling, hold-to-run current changes or first-step transients.
-See the [noise-selection policy and limits](PLOTS.md#stationary-noise).
+See the [noise-selection policy and limits](../advanced/plots.md#stationary-noise).
 
 ## Detector
 
@@ -109,7 +111,7 @@ preserves physical-axis orientation; taking the absolute value makes the
 trigger independent of polarity. Ordinary motion can also cross the
 threshold: it is not an independent classifier of mechanical contact.
 
-With the optional [notch filter](NOTCH.md) enabled for this homing axis, the
+With the optional [notch filter](../advanced/notch.md) enabled for this homing axis, the
 mapped component is filtered after subtracting its stationary reference. Its
 absolute value is compared with the threshold. The first filtered crossing requests the stop, without
 an additional confirmation window. Raw samples are retained for diagnosis;
@@ -123,7 +125,7 @@ error. Host-delivered sensor data does not provide a hard real-time stop bound.
 Generic current-window data is not rejected merely for arriving 80 ms or more
 after measurement. Its reference and moving detector use receipt liveness,
 while cutoffs exclude earlier windows/pre-arm impacts. Native Beacon's age
-policy is unchanged. See [timing details](DETAILS.md#timing-and-optional-travel-policies).
+policy is unchanged. See [timing details](../advanced/technical-reference.md#timing-and-optional-travel-policies).
 
 ## Threshold validity and homing attempts
 
@@ -285,7 +287,7 @@ the queued move does not measure physical arrival.
 ## Saving and ordinary homing
 
 The following saving/margin rules describe ordinary calibration without
-`NOTCH=AUTO`. The dev [automatic-notch mode](NOTCH.md#automatic-selection)
+`NOTCH=AUTO`. The dev [automatic-notch mode](../advanced/notch.md#automatic-selection)
 first measures independent moving noise and unfiltered reference homes, selects
 a fixed filter/threshold, then requires new validation homes. AUTO defaults to
 report-only with no staged configuration and saves exactly the tested threshold
@@ -384,5 +386,7 @@ supervise actual travel and stop on unexpected behavior. A premature trigger
 may arise from vibration, a real obstruction or binding; the workflow does not
 automatically diagnose which occurred. The automatic return does not verify
 that the carriage physically returned. Evidence must be tied to the exact
-revision and environment; see [offline verification](../TESTING.md). Historical
+revision and environment; see [offline verification](../development/testing.md). Historical
 passing tests and publication dates do not establish hardware validation.
+
+Next: [Configuration](configuration.md)
