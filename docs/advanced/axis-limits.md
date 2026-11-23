@@ -52,7 +52,7 @@ The wizard does not calibrate a threshold; set that up first with
 ACCEL_HOMING_CALIBRATE_LIMITS
 ```
 
-Mainsail and Fluidd show a dialog with buttons for each step; everything also
+Mainsail and Fluidd show one dialog that stays open and updates in place at each step; everything also
 appears in the console. `PROMPT=0` turns the dialog off. Closing it does not
 cancel. Run the bare command again, or `ACTION=STATUS`, to reopen the current
 step without moving.
@@ -66,7 +66,10 @@ step without moving.
 2. After the searches the carriage is at the positive stop. Keep motors on and
    use only the wizard's jogs to line the nozzle up with your bed-zero line.
    **Do not push the carriage by hand or use normal movement controls.** Each
-   jog is at most 10 mm and must end at least 1 mm inside the measured ends.
+   jog is at most 100 mm and must end at least 1 mm inside the measured ends.
+   The dialog shows the current coordinate and step buttons -100, -10, -1,
+   -0.1 and +0.1, +1, +10, +100 (buttons that would leave the measured range
+   are hidden). **Accept bed zero** and **Abort** are in the footer.
 3. Accept the origin and review the proposal. Save this axis alone or choose
    **Center X; select Y** (or the reverse). That recenters the measured axis in
    segments of at most 10 mm. The other axis must still be at its prepared
@@ -142,7 +145,7 @@ using the printer.
 
 ## Cancel and invalidation
 
-Use the dialog's **Cancel** button or `ACCEL_HOMING_CANCEL`. This is not an
+Use the dialog's **Cancel** (**Abort** while aligning) button or `ACCEL_HOMING_CANCEL`. This is not an
 emergency stop. Klipper may run it only after the current command returns, and
 a jog in progress finishes its segment (at most 10 mm). Use the printer's
 emergency stop for immediate danger.

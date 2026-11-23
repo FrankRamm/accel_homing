@@ -167,22 +167,33 @@ class AxisLimitsCalibration:
         self._show(session)
 
 
-    def _prompt(self, session, title, lines, buttons):
+    def _prompt(self, session, title, lines, buttons, groups=(), footer=None):
         w = self.workflows
+        if footer is None:
+            footer = [("Cancel", "ACCEL_HOMING_CANCEL", "error")]
+        groups = [group for group in groups if group]
         for line in lines:
             w._info(line)
-        for label, command in buttons:
+        for label, command in list(buttons) + [b for group in groups for b in group]:
+            w._info("%s: %s" % (label, command))
+        for label, command, _style in footer:
             w._info("%s: %s" % (label, command))
         if not session["prompt"]:
             return
         raw = w.gcode.respond_raw
-        raw("// action:prompt_end")
+        # No prompt_end: a new prompt_begin replaces an open dialog in place.
         raw("// action:prompt_begin " + title)
         for line in lines:
             raw("// action:prompt_text " + line)
         for label, command in buttons:
             raw("// action:prompt_button %s|%s|primary" % (label, command))
-        raw("// action:prompt_footer_button Cancel|ACCEL_HOMING_CANCEL|error")
+        for group in groups:
+            raw("// action:prompt_button_group_start")
+            for label, command in group:
+                raw("// action:prompt_button %s|%s|primary" % (label, command))
+            raw("// action:prompt_button_group_end")
+        for label, command, style in footer:
+            raw("// action:prompt_footer_button %s|%s|%s" % (label, command, style))
         raw("// action:prompt_show")
 
 
@@ -206,17 +217,19 @@ class AxisLimitsCalibration:
                 [("Confirm clear center; measure", base + "MEASURE CENTERED=1 CLEAR=1")])
         elif stage == "origin":
             item = session["measurement"]
-            jogs = [("%+.1f mm" % distance, base + "JOG DISTANCE=%s" % distance)
-                    for distance in (-10, -1, -.1, .1, 1, 10)
-                    if 1.0 <= item["coordinate"] + distance <= item["span"] - 1.0]
-            if 1.0 <= item["coordinate"] <= item["span"] - 1.0:
-                jogs.append(("Accept bed zero", base + "ORIGIN CONFIRM=1"))
+            coordinate, span = item["coordinate"], item["span"]
+            groups = [[("%+g" % distance, base + "JOG DISTANCE=%s" % distance)
+                       for distance in steps if 1.0 <= coordinate + distance <= span - 1.0]
+                      for steps in ((-100, -10, -1, -0.1), (0.1, 1, 10, 100))]
+            footer = [("Abort", "ACCEL_HOMING_CANCEL", "error")]
+            if 1.0 <= coordinate <= span - 1.0:
+                footer.insert(0, ("Accept bed zero", base + "ORIGIN CONFIRM=1", "primary"))
             self._prompt(session, "Align nozzle: " + axis.upper() + " bed zero", [
-                "Estimated trigger span %.6f mm. Current temporary coordinate %.6f mm. "
-                "Keep motors enabled; never push the carriage by hand." % (item["span"], item["coordinate"]),
+                "%s %.2f mm (measured span 0 -> %.2f mm)" % (axis.upper(), coordinate, span),
+                "Keep motors enabled; never push the carriage by hand. "
                 "Jog this axis until the nozzle is at your chosen bed-zero line; then accept origin. "
                 "Only the selected axis moves, at %.6g mm/s." % session["jog_speed"]],
-                jogs)
+                [], groups, footer)
         else:
             lines = []
             for name, result in session["results"].items():
@@ -806,9 +819,9 @@ class AxisLimitsCalibration:
             elif action == "MEASURE":
                 self._measure_axis(session, gcmd)
             elif action == "JOG" and session["stage"] == "origin":
-                distance = gcmd.get_float("DISTANCE", minval=-10.0, maxval=10.0)
+                distance = gcmd.get_float("DISTANCE", minval=-100.0, maxval=100.0)
                 if not math.isfinite(distance) or distance == 0:
-                    raise self._error("DISTANCE must be finite, nonzero and at most 10 mm")
+                    raise self._error("DISTANCE must be finite, nonzero and at most 100 mm")
                 self._jog_to(session, session["measurement"]["coordinate"] + distance)
                 self._wait(session, "origin")
             elif action == "ORIGIN":

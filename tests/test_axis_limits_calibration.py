@@ -124,14 +124,59 @@ class AxisLimitsCalibrationTests(unittest.TestCase):
         rig = AxisLimitsRig()
         rig.measure()
         beginning = max(i for i, text in enumerate(rig.prompts) if "prompt_begin" in text)
-        buttons = [text for text in rig.prompts[beginning:] if "prompt_button" in text]
-        self.assertEqual(len(buttons), 1)
-        self.assertIn("DISTANCE=-10", buttons[0])
+        last = rig.prompts[beginning:]
+        item = rig.workflow.session["measurement"]
+        coordinate, span = item["coordinate"], item["span"]
+        self.assertIn("// action:prompt_text X %.2f mm (measured span 0 -> %.2f mm)" % (coordinate, span),
+                      last)
+        distances, inside, pairs, count = [], False, 0, 0
+        for text in last:
+            if "prompt_button_group_start" in text:
+                inside, count = True, 0
+            elif "prompt_button_group_end" in text:
+                inside = False
+                self.assertGreater(count, 0)
+                pairs += 1
+            elif inside and "prompt_button " in text:
+                count += 1
+                distances.append(float(text.split("DISTANCE=")[1].split("|")[0]))
+        self.assertGreaterEqual(pairs, 1)
+        self.assertIn(-100.0, distances)
+        self.assertIn(-10.0, distances)
+        self.assertTrue(all(1.0 <= coordinate + d <= span - 1.0 for d in distances))
+        self.assertTrue(any("Abort|ACCEL_HOMING_CANCEL|error" in text for text in last))
+        self.assertFalse(any("Cancel|ACCEL_HOMING_CANCEL" in text for text in last))
         session = rig.workflow.session
         rig.command()
         self.assertIs(rig.workflow.session, session)
         self.assertEqual(len(rig.measure_calls), 2)
-        self.assertTrue(any("Cancel|ACCEL_HOMING_CANCEL" in text for text in rig.prompts))
+
+    def test_refresh_keeps_dialog_open(self):
+        rig = AxisLimitsRig()
+        rig.select()
+        rig.search()
+        self.assertIsNotNone(rig.workflow.session)
+        self.assertFalse(any("action:prompt_end" in text for text in rig.prompts))
+        self.assertGreaterEqual(sum("prompt_begin" in text for text in rig.prompts), 2)
+
+    def test_session_end_closes_dialog(self):
+        rig = AxisLimitsRig()
+        rig.measure()
+        rig.workflow.cmd_CANCEL(GCmd())
+        self.assertIsNone(rig.workflow.session)
+        last = [text for text in rig.prompts if "action:" in text and "prompt_" in text][-1]
+        self.assertEqual(last, "// action:prompt_end")
+
+    def test_jog_distance_limit(self):
+        rig = AxisLimitsRig()
+        rig.measure()
+        before = rig.workflow.session["measurement"]["coordinate"]
+        rig.command("JOG", DISTANCE=-100)
+        self.assertAlmostEqual(rig.workflow.session["measurement"]["coordinate"], before - 100)
+        moves = len(rig.toolhead.moves)
+        with self.assertRaises(CommandError):
+            rig.command("JOG", DISTANCE=100.5)
+        self.assertEqual(len(rig.toolhead.moves), moves)
 
     def test_console_mode_works_without_prompt_emission(self):
         rig = AxisLimitsRig()
