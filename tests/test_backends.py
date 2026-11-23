@@ -1095,6 +1095,7 @@ class GenericTriggerTest(unittest.TestCase):
 
     def test_batch_straddling_arm_keeps_only_post_arm_trigger(self):
         obj = generic()
+        obj.contact_timing_observer = lambda *args: None
         baseline(obj)
         attempt, trigger = arm(obj, when=10.0625)
         rows = samples(10.060)
@@ -1103,6 +1104,10 @@ class GenericTriggerTest(unittest.TestCase):
         feed(obj, rows)
         self.assertEqual(trigger.messages, [[HIT]])
         self.assertAlmostEqual(obj.onset_time(attempt), rows[12][0], places=6)
+        observed = (rows[12][0], rows[-1][0], rows[-1][0] + .001)
+        self.assertEqual(attempt.trigger_batch_times, observed)
+        feed(obj, samples(10.065))
+        self.assertEqual(attempt.trigger_batch_times, observed)
 
     def test_clock_wrap_and_long_printer_uptime(self):
         obj = generic()

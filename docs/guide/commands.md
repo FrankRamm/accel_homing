@@ -211,7 +211,13 @@ removing the selected-axis/shared manual threshold override before saving.
 
 Raw samples remain in the ZIP. `contact-summary.json` lists each approach's
 threshold, recorded profile, and replayed peaks before, during and after planned
-braking, including failed no-trigger approaches. The main `contact-timing.json`
+braking, including failed no-trigger approaches. For a `klipper_batch` trigger,
+`trigger_batch_timing` gives three intervals in milliseconds from the triggering
+sample to the last sample of its batch, from that sample to the adapter's host
+timestamp after row validation, and from there to the host's stop-request
+timestamp. These last two timestamps are estimates in the main MCU print-time
+clock. Hardware stop receipt and physical stopping distance remain unmeasured.
+The main `contact-timing.json`
 and `.svg` replay the recorded candidate; full calibration writes numbered
 `contact-0001-timing` files for each approach. Historical 200 Hz/Q=5 replay is
 kept separately in `historical_signal` and an explicitly named historical SVG.

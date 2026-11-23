@@ -550,6 +550,7 @@ class AutoNotchCalibration:
         number = session["attempts"]
         if number in self.contact_plans:
             self.contact_plans[number]["observation_count"] += 1
+            self.contact_plans[number].pop("trigger_batch_timing", None)
             self.contact_plans[number]["reason"] = "more than one native seek observation for this attempt"
             return
         observed = self.contact_planner = dict(
@@ -561,6 +562,21 @@ class AutoNotchCalibration:
             stop_request_time_source="host main-MCU print-time estimate immediately after trigger dispatch",
             status="unavailable", verified_native_seek=False)
         self.contact_plans[number] = observed
+        batch = getattr(attempt, "trigger_batch_times", None)
+        if batch is not None and attempt.reason == "impact":
+            onset, last_sample, adapter = batch
+            stop = attempt.request_time
+            timing = dict(source="klipper_batch", clock_domain="main_mcu_print_time",
+                          onset_sample_time_s=onset, batch_last_sample_time_s=last_sample,
+                          adapter_estimated_print_time_s=adapter, stop_request_observed_time_s=stop,
+                          status="unavailable")
+            observed["trigger_batch_timing"] = timing
+            if stop is not None and math.isfinite(stop) and onset <= last_sample <= adapter <= stop:
+                timing.update(status="complete", onset_to_batch_last_ms=(last_sample - onset) * 1000.,
+                              batch_last_to_adapter_ms=(adapter - last_sample) * 1000.,
+                              adapter_to_stop_request_ms=(stop - adapter) * 1000.)
+            else:
+                timing["reason"] = "missing dispatch estimate or inconsistent clock order"
         try:
             direction = 1. if plan["selected_endstop_mm"] > plan["center_mm"] else -1.
             segments = _contact_seek_segments(self.w._beta_extractor(), attempt.arm_time, home_end,
@@ -693,6 +709,7 @@ class AutoNotchCalibration:
             "peak_during_braking_g": phase_peak(("braking",)),
             "peak_from_braking_through_tail_g": phase_peak(("braking", "tail")),
             "stop_request_observed_time_s": alignment.get("stop_request_observed_time_s"),
+            "trigger_batch_timing": alignment.get("trigger_batch_timing"),
             "peak_before_stop_request_g": (signal.get("before_stop_request") or {}).get("filtered_peak_g"),
             "peak_at_or_after_stop_request_g": (signal.get("after_stop_request") or {}).get("filtered_peak_g"),
             "peak_before_braking_basis": "scheduled planner phases",

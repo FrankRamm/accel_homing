@@ -505,12 +505,22 @@ class ConfiguredAccelBackend:
         if trace is not None:
             trace["delivered"] = values
             trace["stage"] = "detector_dispatched"
-        self.owner._inspect({
+        packet = {
             "start_clock": self.print_time_to_clock(values[0][0]) & 0xFFFFFFFF,
             "delta_clock": self.print_time_to_clock(values[-1][0] - values[0][0]),
             "data": data, "#receive_time": now,
             "_sample_start_time_s": values[0][0], "_sample_end_time_s": values[-1][0],
-        })
+        }
+        self.owner._inspect(packet)
+        # The detector has already dispatched any stop. Keep the source-row
+        # timestamps from that packet only, even when tail data arrives later.
+        if (getattr(self.owner, "contact_timing_observer", None) is not None
+                and getattr(attempt, "reason", None) == "impact"):
+            onset = attempt.onset_sample
+            if (onset is not None and onset[0] == packet["start_clock"]
+                    and onset[1] == packet["delta_clock"] and onset[3] == len(values)
+                    and 0 <= onset[2] < len(values)):
+                attempt.trigger_batch_times = (values[onset[2]][0], values[-1][0], print_time)
 
     def validate_rail(self, info, error):
         speeds = [info.speed]

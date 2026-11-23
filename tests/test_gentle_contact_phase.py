@@ -39,6 +39,12 @@ class GentleContactPhaseTests(unittest.TestCase):
     def test_every_full_qualification_contact_has_matched_plan_and_candidate_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
             rig = GentleAutoRig(directory)
+            def observe_batch(attempt, home_end, moves, record):
+                onset = record["onset_time_s"]
+                adapter_offset = .002 if rig.workflow.session["attempts"] == 2 else .0007
+                attempt.trigger_batch_times = (onset, onset + .0004, onset + adapter_offset)
+                return home_end
+            rig.native_plan_mutator = observe_batch
             with rig.helpers():
                 rig.command()
             result = rig.workflow.last_result
@@ -71,6 +77,15 @@ class GentleContactPhaseTests(unittest.TestCase):
                     self.assertTrue(receipt["capture_matches_plan"])
                     self.assertTrue(receipt["qualification"]["accepted"])
                     self.assertEqual(receipt["qualification"]["phase"], "cruise")
+                    batch = receipt["summary"]["trigger_batch_timing"]
+                    self.assertEqual(batch, receipt["planner"]["trigger_batch_timing"])
+                    if number == 2:
+                        self.assertEqual(batch["status"], "unavailable")
+                        self.assertNotIn("adapter_to_stop_request_ms", batch)
+                    else:
+                        self.assertAlmostEqual(batch["onset_to_batch_last_ms"], .4)
+                        self.assertAlmostEqual(batch["batch_last_to_adapter_ms"], .3)
+                        self.assertAlmostEqual(batch["adapter_to_stop_request_ms"], .3)
                     self.assertEqual(receipt["signal"]["analysis_role"], "actual_candidate_replay")
                     self.assertTrue(receipt["signal"]["matches_recorded_live_filter"])
                     self.assertEqual(receipt["historical_signal"]["filter"]["frequency_hz"], 200.)
