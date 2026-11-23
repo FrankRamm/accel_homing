@@ -183,6 +183,15 @@ class AxisLimitsCalibrationTests(unittest.TestCase):
             rig.command("JOG", DISTANCE=100.5)
         self.assertEqual(len(rig.toolhead.moves), moves)
 
+    def test_every_stage_footer_says_abort(self):
+        rig = AxisLimitsRig()
+        rig.command()
+        rig.select()
+        footers = [text for text in rig.prompts if "prompt_footer_button" in text]
+        self.assertGreaterEqual(len(footers), 2)
+        self.assertTrue(all(text == "// action:prompt_footer_button Abort|ACCEL_HOMING_CANCEL|error"
+                            for text in footers))
+
     def test_console_mode_works_without_prompt_emission(self):
         rig = AxisLimitsRig()
         rig.measure(PROMPT=0)

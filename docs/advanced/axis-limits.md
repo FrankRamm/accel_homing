@@ -145,7 +145,7 @@ using the printer.
 
 ## Cancel and invalidation
 
-Use the dialog's **Cancel** (**Abort** while aligning) button or
+Use the dialog's **Abort** button or
 `ACCEL_HOMING_CANCEL`. This is not an emergency stop. Klipper may run it only
 after the current command returns, so it takes effect after the current jog
 move finishes (up to 100 mm, at `JOG_SPEED`, at most 20 mm/s). Use the printer's

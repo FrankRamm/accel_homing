@@ -170,7 +170,7 @@ class AxisLimitsCalibration:
     def _prompt(self, session, title, lines, buttons, groups=(), footer=None):
         w = self.workflows
         if footer is None:
-            footer = [("Cancel", "ACCEL_HOMING_CANCEL", "error")]
+            footer = [("Abort", "ACCEL_HOMING_CANCEL", "error")]
         groups = [group for group in groups if group]
         for line in lines:
             w._info(line)
