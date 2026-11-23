@@ -686,6 +686,8 @@ class AutoNotchCalibration:
         missed = "no trigger on %s after full movement" % session["axis"]
         if contact_result is None and native_error and missed in native_error.lower():
             contact_result = "no_trigger"
+        # Native homing can report the final step position as the trigger position after a miss.
+        trigger_travel = record.get("trigger_travel_mm_signed") if contact_result == "impact" else None
         qualification = copy.deepcopy(planner.get("qualification"))
         if qualification is None:
             reason = None
@@ -698,7 +700,7 @@ class AutoNotchCalibration:
                 qualification = {"accepted": False, "reason": reason}
         attempt_summary = {"workflow_attempt": number if number is not None else session.get("attempts"),
             "contact_result": contact_result, "native_error": native_error,
-            "commanded_trigger_travel_mm_signed": record.get("trigger_travel_mm_signed"),
+            "commanded_trigger_travel_mm_signed": trigger_travel,
             "commanded_halt_travel_mm_signed": record.get("halt_travel_mm_signed"),
             "detector_onset_g": detector.get("onset_g"),
             "threshold_g": detector.get("threshold_g"), "profile": copy.deepcopy(candidate.get("profile")),

@@ -211,7 +211,9 @@ removing the selected-axis/shared manual threshold override before saving.
 
 Raw samples remain in the ZIP. `contact-summary.json` lists each approach's
 threshold, recorded profile, and replayed peaks before, during and after planned
-braking, including failed no-trigger approaches. For a `klipper_batch` trigger,
+braking, including failed no-trigger approaches. If the detector never fires,
+`commanded_trigger_travel_mm_signed` is `null`. Use `commanded_halt_travel_mm_signed`
+for the commanded distance at the end of that approach. For a `klipper_batch` trigger,
 `trigger_batch_timing` gives three intervals in milliseconds from the triggering
 sample to the last sample of its batch, from that sample to the adapter's host
 timestamp after row validation, and from there to the host's stop-request

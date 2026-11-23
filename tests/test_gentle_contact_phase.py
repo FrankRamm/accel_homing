@@ -148,8 +148,21 @@ class GentleContactPhaseTests(unittest.TestCase):
                 self.assertTrue(report["gentle_contact_plans"][0]["qualification"]["accepted"])
                 self.assertFalse(report["gentle_contact_plans"][1]["qualification"]["accepted"])
                 self.assertEqual(len(report["sources"]), 4)
+                for number in (1, 2):
+                    raw = json.loads(gzip.decompress(bundle.read("raw/home-%04d.json.gz" % number)))
+                    summary = json.loads(bundle.read("contact-%04d-timing.json" % number))["summary"]
+                    self.assertEqual(summary["contact_result"], "impact")
+                    self.assertIsNotNone(raw["record"]["trigger_travel_mm_signed"])
+                    self.assertEqual(summary["commanded_trigger_travel_mm_signed"],
+                                     raw["record"]["trigger_travel_mm_signed"])
 
     def test_full_no_trigger_exports_failed_candidate_replay_and_root_peak_summary(self):
+        self.check_no_trigger_archive(contact_only=False)
+
+    def test_contact_only_no_trigger_exports_failed_candidate_replay_and_root_peak_summary(self):
+        self.check_no_trigger_archive(contact_only=True)
+
+    def check_no_trigger_archive(self, contact_only):
         with tempfile.TemporaryDirectory() as directory:
             rig = GentleAutoRig(directory)
             home, capture = rig.stock_home, rig.owner.stop_capture
@@ -160,7 +173,8 @@ class GentleContactPhaseTests(unittest.TestCase):
 
             def missed(gcmd):
                 home(gcmd)
-                rig.owner.last["x"]["result"] = "no_trigger"
+                rig.owner.last["x"].update(result="no_trigger", trigger_travel_mm_signed=-152.,
+                                           halt_travel_mm_signed=-152.)
                 raise CommandError("No trigger on x after full movement")
 
             def no_trigger_capture():
@@ -175,12 +189,19 @@ class GentleContactPhaseTests(unittest.TestCase):
             rig.native_plan_mutator = scheduled_end
             rig.stock_home, rig.owner.stop_capture = missed, no_trigger_capture
             with rig.helpers(), self.assertRaisesRegex(CommandError, "No trigger"):
-                rig.command()
+                rig.command(CONTACT_ONLY=int(contact_only))
             self.assertEqual(len(rig.home_calls), 1)
             self.assertEqual(rig.configfile.saved, {})
             with zipfile.ZipFile(rig.workflow.last_result["artifacts"]["archive"]) as bundle:
                 summary = json.loads(bundle.read("contact-summary.json"))["last_attempt"]
-                timing = json.loads(bundle.read("contact-0001-timing.json"))
+                stem = "contact-timing" if contact_only else "contact-0001-timing"
+                timing = json.loads(bundle.read(stem + ".json"))
+                raw = json.loads(gzip.decompress(bundle.read("raw/home-0001.json.gz")))
+                self.assertEqual(raw["record"]["trigger_travel_mm_signed"], -152.)
+                self.assertEqual(raw["record"]["halt_travel_mm_signed"], -152.)
+                self.assertEqual(timing["summary"], summary)
+                self.assertIsNone(summary["commanded_trigger_travel_mm_signed"])
+                self.assertEqual(summary["commanded_halt_travel_mm_signed"], -152.)
                 self.assertEqual(summary["contact_result"], "no_trigger")
                 self.assertEqual(summary["threshold_g"], rig.home_calls[0]["threshold"])
                 self.assertIsNotNone(summary["peak_before_braking_g"])
@@ -188,7 +209,7 @@ class GentleContactPhaseTests(unittest.TestCase):
                 self.assertGreaterEqual(summary["peak_from_braking_through_tail_g"], summary["peak_during_braking_g"])
                 self.assertTrue(summary["replay_matches_live_filter"])
                 self.assertIsNone(summary["original_trigger_onset_time_s"])
-                self.assertIn("contact-0001-timing.svg", bundle.namelist())
+                self.assertIn(stem + ".svg", bundle.namelist())
                 self.assertEqual(timing["signal"]["analysis_role"], "actual_candidate_replay")
 
 
