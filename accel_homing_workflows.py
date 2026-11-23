@@ -324,6 +324,7 @@ class AccelHomingWorkflows:
                             if config.get(a + "_threshold", None) is not None}
         if config.get("threshold", None) is not None:
             self.manual_axes.update(AXES)
+        self.stale_model_axes = {}
         self.temporary_manual_thresholds = {}
         self.calibration_config_save = None
         self.model = None
@@ -794,6 +795,7 @@ class AccelHomingWorkflows:
         if self.gentle_homing:
             for axis in self.owner.rails_by_axis:
                 self._check_gentle_limits(axis, self.printer.config_error)
+        self.stale_model_axes = {}
         if self.model is None:
             return
         for axis in self.model.thresholds:
@@ -809,9 +811,12 @@ class AccelHomingWorkflows:
                     if self.gentle_homing and key in ("homing_speed_mm_s", "homing_accel_mm_s2"):
                         # Let the host connect to recalibrate this axis. G28 checks the model before motion.
                         continue
-                    raise self.printer.config_error(
-                        "Saved %s homing model does not match current %s; recalibrate "
-                        "or set an explicit %s_threshold override" % (axis.upper(), key, axis))
+                    # Never block Klipper startup: calibration must stay reachable. Homing is refused instead.
+                    self.stale_model_axes[axis] = {"key": key, "saved": saved.get(key), "current": value}
+                    logging.warning("accel_homing: saved %s homing model does not match current %s "
+                                    "(saved %r, current %r); recalibrate before homing this axis",
+                                    axis.upper(), key, saved.get(key), value)
+                    break
 
     def _snapshot(self):
         return (tuple(self.owner.toolhead.get_position()),
@@ -1047,6 +1052,20 @@ class AccelHomingWorkflows:
             metadata = self.model.metadata[axis]
             if metadata.get("axis_mapping_invalidated"):
                 raise self._error("Saved %s axis mapping was invalidated; recalibrate this axis" % axis.upper())
+            stale = self.stale_model_axes.get(axis)
+            if stale is not None and not self._temporary_manual_threshold(axis):
+                if (metadata.get("impact_metric") == "mapped_axis"
+                        and stale["key"] in ("sensor", "backend", "sensor_axes_map")):
+                    remedy = ("manually center XY and run ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1 (the saved "
+                              "axis mapping belongs to the previous sensor configuration, so a manual "
+                              "threshold cannot replace it)" % axis.upper())
+                else:
+                    remedy = ("manually center XY and run ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1, or set "
+                              "%s_threshold in the regular [accel_homing] section (a threshold that "
+                              "calibration wrote to the SAVE_CONFIG block does not count)"
+                              % (axis.upper(), axis))
+                raise self._error("Saved %s homing model does not match current %s (saved %s, current %s); %s"
+                                  % (axis.upper(), stale["key"], stale["saved"], stale["current"], remedy))
             if metadata.get("impact_metric") == "xyz_magnitude":
                 raise self._error("Saved XYZ-magnitude homing model requires automatic axis mapping; "
                                   "recalibrate with ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1 "
@@ -1210,7 +1229,9 @@ class AccelHomingWorkflows:
         except (TypeError, ValueError) as exc:
             raise self._error("invalid saved axis mapping: %s; recalibrate %s" % (exc, axis.upper()))
         if context != self.owner.noise_sensor_context():
-            raise self._error("axis mapping sensor context changed; recalibrate %s" % axis.upper())
+            raise self._error("axis mapping sensor context changed; manually center XY and run "
+                              "ACCEL_HOMING_CALIBRATE AXIS=%s CENTERED=1 (a manual threshold does not "
+                              "replace a saved axis mapping)" % axis.upper())
         return mapping
 
     def _validate_current_axis_mapping(self, mapping, axis):
@@ -5518,6 +5539,7 @@ class AccelHomingWorkflows:
             active["auto_notch"] = session["auto_notch_controller"].summary(session)
         return {"model": self.model_name, "gentle_homing": self.gentle_homing,
                 "manual_threshold_overrides": sorted(self.manual_axes),
+                "stale_model_axes": {a: dict(self.stale_model_axes[a]) for a in sorted(self.stale_model_axes)},
                 "active": active, "last_result": self.last_result,
                 "noise_recommendation": self.noise_recommendation,
                 "noise_seed_axes": sorted(self.noise_seeds),

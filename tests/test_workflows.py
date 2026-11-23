@@ -2458,11 +2458,100 @@ class ModelTests(unittest.TestCase):
                            config=types.SimpleNamespace(axes_map=[(1, 1), (0, 1), (2, 1)])))):
             rig = Rig(sections=sections)
             mutate(rig)
-            with self.assertRaisesRegex(ConfigError, "does not match"):
-                rig.workflow._validate_model_connection()
+            rig.workflow._validate_model_connection()  # Startup stays usable for recalibration.
+            self.assertIn("x", rig.workflow.stale_model_axes)
+            self.assertIn("x", rig.workflow.get_status(0.)["stale_model_axes"])
+            with self.assertRaisesRegex(CommandError, "does not match.*ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1") as cm:
+                rig.workflow.check_home_axes(["x"])
+            mapped = rig.workflow.model.metadata["x"].get("impact_metric") == "mapped_axis"
+            sensor_frame = rig.workflow.stale_model_axes["x"]["key"] in ("sensor", "backend", "sensor_axes_map")
+            if mapped and sensor_frame:
+                self.assertNotIn("regular [accel_homing]", str(cm.exception))
+                self.assertIn("cannot replace it", str(cm.exception))
+            else:
+                self.assertIn("regular [accel_homing]", str(cm.exception))
             override = Rig({"x_threshold": 8.0}, sections=sections)
             mutate(override)
             override.workflow._validate_model_connection()
+            self.assertNotIn("x", override.workflow.stale_model_axes)
+
+    def test_stale_model_leaves_other_axis_usable(self):
+        calibrated = Rig()
+        calibrated.calibrate(save=0)
+        options = {key: value for (section, key), value in calibrated.configfile.saved.items()}
+        rig = Rig(sections={"printer": {"kinematics": "corexy"}, "accel_homing_model default": options})
+        rig.owner.rails_by_axis["x"].info.speed = 80.0
+        rig.workflow._validate_model_connection()
+        self.assertEqual(set(rig.workflow.stale_model_axes), {"x"})
+        with self.assertRaisesRegex(CommandError, "homing_speed_mm_s"):
+            rig.workflow.check_home_axes(["x"])
+        rig.workflow.check_home_axes(["y"])
+
+    def test_stale_model_blocks_only_ordinary_homing_of_that_axis(self):
+        calibrated = Rig()
+        calibrated.calibrate(save=0)
+        options = {key: value for (section, key), value in calibrated.configfile.saved.items()}
+        sections = {"printer": {"kinematics": "corexy"}, "accel_homing_model default": options}
+        rig = Rig(sections=sections)
+        original_helper = getattr(rig.owner, "helper", None)
+        rig.owner.helper = types.SimpleNamespace(
+            config=types.SimpleNamespace(axes_map=[(1, 1), (0, 1), (2, 1)]))
+        rig.workflow._validate_model_connection()
+        stale = rig.workflow.stale_model_axes
+        self.assertEqual(stale["x"]["key"], "sensor_axes_map")
+        self.assertEqual(rig.workflow.get_status(0.)["stale_model_axes"]["x"], stale["x"])
+        with self.assertRaisesRegex(CommandError, "sensor_axes_map"):
+            rig.workflow.check_home_axes(["x"])
+        rig.workflow.session = {"mode": "calibration"}
+        rig.workflow.in_home, rig.workflow.home_axis = True, "x"
+        rig.workflow.check_home_axes(["x"])
+        rig.workflow.session = None
+        # Revalidation clears the record once the context matches again.
+        rig.owner.helper = original_helper
+        rig.workflow._validate_model_connection()
+        self.assertEqual(rig.workflow.stale_model_axes, {})
+        # An explicit regular-section threshold is never stale and does not block homing.
+        override = Rig({"x_threshold": 8.0}, sections=sections)
+        override.owner.helper = types.SimpleNamespace(
+            config=types.SimpleNamespace(axes_map=[(1, 1), (0, 1), (2, 1)]))
+        override.workflow._validate_model_connection()
+        self.assertEqual(override.workflow.stale_model_axes, {})
+        override.workflow.check_home_axes(["x"])
+
+    def test_mapped_model_sensor_frame_mismatch_offers_only_recalibration(self):
+        calibrated = Rig()
+        calibrated.calibrate(save=0)
+        options = {key: value for (section, key), value in calibrated.configfile.saved.items()}
+        sections = {"printer": {"kinematics": "corexy"}, "accel_homing_model default": options}
+        axes_map = types.SimpleNamespace(config=types.SimpleNamespace(axes_map=[(1, 1), (0, 1), (2, 1)]))
+        rig = Rig(sections=sections)
+        self.assertEqual(rig.workflow.model.metadata["x"].get("impact_metric"), "mapped_axis")
+        rig.owner.helper = axes_map
+        rig.workflow._validate_model_connection()
+        with self.assertRaises(CommandError) as cm:
+            rig.workflow.check_home_axes(["x"])
+        message = str(cm.exception)
+        self.assertIn("ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1", message)
+        self.assertIn("cannot replace it", message)
+        self.assertNotIn("regular [accel_homing]", message)
+        speed = Rig(sections=sections)
+        speed.owner.rails_by_axis["x"].info.speed = 80.0
+        speed.workflow._validate_model_connection()
+        with self.assertRaisesRegex(CommandError, "homing_speed_mm_s.*regular \[accel_homing\]"):
+            speed.workflow.check_home_axes(["x"])
+        # A manual threshold does not bypass the saved axis mapping after an axes_map change.
+        manual = Rig({"x_threshold": 8.0}, sections=sections)
+        manual.owner.helper = axes_map
+        # The rig's fake noise_sensor_context is static; like the real one it must follow the driver axes_map.
+        fake_context = manual.owner.noise_sensor_context
+        manual.owner.noise_sensor_context = lambda: dict(
+            fake_context(), capture_axes_map=manual.owner.helper.config.axes_map,
+            sensor_axes_map=manual.owner.helper.config.axes_map)
+        manual.workflow._validate_model_connection()
+        with self.assertRaisesRegex(CommandError, "axis mapping sensor context changed; manually center XY and "
+                                    "run ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 \(a manual threshold does not "
+                                    "replace a saved axis mapping\)"):
+            manual.workflow.check_home_axes(["x"])
 
     def test_saved_models_supply_defaults_but_manual_controls_win(self):
         sections = {"printer": {"kinematics": "corexy"},

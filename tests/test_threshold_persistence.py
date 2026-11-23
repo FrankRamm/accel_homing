@@ -142,8 +142,10 @@ class ThresholdPersistenceTests(unittest.TestCase):
                         if changed == "none":
                             rig.workflow._validate_model_connection()
                         else:
-                            with self.assertRaisesRegex(ConfigError, "does not match"):
-                                rig.workflow._validate_model_connection()
+                            rig.workflow._validate_model_connection()
+                            self.assertIn("x", rig.workflow.stale_model_axes)
+                            with self.assertRaisesRegex(CommandError, "does not match"):
+                                rig.workflow.check_home_axes(["x"])
 
     def test_literal_override_keeps_manual_semantics_even_when_its_value_matches(self):
         values = self.calibrated_values()
