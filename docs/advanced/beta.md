@@ -1,17 +1,19 @@
 # Beta moving-noise calibration experiment
 
+[← Documentation](../README.md)
+
 BETA is a separate supervised experiment. A successful proposal produces a
 **Beta-labelled PNG** and threshold suggestion, with a diagnostic report in the same command's
 console output. It does not stage/save a threshold or model, call SAVE_CONFIG
 or restart Klipper. Its suggestion is not hardware qualification.
 
-On `dev`, BETA refuses an axis with an enabled [notch filter](NOTCH.md) before
+On `dev`, BETA refuses an axis with an enabled [notch filter](notch.md) before
 movement. Use ordinary calibration for a filtered axis; BETA retains its
 existing raw-signal experiment when that axis's notch is disabled.
 
 ## Run
 
-Use the same [manual XY preparation](COMMANDS.md#prepare-every-moving-workflow)
+Use the same [manual XY preparation](../guide/commands.md#prepare-every-moving-workflow)
 as calibration, with an idle unpaused printer, both axes unhomed and centered,
 supported Z, nozzle clearance, suitable XY current/enable behavior, and an
 accessible emergency stop.
@@ -96,7 +98,7 @@ statistics retain their existing definitions. Range notes cover every motion
 and retained home capture, including finite rails without a native sentinel. Native
 markers are bounded endpoint estimates with unknown true sign/peak; finite
 rails have unknown excess amplitude. Reference observations are disclosed
-separately and can overlap capture counts. See [plots](PLOTS.md).
+separately and can overlap capture counts. See [plots](plots.md).
 
 ## Limits and cancellation
 
@@ -108,7 +110,7 @@ steps. Planner/current metadata does not measure actual mechanical motion.
 Normal commands and previously saved models retain their ordinary behavior.
 An experiment does not certify a sensor, printer, current, threshold or stopping
 distance. The implementation's offline/source evidence is described in
-[TESTING](../TESTING.md); historical Beta publication is not a physical test.
+[testing](../development/testing.md); historical Beta publication is not a physical test.
 
 `ACCEL_HOMING_CANCEL` is a normal queued console command, not an emergency stop.
 Use the accessible emergency stop for unexpected active movement. After an

@@ -1,5 +1,7 @@
 # PNG plots and stationary noise
 
+[← Documentation](../README.md)
+
 The standard chart workflows generate completed **PNG** images without raw
 sample sidecars, and publish only successful measurements. Rejected, failed,
 aborted or cancelled standard chart workflows retain console diagnostics.
@@ -7,7 +9,7 @@ aborted or cancelled standard chart workflows retain console diagnostics.
 `ACCEL_HOMING_TROUBLESHOOT` additionally exports JSON, retained full-resolution
 raw samples and diagnostic plots, including available evidence from incomplete
 runs. Its files are separate from the standard chart publication policy. See
-[per-home diagnostic capture](TROUBLESHOOT_CAPTURE.md).
+[per-home diagnostic capture](diagnostic-capture.md).
 
 ## Where files are saved
 
@@ -121,7 +123,7 @@ calibration qualifies and published after required cleanup and saving succeed.
 Stationary measurement does not cover motor enabling, first-step
 transients, acceleration or moving vibration. Calibration noise plots label
 the selected physical component and its peak; any retained XYZ-magnitude peak
-is explicitly diagnostic. See [calibration](SIMPLE_CALIBRATION.md).
+is explicitly diagnostic. See [calibration](../guide/calibration.md).
 
 ## Opening plots in Mainsail or Fluidd
 
@@ -162,4 +164,4 @@ saved user files are preserved.
 Rerun the installer while idle if a Python environment change or Hard Recovery
 invalidated the cache. Use the exact `--klipper-python` for the selected
 instance when automatic discovery cannot establish it; do not install packages
-into a guessed global Python. See [installation](INSTALLATION.md).
+into a guessed global Python. See [installation](../guide/installation.md).

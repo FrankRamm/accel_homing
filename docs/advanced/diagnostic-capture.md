@@ -1,5 +1,7 @@
 # Per-home diagnostic capture
 
+[← Documentation](../README.md)
+
 `ACCEL_HOMING_TROUBLESHOOT` records the evidence needed to investigate intermittent
 impact detection, delayed stopping and a changed return before the next home.
 It uses the active detector and homing settings. Ordinary G28, calibration,
@@ -24,9 +26,9 @@ git pull --ff-only origin dev
 Then restart the selected Klipper/Kalico **host service**, using its actual
 service name or the frontend's service controls. A console RESTART alone does
 not reload imported Python modules. For installation, dependencies or other
-configuration changes, use the normal [installer procedure](INSTALLATION.md).
+configuration changes, use the normal [installer procedure](../guide/installation.md).
 
-Follow the [moving-workflow preparation](COMMANDS.md#prepare-every-moving-workflow):
+Follow the [moving-workflow preparation](../guide/commands.md#prepare-every-moving-workflow):
 both XY axes unhomed, manually centered, Z supported, nozzle clear, suitable
 motor currents and an accessible emergency stop. In the printer console:
 
@@ -47,7 +49,7 @@ diagnostic; it does not start ACCURACY's early-trigger recovery calibration.
 `ACCEL_HOMING_CANCEL` requests cancellation when the command can be handled;
 it is not an emergency stop.
 
-On this `dev` branch it also retains the active [notch profile](NOTCH.md), when
+On this `dev` branch it also retains the active [notch profile](notch.md), when
 configured. Filter selection does not change during the diagnostic run. Compare
 separate raw and filtered runs after qualifying the appropriate thresholds.
 

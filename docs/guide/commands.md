@@ -1,5 +1,7 @@
 # Printer console commands
 
+[← Documentation](../README.md)
+
 Enter these commands in the Mainsail/Fluidd **printer console**. Installation
 commands belong in the Linux host shell instead.
 
@@ -19,7 +21,7 @@ Before CALIBRATE, TEST, CHARTS, ACCURACY, TROUBLESHOOT, EXPERIMENT or BETA:
 
 Do not assume a motor-off command affects only XY; use a procedure appropriate
 for your machine and independent Z support. See the complete
-[workflow restrictions](COMPATIBILITY.md#workflow-restrictions).
+[workflow restrictions](compatibility.md#workflow-restrictions).
 
 ## Command reference
 
@@ -32,8 +34,8 @@ for your machine and independent Z support. See the complete
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1` | Gentle mode only: three free-travel controls, stationary checks, then at most one contact with the selected profile. Exports a ZIP; never qualifies, stages or saves a model. |
 | `ACCEL_HOMING_CALIBRATE_NOISE` | Three stationary one-second noise windows and PNG; no movement, model save or restart. `SAVE_CONFIG` is unsupported. |
 | `ACCEL_HOMING_TEST CENTERED=1` | Test X then Y with active thresholds; both must use this plugin. Does not calibrate or save. |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | Test normal and shorter report intervals over two pairs. With a saved mapped-axis calibration this means four homes using its channel, threshold and fixed filter. Exports a comparison ZIP. See [EXPERIMENT](EXPERIMENT.md). |
-| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW` | One-axis diagnostic retest: discovery, ten reference homes, then raw homes with frozen-profile replay after motion. No shadow profile controls a home. Existing `MODE=LIVE` remains available. No save or restart. See [EXPERIMENT](EXPERIMENT.md). |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X CENTERED=1 MODE=COMPARE SAMPLES=2` | Test normal and shorter report intervals over two pairs. With a saved mapped-axis calibration this means four homes using its channel, threshold and fixed filter. Exports a comparison ZIP. See [EXPERIMENT](../advanced/experiment.md). |
+| `ACCEL_HOMING_EXPERIMENT AXIS=X SAMPLES=10 CENTERED=1 MODE=SHADOW` | One-axis diagnostic retest: discovery, ten reference homes, then raw homes with frozen-profile replay after motion. No shadow profile controls a home. Existing `MODE=LIVE` remains available. No save or restart. See [EXPERIMENT](../advanced/experiment.md). |
 | `ACCEL_HOMING_CHARTS_GENERATE CENTERED=1` | Home/chart X then Y. Optional `AXIS=X` or `Y` selects one; omit for both. |
 | `ACCEL_HOMING_ACCURACY AXIS=X SAMPLES=10 CENTERED=1` | Repeated travel measurement. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 10. Recovery can start a saving calibration; see below. |
 | `ACCEL_HOMING_TROUBLESHOOT AXIS=Y SAMPLES=50 CENTERED=1` | Per-home diagnostic capture. `AXIS=X|Y|XY`, default `XY`; integer `SAMPLES=2..50`, default 50. Keeps active homing settings; no calibration, save or restart. Preserves available evidence on failure. |
@@ -48,7 +50,7 @@ selected-axis model; supply `THRESHOLD` or complete fresh calibration if the
 model's qualification is refused.
 
 No separate centering-confirmation command or popup prompt is required.
-The optional [notch filter](NOTCH.md) has independent X/Y configuration overrides.
+The optional [notch filter](../advanced/notch.md) has independent X/Y configuration overrides.
 `NOTCH=AUTO` on CALIBRATE measures moving noise and selects a profile automatically.
 Gentle calibration also selects a profile when `NOTCH` is omitted. Ordinary G28,
 ACCURACY, TEST and CHARTS use their existing detector; they do not select filters.
@@ -104,7 +106,7 @@ restarting; it does not activate them for ordinary homing. Issue `SAVE_CONFIG`
 to persist/reload both and comment the replaced selected-axis setting. The
 other axis and any shared fallback remain unchanged. Later manual overrides
 still take precedence. Read the
-[complete calibration sequence](SIMPLE_CALIBRATION.md). Its early-hit automatic
+[complete calibration sequence](calibration.md). Its early-hit automatic
 returns apply to ordinary calibration, not gentle mode. Both require ten
 validation homes with at most 2 mm of commanded travel spread after discovery.
 
@@ -182,7 +184,7 @@ step travel does not establish the instant of physical contact. A missing trigge
 does not establish that no physical contact occurred. Record the operator's
 observations separately: free-travel margins alone do not prove sensitivity to a
 soft stop, and step counts do not measure motor slip or physical toolhead position.
-See [automatic selection and evidence](NOTCH.md#automatic-selection).
+See [automatic selection and evidence](../advanced/notch.md#automatic-selection).
 
 ## Accuracy and early-trigger recovery
 
@@ -206,7 +208,7 @@ The console then tells you to prepare XY again and rerun the exact accuracy
 command; it does not rerun accuracy automatically.
 
 `SAVE_CONFIG` is not an ACCURACY option: even `SAVE_CONFIG=0` is rejected.
-Read [accuracy and its recovery limits](ACCURACY.md) before running it.
+Read [accuracy and its recovery limits](../advanced/accuracy.md) before running it.
 
 ## Per-home diagnostic capture
 
@@ -225,7 +227,7 @@ A rejected home ends this diagnostic instead of starting ACCURACY's automatic
 recovery calibration. Available rejected, cancelled and failed-run evidence is
 retained. Files and graphs are produced after motion cleanup; console and
 STATUS report the bundle paths. Share the complete bundle, not only a PNG.
-See [diagnostic contents and interpretation](TROUBLESHOOT_CAPTURE.md).
+See [diagnostic contents and interpretation](../advanced/diagnostic-capture.md).
 
 ## Stationary noise and charts
 
@@ -243,7 +245,7 @@ ACCEL_HOMING_CHARTS_GENERATE AXIS=X CENTERED=1
 ```
 
 CHARTS moves the selected axis; omitting AXIS moves X then Y. It uses the active
-detector/threshold and does not calibrate them. See [plot output](PLOTS.md).
+detector/threshold and does not calibrate them. See [plot output](../advanced/plots.md).
 
 ## Temporary threshold changes
 
@@ -258,7 +260,7 @@ not turn a legacy threshold into a newly qualified mapped-axis model.
 Cancel an active workflow before changing settings.
 
 For persistent manual changes, edit the existing plugin section and issue
-`RESTART` while idle. See [threshold precedence](CONFIGURATION.md#thresholds-and-saved-models).
+`RESTART` while idle. See [threshold precedence](configuration.md#thresholds-and-saved-models).
 
 ## Cancellation and failures
 
@@ -270,3 +272,75 @@ On an abort, inspect the message and STATUS. Do not assume the toolhead remains
 centered, that a model was saved or that a final release occurred. Correct the
 reported fault and manually prepare XY before a new moving command. Shutdown
 or stock homing fault handling can turn off motors, including Z.
+
+## Gentle homing (dev)
+
+Settings and axes-map behavior are in [Gentle homing (dev)](configuration.md#gentle-homing-dev).
+
+`NOTCH=AUTO` defaults to reporting only and tests the exact threshold it
+would save. To report a tester run, send the ZIP printed by each command
+(`MODE=COMPARE` and `NOTCH=AUTO`). Include the axis and how the individual
+homes felt. Each ZIP contains the available measurements, host log for that
+command, and diagnostic context. The report identifies missing evidence.
+
+For a printer already using this plugin for its selected XY endstops, run this
+in the printer's SSH terminal while idle:
+
+```bash
+cd ~/accel_homing && git fetch origin dev && git switch dev && git merge --ff-only origin/dev && bash ./install.sh --gentle-homing
+```
+
+Wait for Klipper to report ready. Run `ACCEL_HOMING_STATUS` in the printer
+console and confirm `"gentle_homing": true` before the first contact. If
+installation used `--no-restart`, first run the host service restart command
+printed by the installer to load the updated Python modules.
+
+**First test one contact.** Leave both axes unhomed, support Z, and use a ruler
+or a center mark to place the toolhead within 2 mm of the configured XY midpoint.
+With the tester at the printer, run the following in the printer console:
+
+```text
+ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1
+```
+
+The command uses two free strokes to select a mapped-axis filter and threshold.
+A third independent stroke and three stationary windows must clear the same
+threshold before the toolhead approaches the endstop. The detector can retain
+the unfiltered signal when a notch gives no benefit. It makes at most one
+contact attempt, prints a diagnostic ZIP and leaves the settings unsaved.
+After a smooth X contact, release XY and manually center again for the same
+command with `AXIS=Y`. If either axis hits hard, skips steps, or aborts, stop
+there and share that ZIP. It contains the motion captures, contact samples when
+available, trigger and halt step positions, effective settings, and host log.
+
+The single-contact ZIP also has `contact-timing.json` and `contact-timing.svg`
+at its root. The SVG shows the full seek and a zoom around scheduled braking,
+with acceleration, cruise and braking shaded separately. The raw signal and
+the replay of the selected detector use absolute acceleration in g;
+timestamps use MCU `print_time` seconds. The JSON reports each phase's peak and
+the largest filtered sample within 100 ms on either side of scheduled braking.
+`peak_minus_brake_ms` is negative when the peak came before braking and positive
+when it came after. If the detector requested a stop, a second window compares
+the signal with the host time observed just after that request. The fixed
+200 Hz / Q=5 replay is a separate historical comparison. These timings describe
+commands and sensor readings. The report identifies missing evidence on aborted
+runs. A soft contact can produce a signal below the selected threshold.
+
+Gentle supervised approaches command at most the midpoint-to-endstop distance
+plus 2 mm. An impact outside the midpoint tolerance, or more than 0.5 mm of
+commanded travel from trigger to halt, aborts the sequence. Ordinary G28 also
+checks that trigger-to-halt distance. These distances come from step commands.
+The physical toolhead position and motor slip require observation.
+
+Full gentle calibration uses the same selection procedure. Starting with XY
+unhomed and physically centered, run `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1`
+for X or use `AXIS=Y` for Y. One discovery and ten repeat contacts must qualify
+with the exact selected filter and threshold before the command saves that
+axis. Each onset must precede commanded braking, fall within the center-travel
+tolerance and meet the trigger-to-halt limit. Ordinary G28 checks the saved
+model and the phase of its own trigger. A single-contact check qualifies no model.
+
+Read the [command reference](#command-reference) for options and restrictions.
+After physically validating both axes, use the printer's normal homing controls.
+
+Next: [Troubleshooting](troubleshooting.md)

@@ -1,9 +1,11 @@
 # Technical reference
 
-Start with [configuration](CONFIGURATION.md) and [console commands](COMMANDS.md)
+[← Documentation](../README.md)
+
+Start with [configuration](../guide/configuration.md) and [console commands](../guide/commands.md)
 for operation. This page explains detector, preparation and transport policies.
-The [calibration sequence](SIMPLE_CALIBRATION.md) and
-[accuracy recovery](ACCURACY.md) are documented separately.
+The [calibration sequence](../guide/calibration.md) and
+[accuracy recovery](accuracy.md) are documented separately.
 
 ## Detector paths
 
@@ -50,7 +52,7 @@ Changing a threshold through temporary SET does not save a new detector/model.
 Persistent manual overrides take precedence over saved model values on reload.
 Successful calibration replaces its selected-axis override through SAVE_CONFIG;
 the generated paired threshold retains the qualified model's context checks.
-See [threshold precedence](CONFIGURATION.md#thresholds-and-saved-models).
+See [threshold precedence](../guide/configuration.md#thresholds-and-saved-models).
 
 ## Fresh reference and legacy quiet policies
 
@@ -187,8 +189,8 @@ ACCURACY early-trigger recovery additionally stages the failing axis's explicit
 override when necessary so its saved replacement is effective after reload;
 native save/include conflicts are reported instead of editing includes by hand.
 
-See [the full algorithm and exact boundaries](SIMPLE_CALIBRATION.md) and
-[accuracy recovery](ACCURACY.md).
+See [the full algorithm and exact boundaries](../guide/calibration.md) and
+[accuracy recovery](accuracy.md).
 
 ## Output and diagnostics
 
@@ -201,8 +203,8 @@ snapshots at the reported event, not continuously updated live measurements.
 Charts are PNG-only bounded diagnostic traces published only for successful
 workflows. Per-home ACCURACY traces remain in memory; failures retain console
 statistics without a chart. A successful Beta proposal emits a labelled PNG;
-its same-command console diagnostics also cover failures. See [plots](PLOTS.md) and
-[Beta](BETA.md).
+its same-command console diagnostics also cover failures. See [plots](plots.md) and
+[Beta](beta.md).
 
 Displayed acceleration components are nonnegative after signed-reference
 subtraction. Bounded envelopes preserve signed extrema and absolute troughs;
@@ -210,6 +212,6 @@ they are not a full-resolution export. Range notes aggregate all displayed
 homes/windows and report limited references separately without double counting.
 
 The source/API references and unresolved physical limits are collected in
-[compatibility](COMPATIBILITY.md). Test evidence belongs to its exact revision
-and environment; see [offline verification](../TESTING.md) rather than treating
+[compatibility](../guide/compatibility.md). Test evidence belongs to its exact revision
+and environment; see [offline verification](../development/testing.md) rather than treating
 old passing counts as current hardware evidence.

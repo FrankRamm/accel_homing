@@ -1,8 +1,10 @@
 # Configuration
 
+[← Documentation](../README.md)
+
 Use the installer-created configuration as your starting point. Do not paste a
 second `[accel_homing]` section or duplicate stepper sections. The annotated
-[complete example](../examples/accel_homing.cfg) lists the same options.
+[complete example](../../examples/accel_homing.cfg) lists the same options.
 
 ## Sensor and endstops
 
@@ -119,7 +121,7 @@ sensor, geometry and speed checks. A later user-written override remains a
 manual override, even when its numeric value matches the calibration.
 The former active thresholds are restored when that workflow ends; saving and
 reloading are still required to activate the staged values. An ordinary restart
-discards unsaved staged values. See [calibration](SIMPLE_CALIBRATION.md).
+discards unsaved staged values. See [calibration](calibration.md).
 
 ## Common plugin options
 
@@ -165,7 +167,7 @@ measures, qualifies and saves the chosen per-axis profile and model together.
 For a mapped-axis calibration, the stop decision uses the filtered component
 for that machine axis. Filter settings belong to the
 calibration: changing them requires requalification of affected saved models.
-See [configuration, calibration and comparison](NOTCH.md).
+See [configuration, calibration and comparison](../advanced/notch.md).
 
 ## Compatibility and release settings
 
@@ -208,7 +210,7 @@ thresholds have a 0.5 g minimum.
 
 These apply to configured batch accelerometers rather than the native Beacon
 raw adapter. Known standard driver ranges are listed in
-[compatibility](COMPATIBILITY.md#sensors).
+[compatibility](compatibility.md#sensors).
 
 | Option | Default | Meaning and accepted range |
 | --- | --- | --- |
@@ -242,12 +244,35 @@ Leave optional limits absent to disable them; do not write `None`. No default
 configured plan, including after a macro lowers live acceleration. They do
 not automatically edit speed, acceleration or receipt timeouts. They describe nominal
 command travel before a host request, not physical stopping distance. See
-[the formulas and limitations](DETAILS.md#timing-and-optional-travel-policies).
+[the formulas and limitations](../advanced/technical-reference.md#timing-and-optional-travel-policies).
 
 ## Historical Beacon names
 
 `[beacon_accel_homing]`, `beacon: beacon`, `beacon_accel:x/y`,
 `BEACON_ACCEL_HOMING_STATUS` and `SET_BEACON_ACCEL_HOMING` remain supported.
 Load only one of `[accel_homing]` and `[beacon_accel_homing]`.
-The [legacy example](../examples/beacon_accel_homing.cfg) is for an existing
+The [legacy example](../../examples/beacon_accel_homing.cfg) is for an existing
 configuration, not an additional section to paste beside a new installation.
+
+Next: [Printer console commands](commands.md)
+
+## Gentle homing (dev)
+
+The workflow and console commands are in [Gentle homing (dev)](commands.md#gentle-homing-dev).
+
+The installer enables `gentle_homing: True`, caps the existing plugin axes at
+40 mm/s and their homing acceleration at 1000 mm/s², and preserves lower
+positive settings. Driver currents retain their configured values. Review the
+printed installation plan if a rail uses a second pass or a separate acceleration
+override. Each axis needs a new calibration at its effective speed and acceleration
+before ordinary homing.
+
+New calibration uses the selected sensor's explicit `accel_axes_map` (Beacon)
+or `axes_map` (other accelerometers). With that setting, X homing uses the
+configured stream's X component and Y uses Y, without automatic mapping strokes.
+An explicitly written `x,y,z` counts; an omitted option with an internal identity
+default does not. Without the setting, calibration learns the channel and sign
+from gentle central strokes. Sensor configuration is preserved and its map is
+applied only once. Ambiguous automatic mappings abort before threshold qualification. Older
+XYZ-magnitude models require per-axis recalibration; their thresholds are not
+silently reused as mapped-axis thresholds.

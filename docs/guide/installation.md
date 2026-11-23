@@ -1,5 +1,7 @@
 # Installation, updates and recovery
 
+[← Documentation](../README.md)
+
 Run shell commands on the Linux printer host as the existing Klipper service
 user. Keep the printer idle and unpaused throughout installation, updating,
 uninstallation and service restarts. Installation does not request motion.
@@ -8,7 +10,7 @@ uninstallation and service restarts. Installation does not request motion.
 
 - A working Klipper or Kalico installation, Bash, Git, and Python 3.8 or newer.
 - A configured, functioning accelerometer supported by the
-  [sensor adapter](COMPATIBILITY.md). Configure its MCU, wiring, firmware and
+  [sensor adapter](compatibility.md). Configure its MCU, wiring, firmware and
   driver before installing this plugin.
 - Write access to the selected printer configuration and Klipper extras
   directory. Use the normal service user; the installer requests sudo for
@@ -226,7 +228,7 @@ For example, replace every path/service below with the actual instance:
 Generic travel flags are optional and rejected for native Beacon. Absent flags
 preserve existing explicit limits or leave them disabled. They do not raise
 acceleration or automatically choose a slower speed. See
-[timing and optional travel policies](DETAILS.md#timing-and-optional-travel-policies).
+[timing and optional travel policies](../advanced/technical-reference.md#timing-and-optional-travel-policies).
 
 Built-in `[safe_z_home]` or `[homing_override]` needs no acknowledgement flag.
 The plugin preserves their ordinary G28 behavior. Custom G28 macros still need
@@ -234,7 +236,7 @@ The plugin preserves their ordinary G28 behavior. Custom G28 macros still need
 homing sequence. Workflows use native selected-axis homing and bypass public
 G28 wrappers/macros, so prepare XY currents/enables and clearance independently.
 See
-[workflow restrictions](COMPATIBILITY.md#workflow-restrictions).
+[workflow restrictions](compatibility.md#workflow-restrictions).
 
 Development opt-outs are not a shared-instance migration mechanism. In
 particular, do not replace links in a shared Klipper checkout while another
@@ -282,6 +284,29 @@ For a manual update, run the [install commands](#install) above.
 If Git or the installer reports local changes, preserve and review them. Do not
 use a forced reset to conceal an ownership or configuration conflict.
 `--no-update-manager` installs do not configure this native update flow.
+
+## Moonraker update manager
+
+The default installer already adds this entry. **Do not add a duplicate** in
+`moonraker.conf` or its includes. For manual setup only, add this if missing:
+
+```ini
+[update_manager accel_homing]
+type: git_repo
+channel: dev
+path: ~/accel_homing
+origin: https://github.com/FrankRamm/accel_homing.git
+primary_branch: main
+is_system_service: False
+managed_services: klipper
+```
+
+Add the base `[update_manager]` section once if absent. After manual edits,
+restart the matching Moonraker service while idle. `~` is Moonraker's service
+user's home; use the printed absolute path if needed. Uninstall removes the
+matching plugin entry while preserving unrelated updater configuration.
+[Update details](#moonraker-updates) ·
+[Moonraker reference](https://moonraker.readthedocs.io/en/latest/configuration/#git-repo-configuration).
 
 ## Migrate from the MISC plugin
 
@@ -341,6 +366,13 @@ succeeds, the configuration is ready, services have restarted and no remaining
 links or updater entries reference that checkout. Do not delete the checkout
 to work around a failed uninstall.
 
+Only after those restarts, and after checking that no remaining plugin links
+or manual updater entries need this checkout, remove the source if desired:
+
+```bash
+rm -rf ~/accel_homing
+```
+
 ## Backup deprecation and interrupted installation
 
 Persistent installation backups and historical rollback are deprecated.
@@ -356,4 +388,6 @@ and source metadata, not copies of configuration contents.
 
 A terminated process or power loss has no persistent automatic restore point.
 Inspect the current files and rerun the installer after resolving any partial
-write or current ownership conflict. See [troubleshooting](TROUBLESHOOTING.md).
+write or current ownership conflict. See [troubleshooting](troubleshooting.md).
+
+Next: [Simple supervised calibration](calibration.md)

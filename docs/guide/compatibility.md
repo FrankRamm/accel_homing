@@ -1,5 +1,7 @@
 # Supported sensors and limits
 
+[← Documentation](../README.md)
+
 This is an experimental host-side impact endstop. Driver/API compatibility and
 synthetic test results do not establish physical contact detection, repeatability
 or stopping distance for your printer. Supervise first homes and workflows.
@@ -60,7 +62,7 @@ hardware using them have been validated:
 | Cartographer configuration | [2e7c69641fb106cf9c59d70f3987008a1117c887](https://github.com/Cartographer3D/docs/blob/2e7c69641fb106cf9c59d70f3987008a1117c887/cartographer-probe/installation-and-setup/installation/klipper-configuation.md): separate standard accelerometer object. |
 | Built-in G28 wrappers | Klipper [safe_z_home](https://github.com/Klipper3d/klipper/blob/ee2c6fb6b00b2b5d097ef70d0868df7d74943b51/klippy/extras/safe_z_home.py) and [homing_override](https://github.com/Klipper3d/klipper/blob/ee2c6fb6b00b2b5d097ef70d0868df7d74943b51/klippy/extras/homing_override.py). |
 
-See [offline testing](../TESTING.md) for the boundary between source checks,
+See [offline testing](../development/testing.md) for the boundary between source checks,
 executed synthetic tests and physical validation.
 
 ## Workflow restrictions
@@ -116,7 +118,7 @@ selected-axis models use absolute deviation on the configured channel, retaining
 legacy preparation/motion rules. Generic legacy homing rejects
 unproved startup with `no_motion`; it does not accept a stationary generic
 sensor as a successful already-pressed stop. Native Beacon retains a separate
-legacy pressed-start path. See [detector details](DETAILS.md#detector-paths).
+legacy pressed-start path. See [detector details](../advanced/technical-reference.md#detector-paths).
 
 Older saved XYZ-magnitude profiles require fresh per-axis calibration, even
 when a manual threshold is present. Legacy selected-axis profiles
@@ -159,3 +161,5 @@ evidence that all physical transients were captured. Existing hardware,
 native-stream and plotting limitations remain relevant after repository
 migration. No new hardware validation is implied by a clean installation or
 a passing offline suite.
+
+Next: [Installation, updates and recovery](installation.md)

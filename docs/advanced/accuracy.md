@@ -1,5 +1,7 @@
 # Accuracy workflow and early-trigger recovery
 
+[← Documentation](../README.md)
+
 ACCURACY measures variation in **commanded homing travel** at the currently
 active thresholds and configured homing speed. It does not measure carriage
 position with an encoder or establish absolute physical accuracy.
@@ -10,11 +12,11 @@ travel and its population statistics retain their mm scale. Range notes count
 every measured home and exclude the qualifier. Native marker estimates and
 finite sensor rails are reported separately with unknown excess amplitude;
 resting-reference uncertainty is disclosed without adding those counts to
-the capture totals. See [plot semantics](PLOTS.md).
+the capture totals. See [plot semantics](plots.md).
 
 ## Run
 
-Follow the [manual preparation](COMMANDS.md#prepare-every-moving-workflow):
+Follow the [manual preparation](../guide/commands.md#prepare-every-moving-workflow):
 idle and unpaused, both XY axes unhomed and physically centered, Z supported,
 nozzle clearance, and suitable XY currents/enables. Supervise the entire run.
 
@@ -121,6 +123,6 @@ axis's rendering complete before final publication starts. A later publication
 error attempts to remove only this run's new files. Existing chart-directory
 outputs are preserved. Partial statistics remain available in console/status.
 
-See [plot locations and access](PLOTS.md) and
-[troubleshooting](TROUBLESHOOTING.md). `ACCEL_HOMING_CANCEL` is not an immediate
+See [plot locations and access](plots.md) and
+[troubleshooting](../guide/troubleshooting.md). `ACCEL_HOMING_CANCEL` is not an immediate
 emergency stop for a running console command.

@@ -1,5 +1,7 @@
 # Experimental notch filter (dev)
 
+[← Documentation](../README.md)
+
 The optional notch attenuates a narrow frequency band during accelerometer
 homing. It is disabled by default. `NOTCH=AUTO` can select frequency and Q
 during calibration; manual configuration remains available. Profiles apply to
@@ -11,7 +13,7 @@ a smoother acceleration trace does not establish better physical homing.
 
 ## Automatic selection
 
-After the [manual preparation](COMMANDS.md#prepare-every-moving-workflow), run:
+After the [manual preparation](../guide/commands.md#prepare-every-moving-workflow), run:
 
 ```gcode
 ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0
@@ -161,7 +163,7 @@ Recalibrate each affected axis before using its saved model:
 ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
 ```
 
-Follow the [manual preparation](COMMANDS.md#prepare-every-moving-workflow)
+Follow the [manual preparation](../guide/commands.md#prepare-every-moving-workflow)
 before running this moving command. It saves and restarts on success by default;
 `SAVE_CONFIG=0` stages only. Reprepare after restart before another moving test.
 
