@@ -2,6 +2,8 @@
 import copy
 import json
 import math
+from pathlib import Path
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -9,6 +11,7 @@ from unittest import mock
 from harness import CommandError
 from test_workflows import BACK_OFF, GCmd, Stepper, workflow_module
 from axis_limits_rig import AxisLimitsFixture, NativeState, NativeMove
+from test_calibration_config import ModernNativeShape
 
 
 class AxisLimitsRig(AxisLimitsFixture):
@@ -51,6 +54,32 @@ class AxisLimitsRig(AxisLimitsFixture):
             callback(0., False)
 
 
+class ModernConfigfile(ModernNativeShape):
+    """Newer layout: pending state and autosave helpers live on autosave."""
+    def __init__(self, root):
+        super().__init__(root)
+        self.set_calls, self.native_calls = [], 0
+
+    def set(self, section, option, value):
+        self.set_calls.append((section, option, value))
+        super().set(section, option, value)
+
+    def cmd_SAVE_CONFIG(self, gcmd):
+        self.native_calls += 1
+        return self.save(gcmd)
+
+
+class ModernLayoutRig(AxisLimitsRig):
+    def __init__(self, directory):
+        super().__init__()
+        self.root = Path(directory) / "printer.cfg"
+        self.root.write_text("[stepper_x]\nposition_max: 300\nposition_endstop: 0\n"
+                             "[stepper_y]\nposition_max: 200\nposition_endstop: 0\n")
+        self.configfile = ModernConfigfile(self.root)
+        self.objects["configfile"] = self.configfile
+        self.get_start_args = lambda: {"config_file": str(self.root)}
+
+
 class AxisLimitsCalibrationTests(unittest.TestCase):
     def test_start_has_no_motion_and_center_is_operator_confirmation(self):
         rig = AxisLimitsRig()
@@ -62,6 +91,8 @@ class AxisLimitsCalibrationTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandError, "CENTERED=1"):
             rig.command("MEASURE", CLEAR=1)
         self.assertEqual(rig.measure_calls, [])
+        self.assertEqual(rig.workflow.session["stage"], "prepare")
+        rig.workflow.cmd_CANCEL(GCmd())
         self.assertIsNone(rig.workflow.session)
         self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
 
@@ -178,10 +209,139 @@ class AxisLimitsCalibrationTests(unittest.TestCase):
         before = rig.workflow.session["measurement"]["coordinate"]
         rig.command("JOG", DISTANCE=-100)
         self.assertAlmostEqual(rig.workflow.session["measurement"]["coordinate"], before - 100)
-        moves = len(rig.toolhead.moves)
+        moves, position = len(rig.toolhead.moves), list(rig.toolhead.position)
+        session = rig.workflow.session
         with self.assertRaises(CommandError):
             rig.command("JOG", DISTANCE=100.5)
         self.assertEqual(len(rig.toolhead.moves), moves)
+        self.assertEqual(rig.toolhead.position, position)
+        # A rejected command keeps the session, stage and measured coordinate.
+        self.assertIs(rig.workflow.session, session)
+        self.assertEqual(session["stage"], "origin")
+        self.assertAlmostEqual(session["measurement"]["coordinate"], before - 100)
+
+    def test_rejected_commands_keep_session_stage_and_show_dialog_again(self):
+        cases = [("select", "ORIGIN", {"CONFIRM": 1}), ("select", "JOG", {"DISTANCE": -10}),
+                 ("select", "MEASURE", {"CENTERED": 1, "CLEAR": 1}), ("select", "SAVE", {"CONFIRM": 1}),
+                 ("select", "SELECT", {"AXIS": "Z"}), ("select", "BOGUS", {}),
+                 ("prepare", "ORIGIN", {"CONFIRM": 1}), ("prepare", "SELECT", {"AXIS": "Y"}),
+                 ("prepare", "MEASURE", {"CENTERED": 1}), ("prepare", "MEASURE", {"CLEAR": 1}),
+                 ("origin", "MEASURE", {"CENTERED": 1, "CLEAR": 1}), ("origin", "ORIGIN", {}),
+                 ("origin", "JOG", {"DISTANCE": 0}), ("origin", "JOG", {"DISTANCE": 300}),
+                 ("origin", "JOG", {"DISTANCE": 10}), ("origin", "SAVE", {"CONFIRM": 1}),
+                 ("review", "SAVE", {}), ("review", "JOG", {"DISTANCE": -10}),
+                 ("review", "ORIGIN", {"CONFIRM": 1})]
+        for stage, action, params in cases:
+            with self.subTest(stage=stage, action=action, params=params):
+                rig = AxisLimitsRig()
+                if stage == "select":
+                    rig.command()
+                elif stage == "prepare":
+                    rig.select()
+                else:
+                    rig.measure()
+                    if stage == "review":
+                        rig.origin()
+                session, moves = rig.workflow.session, len(rig.toolhead.moves)
+                calls, prompts = len(rig.measure_calls), len(rig.prompts)
+                coordinate = session.get("measurement", {}).get("coordinate")
+                with self.assertRaises(CommandError):
+                    rig.command(action, **params)
+                self.assertIs(rig.workflow.session, session)
+                self.assertEqual(session["stage"], stage)
+                self.assertEqual(len(rig.toolhead.moves), moves)
+                self.assertEqual(len(rig.measure_calls), calls)
+                self.assertEqual(rig.configfile.set_calls, [])
+                self.assertEqual(session.get("measurement", {}).get("coordinate"), coordinate)
+                self.assertGreater(len(rig.prompts), prompts)
+                self.assertNotIn("// action:prompt_end", rig.prompts)
+
+    def test_selected_axis_impact_without_motion_is_rejected(self):
+        rig = AxisLimitsRig()
+        rig.select()
+        rig.measure_results.append({"distance": 73., "motion_seen": False})
+        with self.assertRaises(CommandError):
+            rig.command("MEASURE", CENTERED=1, CLEAR=1)
+        self.assertEqual(len(rig.measure_calls), 1)
+        self.assertIsNone(rig.workflow.session)
+
+    def test_mapped_impacts_do_not_need_motion_like_ordinary_homing(self):
+        rig = AxisLimitsRig()
+        rig.mapped_axes.add("x")
+        rig.select()
+        rig.measure_results.extend([{"distance": 73., "motion_seen": False},
+                                    {"distance": 299., "motion_seen": False}])
+        rig.command("MEASURE", CENTERED=1, CLEAR=1)
+        self.assertEqual(rig.workflow.session["stage"], "origin")
+
+    def test_bed_zero_button_only_when_coordinate_is_valid(self):
+        rig = AxisLimitsRig()
+        rig.measure()
+        accept = "Accept bed zero|ACCEL_HOMING_CALIBRATE_LIMITS ACTION=ORIGIN CONFIRM=1|primary"
+        item = rig.workflow.session["measurement"]
+        for coordinate, shown in ((item["coordinate"], False), (0.5, False), (item["span"] - 0.5, False),
+                                  (1.0, True), (item["span"] - 1.0, True)):
+            with self.subTest(coordinate=coordinate):
+                item["coordinate"] = coordinate
+                rig.prompts.clear()
+                rig.workflow.axis_limits._show(rig.workflow.session)
+                self.assertEqual(any(accept in text for text in rig.prompts), shown)
+
+    def test_newer_layout_snapshots_and_saves_through_native_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rig = ModernLayoutRig(directory)
+            rig.measure()
+            self.assertIsNotNone(rig.workflow.session["configuration"])
+            rig.origin()
+            rig.command("SAVE", CONFIRM=1)
+            self.assertEqual(rig.configfile.native_calls, 1)
+            self.assertEqual(len(rig.configfile.set_calls), 3)
+            self.assertEqual(rig.workflow.last_result["result"], "axis_limits_report")
+            self.assertEqual(rig.workflow.last_result["persistence"], "native_save_requested")
+            self.assertTrue(rig.workflow.last_result["save_config"])
+            self.assertIn("position_min", rig.root.read_text().split("SAVE_CONFIG")[-1])
+
+    def test_newer_layout_refusals_prevent_writes_and_keep_report(self):
+        for change in ("source", "pending", "include"):
+            with self.subTest(change=change):
+                with tempfile.TemporaryDirectory() as directory:
+                    rig = ModernLayoutRig(directory)
+                    rig.measure()
+                    rig.origin()
+                    if change == "source":
+                        rig.root.write_text(rig.root.read_text() + "# external edit\n")
+                    elif change == "pending":
+                        rig.configfile.autosave.save_config_pending = True
+                    else:
+                        (Path(directory) / "extra.cfg").write_text("[stepper_x]\nposition_min: 0\n")
+                        rig.root.write_text("[include extra.cfg]\n" + rig.root.read_text())
+                        rig.workflow.session["configuration"] = \
+                            rig.workflow.axis_limits._configuration_state()
+                    with self.assertRaises(CommandError):
+                        rig.command("SAVE", CONFIRM=1)
+                    self.assertEqual(rig.configfile.set_calls, [])
+                    self.assertEqual(rig.configfile.native_calls, 0)
+                    self.assertIn("stepper_x", rig.workflow.last_result["proposed_config"])
+
+    def test_refused_save_keeps_and_prints_the_complete_report(self):
+        rig = AxisLimitsRig()
+        rig.measure()
+        rig.origin()
+        rig.configfile.included = {"stepper_x": {"position_min": "0"}}
+        rig.output.clear()
+        with self.assertRaises(CommandError):
+            rig.command("SAVE", CONFIRM=1)
+        result = rig.workflow.last_result
+        self.assertEqual(result["result"], "axis_limits_report")
+        self.assertIn("position_min", result["proposed_config"]["stepper_x"])
+        self.assertIn("x", result["axis_results"])
+        self.assertFalse(result["save_config"])
+        self.assertEqual(result["persistence"], "save_refused")
+        self.assertIn("included options", result["reason"])
+        text = "\n".join(rig.output)
+        self.assertIn("position_min", text)
+        self.assertIn("not saved", text)
+        self.assertIsNone(rig.workflow.session)
 
     def test_every_stage_footer_says_abort(self):
         rig = AxisLimitsRig()

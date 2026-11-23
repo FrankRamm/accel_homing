@@ -246,16 +246,38 @@ class AxisLimitsCalibration:
             self._prompt(session, "Review axis limits", lines, buttons)
 
 
+    @staticmethod
+    def _legacy_layout(configfile):
+        """Retained PrinterConfig layout: pending state and readers on configfile."""
+        return hasattr(configfile, "status_save_pending")
+
+
+    def _newer_files(self, configfile, filename):
+        """Read the newer layout through the helper's native reader; read-only."""
+        module = self.workflows.config_module
+        reader = module._NativeReader(configfile)
+        root, files, _ = module.CalibrationConfigSave(
+            self.workflows.printer, "accel_homing")._configuration(reader, filename)
+        return reader, root, files
+
+
     def _configuration_state(self):
-        config = self.workflows.printer.lookup_object("configfile")
+        w = self.workflows
+        config = w.printer.lookup_object("configfile")
         try:
-            filename = self.workflows.printer.get_start_args()["config_file"]
+            filename = w.printer.get_start_args()["config_file"]
+            if not self._legacy_layout(config):
+                _reader, _root, files = self._newer_files(config, filename)
+                state = config.autosave
+                return (tuple(sorted((path, item["data"]) for path, item in files.items())), [],
+                        self._parser_values(state.fileconfig), copy.deepcopy(state.status_save_pending),
+                        state.save_config_pending)
             source = config._read_config_file(filename)
             regular, _ = config._find_autosave_data(source)
             resolved = config._build_config_wrapper(regular, filename).fileconfig
             return (source, self._parser_values(resolved), self._parser_values(config.autosave.fileconfig),
                     copy.deepcopy(config.status_save_pending), config.save_config_pending)
-        except (AttributeError, KeyError):
+        except (AttributeError, KeyError, ValueError, OSError):
             return None
 
 
@@ -526,6 +548,10 @@ class AxisLimitsCalibration:
                     or record.get("axis") != axis or record.get("pass") != 1
                     or record.get("result") != "impact"
                     or record.get("impact_metric") != plan["metric"]
+                    # Ordinary homing accepts a selected_axis impact only with
+                    # proof of motion; vector and mapped metrics need none.
+                    or (record["impact_metric"] == "selected_axis"
+                        and not (record.get("moving") or record.get("motion_seen")))
                     or record.get("polarity_policy") != POLARITY_POLICY):
                 raise self._error("%s returned no new valid single impact; pressed/early/no-trigger "
                                   "results cannot establish an endpoint" % axis.upper())
@@ -601,34 +627,58 @@ class AxisLimitsCalibration:
         """Read-only native include check and snapshot; never write config files."""
         w = self.workflows
         configfile = w.printer.lookup_object("configfile")
-        required = ("autosave", "status_save_pending", "save_config_pending", "_read_config_file",
-                    "_find_autosave_data", "_strip_duplicates", "_build_config_wrapper", "cmd_SAVE_CONFIG")
-        if any(not hasattr(configfile, name) for name in required):
+        legacy = self._legacy_layout(configfile)
+        # Newer hosts keep pending state and autosave helpers on configfile.autosave.
+        state = configfile if legacy else getattr(configfile, "autosave", None)
+        legacy_required = ("autosave", "_read_config_file", "_find_autosave_data",
+                           "_strip_duplicates", "_build_config_wrapper")
+        if (not hasattr(getattr(configfile, "autosave", None), "fileconfig")
+                or not hasattr(state, "status_save_pending") or not hasattr(state, "save_config_pending")
+                or (legacy and any(not hasattr(configfile, name) for name in legacy_required))):
             raise self._error("SAVE_CONFIG=1 needs supported native autosave snapshot/include APIs; use report-only")
-        if configfile.save_config_pending or configfile.status_save_pending:
+        if state.save_config_pending or state.status_save_pending:
             raise self._error("unrelated SAVE_CONFIG changes are pending; save or discard them separately first")
         parser = configfile.autosave.fileconfig
         filename = w.printer.get_start_args()["config_file"]
-        data = configfile._read_config_file(filename)
-        regular, _ = configfile._find_autosave_data(data)
-        proposed = copy.deepcopy(parser)
-        for section, option in keys:
-            if not proposed.has_section(section):
-                proposed.add_section(section)
-            proposed.set(section, option, "axis_limits_include_preflight")
-        stripped = configfile._strip_duplicates(regular, types.SimpleNamespace(fileconfig=proposed))
-        included = configfile._build_config_wrapper(stripped, filename).fileconfig
-        conflicts = ["[%s] %s" % key for key in keys if included.has_option(*key)]
+        if legacy:
+            data = configfile._read_config_file(filename)
+            regular, _ = configfile._find_autosave_data(data)
+            proposed = copy.deepcopy(parser)
+            for section, option in keys:
+                if not proposed.has_section(section):
+                    proposed.add_section(section)
+                proposed.set(section, option, "axis_limits_include_preflight")
+            stripped = configfile._strip_duplicates(regular, types.SimpleNamespace(fileconfig=proposed))
+            included = configfile._build_config_wrapper(stripped, filename).fileconfig
+            conflicts = ["[%s] %s" % key for key in keys if included.has_option(*key)]
+        else:
+            module = w.config_module
+            targets = {key: {"value": "axis_limits_include_preflight"} for key in keys}
+            try:
+                reader, root, files = self._newer_files(configfile, filename)
+                reader.check_root_targets(root["data"], targets)
+            except (ValueError, OSError) as exc:
+                raise self._error("SAVE_CONFIG=1 cannot read the configuration safely: %s; use report-only" % exc)
+            data = tuple(sorted((path, item["data"]) for path, item in files.items()))
+            conflicts = ["[%s] %s" % key for key in keys
+                         if any(path != root["path"] and module._comment_selected(
+                                    item["data"], {key: targets[key]}) != item["data"]
+                                for path, item in files.items())]
         if conflicts:
             raise self._error("SAVE_CONFIG=1 cannot safely replace included options: %s. "
                               "Move these options into the main printer.cfg first, or use report-only" % ", ".join(conflicts))
         native_save = getattr(type(configfile), "cmd_SAVE_CONFIG", None)
+        if not callable(native_save) and not legacy:
+            native_save = getattr(type(configfile.autosave), "cmd_SAVE_CONFIG", None)
+            owner = configfile.autosave
+        else:
+            owner = configfile
         if not callable(native_save):
             raise self._error("native SAVE_CONFIG implementation is unavailable before motion")
-        return {"configfile": configfile, "parser": copy.deepcopy(parser),
-                "pending": copy.deepcopy(configfile.status_save_pending),
-                "flag": configfile.save_config_pending, "source": data,
-                "native_save": types.MethodType(native_save, configfile)}
+        return {"configfile": configfile, "state": state, "parser": copy.deepcopy(parser),
+                "pending": copy.deepcopy(state.status_save_pending),
+                "flag": state.save_config_pending, "source": data,
+                "native_save": types.MethodType(native_save, owner)}
 
 
     @staticmethod
@@ -658,8 +708,8 @@ class AxisLimitsCalibration:
             # firmware owns disk I/O; an I/O failure can leave persistence
             # uncertain and must never be described as a successful save.
             configfile.autosave.fileconfig = snapshot["parser"]
-            configfile.status_save_pending = snapshot["pending"]
-            configfile.save_config_pending = snapshot["flag"]
+            snapshot["state"].status_save_pending = snapshot["pending"]
+            snapshot["state"].save_config_pending = snapshot["flag"]
             result.update(result="save_failed", save_config=False,
                           persistence="native_save_failed_disk_state_unconfirmed")
             raise
@@ -808,39 +858,42 @@ class AxisLimitsCalibration:
         if session["busy"]:
             raise self._error("wizard operation is still running")
         try:
+            self._validate(session, action, gcmd)
+        except Exception:
+            # A rejected command changes nothing: keep the session, stage and
+            # measurements, and show the current dialog again.
+            if session["state"] == "waiting":
+                self._show(session)
+            raise
+        report = None
+        try:
             self._continue(session)
             session["busy"] = True
             session["state"] = "running"
             self.workflows.reactor.update_timer(self.workflows.timer, self.workflows.reactor.NEVER)
             if action == "STATUS":
                 self._wait(session, session["stage"])
-            elif action == "SELECT" and session["stage"] == "select":
+            elif action == "SELECT":
                 self._select(session, str(gcmd.get("AXIS", "")).strip().lower())
             elif action == "MEASURE":
                 self._measure_axis(session, gcmd)
-            elif action == "JOG" and session["stage"] == "origin":
+            elif action == "JOG":
                 distance = gcmd.get_float("DISTANCE", minval=-100.0, maxval=100.0)
-                if not math.isfinite(distance) or distance == 0:
-                    raise self._error("DISTANCE must be finite, nonzero and at most 100 mm")
                 self._jog_to(session, session["measurement"]["coordinate"] + distance)
                 self._wait(session, "origin")
             elif action == "ORIGIN":
                 self._origin(session, gcmd)
-            elif action == "NEXT" and session["stage"] == "review":
+            elif action == "NEXT":
                 other = "y" if session["axis"] == "x" else "x"
-                if other in session["results"]:
-                    raise self._error("both axes are already accepted; review and SAVE or DONE")
                 midpoint = session["measurement"]["span"] * 0.5
                 while abs(session["measurement"]["coordinate"] - midpoint) > 0.000001:
                     current = session["measurement"]["coordinate"]
                     target = current + max(-10.0, min(10.0, midpoint - current))
                     self._jog_to(session, target)
                 self._select(session, other)
-            elif action in ("SAVE", "DONE") and session["stage"] == "review":
-                result = self._result(session)
+            elif action in ("SAVE", "DONE"):
+                result = report = self._result(session)
                 if action == "SAVE":
-                    if gcmd.get_int("CONFIRM", 0, minval=0, maxval=1) != 1:
-                        raise self._error("SAVE CONFIRM=1 is required after reviewing coordinates")
                     keys = self._save_keys(session["results"])
                     snapshot = self._save_snapshot(keys)
                     if session["configuration"] is None or self._configuration_state() != session["configuration"]:
@@ -860,11 +913,73 @@ class AxisLimitsCalibration:
                 self._check(session)
         except Exception as exc:
             ending = session.get("limits_ending", {})
-            result = self._result(session, ending.get("result", "aborted"), str(exc))
+            if report is not None and action == "SAVE":
+                # The proposal was complete; a refused or failed save must not
+                # lose the measurements. Keep the full report and print it.
+                result = report
+                result["reason"] = str(exc)
+                if result["result"] != "save_failed":
+                    result.update(persistence="save_refused",
+                                  result=ending.get("result", "axis_limits_report"))
+                self._print_report(result)
+            else:
+                result = self._result(session, ending.get("result", "aborted"), str(exc))
             if self.workflows.session is session:
                 self._close(session, result)
+            elif report is not None and action == "SAVE":
+                self.workflows.last_result = result
             elif self.workflows.last_result is not None and self.workflows.last_result.get("result") != "save_failed":
                 self.workflows.last_result = result
             raise
         finally:
             session["busy"] = False
+
+
+    def _validate(self, session, action, gcmd):
+        """Check stage and parameters before anything can change or close."""
+        stage = session["stage"]
+        if action == "STATUS":
+            return
+        required = {"SELECT": "select", "MEASURE": "prepare", "JOG": "origin", "ORIGIN": "origin",
+                    "NEXT": "review", "SAVE": "review", "DONE": "review"}
+        if required.get(action) != stage:
+            raise self._error("action is invalid for the current wizard stage")
+        if action == "SELECT":
+            axis = str(gcmd.get("AXIS", "")).strip().lower()
+            if axis not in AXES:
+                raise self._error("AXIS must be X or Y")
+            if axis in session["results"]:
+                raise self._error("axis already accepted; cancel and start again to repeat it")
+        elif action == "MEASURE":
+            self.workflows._require_centered(gcmd)
+            if gcmd.get_int("CLEAR", 0, minval=0, maxval=1) != 1:
+                raise self._error("CLEAR=1 must confirm physical nozzle and path clearance")
+        elif action == "JOG":
+            distance = gcmd.get_float("DISTANCE", minval=-100.0, maxval=100.0)
+            if not math.isfinite(distance) or distance == 0:
+                raise self._error("DISTANCE must be finite, nonzero and at most 100 mm")
+            item = session["measurement"]
+            if not 1.0 <= item["coordinate"] + distance <= item["span"] - 1.0:
+                raise self._error("jog target must stay at least 1 mm inside estimated trigger endpoints")
+        elif action == "ORIGIN":
+            if gcmd.get_int("CONFIRM", 0, minval=0, maxval=1) != 1:
+                raise self._error("align the nozzle using JOG, then ORIGIN CONFIRM=1")
+            item = session["measurement"]
+            if not 1.0 <= item["coordinate"] <= item["span"] - 1.0:
+                raise self._error("origin must be at least 1 mm inside estimated trigger endpoints")
+        elif action == "NEXT":
+            if ("y" if session["axis"] == "x" else "x") in session["results"]:
+                raise self._error("both axes are already accepted; review and SAVE or DONE")
+        elif action == "SAVE":
+            if gcmd.get_int("CONFIRM", 0, minval=0, maxval=1) != 1:
+                raise self._error("SAVE CONFIRM=1 is required after reviewing coordinates")
+
+
+    def _print_report(self, result):
+        w = self.workflows
+        status = "persistence unconfirmed" if result["result"] == "save_failed" else "not saved"
+        w._info("Axis limits proposal %s (%s). Measurements are kept; apply by hand if wanted:"
+                % (status, result["reason"]))
+        for name, p in result["proposed_config"].items():
+            w._info("[%s] position_min: %.6f; position_max: %.6f; position_endstop: %.6f"
+                    % (name, p["position_min"], p["position_max"], p["position_endstop"]))

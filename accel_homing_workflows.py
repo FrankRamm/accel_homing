@@ -51,8 +51,8 @@ _axes_module = _ah_compat_sibling_module("accel_homing_axes", __package__, __fil
 infer_axis_mapping = _axes_module.infer_axis_mapping
 validate_axis_mapping = _axes_module.validate_axis_mapping
 CONFIGURED_MAPPING_METHOD = _axes_module.CONFIGURED_METHOD
-CalibrationConfigSave = _ah_compat_sibling_module(
-    "accel_homing_config", __package__, __file__).CalibrationConfigSave
+_config_module = _ah_compat_sibling_module("accel_homing_config", __package__, __file__)
+CalibrationConfigSave = _config_module.CalibrationConfigSave
 
 # A source-only update of an older installation may precede creation of the
 # new extras symlink. Existing homing must keep loading during that interval.
@@ -392,6 +392,7 @@ class AccelHomingWorkflows:
         self.noise_seeds = {}
         self.in_home = False
         self.home_axis = None
+        self.config_module = _config_module
         self.axis_limits = AxisLimitsCalibration(self) if AxisLimitsCalibration is not None else None
         self.timer = self.reactor.register_timer(self._timeout)
         self.printer.register_event_handler("klippy:shutdown", self._shutdown)

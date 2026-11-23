@@ -332,6 +332,7 @@ class NativeAxisLimitsRig(AxisLimitsRig):
                                       else "xyz_magnitude" if self.owner._uses_vector_detector(axis)
                                       else "selected_axis"),
                     "polarity_policy": "absolute_after_reference_subtraction_v1",
+                    "motion_seen": True,
                     "trigger_travel_mm_signed": item["signed_trigger"],
                     "halt_travel_mm_signed": item["signed_halt"],
                     "onset_g": 8.0, "impact_peak_g": 9.0}

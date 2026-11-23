@@ -142,6 +142,7 @@ class NativeMove:
         owner.last[axis] = {"axis": axis, "pass": 1, "result": item.get("result", "impact"),
                             "impact_metric": metric,
                             "polarity_policy": "absolute_after_reference_subtraction_v1",
+                            "motion_seen": item.get("motion_seen", True),
                             "trigger_travel_mm_signed": trigger, "halt_travel_mm_signed": halt,
                             "onset_g": 8., "impact_peak_g": 9.}
         rig.toolhead.position[index] += halt
