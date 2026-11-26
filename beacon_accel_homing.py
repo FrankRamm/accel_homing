@@ -41,6 +41,7 @@ CONFIGURED_METHOD = _axes_module.CONFIGURED_METHOD
 _filter = load_filter_module()
 CausalNotch, DISABLED = _filter.CausalNotch, _filter.DISABLED
 coefficients, profile, replay, same_rate = _filter.coefficients, _filter.profile, _filter.replay, _filter.same_rate
+RATE_TOLERANCE = _filter.RATE_TOLERANCE
 
 SAMPLE = struct.Struct("<hhh")
 CLIPPED = 0x7FFF
@@ -58,6 +59,7 @@ IMPACT_WINDOW = 0.015      # s after the onset in which the impact peak is kept
 IDLE_CLEANUP = 3.0         # s, closes a homing session left open by an error
 MAX_SHORT_HOME_RETRIES = 2     # re-homes after a G28 travel below min_home_dist
 SECOND_TOUCH_TOLERANCE = 1.5   # mm, only used if a second touch is configured
+POST_TRIGGER_NOTICE_MM = 1.0   # mm commanded into the stop after the trigger sample
 MIN_SPEED = 50.0           # mm/s, below this impacts were too soft in testing
 AUTO_DIRECTION_SPEED = 30.0    # mm/s of travel that fixes which way an impact points
 PRESSED_MIN_SPEED = 40.0   # mm/s commanded before missing motion counts as pressed
@@ -330,10 +332,14 @@ def describe(r):
     uncertainty = (" (bounded endpoint estimate; true sign/peak unknown)"
                    if (r.get("native_clip_decode") or {}).get("marker_axis_values") else
                    " (range reached; true peak may be higher)" if r.get("amplitude_limited") else "")
-    return ("%s pass %d: %s, onset %s g, peak %s g%s, noise +%.1f/-%.1f g, travel %s mm%s"
+    post = r.get("post_trigger_mm")
+    request = r.get("stop_request_after_onset_ms")
+    return ("%s pass %d: %s, onset %s g, peak %s g%s, noise +%.1f/-%.1f g, travel %s mm%s%s%s"
             % (r["axis"].upper(), r["pass"], r["result"], r["onset_g"], r["impact_peak_g"],
                uncertainty,
                r["noise_pos_g"], r["noise_neg_g"], r.get("travel_mm"),
+               "" if post is None else ", post-trigger %.3f mm" % post,
+               "" if request is None else ", stop request %.1f ms after onset" % request,
                ", origin kept" if r.get("kept_origin") else ""))
 
 
@@ -411,6 +417,18 @@ def homing_warnings(name, info):
     return warnings
 
 
+def threshold_ramp_warning(axis, threshold, accel):
+    """Manual threshold the homing acceleration alone can reach. Advice only."""
+    ramp = accel / MM_PER_S2_PER_G
+    limit = round(2.0 * ramp, 1)
+    if not threshold < limit:
+        return None
+    return ("accel_homing: %s threshold %.3g g is below %.1f g, twice the %.2f g that the"
+            " homing acceleration of %.0f mm/s^2 produces on its own. The start of a homing"
+            " move can trigger it and leave the origin at the start position. Raise the"
+            " threshold or calibrate the axis." % (axis.upper(), threshold, limit, ramp, accel))
+
+
 class Attempt:
     """State of one armed homing move. The trigger path runs in the Beacon serial thread."""
 
@@ -459,6 +477,7 @@ class Attempt:
         self.filter_first_sample = None
         self.filter_last_time = self.filter_tail_error = None
         self.filter_last_clock = None
+        self.filter_last_interval = self.filter_last_packet = None
         self.first_armed_sample = None
         self.reference_sampling = None
         self.signal_quality = None
@@ -509,6 +528,7 @@ class Attempt:
         self.impact_until = None
         self.record = None
         self.start_position = self.expected_travel = None
+        self.believed_distance = None  # to the stop, from the real position before homing
 
 
 class BeaconAccelEndstop:
@@ -703,7 +723,8 @@ class BeaconAccelHoming:
         self.saved_accel = None
         self.last_batch = None
         self.last_activity = 0.0
-        self.homed_before = self.last_pass = None
+        self.homed_before = self.last_pass = self.first_pass = None
+        self.start_homed = self.start_believed_distance = None
         self.last = {}
         self.history = collections.deque(maxlen=20)
         self.capture_batches = None
@@ -798,6 +819,10 @@ class BeaconAccelHoming:
                     self.backend.validate_rail(rail.get_homing_info(), self.printer.config_error)
                 for msg in homing_warnings(rail.get_name(), rail.get_homing_info()):
                     configfile.runtime_warning(msg)
+        for axis in sorted(self.workflows.manual_axes):
+            msg = threshold_ramp_warning(axis, self.threshold_g[axis], self._ramp_accel())
+            if msg:
+                configfile.runtime_warning(msg)
         kin = self.toolhead.get_kinematics()
         home = getattr(kin, "home", None)
         if (getattr(home, "__self__", None) is self
@@ -927,7 +952,8 @@ class BeaconAccelHoming:
             if not minimum:
                 continue
             accepted = (context["rails"].get(axis) or (None, None))[1] is record
-            travels = [record.get("travel_mm_exact")]
+            first_travel = context.setdefault("first_travel", {})
+            travels = [first_travel.get(axis, record.get("travel_mm_exact"))]
             limit = minimum
             while not accepted or travels[-1] is None or travels[-1] < limit:
                 if len(travels) > MAX_SHORT_HOME_RETRIES:
@@ -966,6 +992,7 @@ class BeaconAccelHoming:
                                          else 1.5 * (high - info.position_endstop))
                 context["rails"].pop(axis, None)
                 context["homed"].pop(axis, None)
+                first_travel.pop(axis, None)
                 context["homing"].home_rails([rail], forcepos, homepos)
                 if not current():
                     raise interrupted()
@@ -975,7 +1002,7 @@ class BeaconAccelHoming:
                         "accel_homing: %s re-home was not accepted" % axis.upper())
                 rail, record = entry
                 accepted = True
-                travels.append(record.get("travel_mm_exact"))
+                travels.append(first_travel.get(axis, record.get("travel_mm_exact")))
                 limit = minimum - SECOND_TOUCH_TOLERANCE
             if len(travels) > 1:
                 logging.info("accel_homing: %s re-home accepted, stop confirmed "
@@ -1197,6 +1224,10 @@ class BeaconAccelHoming:
             self.saved_accel = accel
             self._set_accel(self.homing_accel)
 
+    def _ramp_accel(self):
+        accel = self.toolhead.get_max_velocity()[1]
+        return min(accel, self.homing_accel) if self.homing_accel else accel
+
     def _restore_accel(self):
         if self.saved_accel is not None:
             accel, self.saved_accel = self.saved_accel, None
@@ -1291,8 +1322,18 @@ class BeaconAccelHoming:
         self.session_axes = axes
         self.passes = 0
         self.recent.clear()
-        self.tail = self.last_pass = None
+        self.tail = self.last_pass = self.first_pass = None
         self.homed_before = self._homed_at_stop(*list(axes.items())[0])
+        # Klipper applies the forced start position only after this event.
+        axis, rail = list(axes.items())[0]
+        self.start_homed, self.start_believed_distance = self._homed(axis), None
+        if self.start_homed and hasattr(self.toolhead, "get_position"):
+            info = rail.get_homing_info()
+            position = self.toolhead.get_position()[AXES[axis]]
+            distance = (info.position_endstop - position if info.positive_dir
+                        else position - info.position_endstop)
+            if math.isfinite(distance):
+                self.start_believed_distance = distance
         self.homing_active = True
         self.last_activity = started = self.reactor.monotonic()
         self.reactor.update_timer(self.idle_timer, started + 0.5)
@@ -1422,6 +1463,11 @@ class BeaconAccelHoming:
             record = attempt.record
             context.setdefault("homed", {})[attempt.axis] = (
                 self.session_axes[attempt.axis], record)
+            # A second touch only travels the retract; the first pass is the
+            # approach that min_home_dist judges.
+            first = self.first_pass
+            source = first.record if first is not None and first.axis == attempt.axis else record
+            context.setdefault("first_travel", {})[attempt.axis] = source.get("travel_mm_exact")
             accepted = (attempt.reason == "impact" and
                         (record.get("moving") or record.get("motion_seen")
                          or record.get("impact_metric") in ("xyz_magnitude", "mapped_axis"))) or (
@@ -1645,22 +1691,46 @@ class BeaconAccelHoming:
 
     def _filter_packet_valid(self, attempt, params, count, skip=0):
         start, interval = self._batch_timing(params, count)
-        if interval <= 0 or not same_rate(1.0 / interval, attempt.notch.rate):
+        rate = attempt.notch.rate
+        if interval <= 0:
             return False
         first = start + skip * interval
         if self.backend is None:
             # Clock synchronization may adjust the print-time offset between
             # callbacks. Sensor-clock differences preserve continuity through
-            # those adjustments and through the 32-bit clock wrap.
+            # those adjustments and through the 32-bit clock wrap. A single
+            # packet period carries native timestamp jitter; the span of two
+            # consecutive packets must still match the filter rate.
+            if abs(1.0 / (interval * rate) - 1) > BEACON_BATCH_INTERVAL_TOLERANCE:
+                return False
             ticks = params["delta_clock"] / (count - 1.0)
             first_clock = params["start_clock"] + skip * ticks
-            if (attempt.filter_last_clock is not None
-                    and abs(((first_clock - attempt.filter_last_clock) % 0x100000000) / ticks - 1) > 0.02):
+            end_clock = params["start_clock"] + params["delta_clock"]
+            if attempt.filter_last_clock is not None:
+                gap = ((first_clock - attempt.filter_last_clock) % 0x100000000) / ticks
+                previous_clock, previous_count = attempt.filter_last_packet
+                span = ((end_clock - previous_clock) % 0x100000000) / self.beacon_freq
+                if (abs(gap - 1) > BEACON_BATCH_INTERVAL_TOLERANCE or span <= 0
+                        or not same_rate((previous_count + count - 1) / span, rate)):
+                    return False
+            attempt.filter_last_packet = (params["start_clock"], count)
+            attempt.filter_last_clock = end_clock & 0xFFFFFFFF
+        else:
+            if not same_rate(1.0 / interval, rate):
                 return False
-            attempt.filter_last_clock = (params["start_clock"] + params["delta_clock"]) & 0xFFFFFFFF
-        elif (attempt.filter_last_time is not None
-              and abs((first - attempt.filter_last_time) / interval - 1.0) > 0.02):
-            return False
+            if (attempt.filter_last_time is not None
+                    and abs((first - attempt.filter_last_time) / interval - 1.0) > 0.02):
+                # Same acceptance as the offline gentle analysis of decoded
+                # batches: one isolated boundary interval may deviate up to
+                # twice the rate tolerance if both two-period spans agree.
+                tolerance = RATE_TOLERANCE + 1e-8
+                boundary = (first - attempt.filter_last_time) * rate
+                previous = attempt.filter_last_interval
+                if (abs(boundary - 1) > 2 * tolerance or previous is None
+                        or any(abs((boundary + neighbor * rate) / 2 - 1) > tolerance
+                               for neighbor in (previous, interval))):
+                    return False
+            attempt.filter_last_interval = interval if count - skip > 1 else None
         attempt.filter_last_time = start + (count - 1) * interval
         return True
 
@@ -1781,15 +1851,35 @@ class BeaconAccelHoming:
         record["travel_mm"] = None if travel is None else round(abs(travel), 3)
         record["travel_mm_exact"] = None if travel is None else abs(travel)
         record["trigger_travel_mm_signed"] = travel
-        record["halt_travel_mm_signed"] = self._travel(positions, attempt.axis, halt=True)
+        record["halt_travel_mm_signed"] = halt = self._travel(positions, attempt.axis, halt=True)
         attempt.halt_delta = self._travel(positions, attempt.axis, halt=True)
+        post = (None if travel is None or halt is None or not math.isfinite(halt - travel)
+                else round(abs(halt - travel), 3))
+        record["post_trigger_mm"] = post
+        believed = record.get("believed_distance_to_stop_mm")
+        record["believed_minus_trigger_travel_mm"] = (
+            None if believed is None or travel is None or not math.isfinite(travel)
+            else round(believed - abs(travel), 3))
         self.last_pass = attempt
+        if attempt.pass_no == 1:
+            self.first_pass = attempt
         if getattr(self, "troubleshoot", None) is not None:
             self._troubleshoot_home_end(attempt, hmove, diagnostic_time)
         self.workflows.note_calibration_halt(record, positions)
         self.workflows.check_home_result(record)
         logging.info("beacon_accel_homing: %s, %.4f s after arm", describe(record),
                      record["trigger_after_arm_s"] or 0.0)
+        speed = attempt.effective_speed if post is not None and post > POST_TRIGGER_NOTICE_MM else None
+        if record.get("result") == "impact" and speed:
+            try:
+                self.printer.lookup_object("gcode").respond_info(
+                    "accel_homing: %s pass %d: after contact the motor was still commanded"
+                    " %.2f mm into the stop (about %.0f ms at %.0f mm/s). This is where steps"
+                    " are lost. A lower %s reduces it."
+                    % (attempt.axis.upper(), attempt.pass_no, post, post / speed * 1000.0, speed,
+                       "homing_speed" if attempt.pass_no == 1 else "second_homing_speed"))
+            except Exception:
+                logging.exception("accel_homing: could not report the post-contact travel")
         if travel is not None:
             travel = abs(travel)
         if attempt.reason != "impact" or travel is None:
@@ -1968,6 +2058,8 @@ class BeaconAccelHoming:
                 except Exception:
                     pass
             attempt.expected_travel = abs(attempt.start_position - info.position_endstop)
+        if self.passes == 1:
+            attempt.believed_distance = self.start_believed_distance
         self._configure_experimental(attempt)
         return attempt
 
@@ -2314,13 +2406,11 @@ class BeaconAccelHoming:
                         returned = True
                     finally:
                         diagnostic = (before, self._troubleshoot_now(), returned)
-            if (attempt.motion_deadline is not None or self.backend is not None
-                    or getattr(self, "contact_timing_observer", None) is not None):
-                # Preserve the existing observation before the optional sink.
-                try:
-                    attempt.request_time = self.main_mcu.estimated_print_time(self.reactor.monotonic())
-                except Exception:
-                    attempt.request_time = None
+            # Preserve the existing observation before the optional sink.
+            try:
+                attempt.request_time = self.main_mcu.estimated_print_time(self.reactor.monotonic())
+            except Exception:
+                attempt.request_time = None
         finally:
             if diagnostic is not None:
                 self._troubleshoot_stop(attempt, reason, code, *diagnostic)
@@ -4274,6 +4364,11 @@ class BeaconAccelHoming:
             attempt.noise_checked = max(attempt.noise_checked, attempt.pending_noise[2])
         onset = attempt.onset_batch is not None
         recorded_onset = self.onset_time(attempt) if onset else None
+        # Both are main-MCU print times. An experiment's decision time is
+        # not an onset sample time, so it gets no stop-request latency.
+        request_after_onset = (None if not onset or attempt.reason != "impact"
+                               or attempt.experimental is not None or attempt.request_time is None
+                               else (attempt.request_time - recorded_onset) * 1000.0)
         velocity = self._velocity(attempt)
         result = {
             "axis": attempt.axis,
@@ -4303,8 +4398,13 @@ class BeaconAccelHoming:
             "onset_sample": attempt.onset_sample,
             "start_position_mm": attempt.start_position,
             "expected_travel_mm": attempt.expected_travel,
+            "axis_was_homed": self.start_homed,
+            "believed_distance_to_stop_mm": attempt.believed_distance,
             "backend": "beacon_raw" if self.backend is None else self.backend.kind,
             "trigger_after_arm_s": round(recorded_onset - attempt.arm_time, 4) if onset else None,
+            "stop_request_after_onset_ms": (round(request_after_onset, 3)
+                                            if request_after_onset is not None
+                                            and math.isfinite(request_after_onset) else None),
         }
         if attempt.signal_quality is not None:
             result.update(attempt.signal_quality.summary())
@@ -4478,6 +4578,10 @@ class BeaconAccelHoming:
             self.impact_sign[axis] = sign
         gcmd.respond_info("beacon_accel_homing %s: threshold %.12g g, impact_sign %d (until restart)"
                           % (axis.upper(), self.threshold_g[axis], self.impact_sign[axis]))
+        if threshold is not None and self.toolhead is not None:
+            msg = threshold_ramp_warning(axis, threshold, self._ramp_accel())
+            if msg:
+                gcmd.respond_info(msg)
 
 
 def load_config(config):

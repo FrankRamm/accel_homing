@@ -33,14 +33,14 @@ class ManualThresholdRangeTests(unittest.TestCase):
     commands = ("SET_ACCEL_HOMING", "SET_BEACON_ACCEL_HOMING")
 
     def create(self, backend="generic", section="accel_homing", options=None,
-               range_g=16.0, known_range=True):
+               range_g=16.0, known_range=True, accel=20000.0):
         beacon = make_beacon()
         helper = beacon.accel_helper
         helper._scale["scale"] = MG_PER_COUNT_16G * range_g / 16.0
         helper._scales = {"test": helper._scale}
         if not known_range:
             del helper._clip_values
-        printer = FakePrinter(FakeToolhead(), beacon)
+        printer = FakePrinter(FakeToolhead(accel), beacon)
         sensor = "beacon" if backend == "beacon" else "adxl345 toolhead"
         if backend == "generic":
             printer.objects[sensor] = types.SimpleNamespace(
@@ -205,6 +205,59 @@ class ManualThresholdRangeTests(unittest.TestCase):
         obj.cmd_STATUS(status)
         self.assertIn("X 0.001 g", status.replies[0])
         self.assertEqual(obj.get_status(0.0)["threshold_g"]["x"], 0.001)
+
+
+class AccelerationRampWarningTests(unittest.TestCase):
+    create = ManualThresholdRangeTests.create
+
+    def warnings(self, obj):
+        return obj.fake_printer.objects["configfile"].warnings
+
+    def test_manual_threshold_below_twice_the_ramp_warns_at_connect_only(self):
+        for backend in ("generic", "beacon"):
+            with self.subTest(backend=backend):
+                obj = self.create(backend, options={"x_threshold": 0.5})
+                self.assertEqual(obj.threshold_g["x"], 0.5)
+                self.assertEqual(self.warnings(obj), [
+                    "accel_homing: X threshold 0.5 g is below 1.0 g, twice the 0.51 g that the"
+                    " homing acceleration of 5000 mm/s^2 produces on its own. The start of a"
+                    " homing move can trigger it and leave the origin at the start position."
+                    " Raise the threshold or calibrate the axis."])
+                shared = self.create(backend, options={"threshold": 0.9})
+                self.assertEqual(len(self.warnings(shared)), 2)
+                self.assertEqual([w.split()[1] for w in self.warnings(shared)], ["X", "Y"])
+
+    def test_default_settings_and_calibration_start_value_do_not_warn(self):
+        for backend in ("generic", "beacon"):
+            for options in ({}, {"x_threshold": 1.0}, {"threshold": 1.0}):
+                with self.subTest(backend=backend, options=options):
+                    self.assertEqual(self.warnings(self.create(backend, options=options)), [])
+        # A generic default below the limit is not a manual value.
+        self.assertEqual(self.create(range_g=2.0).threshold_g, {"x": 1.0, "y": 1.0})
+
+    def test_limit_uses_the_lower_of_live_max_accel_and_homing_accel(self):
+        cases = ((20000.0, {}, 0.95, True), (3000.0, {}, 0.55, True), (3000.0, {}, 0.6, False),
+                 (20000.0, {"homing_accel": 0.0}, 4.0, True),
+                 (20000.0, {"homing_accel": 0.0}, 4.1, False))
+        for accel, extra, threshold, warned in cases:
+            with self.subTest(accel=accel, extra=extra, threshold=threshold):
+                obj = self.create(options=dict(extra, x_threshold=threshold), accel=accel)
+                self.assertEqual(len(self.warnings(obj)), int(warned))
+
+    def test_set_adds_one_notice_after_its_normal_reply_and_still_applies(self):
+        for command in ManualThresholdRangeTests.commands:
+            with self.subTest(command=command):
+                obj = self.create()
+                low = BoundedGcmd(AXIS="Y", THRESHOLD=0.5)
+                obj.fake_printer.commands[command](low)
+                self.assertEqual(obj.threshold_g["y"], 0.5)
+                self.assertEqual(len(low.replies), 2)
+                self.assertIn("threshold 0.5 g", low.replies[0])
+                self.assertTrue(low.replies[1].startswith("accel_homing: Y threshold 0.5 g is below 1.0 g"))
+                for params in ({"THRESHOLD": 1.0}, {"IMPACT_SIGN": 1}):
+                    gcmd = BoundedGcmd(AXIS="Y", **params)
+                    obj.fake_printer.commands[command](gcmd)
+                    self.assertEqual(len(gcmd.replies), 1)
 
 
 if __name__ == "__main__":

@@ -200,6 +200,46 @@ Diagnostics may report current/best quiet candidate spans, per-axis peak-to-peak
 g, sample/batch ages, rejection details and cleanup state. Those ages are
 snapshots at the reported event, not continuously updated live measurements.
 
+`home_wait` returns the onset sample time, so Klipper takes the trigger
+position at that sample and the halt position where the steppers stopped.
+Every homing-move record therefore carries `post_trigger_mm`, the absolute
+difference of `halt_travel_mm_signed` and `trigger_travel_mm_signed`: travel
+commanded into the stop after contact, roughly speed times sensor delivery,
+host, stop-request and MCU stop delay. It is `null` without both step
+positions. `stop_request_after_onset_ms` is the main-MCU print-time estimate
+taken right after the stop request was sent, minus the onset sample time; both
+are print times. It is `null` for stops other than an impact, without a clock
+estimate, and for ACCEL_HOMING_EXPERIMENT decisions, whose recorded time is a
+host decision time rather than a sample time. After an impact with more than
+1 mm of post-trigger travel, one console notice per homing move explains the
+push. Neither field nor the notice changes detection, motion or the homed
+position. See [lost steps after homing](../guide/troubleshooting.md#the-axis-loses-position-or-skips-steps-after-homing).
+
+`start_position_mm` and `expected_travel_mm` describe the forced start position
+Klipper applies during homing (1.5 times the rail range). The record also
+carries `axis_was_homed` and, for the first pass of a homed axis,
+`believed_distance_to_stop_mm` from the commanded position at
+`homing:home_rails_begin`, before the forced position. After the move,
+`believed_minus_trigger_travel_mm` is that distance minus the measured trigger
+travel. These are diagnostic only.
+
+`min_home_dist` judges the first pass of each G28 (the long approach). With
+`homing_retract_dist` above zero the second touch only travels the retract;
+acceptance, the final release and record identity still use the final pass.
+
+With a notch enabled, every armed packet is checked against the filter rate.
+For decoded batches, the packet period must be within 2%, and the interval
+across a packet boundary within 2% of the packet period. As in the offline
+gentle analysis of decoded batches, one boundary interval may instead deviate
+up to 4% from the filter period when its average with the previous and with
+the current packet period is within 2% of it; a boundary after a packet with a
+single eligible sample gets no such allowance. Native Beacon packet periods and
+boundary intervals use the 25% Beacon packet tolerance, and the span from the
+previous packet's first sample to the current packet's last must be within 2%
+of the filter rate. A lost sample or a sustained rate change still stops the
+move with `filter_rate`. On Beacon a sustained change below 25% is found at
+the latest one packet later, when the two-packet span covers it.
+
 Charts are PNG-only bounded diagnostic traces published only for successful
 workflows. Per-home ACCURACY traces remain in memory; failures retain console
 statistics without a chart. A successful Beta proposal emits a labelled PNG;

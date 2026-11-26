@@ -216,7 +216,7 @@ class GentleContactProbeTests(unittest.TestCase):
             owner.main_mcu.estimated_print_time = observed
             owner._fire(attempt, "impact", code)
             self.assertEqual(trigger.messages, [[code]])
-            self.assertEqual(attempt.request_time, .215 if enabled else None)
+            self.assertEqual(attempt.request_time, .215)
 
     def test_invalid_probe_options_fail_before_motion(self):
         with tempfile.TemporaryDirectory() as directory:

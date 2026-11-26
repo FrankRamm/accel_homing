@@ -56,7 +56,7 @@ not move anything.
 | Command | Options and behavior | What it's for |
 | --- | --- | --- |
 | `ACCEL_HOMING_STATUS` | Read-only workflow/model/settings, result and plot paths. | Shows the plugin's current state. Read-only: it does not move anything. |
-| `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. | Same idea for the sensor, kept under its old name. Read-only: it does not move anything. |
+| `BEACON_ACCEL_HOMING_STATUS` | Read-only detector and preparation diagnostics; retained legacy name. One line per recent homing move, with post-contact travel and stop-request delay when known ([lost steps](troubleshooting.md#the-axis-loses-position-or-skips-steps-after-homing)). | Same idea for the sensor, kept under its old name. Read-only: it does not move anything. |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1` | One axis, required `AXIS=X` or `Y`; optional `START_THRESHOLD`, `STEP`, `SAVE_CONFIG=0|1`; default saves/restarts on success. With `gentle_homing: True`, selects and freezes a profile before the first contact. | Finds the [threshold](glossary.md#threshold) for one axis (the main [calibration](glossary.md#calibration) command). |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO SAVE_CONFIG=0` | Select and qualify an exact filter/threshold pair. Explicit AUTO defaults to report only; `SAVE_CONFIG=1` repeats the run and saves on success. | Calibrates and lets the plugin pick a noise filter too, without saving anything. |
 | `ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 NOTCH=AUTO CONTACT_ONLY=1` | Gentle mode only: three free-travel controls, stationary checks, then at most one contact with the selected profile. Exports a ZIP; never qualifies, stages or saves a model. | A careful first test: at most one gentle touch of the [endstop](glossary.md#endstop), nothing saved. |
@@ -322,6 +322,9 @@ Thresholds must be finite and positive and satisfy known sensor-range limits.
 The current model/manual detector context remains relevant; the command does
 not turn a legacy threshold into a newly qualified mapped-axis model.
 Cancel an active workflow before changing settings.
+A value below twice the homing acceleration ramp prints one extra advice line
+after the normal reply; the value is still applied. See
+[low manual thresholds](configuration.md#thresholds-and-saved-models).
 
 For persistent manual changes, edit the existing plugin section and issue
 `RESTART` while idle. See [threshold precedence](configuration.md#thresholds-and-saved-models).

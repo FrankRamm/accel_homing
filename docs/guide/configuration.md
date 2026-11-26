@@ -91,6 +91,16 @@ with unknown excess amplitude; they do not relax threshold headroom or other
 data-fault checks. Do not paste an 8 g threshold for
 an 8 g MPU9250 sensor.
 
+The homing acceleration alone reads `accel / 9806.65` g on the motion axis,
+0.51 g at the default `homing_accel: 5000`, plus ringing. A manual
+`x_threshold`, `y_threshold` or shared `threshold` below twice that value,
+rounded to 0.1 g, can trigger at the start of the move and leave the origin
+at the start position. `accel` is the lower of the live `max_accel` and
+`homing_accel` (when not 0). Such a value gives a startup warning and the same
+advice after `SET_ACCEL_HOMING`. It is advice only; the value is used as set.
+At the defaults the limit is 1.0 g, so the default calibration start of 1.0 g
+and thresholds written by calibration do not warn.
+
 Successful calibration replaces the selected axis's old manual value by saving
 `x_threshold` or `y_threshold` alongside its qualified model. You do not need to
 comment out those overrides before calibrating. Existing selected-axis entries
@@ -162,7 +172,7 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `homing_accel` | `5000` | Homing/release/early-return acceleration cap in mm/s²; nonnegative; `0` leaves the live limit unchanged. Never raises a lower live acceleration. |
 | `back_off_dist` | `5` | Shared fallback for the final successful XY release and cross-axis release in mm; at least 0, no maximum, zero disables. Not a second touch. |
 | `x_back_off_dist`, `y_back_off_dist` | `back_off_dist` | Per-axis override of the release distance in mm; at least 0, no maximum, zero disables that axis. There is no Z back-off option. |
-| `min_home_dist` | `0` | Minimum G28 travel in mm before a home is trusted; a shorter home backs off this distance and homes again (up to 2 times, at homing_speed). 0 disables. Not used by calibration workflows. |
+| `min_home_dist` | `0` | Minimum G28 travel in mm before a home is trusted; a shorter home backs off this distance and homes again (up to 2 times, at homing_speed). With `homing_retract_dist` set, the first approach is judged, not the second touch. 0 disables. Not used by calibration workflows. |
 | `x_min_home_dist`, `y_min_home_dist` | `min_home_dist` | Per-axis override. |
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |
 | `baseline_time` | `0.1` | Fresh reference duration in seconds; 0.05–1, with at least 50 contiguous samples. |

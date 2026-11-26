@@ -164,6 +164,61 @@ Checks:
   from the back-off position to the physical stop: the trigger fires on a valid
   home. Lower the value to match the real travel.
 
+The travels in the message are the first approach of each home. With
+`homing_retract_dist` above zero, the shorter second touch is not compared
+with `min_home_dist`. Earlier versions compared the second touch, so every
+G28 with `min_home_dist` above the retract distance plus 1.5 mm ended in
+this error.
+
+### The axis loses position or skips steps after homing
+
+**What you see:** homing finishes, but the axis is off afterwards, prints are
+shifted, or the motor clicks or grinds at the end of the home. Or the console
+shows `accel_homing: <AXIS> pass <N>: after contact the motor was still
+commanded <D> mm into the stop (about <T> ms at <S> mm/s). This is where steps
+are lost. A lower homing_speed reduces it.`
+
+The plugin detects the stop on the host, so the motor keeps being driven into
+the stop for a moment after contact: until the sensor data arrives, the host
+reacts and the stepper MCU stops. Whatever the belt does not absorb is lost as
+skipped steps. Each line of `BEACON_ACCEL_HOMING_STATUS` and the `last` result
+in the printer status show it:
+
+- `post_trigger_mm` (`post-trigger ... mm` in the line): commanded travel
+  between the first sample over the threshold and where the motors stopped.
+- `stop_request_after_onset_ms` (`stop request ... ms after onset`): time from
+  that sample to the host's stop request. The rest of the delay is the stepper
+  MCU stopping. It is missing when the stop was not caused by an impact, or no
+  comparable time was available.
+
+The console line above appears once per homing move, only after an impact and
+only when `post_trigger_mm` is above 1 mm. It is advice: the home and its
+position are unchanged.
+
+Checks:
+
+- Lower `homing_speed` (or `second_homing_speed` for a second touch). The
+  push is roughly speed times delay, so halving the speed halves it. Speeds
+  below about 50 mm/s can be too soft to detect.
+- A large `stop_request_after_onset_ms` points to a slow or batched sensor
+  stream or a busy host; a large push with a small request delay points to the
+  stepper MCU or its connection.
+
+To see whether the position belief was wrong before the home, compare these
+fields of the first pass. They are diagnostic only.
+
+- `axis_was_homed`: the axis was homed before this home started.
+- `believed_distance_to_stop_mm`: how far Klipper believed the stop was, from
+  the position before homing. Empty for an unhomed axis.
+- `believed_minus_trigger_travel_mm`: that distance minus the measured trigger
+  travel. Near zero means the earlier position was right. A positive value
+  means the trigger came before the believed stop: an early trigger, or the
+  carriage was really closer to the stop than Klipper believed. A negative
+  value means the carriage travelled further than Klipper believed.
+
+`start_position_mm` and `expected_travel_mm` keep their old meaning: the
+forced start position Klipper uses during homing, not the real one.
+
 ### Automatic mapping interruption
 
 **What you see:** calibration stops during the first gentle strokes and names the

@@ -345,5 +345,98 @@ class NotchTests(unittest.TestCase):
             self.assertEqual(home["capture"]["signal_filter"]["first_sample_index"], 1)
 
 
+class FilterPacketTimingTests(unittest.TestCase):
+    """The live notch accepts the batch jitter the offline selection accepts."""
+    RATE = 3200.
+
+    def decoded(self, times):
+        obj = generic()
+        baseline(obj)
+        attempt, sent = arm(obj, "x")
+        attempt.vector_mode = True
+        attempt.notch = CausalNotch(profile(100., 10.), self.RATE)
+        for start in range(0, len(times), 16):
+            feed(obj, [(when, 0., 0., G) for when in times[start:start + 16]])
+        return obj, attempt, sent
+
+    def test_decoded_isolated_boundary_jitter_matches_offline_policy(self):
+        regular = [10.060 + n / self.RATE for n in range(160)]
+        # One 609 us interval at a nominal 622.82 us is 2.22 percent short.
+        cases = {"regular": (0., None), "isolated": (.0222, None), "both_sides": (-.0222, None),
+                 "wide": (.05, "filter_rate")}
+        for case, (shift, expected) in cases.items():
+            with self.subTest(case=case):
+                times = regular[:48] + [when - shift / self.RATE for when in regular[48:]]
+                obj, attempt, sent = self.decoded(times)
+                self.assertIsNone(obj.sensor_fault)
+                self.assertEqual(attempt.reason, expected)
+                self.assertEqual(sent.messages, [] if expected is None else [[plugin.mcu.MCU_trsync.REASON_HOST_REQUEST]])
+
+    def test_decoded_lost_sample_and_rate_change_still_fault(self):
+        regular = [10.060 + n / self.RATE for n in range(160)]
+        cases = {
+            "lost_at_boundary": (regular[:48] + regular[49:], "filter_rate"),
+            "lost_inside_packet": (regular[:40] + regular[41:], "sample_gap"),
+            "sustained_rate": (regular[:48] + [regular[48] + n * 1.03 / self.RATE for n in range(112)],
+                               "filter_rate"),
+        }
+        for case, (times, expected) in cases.items():
+            with self.subTest(case=case):
+                _obj, attempt, sent = self.decoded(times)
+                self.assertEqual(attempt.reason, expected)
+                self.assertEqual(sent.messages, [[plugin.mcu.MCU_trsync.REASON_HOST_REQUEST]])
+
+    def native(self, starts_periods):
+        from test_beacon_packet_timing import BOUNDARY_GAP, CLOCK_HZ, PERIODS, packet, timed_sensor
+        obj = timed_sensor()
+        endstop = FakeEndstop("x")
+        count_g = obj.scale["scale"] / 1000.
+        attempt = plugin.Attempt(endstop, 1, 10.001, round(10.001 * CLOCK_HZ),
+                                 11., round(11. * CLOCK_HZ), 0, 1, -1, 8. / count_g, count_g)
+        attempt.bases = (0, 0, counts(1.))
+        attempt.vector_mode = True
+        cycle = 7 * PERIODS[0] + BOUNDARY_GAP + 7 * PERIODS[1] + BOUNDARY_GAP
+        attempt.notch = CausalNotch(profile(100., 10.), 16 / cycle)
+        obj.arm(attempt)
+        reasons = []
+        for start, interval in starts_periods:
+            obj.reactor.now = start + 7 * interval + .001
+            obj._inspect(packet(obj, start, interval))
+            reasons.append(attempt.reason)
+        return attempt, endstop, reasons
+
+    @staticmethod
+    def beacon_packets(count, gaps=None, scale=1.):
+        from test_beacon_packet_timing import BOUNDARY_GAP, PERIODS
+        start, result = 10.001, []
+        for number in range(count):
+            interval = PERIODS[number % 2] * (scale if number >= 2 else 1.)
+            result.append((start, interval))
+            gap = (gaps or {}).get(number, BOUNDARY_GAP)
+            start += 7 * interval + gap * (scale if number >= 2 else 1.)
+        return result
+
+    def test_native_packet_period_jitter_is_accepted_with_the_beacon_tolerance(self):
+        attempt, endstop, reasons = self.native(self.beacon_packets(8))
+        self.assertEqual(reasons, [None] * 8)
+        self.assertEqual(endstop.trigger_log.messages, [])
+        self.assertIsNone(attempt.filter_tail_error)
+
+    def test_native_lost_sample_and_sustained_rate_change_still_fault(self):
+        from test_beacon_packet_timing import BOUNDARY_GAP, PERIODS
+        mean = (7 * PERIODS[0] + BOUNDARY_GAP + 7 * PERIODS[1] + BOUNDARY_GAP) / 16
+        attempt, endstop, reasons = self.native(self.beacon_packets(5, {2: BOUNDARY_GAP + mean}))
+        self.assertEqual(reasons[:3], [None] * 3)
+        self.assertEqual(attempt.reason, "filter_rate")
+        self.assertEqual(endstop.trigger_log.messages, [[plugin.mcu.MCU_trsync.REASON_HOST_REQUEST]])
+        # A sustained 5 percent slower cadence stays inside the per-packet
+        # jitter tolerance; the span of two packets still rejects it.
+        attempt, endstop, reasons = self.native(self.beacon_packets(6, scale=1.05))
+        self.assertEqual(reasons[:2], [None] * 2)
+        self.assertEqual(attempt.reason, "filter_rate")
+        self.assertIn("filter_rate", reasons[2:4])
+        self.assertEqual(endstop.trigger_log.messages, [[plugin.mcu.MCU_trsync.REASON_HOST_REQUEST]])
+
+
 if __name__ == "__main__":
     unittest.main()
