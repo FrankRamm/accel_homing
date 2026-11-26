@@ -176,6 +176,8 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `x_back_off_dist`, `y_back_off_dist` | `back_off_dist` | Per-axis override of the release distance in mm; at least 0, no maximum, zero disables that axis. There is no Z back-off option. |
 | `min_home_dist` | `0` | Minimum G28 travel in mm before a home is trusted; a shorter home backs off this distance and homes again (up to 2 times, at homing_speed). With `homing_retract_dist` set, the first approach is judged, not the second touch. 0 disables. Not used by calibration workflows. |
 | `x_min_home_dist`, `y_min_home_dist` | `min_home_dist` | Per-axis override. |
+| `cruise_threshold` | `0` | Lower trigger threshold in g that replaces the axis threshold once the homing move cruises: after the acceleration ramp plus 0.25 s. 0 disables. See [cruise threshold](#cruise-threshold-dev). |
+| `x_cruise_threshold`, `y_cruise_threshold` | `cruise_threshold` | Per-axis override. |
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |
 | `baseline_time` | `0.1` | Fresh reference duration in seconds; 0.05–1, with at least 50 contiguous samples. |
 | `baseline_batches` | `25` | Retained baseline batch capacity; integer 10–200. |
@@ -186,6 +188,38 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `charts_directory` | `accel_homing_charts/` beside main config | PNG output directory; use a writable path with hard-link support. |
 
 The Kalico stepper-section `min_home_dist` stays disabled; this plugin option provides the behaviour on both Klipper and Kalico.
+
+## Cruise threshold (dev)
+
+The start of a homing move shakes the sensor more than steady travel, so the
+axis threshold has to stay above that start-up transient. A contact then builds
+for several milliseconds before it reaches the threshold, and the motor keeps
+pushing into the stop during that time.
+
+`x_cruise_threshold` / `y_cruise_threshold` set a second, lower threshold that
+applies only once the move is cruising: `homing_speed / acceleration` after the
+start of the move, plus 0.25 s. Before that, and on short homes that end
+earlier, the normal threshold applies. The stop is detected sooner; the first
+contact is not softer, only the push after it is shorter.
+
+```ini
+[accel_homing]
+x_cruise_threshold: 3.0
+```
+
+Choose a value above the vibration the axis shows while travelling and below
+its normal threshold. `ACCEL_HOMING_TROUBLESHOOT AXIS=X CENTERED=1` records the
+raw signal of every home; the largest reading between the start-up phase and
+the contact is the level to stay above. A value at or above the axis threshold
+has no effect.
+
+It is off by default and applies to the first pass of ordinary G28 and to the
+TEST, ACCURACY and TROUBLESHOOT workflows. Calibration, gentle homing and
+ACCEL_HOMING_EXPERIMENT ignore it. A home that used it reports
+`cruise threshold ... g` in its status line and `cruise_threshold_active` in
+its record. Too low a value triggers mid-travel and leaves a wrong origin, so
+check several homes after setting it; `min_home_dist` does not catch a false
+trigger that happens after its distance.
 
 ## Experimental notch filter (dev)
 
