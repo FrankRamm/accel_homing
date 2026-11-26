@@ -84,8 +84,11 @@ the terminal, then press Enter:
       echo "Expected a clean accel_homing checkout with origin $url." >&2
       exit 1
     fi
+    if [ "$(git symbolic-ref -q --short HEAD)" != main ]; then
+      echo "$repo is not on main (the stable version). See the installation guide to update the test version or return to stable." >&2
+      exit 1
+    fi
     git fetch origin refs/heads/main:refs/remotes/origin/main
-    git switch main
     git merge --ff-only origin/main
     if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
       echo "Local main has unpublished commits. Review them before installing." >&2
@@ -99,9 +102,12 @@ the terminal, then press Enter:
 )
 ```
 
-Use the same block for a fresh installation or a reinstall. It updates an
-existing clean checkout to the published `main` (the stable version) before
-running its installer.
+Use the same block for a fresh installation or a reinstall of the stable
+version. It updates an existing clean checkout of `main` to the published
+`main` before running its installer. On a checkout of the test version or
+another branch it stops without changing anything: rerun the
+[test-version block](#switch-to-the-test-version) to update the test version,
+or [return to the stable version](#return-to-the-stable-version).
 If Git reports an error, the block stops. Keep the checkout in place because
 the installed extras link to its Python modules.
 
@@ -142,6 +148,35 @@ standard `primary_branch: main` registration to `dev`, including in an
 included Moonraker configuration. Subsequent frontend updates follow dev.
 Verify the checkout with `git -C ~/accel_homing status -sb`; it should show
 `dev...origin/dev`.
+
+## Return to the stable version
+
+The stable version refuses options that only the test version reads, so
+Klipper does not start while they remain. With the printer idle:
+
+1. In the plugin section (`[accel_homing]` or `[beacon_accel_homing]`, usually
+   in `accel_homing.cfg`) and in the same section of the SAVE_CONFIG block at
+   the end of `printer.cfg` (`#*# [accel_homing]`), delete these options:
+   `gentle_homing`, `min_home_dist`, `x_min_home_dist`, `y_min_home_dist`,
+   `x_back_off_dist`, `y_back_off_dist`, `notch_frequency`, `notch_q`,
+   `x_notch_frequency`, `x_notch_q`, `y_notch_frequency`, `y_notch_q`.
+   Keep `back_off_dist` at 20 mm or less.
+2. In the SAVE_CONFIG block, delete every `#*# [accel_homing_model NAME]`
+   section that contains `#*# version = 2` (a model saved with a notch filter).
+   Recalibrate that axis on the stable version.
+3. In the Moonraker configuration, change `primary_branch: dev` to
+   `primary_branch: main` in `[update_manager accel_homing]`. The stable
+   installer does not change it.
+4. Switch the checkout, then run the [install block](#install):
+
+   ```bash
+   git -C ~/accel_homing switch main
+   ```
+
+The links for test-only modules (`accel_homing_filter.py`,
+`accel_homing_auto.py`, `accel_homing_auto_notch.py`) stay in `klippy/extras`
+and point to files the stable checkout does not have. Klipper does not load
+them; you can delete them.
 
 ## If something goes wrong
 
@@ -194,8 +229,10 @@ Beacon sections retain their aliases. Only the selected axes are changed.
 
 Associated X/Y TMC `diag_pin`, `diag0_pin`, `diag1_pin`, `home_current` and rail
 `homing_accel`/`min_home_dist` settings are commented with their former values.
-A stepper-section `min_home_dist` value is copied into `accel_homing.cfg` as
-`<axis>_min_home_dist`.
+A positive stepper-section `min_home_dist` value is copied into the plugin
+section as `<axis>_min_home_dist`: the existing `[accel_homing]` or
+`[beacon_accel_homing]` section wherever it is, or the new section in
+`accel_homing.cfg` on a fresh installation.
 Existing `run_current`, thresholds, Z/probe settings, unrelated macros and other
 axes are preserved. Default installation preserves configured homing speeds;
 `--homing-speed` explicitly requests a speed change. An update does not infer
@@ -273,9 +310,10 @@ pending work before installing or updating.
 | `--generic-names` | Rename a legacy plugin section and both X/Y pin aliases transactionally; preserve calibration and reject active legacy macro/object/command references. Installation/update only. |
 | `--axes x,y`, `--axes x`, `--axes y` | Install both axes by default, or only the selected axis. |
 | `--homing-speed N` | Explicitly replace selected-axis homing speeds in mm/s. |
+| `--gentle-homing` | Enable [gentle homing](configuration.md#gentle-homing-dev) on an existing installation: caps all plugin axes at 40 mm/s and 1000 mm/s², preserves hardware settings. `--axes` must match the installed plugin axes; not combinable with `--homing-speed`. Installation/update only. |
 | `--max-report-travel N` | Opt into the generic reporting policy, finite 0.1–2.0 mm. |
 | `--max-startup-travel N` | Opt into the generic startup policy, finite 0.1–5.0 mm. |
-| `--no-update-manager` | Skip managed source/Moonraker registration for offline or development use. |
+| `--no-update-manager` | Skip managed source/Moonraker registration for offline or development use. With `--uninstall`, leave Moonraker unchecked and unchanged. |
 | `--no-restart` | Defer service activation to the operator. |
 | `--replace-existing-links` | Replace reviewed links from another source. |
 | `--acknowledge-homing-override` | Acknowledge reviewed `gcode_macro G28` behavior for installation only. |
@@ -428,13 +466,29 @@ Uninstall checks current ownership and refuses ambiguous or foreign module
 links, regular Python files at module paths, shared consumers and concurrent
 changes. It does not compare your files with old installation snapshots.
 
+Removing the Moonraker registration needs Klipper's API socket, detected from
+the running Klipper process or given with `--klippy-socket`, and the matching
+Moonraker. If Klipper is stopped or does not start, uninstall with
+`~/accel_homing/uninstall.sh --no-update-manager`. It removes the printer
+configuration and module links and leaves Moonraker unchanged. Then delete the
+`[update_manager accel_homing]` section by hand (keep the base
+`[update_manager]` section) and restart Moonraker while idle. The updater
+receipts `.accel_homing_updater.json` and
+`.accel_homing_moonraker_activation.json` next to `printer.cfg` stay until a
+later uninstall without `--no-update-manager`, once Klipper runs again.
+
 Uninstall does not restart services or move the printer. Once the configuration
 is ready, manually restart the selected Klipper and any listed Moonraker
 service while idle. The old Python module and updater may remain loaded until
 those processes restart.
 
 Charts, old backups, source checkouts and the `.plot-deps/` cache remain on disk.
-No new backup or undo command is created. Only remove the source after uninstall
+So do the base `[update_manager]` section, the plugin's `klippy/extras/...`
+lines in the Klipper checkout's `.git/info/exclude`, `homing_retract_dist: 0`
+on the converted rails, the commented TMC (`# diag_pin: ...`,
+`# home_current: ...`) and rail (`# homing_accel: ...`, `# min_home_dist: ...`)
+lines, and `accel_homing.cfg` with any of your own content. No new backup or
+undo command is created. Only remove the source after uninstall
 succeeds, the configuration is ready, services have restarted and no remaining
 links or updater entries reference that checkout. Do not delete the checkout
 to work around a failed uninstall.
@@ -454,8 +508,9 @@ updates, activation and uninstall ignore `.accel_homing_backups/`; no old
 manifest can block a new installation.
 
 The installer retains the current operation's before-state only in memory
-while applying changes. If a write fails, it attempts to restore changes from
-that operation without overwriting a later concurrent edit. These temporary
+while applying changes. If a write fails or you press Ctrl-C, it attempts to
+restore changes from that operation without overwriting a later concurrent
+edit. Module links are written before the printer configuration. These temporary
 states are not saved as a backup elsewhere. Activation receipts contain service
 and source metadata, not copies of configuration contents.
 

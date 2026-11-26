@@ -107,7 +107,8 @@ def command_instance(argv, cwd, origin, pid=None, service=None):
     if len(positional) != 1:
         return None
     return dict(repo=script.parent.parent, config=canonical(positional[0], cwd), socket=api_socket,
-                pid=pid, service=service, origin=origin, executable=argv[0])
+                pid=pid, service=service, origin=origin, executable=argv[0],
+                config_dir=canonical(Path(positional[0]).parent, cwd))
 
 
 def proc_instances(proc_root=Path("/proc")):
@@ -225,15 +226,21 @@ def discover_target(args, home=None, processes=None, services=None):
                                    "environment-based units/drop-ins require a readable running /proc command." % service)
             repos = [repo] if repo else sorted({canonical(p) for pattern in ("klipper", "kalico", "klipper-*", "kalico-*")
                                                for p in home.glob(pattern) if (p / "klippy/klippy.py").is_file()})
-            configs = [config] if config else sorted({canonical(p) for pattern in (
-                "printer_data/config/printer.cfg", "printer_data*/config/printer.cfg", "printer_*/config/printer.cfg", "printer.cfg")
-                for p in home.glob(pattern) if p.is_file()})
+            found = {}
+            for pattern in ("printer_data/config/printer.cfg", "printer_data*/config/printer.cfg",
+                            "printer_*/config/printer.cfg", "printer.cfg"):
+                for p in home.glob(pattern):
+                    if p.is_file():
+                        found.setdefault(canonical(p), set()).add(canonical(p.parent))
+            configs = [config] if config else sorted(found)
             if len(repos) != 1 or len(configs) != 1:
                 raise InstallError("Cannot choose one checkout/main config. Set --klipper-path /path/to/klipper "
                                    "--config /path/to/printer.cfg (and --service on multi-instance hosts). "
                                    "Checkouts: %s; configs: %s" % (repos, configs))
+            directories = {canonical(Path(args.config).parent)} if config else found[configs[0]]
             selected = dict(repo=repos[0], config=configs[0], socket=None, service=None, pid=None,
-                            executable=None, origin="explicit paths/common directories (stopped host)")
+                            executable=None, origin="explicit paths/common directories (stopped host)",
+                            config_dir=configs[0].parent if configs[0].parent in directories else min(directories))
         overlap = [p for p in processes if p["repo"] == selected["repo"] or p["config"] == selected["config"]]
         if overlap:
             raise InstallError("Selected paths overlap a live instance with different arguments/service. "
@@ -244,6 +251,10 @@ def discover_target(args, home=None, processes=None, services=None):
         raise InstallError("Not a compatible checkout (requires klippy/klippy.py and klippy/extras): %s" % selected["repo"])
     if not selected["config"].is_file():
         raise InstallError("Main config not found: %s" % selected["config"])
+    if selected.get("config_dir", selected["config"].parent) != selected["config"].parent:
+        raise InstallError("Main config is a symlink into another directory: Klipper reads includes next to %s, "
+                           "but the file is %s. Start Klipper with the real file path, or replace the link with "
+                           "the file. No files changed." % (selected["config_dir"], selected["config"]))
     return selected
 
 
@@ -724,6 +735,7 @@ def make_plan(source, selected, args):
         messages.append("Moved stepper min_home_dist into [accel_homing] as %s (accel_homing re-homes short homes)."
                         % ", ".join("%s=%s" % item for item in migrated.items()))
     plugin_options = dict(overrides, **migrated)
+    appended = []
     if existing:
         existing.replace("accel_chip", sensor)
         for name, value in plugin_options.items():
@@ -747,13 +759,13 @@ def make_plan(source, selected, args):
                     "#x_threshold: 8.0\n#y_threshold: 8.0\n#model: default\n"
                     + "".join("%s: %s\n" % item for item in plugin_options.items()))
         if included_managed is not None:
-            included_managed.insertions.setdefault(included_managed.active_end, []).append(
-                included_managed.newline + content.replace("\n", included_managed.newline))
+            appended.append((included_managed, included_managed.newline
+                             + content.replace("\n", included_managed.newline)))
         else:
             changes[managed] = {"kind": "file", "data": content.encode("utf-8")}
         if included_managed is None and not any(managed.match(pattern) for pattern in graph.include_patterns):
             main = graph.documents[selected["config"]]
-            main.insertions.setdefault(main.active_end, []).append(main.newline + "[include " + MANAGED + "]" + main.newline + main.newline)
+            appended.append((main, main.newline + "[include " + MANAGED + "]" + main.newline + main.newline))
     for axis, (rail, speed, actual_speed) in speeds.items():
         if gentle_accel is not None:
             rail.replace("homing_speed", "%.12g" % speed)
@@ -773,10 +785,10 @@ def make_plan(source, selected, args):
                 driver = graph.one(name)
                 for key in ("diag_pin", "diag0_pin", "diag1_pin", "home_current"):
                     driver.disable(key)
-    for document in graph.documents.values():
-        data = document.rendered()
-        if data != document.original:
-            changes[document.path] = {"kind": "file", "data": data}
+    # Options added to a document's last section share its end index; new
+    # sections must follow them or the options would land under the new header.
+    for document, text in appended:
+        document.insertions.setdefault(document.active_end, []).append(text)
     for module in MODULES:
         link, wanted = selected["repo"] / "klippy/extras" / module, str(source / module)
         if link.is_symlink():
@@ -789,8 +801,9 @@ def make_plan(source, selected, args):
         changes[link] = {"kind": "symlink", "target": wanted}
         if link in getattr(args, "_migration_expected", {}):
             changes[link]["expected"] = dict(args._migration_expected[link])
-    exclude = selected["repo"] / ".git/info/exclude"
-    if exclude.parent.is_dir():
+    git_directory = selected["repo"] / ".git"
+    exclude = git_directory / "info/exclude"
+    if exclude.parent.is_dir() or (git_directory.is_dir() and not os.path.lexists(str(exclude.parent))):
         before = exclude.read_bytes() if exclude.exists() else b""
         text = before.decode("utf-8")
         missing = ["klippy/extras/" + name for name in MODULES if "klippy/extras/" + name not in text.splitlines()]
@@ -800,6 +813,10 @@ def make_plan(source, selected, args):
                                 "expected": snapshot(exclude)}
             if changes[exclude]["expected"].get("kind") == "file":
                 changes[exclude]["expected"]["data"] = base64.b64encode(before).decode("ascii")
+    for document in graph.documents.values():
+        data = document.rendered()
+        if data != document.original:
+            changes[document.path] = {"kind": "file", "data": data}
     for path, change in changes.items():
         change.setdefault("expected", snapshot(path))
         if path in graph.documents:
@@ -1307,7 +1324,7 @@ def execute_transaction(entries, config, metadata, writer=write_state, before_wr
             writer(path, entry["after"])
             expected_inputs[str(path)] = entry["after"]
         verify_inputs()
-    except Exception as exc:
+    except BaseException as exc:
         errors = []
         for entry in reversed(applied):
             try:
@@ -1318,15 +1335,19 @@ def execute_transaction(entries, config, metadata, writer=write_state, before_wr
                 write_state(Path(entry["path"]), entry["before"])
             except Exception as undo:
                 errors.append("%s: %s" % (entry["path"], undo))
-        raise InstallError("%s failed; %s. No persistent backup was created. Cause: %s%s" %
-                           ("Uninstall" if metadata.get("operation") == "uninstall" else "Installation",
-                            "recovery needs manual repair" if errors else "applied changes restored", exc,
-                            ("; " + "; ".join(errors)) if errors else ""))
+        message = ("%s failed; %s. No persistent backup was created. Cause: %s%s" %
+                   ("Uninstall" if metadata.get("operation") == "uninstall" else "Installation",
+                    "recovery needs manual repair" if errors else "applied changes restored", str(exc) or type(exc).__name__,
+                    ("; " + "; ".join(errors)) if errors else ""))
+        if not isinstance(exc, Exception):
+            print(message, file=sys.stderr)
+            raise
+        raise InstallError(message)
     return None
 
 
-def make_uninstall_plan(selected):
-    plan = load_uninstaller().make_plan(selected, uninstall_api())
+def make_uninstall_plan(selected, update_manager=True):
+    plan = load_uninstaller().make_plan(selected, uninstall_api(), update_manager)
     assert_uninstall_consumers(selected, plan)
     return plan
 
@@ -1591,9 +1612,14 @@ def main(argv=None):
     print("Checkout: %s\nMain config: %s\nDetection: %s\nService: %s\nExecutable: %s" %
           (selected["repo"], selected["config"], selected["origin"], selected["service"] or "none", selected["executable"] or "stopped host"))
     if args.uninstall:
-        plan = make_uninstall_plan(selected)
+        plan = make_uninstall_plan(selected, not args.no_update_manager)
         for entry in plan["entries"]:
             print("Remove plugin state from %s (%s -> %s)" % (entry["path"], entry["before"]["kind"], entry["after"]["kind"]))
+        if args.no_update_manager:
+            print("Moonraker was not checked or changed (--no-update-manager). If moonraker.conf or one of its "
+                  "includes has an [update_manager accel_homing] section, delete that section by hand, keep the "
+                  "base [update_manager] section, and restart Moonraker while idle. Any updater receipts in %s are "
+                  "kept until an uninstall without --no-update-manager." % selected["config"].parent)
         if args.dry_run:
             print("Uninstall dry run: %d current file change(s); no writes, restart, or movement." % len(plan["entries"]))
             return 0
@@ -1602,8 +1628,9 @@ def main(argv=None):
             return 0
         print(assert_idle(selected))
         apply_uninstall_plan(plan, selected)
-        print("Uninstalled the recognized current plugin configuration, module links and updater registration. "
-              "No persistent backups were created; historical settings were not restored.")
+        print("Uninstalled the recognized current plugin configuration, module links%s. "
+              "No persistent backups were created; historical settings were not restored."
+              % ("" if args.no_update_manager else " and updater registration"))
         print("Before restarting Klipper, configure valid physical/sensorless endstops and review homing settings "
               "and any macros that called the plugin. Existing comments are reference only, not restored settings.")
         print("Source checkout, caches, charts, configuration files and existing backup directories were retained.")
@@ -1685,6 +1712,9 @@ def main(argv=None):
     try:
         if updater:
             updater_api.publish_source(updater, uninstall_api(), before_write)
+        exclude = selected["repo"] / ".git/info/exclude"
+        if exclude in changes and not os.path.lexists(str(exclude.parent)):
+            exclude.parent.mkdir()
         if changes:
             options = {"updater": updater} if updater else {}
             apply_plan(changes, selected["config"], selected=selected, before_write=before_write, **options)

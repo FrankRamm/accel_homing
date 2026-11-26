@@ -600,6 +600,22 @@ class UpdaterFixture(unittest.TestCase):
         self.assertFalse((self.config.parent / updater.ACTIVATION_RECEIPT).exists())
         self.assertEqual((old / "garbage").read_text(), "untouched")
 
+    def test_no_update_manager_uninstall_of_stopped_klipper_leaves_registration_and_receipt(self):
+        self.install_config(self.updater_plan())
+        registration = self.moon_config.read_bytes()
+        receipt = (self.config.parent / updater.RECEIPT).read_bytes()
+        stopped = dict(self.selected, socket=None, pid=None)
+        with mock.patch.object(installer, "assert_uninstall_consumers"):
+            with self.assertRaisesRegex(installer.InstallError, "no verified API socket"):
+                installer.make_uninstall_plan(stopped)
+            with mock.patch.object(updater, "moonraker_instances", side_effect=AssertionError("Moonraker queried")):
+                plan = installer.make_uninstall_plan(stopped, update_manager=False)
+                self.assertIsNone(installer.apply_uninstall_plan(plan, stopped))
+        self.assertIsNone(plan["updater"])
+        self.assertNotIn("accel_homing:", self.axes.read_text())
+        self.assertEqual(self.moon_config.read_bytes(), registration)
+        self.assertEqual((self.config.parent / updater.RECEIPT).read_bytes(), receipt)
+
     def test_uninstall_refuses_concurrent_registration_edit(self):
         self.install_config(self.updater_plan())
         plan = updater.make_uninstall_plan(self.selected, installer.uninstall_api())

@@ -33,8 +33,11 @@ for supported sensors and limits.
          echo "Expected a clean accel_homing checkout with origin $url." >&2
          exit 1
        fi
+       if [ "$(git symbolic-ref -q --short HEAD)" != main ]; then
+         echo "$repo is not on main (the stable version). See the installation guide to update the test version or return to stable." >&2
+         exit 1
+       fi
        git fetch origin refs/heads/main:refs/remotes/origin/main
-       git switch main
        git merge --ff-only origin/main
        if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
          echo "Local main has unpublished commits. Review them before installing." >&2
@@ -51,6 +54,8 @@ for supported sensors and limits.
    Want to try the test version (newer features, may have bugs)? See
    [switching to the test version](docs/guide/installation.md#switch-to-the-test-version).
    The block above installs the [stable version](docs/guide/glossary.md#stable-and-test-versions).
+   On a test-version checkout it stops without changes; see
+   [returning to the stable version](docs/guide/installation.md#return-to-the-stable-version).
    The installer sets up X/Y [homing](docs/guide/glossary.md#homing) and
    [Moonraker](docs/guide/glossary.md#moonraker) updates, then restarts Klipper
    (and Moonraker if needed). Klipper and Moonraker are the programs behind

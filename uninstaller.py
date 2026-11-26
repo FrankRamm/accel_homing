@@ -73,7 +73,7 @@ def _module_links(selected, api):
     return links, expected
 
 
-def make_plan(selected, api):
+def make_plan(selected, api, update_manager=True):
     """Return cleanup entries; caller checks idleness and checkout consumers."""
     config, repo = selected["config"], selected["repo"]
     graph = api.ConfigGraph(config)
@@ -104,7 +104,15 @@ def make_plan(selected, api):
     for path in links:
         changes[path] = dict(kind="absent", expected=expected[str(path)])
 
-    updater = api.load_updater()
+    activation = api.activation_path(selected)
+    state = api.snapshot(activation)
+    expected[str(activation)] = state
+    if state["kind"] == "file":
+        changes[activation] = dict(kind="absent", expected=state)
+    elif state["kind"] != "absent":
+        _fail(api, "Refusing unsafe activation receipt %s" % activation)
+
+    updater = api.load_updater() if update_manager else None
     update_plan = updater.make_uninstall_plan(selected, api) if updater else {}
     for path, change in update_plan.get("changes", {}).items():
         path = Path(path)

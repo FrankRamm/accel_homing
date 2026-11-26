@@ -1,6 +1,8 @@
 """Offline synthetic host/config fixtures. Never contact a printer or a service."""
 import base64
+import configparser
 import contextlib
+import glob
 import hashlib
 import io
 import importlib.util
@@ -23,6 +25,28 @@ def load(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def klipper_parse(path, parser=None):
+    """Read a config like Klipper: comments stripped, includes split the buffer."""
+    parser = parser or configparser.RawConfigParser(strict=False)
+    lines = []
+    def flush():
+        if lines:
+            parser.read_string("\n".join(lines), str(path))
+            del lines[:]
+    for line in Path(path).read_text().replace("\r\n", "\n").split("\n"):
+        line = line.split("#", 1)[0]
+        match = configparser.RawConfigParser.SECTCRE.match(line)
+        header = match and match.group("header")
+        if header and header.startswith("include "):
+            flush()
+            for found in sorted(glob.glob(os.path.join(os.path.dirname(str(path)), header[8:].strip()))):
+                klipper_parse(found, parser)
+        else:
+            lines.append(line)
+    flush()
+    return parser
 
 
 installer = load("installer")
@@ -1413,6 +1437,116 @@ class HostFixture(unittest.TestCase):
         self.assertEqual(self.plan()[0], {})
         self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
 
+    def install_files(self, *flags):
+        changes = {path: value for path, value in self.plan(*flags)[0].items() if value["kind"] != "symlink"}
+        self.assertIsNone(installer.apply_plan(changes, self.config))
+
+    def test_include_follows_options_added_to_last_stepper_section(self):
+        head = ("[printer]\nkinematics: corexy\nmax_velocity: 300\nmax_accel: 5000\n"
+                "[adxl345 toolhead]\ncs_pin: fixture:None\n"
+                "[stepper_x]\nendstop_pin: !PA0\nhoming_speed: 60\n")
+        cases = (("no SAVE_CONFIG", "[stepper_y]\nendstop_pin: !PA1\nhoming_speed: 60\n", "", ()),
+                 ("SAVE_CONFIG", "[stepper_y]\nendstop_pin: !PA1\nhoming_speed: 60\n", SAVED, ()),
+                 ("homing speed", "[stepper_y]\nendstop_pin: !PA1\n", SAVED, ("--homing-speed", "60")))
+        for label, last, tail, flags in cases:
+            with self.subTest(label):
+                managed = self.config.parent / installer.MANAGED
+                if managed.exists():
+                    managed.unlink()
+                self.config.write_text(head + last + tail)
+                self.install_files(*flags)
+                parsed = klipper_parse(self.config)
+                self.assertEqual(parsed.get("stepper_y", "homing_retract_dist"), "0")
+                self.assertEqual(parsed.get("stepper_y", "homing_speed"), "60")
+                self.assertEqual(parsed.get("accel_homing", "accel_chip"), "adxl345 toolhead")
+                text = self.config.read_text()
+                self.assertLess(text.rindex("homing_retract_dist: 0"), text.index("[include accel_homing.cfg]"))
+                if tail:
+                    self.assertTrue(text.endswith(tail))
+                    self.assertLess(text.index("[include accel_homing.cfg]"), text.index(installer.SAVE_MARKER))
+
+    def test_new_plugin_section_follows_options_added_to_retained_include(self):
+        managed = self.config.parent / installer.MANAGED
+        managed.write_text("[stepper_y]\nendstop_pin: !PA1\nhoming_speed: 60\n")
+        self.config.write_text("[printer]\nkinematics: corexy\nmax_velocity: 300\nmax_accel: 5000\n"
+                               "[adxl345 toolhead]\ncs_pin: fixture:None\n"
+                               "[stepper_x]\nendstop_pin: !PA0\nhoming_speed: 60\n"
+                               "[include accel_homing.cfg]\n" + SAVED)
+        self.install_files()
+        parsed = klipper_parse(self.config)
+        self.assertEqual(parsed.get("stepper_y", "homing_retract_dist"), "0")
+        self.assertFalse(parsed.has_option("accel_homing", "homing_retract_dist"))
+        self.assertEqual(parsed.get("accel_homing", "accel_chip"), "adxl345 toolhead")
+
+    def test_module_links_are_written_before_printer_configuration(self):
+        order = list(self.plan()[0])
+        links = [order.index(self.extras / name) for name in installer.MODULES]
+        self.assertLess(max(links), order.index(self.config))
+        self.assertLess(max(links), order.index(self.axes))
+
+    def test_interrupted_write_restores_prior_bytes_and_propagates(self):
+        for interruption in (KeyboardInterrupt, SystemExit):
+            with self.subTest(interruption.__name__):
+                calls = []
+                def interrupt_second(path, value):
+                    calls.append(path)
+                    if len(calls) == 2:
+                        raise interruption()
+                    installer.write_state(path, value)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(interruption):
+                    installer.apply_plan({self.config: {"kind": "file", "data": b"changed"},
+                                          self.axes: {"kind": "file", "data": b"changed"}},
+                                         self.config, interrupt_second)
+                self.assertEqual(self.config.read_bytes(), (CONFIG + SAVED).encode())
+                self.assertEqual(self.axes.read_bytes(), AXES.encode())
+                self.assertIn("applied changes restored", stderr.getvalue())
+
+    def test_missing_git_info_directory_is_created_for_exclude(self):
+        self.require_symlinks()
+        shutil.rmtree(self.repo / ".git/info")
+        exclude = self.repo / ".git/info/exclude"
+        self.assertIn(exclude, self.plan()[0])
+        with mock.patch.object(installer, "discover_target", return_value=self.selected), \
+             mock.patch.object(installer, "__file__", str(self.source / "installer.py")), \
+             mock.patch.object(installer.os, "geteuid", return_value=1000, create=True), \
+             mock.patch.object(installer, "assert_idle", return_value="idle fixture"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(installer.main(["--no-restart", "--no-update-manager"]), 0)
+        self.assertEqual(exclude.read_text().splitlines(), ["klippy/extras/" + name for name in installer.MODULES])
+        shutil.rmtree(self.repo / ".git")
+        (self.repo / ".git").write_text("gitdir: /elsewhere\n")
+        self.assertNotIn(exclude, self.plan()[0])
+
+    def test_symlinked_main_config_into_another_directory_is_refused(self):
+        self.require_symlinks()
+        elsewhere = self.home / "config-repo"
+        elsewhere.mkdir()
+        os.replace(self.config, elsewhere / "printer.cfg")
+        os.symlink(elsewhere / "printer.cfg", self.config)
+        before = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*"))
+        argv = ["python", str(self.repo / "klippy/klippy.py"), str(self.config), "-a", str(self.home / "uds")]
+        live = installer.command_instance(argv, self.home, "fixture", pid=5, service="klipper.service")
+        for label, args, processes in (("common directories", installer.arguments([]), []),
+                                       ("explicit", installer.arguments(["--config", str(self.config)]), []),
+                                       ("running", installer.arguments([]), [live])):
+            with self.subTest(label), \
+                 self.assertRaisesRegex(installer.InstallError, "symlink into another directory"):
+                installer.discover_target(args, self.home, processes, [])
+        self.assertEqual(sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*")), before)
+        chosen = installer.discover_target(installer.arguments(["--config", str(elsewhere / "printer.cfg")]),
+                                           self.home, [], [])
+        self.assertEqual(chosen["config"], (elsewhere / "printer.cfg").resolve())
+
+    def test_symlinked_config_directory_keeps_include_location(self):
+        self.require_symlinks()
+        linked = self.home / "linked-config"
+        os.symlink(self.config.parent, linked, target_is_directory=True)
+        argv = ["python", str(self.repo / "klippy/klippy.py"), str(linked / "printer.cfg")]
+        live = installer.command_instance(argv, self.home, "fixture", pid=5)
+        chosen = installer.discover_target(installer.arguments([]), self.home, [live], [])
+        self.assertEqual(chosen["config"], self.config.resolve())
+
 
 class SudoPolicyFixture(unittest.TestCase):
     def test_legacy_nss_source_must_be_absent_or_unambiguously_files_only(self):
@@ -2275,6 +2409,42 @@ class UninstallFixture(unittest.TestCase):
         self.config.write_text(CONFIG)
         self.assertEqual(self.remove()["entries"], [])
         self.assertFalse((self.config.parent / ".accel_homing_backups").exists())
+
+    def test_uninstall_removes_klipper_activation_receipt(self):
+        self.install()
+        receipt = installer.activation_path(self.selected)
+        installer.save_activation(receipt, self.selected, "skipped", reason="--no-restart")
+        plan = self.remove()
+        self.assertIn(str(receipt), [entry["path"] for entry in plan["entries"]])
+        self.assertFalse(receipt.exists())
+        self.assertEqual(self.remove()["entries"], [])
+        receipt.mkdir()
+        with self.assertRaises(installer.InstallError):
+            installer.make_uninstall_plan(self.selected)
+
+    def test_no_update_manager_uninstall_skips_moonraker_for_stopped_klipper(self):
+        self.install()
+        receipt = self.config.parent / ".accel_homing_updater.json"
+        receipt.write_text("{}\n")
+        unreachable = mock.Mock()
+        unreachable.make_uninstall_plan.side_effect = installer.InstallError(
+            "Moonraker updater: the selected Klipper has no verified API socket")
+        with mock.patch.object(installer, "load_updater", return_value=unreachable):
+            with self.assertRaisesRegex(installer.InstallError, "no verified API socket"):
+                installer.make_uninstall_plan(self.selected)
+        output = io.StringIO()
+        with mock.patch.object(installer, "load_updater", side_effect=AssertionError("Moonraker was consulted")), \
+             mock.patch.object(installer, "discover_target", return_value=self.selected), \
+             mock.patch.object(installer.os, "geteuid", return_value=1000, create=True), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(installer.main(["--uninstall", "--no-update-manager"]), 0)
+        self.assertIn("Selected Klipper is stopped", output.getvalue())
+        self.assertIn("delete that section by hand", output.getvalue())
+        self.assertIn("[update_manager accel_homing]", output.getvalue())
+        graph = installer.ConfigGraph(self.config)
+        self.assertIsNone(graph.one("accel_homing", False))
+        self.assertIsNone(graph.one("stepper_x").get("endstop_pin"))
+        self.assertEqual(receipt.read_text(), "{}\n")
 
 
 if __name__ == "__main__":
