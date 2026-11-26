@@ -62,6 +62,10 @@ class AccelHomingModel:
                     if not isinstance(rate, (int, float)) or isinstance(rate, bool):
                         raise ValueError("notch model requires its measured sensor sample rate")
                     coefficients(settings, rate)
+                cruise = metadata.get("cruise_threshold_g")
+                if cruise is not None and (type(cruise) not in (int, float) or not cruise > 0.0
+                                           or threshold is not None and not cruise < threshold):
+                    raise ValueError("cruise_threshold_g must be positive and below the saved threshold")
             except (ValueError, TypeError) as exc:
                 raise config.error("Invalid %s model metadata: %s" % (axis, exc))
             self.metadata[axis] = metadata

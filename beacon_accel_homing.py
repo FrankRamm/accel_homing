@@ -61,6 +61,8 @@ MAX_SHORT_HOME_RETRIES = 2     # re-homes after a G28 travel below min_home_dist
 SECOND_TOUCH_TOLERANCE = 1.5   # mm, only used if a second touch is configured
 POST_TRIGGER_NOTICE_MM = 1.0   # mm commanded into the stop after the trigger sample
 CRUISE_SETTLE = 0.25       # s after the acceleration ramp before a cruise threshold applies
+CRUISE_PEAK_EXCLUSION = 0.020  # s before the trigger batch left out of the cruise peak
+CRUISE_PEAK_QUEUE = 64     # batches held back from the cruise peak; older ones are counted early
 MIN_SPEED = 50.0           # mm/s, below this impacts were too soft in testing
 AUTO_DIRECTION_SPEED = 30.0    # mm/s of travel that fixes which way an impact points
 PRESSED_MIN_SPEED = 40.0   # mm/s commanded before missing motion counts as pressed
@@ -335,11 +337,12 @@ def describe(r):
                    " (range reached; true peak may be higher)" if r.get("amplitude_limited") else "")
     post = r.get("post_trigger_mm")
     request = r.get("stop_request_after_onset_ms")
-    return ("%s pass %d: %s, onset %s g, peak %s g%s, noise +%.1f/-%.1f g, travel %s mm%s%s%s%s"
+    return ("%s pass %d: %s, onset %s g, peak %s g%s, noise +%.1f/-%.1f g, travel %s mm%s%s%s%s%s"
             % (r["axis"].upper(), r["pass"], r["result"], r["onset_g"], r["impact_peak_g"],
                uncertainty,
                r["noise_pos_g"], r["noise_neg_g"], r.get("travel_mm"),
                ", cruise threshold %s g" % r["cruise_threshold_g"] if r.get("cruise_threshold_active") else "",
+               "" if r.get("cruise_peak_g") is None else ", cruise peak %s g" % r["cruise_peak_g"],
                "" if post is None else ", post-trigger %.3f mm" % post,
                "" if request is None else ", stop request %.1f ms after onset" % request,
                ", origin kept" if r.get("kept_origin") else ""))
@@ -448,7 +451,9 @@ class Attempt:
         self.direction = direction
         self.limit_raw = self.configured_limit_raw = limit_raw
         self.cruise_limit_raw = self.cruise_clock = None
-        self.cruise_active = False
+        self.cruise_active = self.cruise_measuring = False
+        self.cruise_queue = collections.deque()  # (batch end clock, batch peak) not yet counted
+        self.cruise_peak = None    # largest detector reading of steady travel, raw units
         self.count_g = count_g
         self.baseline = None
         self.done = False
@@ -644,6 +649,9 @@ class BeaconAccelHoming:
         for axis, value in self.cruise_threshold_g.items():
             if value:
                 validate_threshold(value, axis + "_cruise_threshold", config.error)
+        # An explicit value, 0 included, replaces a cruise threshold saved by calibration.
+        self.cruise_threshold_set = {a for a in AXES if config.get("cruise_threshold", None) is not None
+                                     or config.get("%s_cruise_threshold" % a, None) is not None}
         self.homing_accel = config.getfloat("homing_accel", 5000.0, minval=0.0)
         shared_back_off = config.getfloat("back_off_dist", 5.0, minval=0.0)
         self.back_off_dist = {a: config.getfloat("%s_back_off_dist" % a, shared_back_off,
@@ -704,7 +712,7 @@ class BeaconAccelHoming:
         self.endstops = {}
         self.trigger_cmds = {}
         self.beacon = self.helper = self.toolhead = self.main_mcu = None
-        self.impact_window = 0
+        self.impact_window = self.cruise_exclusion = 0
         self.beacon_freq = 1.0
         self.saved_handler = None
         self.sensor_clock = self.clock_to_time = None
@@ -807,6 +815,7 @@ class BeaconAccelHoming:
             self.sensor_clock = self.backend
             self.clock_to_time = self.backend.clock_to_time
         self.impact_window = int(self.sensor_clock.seconds_to_clock(IMPACT_WINDOW))
+        self.cruise_exclusion = int(self.sensor_clock.seconds_to_clock(CRUISE_PEAK_EXCLUSION))
         self.beacon_freq = float(self.sensor_clock.seconds_to_clock(1.0))
         full_scale = self._full_scale_g(self.scale)
         for axis, value in self.threshold_g.items():
@@ -2071,16 +2080,14 @@ class BeaconAccelHoming:
         if self.passes == 1:
             attempt.believed_distance = self.start_believed_distance
         self._configure_experimental(attempt)
-        cruise = self.cruise_threshold_g[axis]
-        session = getattr(self.workflows, "session", None)
-        if (cruise and cruise < threshold and self.passes == 1 and attempt.experimental is None
-                and not getattr(self.workflows, "gentle_homing", False)
-                and not (session and session.get("mode") == "calibration")):
+        if self.passes == 1 and attempt.experimental is None:
             # The start of the move shakes the sensor more than steady travel.
             # Only samples after the ramp has settled use the lower limit.
-            attempt.cruise_limit_raw = cruise / count_g
             attempt.cruise_clock = beacon_mcu.print_time_to_clock(
                 print_time + speed / accel + CRUISE_SETTLE) & 0xFFFFFFFF
+            cruise = self.workflows.cruise_threshold(axis)
+            if cruise and cruise < threshold:
+                attempt.cruise_limit_raw = cruise / count_g
         return attempt
 
     def arm(self, attempt):
@@ -2942,9 +2949,19 @@ class BeaconAccelHoming:
         if clock_after(start_clock, attempt.deadline_clock):
             self._fire(attempt, "travel", mcu.MCU_trsync.REASON_HOST_REQUEST)
             return
-        if attempt.cruise_limit_raw is not None and clock_after(start_clock, attempt.cruise_clock):
-            attempt.limit_raw, attempt.cruise_limit_raw = attempt.cruise_limit_raw, None
-            attempt.cruise_active = True
+        if attempt.cruise_clock is not None and clock_after(start_clock, attempt.cruise_clock):
+            if attempt.cruise_limit_raw is not None:
+                attempt.limit_raw, attempt.cruise_limit_raw = attempt.cruise_limit_raw, None
+                attempt.cruise_active = True
+            # Count a batch peak only once it is CRUISE_PEAK_EXCLUSION older than
+            # the newest batch, so the build-up of a contact is never included.
+            queue = attempt.cruise_queue
+            cutoff = start_clock - self.cruise_exclusion
+            while queue and (len(queue) > CRUISE_PEAK_QUEUE or clock_after(cutoff, queue[0][0])):
+                peak = queue.popleft()[1]
+                if attempt.cruise_peak is None or peak > attempt.cruise_peak:
+                    attempt.cruise_peak = peak
+            attempt.cruise_measuring = True
         data = sample_slice(data, count)
         params = dict(params, data=data)
         raw = (data if isinstance(data, tuple) else memoryview(data).cast("h") if NATIVE_LE
@@ -3027,6 +3044,8 @@ class BeaconAccelHoming:
                     self._fire(attempt, "proof_overflow", mcu.MCU_trsync.REASON_HOST_REQUEST)
                     return
             attempt.last_end_clock = end_clock
+            if attempt.cruise_measuring:
+                attempt.cruise_queue.append((end_clock, level))
             if self.backend is not None and attempt.proof_noise is None:
                 attempt.proof_sample_time = self.clock_to_time(end_clock)
             attempt.last_samples = [raw[-3], raw[-2], raw[-1]]
@@ -3185,6 +3204,8 @@ class BeaconAccelHoming:
         attempt.noise_checked = max(attempt.noise_checked, peak)
         attempt.noise_pos = max(attempt.noise_pos, peak)
         attempt.last_end_clock = params["start_clock"] + params["delta_clock"]
+        if attempt.cruise_measuring:
+            attempt.cruise_queue.append((attempt.last_end_clock, peak))
         attempt.proof_sample_time = self.clock_to_time(attempt.last_end_clock)
         attempt.last_samples = list(previous)
         original = params["data"]
@@ -4402,6 +4423,9 @@ class BeaconAccelHoming:
                                    None if attempt.cruise_limit_raw is None else
                                    round(attempt.cruise_limit_raw * to_g, 2)),
             "cruise_threshold_active": attempt.cruise_active,
+            "cruise_peak_g": (round(attempt.cruise_peak * to_g, 2) if attempt.reason == "impact"
+                              and attempt.cruise_peak is not None and attempt.experimental is None
+                              else None),
             "impact_metric": self._impact_metric(attempt),
             "coordinate_frame": "configured_sensor_stream",
             "axis_mapping": (None if attempt.axis_mapping is None else
@@ -4541,6 +4565,10 @@ class BeaconAccelHoming:
         gcmd.respond_info("accel_homing: back-off X %.12g mm, Y %.12g mm"
                           " (final and cross-axis release; 0 disables)"
                           % (self.back_off_dist["x"], self.back_off_dist["y"]))
+        cruise = {axis: self.workflows.ordinary_cruise_threshold(axis) for axis in AXES}
+        gcmd.respond_info("accel_homing: cruise threshold " + ", ".join(
+            "%s %s" % (axis.upper(), "%.12g g (%s)" % cruise[axis] if cruise[axis][0] else
+                       "off (config)" if cruise[axis][1] == "config" else "off") for axis in sorted(AXES)))
         gcmd.respond_info("accel_homing: baseline policy: legacy ordinary homing requires quiet XYZ;"
                           " mapped-axis calibration and saved models require a post-settle"
                           " %.2f ms / %d sample reference without a quiet-range limit;"

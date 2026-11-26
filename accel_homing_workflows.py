@@ -90,6 +90,13 @@ CALIBRATION_REPEATED_EARLY_HITS = 3
 CALIBRATION_MAX_SPREAD_REJECTIONS = 3
 TRAVEL_EXCESS_NOTICE_MM = 0.5
 UNKNOWN_RANGE_MAX_CANDIDATE_G = 16.0
+# Cruise threshold: steady-travel peak of the qualified homes plus this margin,
+# offered only below this share of the saved threshold, then tested by more homes.
+CRUISE_PEAK_MARGIN_FACTOR = 1.2
+CRUISE_PEAK_MARGIN_G = 0.1
+CRUISE_MIN_THRESHOLD_G = 1.0
+CRUISE_MAX_THRESHOLD_FRACTION = 0.75
+CRUISE_VERIFICATION_HOMES = 5
 SIMPLE_CALIBRATION = "impact20_mapped_axis_v1"
 REQUIRED_SUCCESSES = 10
 # Diagnostic captures only: retain the final discovery + ten checks and context.
@@ -1162,6 +1169,32 @@ class AccelHomingWorkflows:
 
     def note_manual_threshold(self, axis, threshold):
         self.temporary_manual_thresholds[axis] = threshold
+
+    def ordinary_cruise_threshold(self, axis):
+        """Cruise threshold of an ordinary home and its source: "config", "model" or None."""
+        if self.gentle_homing:
+            return 0.0, None
+        if axis in self.owner.cruise_threshold_set:
+            return self.owner.cruise_threshold_g[axis], "config"
+        model = self.model
+        # Only the saved model whose calibrated threshold is in force supplies one.
+        if (model is None or axis not in model.thresholds or axis in self.manual_axes
+                or self._temporary_manual_threshold(axis) or axis in self.stale_model_axes
+                or model.metadata[axis].get("axis_mapping_invalidated")
+                or self.owner.threshold_g[axis] != model.thresholds[axis]
+                or model.metadata[axis].get("cruise_threshold_g") is None):
+            return 0.0, None
+        return model.metadata[axis]["cruise_threshold_g"], "model"
+
+    def cruise_threshold(self, axis):
+        """Cruise threshold for the next first-pass home of this axis; 0 when none applies."""
+        session = self.session
+        if session is not None and session.get("mode") == "calibration":
+            # Calibration homes ignore every cruise threshold except its own candidate.
+            verification = session.get("cruise_verification")
+            return (verification["threshold_g"] if verification is not None and verification["active"]
+                    and self.calibration_reference(axis) else 0.0)
+        return self.ordinary_cruise_threshold(axis)[0]
 
     @staticmethod
     def _signal_metadata(capture):
@@ -2292,7 +2325,8 @@ class AccelHomingWorkflows:
         record["workflow_attempt"] = session["attempts"]
         record["workflow_threshold_g"] = (threshold if threshold is not None
                                           else self.owner.threshold_g[axis])
-        record["workflow_phase"] = ("validation" if session["candidate_qualified"] else "discovery") \
+        record["workflow_phase"] = ("cruise_verification" if session.get("cruise_verification") else
+                                    "validation" if session["candidate_qualified"] else "discovery") \
             if session["mode"] == "calibration" else session["mode"]
         calibration_quality, calibration_reason = (self._quality(axis, record)
                                                    if session["mode"] == "calibration" else (None, None))
@@ -2941,8 +2975,102 @@ class AccelHomingWorkflows:
             if session.get("auto_notch") and session["auto_notch_phase"] == "raw_reference":
                 session["auto_notch_controller"].select(session)
                 continue
+            if not (self.gentle_homing or session.get("auto_notch") or session.get("beta")):
+                self._verify_cruise_threshold()
             self._save_model()
             return
+
+    def _verify_cruise_threshold(self):
+        """Derive a cruise threshold from the qualified homes and test it with more homes."""
+        session = self.session
+        axis = session["axis"]
+        qualified = session["validation_records"]
+        discovery = session["records"][session["candidate_attempt"] - 1]
+        peaks = [record.get("cruise_peak_g") for record in [discovery] + qualified]
+        if any(type(peak) not in (int, float) or not math.isfinite(peak) for peak in peaks):
+            self._info("%s cruise threshold: steady travel was not measured on every qualified home; "
+                       "no cruise threshold is saved" % axis.upper())
+            return
+        worst = max(peaks)
+        # The calibration grid, below its start too, never under CRUISE_MIN_THRESHOLD_G;
+        # exact decimal arithmetic as for the noise-selected start.
+        start, step = Decimal(str(session["start_threshold_g"])), Decimal(str(session["threshold_step_g"]))
+        peak = Decimal(str(worst))
+        required = max(Decimal(str(CRUISE_MIN_THRESHOLD_G)), Decimal(str(CRUISE_PEAK_MARGIN_FACTOR)) * peak,
+                       peak + Decimal(str(CRUISE_PEAK_MARGIN_G)))
+        candidate = float(start + math.ceil((required - start) / step) * step)
+        threshold = self._calibration_saved_threshold(session["candidate"], self._weakest_impact_peak(qualified))
+        evidence = session["cruise_threshold_calibration"] = {
+            "result": None, "reason": None, "cruise_peak_g": peaks, "worst_cruise_peak_g": worst,
+            "candidate_g": candidate, "margin_factor": CRUISE_PEAK_MARGIN_FACTOR,
+            "margin_g": CRUISE_PEAK_MARGIN_G, "max_threshold_fraction": CRUISE_MAX_THRESHOLD_FRACTION,
+            "threshold_g": threshold, "verification_homes_required": CRUISE_VERIFICATION_HOMES,
+            "verification_homes": 0, "min_commanded_travel_mm": None, "max_commanded_travel_mm": None}
+        if not candidate < CRUISE_MAX_THRESHOLD_FRACTION * threshold:
+            evidence.update(result="not_offered", reason="candidate not below %.0f%% of the threshold"
+                            % (CRUISE_MAX_THRESHOLD_FRACTION * 100.0))
+            self._info("%s cruise threshold not offered: steady travel peaked at %.6g g, so the candidate "
+                       "%.6g g is not below %.0f%% of the %.6g g threshold (%.6g g); no cruise threshold "
+                       "is saved" % (axis.upper(), worst, candidate, CRUISE_MAX_THRESHOLD_FRACTION * 100.0,
+                                     threshold, CRUISE_MAX_THRESHOLD_FRACTION * threshold))
+            return
+        self._validate_calibration_threshold(candidate, "cruise threshold candidate")
+        checks = []
+        verification = session["cruise_verification"] = {"threshold_g": candidate, "active": True,
+                                                         "records": checks, "result": None}
+        self._info("%s cruise threshold candidate %.6g g (steady travel peaked at %.6g g); %d more centered "
+                   "homes at %.6g g with it active once the move cruises" % (
+                       axis.upper(), candidate, worst, CRUISE_VERIFICATION_HOMES, session["candidate"]))
+        failure = quality = None
+        try:
+            while failure is None and len(checks) < CRUISE_VERIFICATION_HOMES:
+                self._recenter(axis)
+                record, _capture = self._home(axis, session["candidate"])
+                quality, reason = self._quality(axis, record)
+                if quality == "implausible":
+                    raise self._error(self._mark_implausible_calibration(
+                        axis, session["terminal_home"][2], reason))
+                if quality == "fatal":
+                    raise self._error(reason + "; calibration aborted during the cruise threshold check")
+                checks.append(record)
+                spread = None
+                if quality == "early":
+                    failure = reason
+                elif record.get("cruise_threshold_active") is not True:
+                    failure = "the cruise threshold never became active"
+                else:
+                    spread = self._repeatability_spread(qualified + checks)
+                    if spread > CALIBRATION_REPEATABILITY_MM:
+                        failure = ("commanded travel spread %s mm over the ten checks and this home "
+                                   "exceeds %.2f mm" % (spread, CALIBRATION_REPEATABILITY_MM))
+                self._info("%s cruise check %d/%d at %.6g g: %s; commanded travel %.3f mm%s" % (
+                    axis.upper(), len(checks), CRUISE_VERIFICATION_HOMES, candidate,
+                    "passed" if failure is None else "failed (%s)" % failure,
+                    record.get("travel_mm_exact", record.get("travel_mm")),
+                    "" if spread is None else ", spread %s mm" % spread))
+        finally:
+            verification["active"] = False
+        travels = [record.get("travel_mm_exact", record["travel_mm"]) for record in checks]
+        evidence.update(verification_homes=len(checks), min_commanded_travel_mm=min(travels),
+                        max_commanded_travel_mm=max(travels))
+        if failure is None:
+            verification["result"] = evidence["result"] = "verified"
+            return
+        verification["result"] = evidence["result"] = "verification_failed"
+        evidence["reason"] = failure
+        # The failed home is not qualified: never release or recenter from it.
+        if quality == "early":
+            try:
+                self._return_early_calibration(axis, checks[-1])
+            finally:
+                self._invalidate_calibration_axis(session)
+            ending = "The early home was reversed by its recorded commanded travel and %s is left unhomed"
+        else:
+            self._invalidate_calibration_axis(session)
+            ending = "%s is left unhomed where that home stopped"
+        self._info("%s cruise threshold dropped: %s. %s; the final back-off is skipped. The threshold "
+                   "qualified by the ten checks is still saved, without a cruise threshold" % (
+                       axis.upper(), failure, ending % axis.upper()))
 
     def _qualified_validation_records(self):
         """Recheck the entire current-candidate window before any config writes."""
@@ -2957,6 +3085,10 @@ class AccelHomingWorkflows:
         candidate_attempt = session.get("candidate_attempt")
         record_offset = session.get("auto_notch_record_offset", 0) if session.get("auto_notch") else 0
         records, qualified = session.get("records"), session.get("validation_records")
+        # Cruise threshold checks follow the window; they never count towards it.
+        verification = session.get("cruise_verification")
+        checks = [] if verification is None else verification.get("records")
+        extra = len(checks) if isinstance(checks, list) else -1
         if session.get("mode") != "calibration" or session.get("state") != "running" \
                 or not isinstance(axis, str) or axis not in AXES \
                 or session.get("candidate_qualified") is not True \
@@ -2966,7 +3098,10 @@ class AccelHomingWorkflows:
                 or (threshold_limit is not None and threshold > threshold_limit) \
                 or type(candidate_attempt) is not int or candidate_attempt < 1 \
                 or type(session.get("attempts")) is not int \
-                or session.get("attempts") != candidate_attempt + REQUIRED_SUCCESSES \
+                or not 0 <= extra <= CRUISE_VERIFICATION_HOMES \
+                or (verification is not None and (self.gentle_homing or session.get("auto_notch")
+                                                  or session.get("beta"))) \
+                or session.get("attempts") != candidate_attempt + REQUIRED_SUCCESSES + extra \
                 or type(record_offset) is not int or record_offset < 0 \
                 or not isinstance(records, list) or len(records) + record_offset != session["attempts"] \
                 or candidate_attempt <= record_offset \
@@ -2976,10 +3111,19 @@ class AccelHomingWorkflows:
             raise self._error(message)
         discovery = records[candidate_attempt - 1 - record_offset]
         window = [discovery] + qualified
-        if len({id(record) for record in window}) != REQUIRED_SUCCESSES + 1 \
+        end = len(records) - extra
+        if len({id(record) for record in window + checks}) != REQUIRED_SUCCESSES + 1 + extra \
                 or any(actual is not expected for actual, expected in
-                       zip(qualified, records[-REQUIRED_SUCCESSES:])):
+                       zip(qualified + checks, records[end - REQUIRED_SUCCESSES:])):
             raise self._error(message)
+        for index, record in enumerate(checks):
+            if not isinstance(record, dict) or record.get("axis") != axis \
+                    or record.get("run_id") != session["run_id"] \
+                    or type(record.get("workflow_attempt")) is not int \
+                    or record.get("workflow_attempt") != candidate_attempt + REQUIRED_SUCCESSES + 1 + index \
+                    or record.get("workflow_threshold_g") != threshold \
+                    or record.get("workflow_phase") != "cruise_verification":
+                raise self._error(message)
         for index, record in enumerate(window):
             if not isinstance(record, dict) or record.get("axis") != axis \
                     or record.get("run_id") != session["run_id"] \
@@ -3005,7 +3149,13 @@ class AccelHomingWorkflows:
         minimum = min(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
         maximum = max(r.get("travel_mm_exact", r["travel_mm"]) for r in qualified)
         spread = self._repeatability_spread(qualified)
-        self._release_terminal_home(axis, qualified[-1])
+        verification = session.get("cruise_verification")
+        if verification is None:
+            self._release_terminal_home(axis, qualified[-1])
+        elif verification["result"] == "verified":
+            self._release_terminal_home(axis, verification["records"][-1])
+        elif verification["result"] != "verification_failed":
+            raise self._error("cruise threshold check did not finish")
         if session["axis_mapping_context"] != self.owner.noise_sensor_context():
             raise self._error("automatic axis mapping sensor context changed during final release; recalibrate")
         # Final release may yield while its motion completes. Recheck all ten
@@ -3091,6 +3241,11 @@ class AccelHomingWorkflows:
             metadata["stationary_noise_seed"] = dict(session["noise_seed"])
         if session.get("stationary_noise") is not None:
             metadata["stationary_noise_measurement"] = dict(session["stationary_noise"])
+        cruise = session.get("cruise_threshold_calibration")
+        if cruise is not None:
+            metadata["cruise_threshold_calibration"] = copy.deepcopy(cruise)
+            if cruise["result"] == "verified":
+                metadata["cruise_threshold_g"] = cruise["candidate_g"]
         if metadata["signal_filter"]["type"] != "disabled":
             rates = [r.get("signal_filter", {}).get("sample_rate_hz") for r in qualified]
             if (any(type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0 for rate in rates)
@@ -3144,7 +3299,10 @@ class AccelHomingWorkflows:
                   "run_id": session["run_id"], "save_config": session["save_config"],
                   "repeatability_spread_mm": spread,
                   "repeatability_limit_mm": CALIBRATION_REPEATABILITY_MM,
-                  "algorithm": SIMPLE_CALIBRATION, "restarts": session["restarts"]}
+                  "algorithm": SIMPLE_CALIBRATION, "restarts": session["restarts"],
+                  "cruise_threshold_g": metadata.get("cruise_threshold_g")}
+        if cruise is not None:
+            result["cruise_threshold_calibration"] = copy.deepcopy(cruise)
         if self.gentle_homing:
             result.update(gentle_homing=True, gentle_motion_noise=metadata["gentle_motion_noise"])
         else:
@@ -3192,6 +3350,13 @@ class AccelHomingWorkflows:
                            "The saved threshold was not tested by those homes." if threshold != tested_threshold
                            else "The saved threshold is the tested one.",
                            "The calibrated %s_threshold and model become active after SAVE_CONFIG and restart." % axis))
+            if "cruise_threshold_g" in metadata:
+                self._info("%s cruise threshold %.12g g passed %d homes (commanded travel %.3f..%.3f mm) and is "
+                           "saved with the model; an explicit %s_cruise_threshold or cruise_threshold in "
+                           "[%s] overrides it" % (
+                               axis.upper(), metadata["cruise_threshold_g"], cruise["verification_homes"],
+                               cruise["min_commanded_travel_mm"], cruise["max_commanded_travel_mm"], axis,
+                               self.config.get_name()))
         if save:
             if recovery is not None:
                 self._info("After SAVE_CONFIG succeeds and Klipper restarts, release and manually center XY, "
@@ -5763,7 +5928,8 @@ class AccelHomingWorkflows:
                 active.update(algorithm=session.get("algorithm"), restarts=session.get("restarts", 0),
                               minimum_impact_travel_mm=CALIBRATION_MIN_TRAVEL_MM,
                               discovery_impact_required=True, recenter_policy="selected_axis_midpoint",
-                              phase="validation" if session["candidate_qualified"] else "discovery")
+                              phase="cruise_verification" if session.get("cruise_verification")
+                              else "validation" if session["candidate_qualified"] else "discovery")
                 if session.get("stationary_noise") is not None:
                     active["stationary_noise"] = dict(session["stationary_noise"])
         if active is not None and session.get("auto_notch"):

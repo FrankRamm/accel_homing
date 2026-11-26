@@ -104,9 +104,11 @@ class CruisePlanTests(unittest.TestCase):
         for options, session in (({}, None), ({"x_cruise_threshold": 8.0}, None),
                                  ({"x_cruise_threshold": 3.0}, {"mode": "calibration", "state": "running"})):
             with self.subTest(options=options, session=session):
-                attempt = self.prepared(options, session)[3]
+                obj, _endstop, _move, attempt = self.prepared(options, session)
                 self.assertIsNone(attempt.cruise_limit_raw)
-                self.assertIsNone(attempt.cruise_clock)
+                # The cruise window is still measured, only the lower limit is off.
+                self.assertEqual(attempt.cruise_clock,
+                                 obj.sensor_clock.print_time_to_clock(100.0 + 0.15 + 0.25) & 0xFFFFFFFF)
 
     def test_negative_value_is_a_config_error(self):
         with self.assertRaises(ConfigError):

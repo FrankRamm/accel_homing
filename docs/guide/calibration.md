@@ -42,7 +42,9 @@ checklist is in [commands](commands.md#prepare-every-moving-workflow).
    matches this axis. Only add `CENTERED=1` when steps 1 to 4 are done.
 6. **Watch what happens.** The plugin may first make small mapping strokes
    (at most 15 mm; see Details). Then the axis makes a discovery approach into
-   its stop, followed by ten validation trips. When it succeeds, it saves the
+   its stop, followed by ten validation trips. If those homes show a low
+   enough vibration while travelling, five more trips check a
+   [cruise threshold](#cruise-threshold). When it succeeds, it saves the
    result and restarts Klipper (this is the default).
 7. **Repeat the preparation (steps 1 to 4) after that restart**, including
    centering the toolhead by hand again. Then calibrate Y:
@@ -406,6 +408,40 @@ These are commanded steps, not encoder measurements. Skipped steps, slip or a
 blocked carriage can make the estimated starting point wrong. Completion of
 the queued move does not measure physical arrival.
 
+### Cruise threshold
+
+After the ten checks pass, ordinary calibration also looks for a lower
+[cruise threshold](configuration.md#cruise-threshold-dev). Gentle mode,
+`NOTCH=AUTO` and Beta skip this step.
+
+1. Every first-pass home records `cruise_peak_g`: the largest detector reading
+   from the start of cruise (acceleration ramp plus 0.25 s) up to 20 ms before
+   the trigger. If the discovery home or any of the ten checks has no value,
+   no cruise threshold is saved.
+2. With `p` the largest `cruise_peak_g` of those eleven homes, the candidate
+   is the smallest value of the calibration grid (start plus whole STEPs,
+   below the start too, at least 1 g) that is at least
+   `max(1.2 * p, p + 0.1)`.
+3. It is offered only below 75% of the threshold that will be saved. Otherwise
+   the console gives the numbers and no cruise threshold is saved. An axis
+   with a strong vibration spot mid-travel ends here.
+4. Five more homes from the midpoint run at the same tested threshold with the
+   candidate active once the move cruises. Each must pass the travel
+   plausibility check, use the cruise threshold, and keep the travel spread of
+   the ten checks plus these homes at most 2.00 mm. The console prints one
+   line per home.
+5. If all five pass, the candidate is saved with the model and the axis is
+   released from the fifth home. If one fails, no cruise threshold is saved,
+   and the console says why. The threshold that the ten checks qualified is
+   still saved. The axis is released from no home and is left unhomed: an
+   early home is first reversed as in
+   [automatic early-impact returns](#automatic-early-impact-returns); any
+   other failed home leaves the carriage where it stopped. A sensor fault,
+   implausible travel, cancellation or shutdown aborts as before, without
+   saving.
+
+The five homes never count towards the ten checks.
+
 ### Saving and ordinary homing
 
 This section explains what is saved after a successful calibration and how normal homing uses it.
@@ -447,6 +483,15 @@ without this final margin; a higher saved value was **not tested by those ten
 homes**. A later `SAVE_CONFIG`, restart or model reload does not add the margin
 again. Failed qualification stages no replacement threshold. Beta proposals are
 unchanged.
+
+A verified cruise threshold is saved as `cruise_threshold_g` in the model
+metadata, with the evidence in `cruise_threshold_calibration` (the peaks, the
+margin and 75% constants, the number of check homes and their travel range).
+Ordinary homing uses it while that model's calibrated threshold is in force:
+not for a manual or temporary threshold, a stale model or gentle mode. An
+explicit `x_cruise_threshold`, `y_cruise_threshold` or `cruise_threshold`,
+including 0, replaces it. A later calibration without one removes it. Older
+models have no cruise threshold.
 
 Console output and saved metadata distinguish `tested_threshold_g`,
 `saved_threshold_g` and `threshold_margin_g` (the applied margin, normally 0.5),

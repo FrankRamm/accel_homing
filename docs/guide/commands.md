@@ -116,6 +116,11 @@ Those checks do not test a higher saved value. Gentle calibration and explicit
 AUTO instead save the **exact tested threshold and filter**, with no later margin.
 The other axis is unchanged.
 
+Ordinary calibration then derives a lower
+[cruise threshold](calibration.md#cruise-threshold) from the vibration of steady
+travel and tests it with five more homes. It is saved with the model only if all
+five pass; otherwise the console says why and the normal threshold is still saved.
+
 Both commands use an explicit `accel_axes_map` (Beacon) or `axes_map` from the
 selected sensor's configuration. Without that setting, they identify the
 selected physical axis with gentle bidirectional strokes around the manual

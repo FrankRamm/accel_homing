@@ -176,8 +176,8 @@ finite. Sensor timing options do not make host-delivered stopping real time.
 | `x_back_off_dist`, `y_back_off_dist` | `back_off_dist` | Per-axis override of the release distance in mm; at least 0, no maximum, zero disables that axis. There is no Z back-off option. |
 | `min_home_dist` | `0` | Minimum G28 travel in mm before a home is trusted; a shorter home backs off this distance and homes again (up to 2 times, at homing_speed). With `homing_retract_dist` set, the first approach is judged, not the second touch. 0 disables. Not used by calibration workflows. |
 | `x_min_home_dist`, `y_min_home_dist` | `min_home_dist` | Per-axis override. |
-| `cruise_threshold` | `0` | Lower trigger threshold in g that replaces the axis threshold once the homing move cruises: after the acceleration ramp plus 0.25 s. 0 disables. See [cruise threshold](#cruise-threshold-dev). |
-| `x_cruise_threshold`, `y_cruise_threshold` | `cruise_threshold` | Per-axis override. |
+| `cruise_threshold` | Saved model, else off | Lower trigger threshold in g that replaces the axis threshold once the homing move cruises: after the acceleration ramp plus 0.25 s. Replaces the value calibration saved; 0 disables. See [cruise threshold](#cruise-threshold-dev). |
+| `x_cruise_threshold`, `y_cruise_threshold` | `cruise_threshold` | Per-axis override; also replaces the saved value, 0 included. |
 | `enable_settle_time` | `0.25` | Seconds after enabling disabled homing motors; 0–2. |
 | `baseline_time` | `0.1` | Fresh reference duration in seconds; 0.05–1, with at least 50 contiguous samples. |
 | `baseline_batches` | `25` | Retained baseline batch capacity; integer 10–200. |
@@ -202,22 +202,31 @@ start of the move, plus 0.25 s. Before that, and on short homes that end
 earlier, the normal threshold applies. The stop is detected sooner; the first
 contact is not softer, only the push after it is shorter.
 
+Calibration finds the value: after the ten checks it derives a candidate from
+the vibration of steady travel, tests it with five more homes and saves it with
+the model only if they pass (see [calibration](calibration.md#cruise-threshold)).
+Every first-pass home reports that vibration as `cruise_peak_g` (status line:
+`cruise peak ... g`). `ACCEL_HOMING_STATUS` shows the active cruise threshold
+and its source.
+
+A manual value replaces the saved one, and 0 turns it off:
+
 ```ini
 [accel_homing]
 x_cruise_threshold: 3.0
 ```
 
 Choose a value above the vibration the axis shows while travelling and below
-its normal threshold. `ACCEL_HOMING_TROUBLESHOOT AXIS=X CENTERED=1` records the
-raw signal of every home; the largest reading between the start-up phase and
-the contact is the level to stay above. A value at or above the axis threshold
-has no effect.
+its normal threshold; the largest `cruise_peak_g` of several homes is the level
+to stay above. A value at or above the axis threshold has no effect.
 
-It is off by default and applies to the first pass of ordinary G28 and to the
-TEST, ACCURACY and TROUBLESHOOT workflows. Calibration, gentle homing and
-ACCEL_HOMING_EXPERIMENT ignore it. A home that used it reports
-`cruise threshold ... g` in its status line and `cruise_threshold_active` in
-its record. Too low a value triggers mid-travel and leaves a wrong origin, so
+Without a manual value or a saved one it is off. It applies to the first pass
+of ordinary G28 and to the TEST, ACCURACY and TROUBLESHOOT workflows. The
+saved value applies only while its model's calibrated threshold is in force,
+not with a manual or temporary threshold. Calibration homes (except its own
+five checks), gentle homing and ACCEL_HOMING_EXPERIMENT ignore it. A home that
+used it reports `cruise threshold ... g` in its status line and
+`cruise_threshold_active` in its record. Too low a value triggers mid-travel and leaves a wrong origin, so
 check several homes after setting it; `min_home_dist` does not catch a false
 trigger that happens after its distance.
 

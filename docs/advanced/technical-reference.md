@@ -179,6 +179,21 @@ the margin was reduced to zero, and records the applied margin, the weakest
 peak, the effective homing speed and acceleration, and the validation homes'
 travel beyond the midpoint-to-endstop distance.
 
+Every first-pass home records `cruise_peak_g`, the largest detector reading
+from cruise start (ramp plus 0.25 s) to 20 ms before the trigger batch, kept
+per batch on the trigger path. Ordinary calibration (not gentle, AUTO or Beta)
+takes the largest value `p` of the discovery and ten validation homes and
+offers the smallest grid value at least `max(1.2 * p, p + 0.1)` (never below
+1 g) as a cruise threshold if it is below 75% of the saved threshold. Five
+further midpoint homes at the tested threshold must each be plausible, use the
+cruise threshold and keep the eleven-to-fifteen-home spread at most 2 mm; they
+stay outside the qualification window, whose attempt and record checks account
+for them explicitly. Only then is `cruise_threshold_g` saved in the metadata.
+A failed check drops it, releases no home, leaves the axis unhomed (an early
+home is reversed first) and still saves the qualified threshold. Ordinary
+homing uses a saved value only while its model's generated threshold is in
+force; an explicit cruise option, including 0, takes precedence.
+
 Premature impacts reverse recorded signed **start-to-halt** command travel,
 not merely trigger travel; the workflow then settles, increases the candidate
 and starts a new discovery. A running spread above 2 mm likewise rejects the
