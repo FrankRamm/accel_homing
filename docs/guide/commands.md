@@ -110,7 +110,9 @@ ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
 
 With gentle mode disabled and `NOTCH` omitted, the saved threshold is the
 candidate that passed ten checks **plus 0.5 g**, applied once after qualification.
-Those checks do not test the higher saved value. Gentle calibration and explicit
+The margin is reduced if needed so the saved value stays at or below 80% of the
+weakest impact those homes measured, never below the tested candidate.
+Those checks do not test a higher saved value. Gentle calibration and explicit
 AUTO instead save the **exact tested threshold and filter**, with no later margin.
 The other axis is unchanged.
 
@@ -134,7 +136,8 @@ ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 SAVE_CONFIG=0
 
 This stages the model and selected-axis runtime threshold, plus the selected
 filter in gentle mode, without writing or
-restarting; it does not activate them for ordinary homing. Issue `SAVE_CONFIG`
+restarting; it does not activate them for ordinary homing, which keeps the
+previous threshold until `SAVE_CONFIG` and the restart. Issue `SAVE_CONFIG`
 to persist/reload both and comment the replaced selected-axis setting. The
 other axis and any shared fallback remain unchanged. Later manual overrides
 still take precedence. Read the

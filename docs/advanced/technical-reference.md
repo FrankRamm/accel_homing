@@ -170,16 +170,28 @@ fresh three-window stationary noise on that mapped component to select
 an initial candidate, then requires an impact beyond 20 mm inside the
 midpoint-to-endstop travel band. It excludes discovery and requires ten fresh
 validation homes at the candidate threshold with travel range at most 2 mm.
-After qualification, the saved threshold is that candidate plus 0.5 g once,
-subject to sensor headroom. Metadata distinguishes the tested candidate from
-the higher saved value, which those homes did not test.
+After qualification, the saved threshold is
+`min(candidate + 0.5, max(candidate, 0.8 * p))`, where `p` is the weakest
+impact peak of the discovery and ten validation homes (the full 0.5 g if a
+peak is missing), subject to sensor headroom. Metadata distinguishes the
+tested candidate from the saved value, which those homes did not test unless
+the margin was reduced to zero, and records the applied margin, the weakest
+peak, the effective homing speed and acceleration, and the validation homes'
+travel beyond the midpoint-to-endstop distance.
 
 Premature impacts reverse recorded signed **start-to-halt** command travel,
 not merely trigger travel; the workflow then settles, increases the candidate
 and starts a new discovery. A running spread above 2 mm likewise rejects the
 candidate. Ordinary and Beta calibration have no total monitored-home limit;
 the deprecated `calibration_max_attempts` option is accepted without numeric
-validation and ignored with a warning. Qualification still requires discovery
+validation and ignored with a warning. Three narrow stops replace further
+escalation: three consecutive premature triggers beyond 20 mm within 2 mm of
+each other (after the third return), the third spread rejection in a run, and,
+with an unknown sensor range (also Beta), a next candidate above 16 g.
+Outside gentle mode, workflow homes command a seek bounded to the plausible
+travel band plus the braking distance (gentle: midpoint + 2 mm), so a missed
+contact pushes into the stop only for the remainder of that seek. Ordinary
+G28 keeps the stock full-range seek. Qualification still requires discovery
 plus ten checks. Cancellation, disconnects and sensor/motion faults still abort.
 No encoder verifies those returns or the intended stop.
 

@@ -47,7 +47,11 @@ For each axis:
 
 Midpoint returns use ordinary acceleration restored after homing and the same
 `calibration_settle_time` wait as CALIBRATE. Homing speed/cap are not lowered
-to make the measurement appear more repeatable.
+to make the measurement appear more repeatable. As in CALIBRATE, each home's
+commanded seek is bounded to the plausible travel band plus braking (see
+[the shared homing path](../guide/calibration.md#impact-discovery-and-validation));
+a missed contact ends with Klipper's `No trigger … after full movement` error
+and the motors off.
 
 The report includes each accepted home's commanded travel, actual trigger
 threshold, measured onset and peak acceleration. It reports minimum, maximum,
@@ -55,6 +59,14 @@ mean, range, population standard deviation in mm and population variance in mm²
 Range is max minus min; population variance divides by N. Fewer than two
 accepted measured homes have no standard deviation/variance. An interrupted run
 reports incomplete statistics in the console without saving a chart.
+
+Each measured home also records `travel_excess_mm`, its commanded travel minus
+the configured midpoint-to-endstop distance, and prints it with its progress
+line. Because every measured home starts from a midpoint return after a previous
+home, this is approximately the travel the motor lost against the stop on that
+previous home. The per-axis summary adds its min/median/max (also in the result
+as `travel_excess_mm`); when the median exceeds 0.5 mm, one console notice says
+so and that a lower `homing_speed` reduces it. It does not reject homes.
 
 Travel is reported to 0.001 mm from commanded/firmware steps. Small reported
 variation does not prove correct-stop contact, no missed steps or a physically
@@ -83,12 +95,16 @@ When that evidence is valid, the same command:
    used by the failed ACCURACY attempt **plus exactly 0.25 g**. This increment
    is fixed; later candidate changes use configured `calibration_step`.
 5. Performs normal fresh stationary-noise checks, discovery and ten qualified
-   validation homes. It then adds the normal **0.5 g final margin** to the
-   qualified candidate and saves only after that calibration succeeds.
+   validation homes. It then adds the normal **final margin** to the qualified
+   candidate: 0.5 g, reduced if needed so the saved value stays at or below 80%
+   of the weakest measured impact, but never below the tested candidate (see
+   [saving](../guide/calibration.md#saving-and-ordinary-homing)). It saves only
+   after that calibration succeeds. Because the candidate is at least the
+   failed threshold plus 0.25 g, the saved threshold always increases.
 
 For example, a failed attempt using 1.75 g starts recovery calibration at
-2.00 g. If that candidate passes, the saved threshold is 2.50 g; those ten homes
-tested 2.00 g, not 2.50 g. A temporary SET threshold counts as the effective
+2.00 g. If that candidate passes and every measured impact peaked at 3.125 g or
+more, the saved threshold is 2.50 g; those ten homes tested 2.00 g, not 2.50 g. A temporary SET threshold counts as the effective
 threshold; recovery does not assume the configured default or the model's older value.
 The 0.5 g calibration minimum, known sensor-range headroom and finite-number
 requirements still apply to both candidate and saved threshold. Either value

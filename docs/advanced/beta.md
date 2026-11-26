@@ -50,7 +50,10 @@ can continue beyond 40 attempts. The legacy `calibration_max_attempts` option
 is accepted without numeric validation and ignored, with a deprecation warning.
 Each candidate still needs a fresh discovery plus ten passing checks.
 Cancellation, disconnects, sensor/motion faults and invalid thresholds still
-stop the workflow.
+stop the workflow. With an unknown sensor range, a next candidate above 16 g
+also stops it. The repeated-contact and spread stops of ordinary calibration do
+not apply to BETA. Each home's commanded seek is bounded as in
+[calibration](../guide/calibration.md#impact-discovery-and-validation).
 
 The noise margin is the larger of 20% or 0.1 g above the observed forward
 peak, rounded upward onto the selected grid. Automatic selection requires a

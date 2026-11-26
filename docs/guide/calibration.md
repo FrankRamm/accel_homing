@@ -209,9 +209,11 @@ excess amplitude is unknown, as are native markers' true sign and peak.
 Invalid/non-finite samples and acquisition/timing faults still abort. An
 unknown range prevents automatic noise-based
 selection; an explicit, otherwise valid `START_THRESHOLD` can still be used.
-Neither value is clamped downward to fit a limit. If the qualified candidate
-plus the final 0.5 g margin exceeds that ceiling, calibration aborts without
-staging a model, saving configuration or publishing its noise PNG.
+Neither value is clamped downward to fit a limit. If the final saved value
+(the qualified candidate plus the margin described under
+[Saving and ordinary homing](#saving-and-ordinary-homing)) exceeds that ceiling,
+calibration aborts without staging a model, saving configuration or publishing
+its noise PNG.
 Before arming, the derived raw trigger representation must be finite and
 positive. This validates numeric
 representation rather than adding a configurable g maximum.
@@ -224,6 +226,27 @@ ten passing validation homes. Cancellation, disconnects, sensor/motion faults
 and invalid thresholds still stop the workflow. There is no recovery-count
 cap or accumulated recovery-distance budget. The separate bounded stationary
 sensor acquisition retries are unchanged.
+
+Three narrow stops end ordinary calibration (including the raw reference
+phase of `NOTCH=AUTO`) where raising the threshold again cannot help:
+
+- **Repeatable premature contact.** Three consecutive premature triggers beyond
+  20 mm, at successively higher candidates, whose trigger travels lie within
+  2.00 mm of each other. The third trigger is reversed like the others, then
+  calibration stops with an error that gives the travel from the start. Check
+  the manual centring and look for an obstruction. If the spot is a known
+  harmless vibration, restart with a higher `START_THRESHOLD`. Triggers at
+  20 mm or less (start-up transients) keep the unlimited escalation; such a
+  trigger, a trigger outside the 2 mm group or a qualifying discovery resets
+  the count.
+- **Third spread rejection.** The third validation-spread rejection in one run
+  stops calibration. The error gives the spread in mm and as time at the
+  effective homing speed (spread divided by speed). That spread is usually
+  detection timing jitter, which a higher threshold does not reduce; lower
+  `homing_speed` and calibrate again. Gentle mode already stops at the first.
+- **Unknown sensor range.** When the accelerometer range is unknown, a next
+  candidate above 16 g stops calibration (and BETA) instead of raising the
+  threshold further.
 
 ### Impact discovery and validation
 
@@ -241,7 +264,8 @@ The plugin finds a first impact, then confirms it ten times.
    and settling complete, advance one threshold step and restart discovery with
    the previous candidate and measurements cleared. Exactly 20 mm is still an
    early hit; no further command or manual recentering is needed for an accepted
-   recovery.
+   recovery. The third matching premature contact beyond 20 mm stops the run
+   after its return (see the stops above).
 3. The first plausible impact **beyond 20 mm** selects the candidate. Stock
    axis homing assigns the endstop coordinate before its result is checked.
    After the travel check passes, move **only that printer axis** to its
@@ -263,7 +287,20 @@ The plugin finds a first impact, then confirms it ten times.
    requires **ten** validation impacts with a spread **at most 2.00 mm**;
    exactly 2.00 mm passes. The new discovery impact also stays outside its
    following ten measurements. All cycles retain the sensor-range headroom
-   policy described above.
+   policy described above. The third spread rejection in a run stops
+   calibration instead. Each progress line shows the running spread in mm and
+   in ms at the effective homing speed.
+
+Each accepted validation home also records and prints `travel_excess_mm`: its
+commanded travel minus the configured midpoint-to-endstop distance. The plugin
+reports the first threshold-crossing sample as the trigger time, so after a home
+the commanded coordinate is `endstop + (halt - trigger)` while the carriage is
+at the stop. The midpoint return therefore ends further from the stop by the part
+of the post-trigger push that was lost as skipped steps. The next validation
+home's excess is approximately what the motor lost against the stop on the
+previous home. This is reported only and does not change acceptance. When the
+median of the ten exceeds 0.5 mm, the console says so once; a lower
+`homing_speed` reduces it.
 
 Discovery and validation use the same native selected-axis homing path,
 independently of public G28 macros or wrappers.
@@ -276,6 +313,19 @@ acceleration cap to midpoint returns. Homing speed and its acceleration cap
 are unchanged. No return command changes the other XY coordinate or Z.
 Cancellation/failure restores settings; native homing's fatal error handling may
 turn off all motors, including Z. Keep Z supported as for ordinary homing faults.
+
+Every supervised workflow home (CALIBRATE, ACCURACY, TEST, CHARTS,
+TROUBLESHOOT, EXPERIMENT and BETA) starts from the manual center, the configured
+midpoint or a reversed return to its own start, and commands a bounded seek
+instead of stock homing's 1.5 × axis range. Outside gentle mode the seek is
+`expected * (1 + calibration_travel_tolerance)` plus the braking distance
+`v² / (2a)` at the effective homing speed and acceleration, so commanded braking
+starts only after the upper edge of the plausible band below. Any trigger past
+that edge would be rejected anyway. When no impact is detected, Klipper ends the
+move with `No trigger on … after full movement`, switches the motors off, and
+the workflow aborts with its normal cleanup; the console first explains that the
+seek was bounded. Gentle mode keeps its midpoint + 2 mm seek. Ordinary G28 is
+unchanged.
 
 ### Travel plausibility before midpoint returns
 
@@ -333,7 +383,9 @@ There is no additional test of whether the carriage physically arrived.
 Ordinary firmware movement limits and errors still apply to the commanded move.
 
 Before returning, the next threshold must satisfy the existing sensor headroom
-policy and at least one monitored-home attempt must remain.
+policy and at least one monitored-home attempt must remain. The third matching
+premature contact beyond 20 mm is still returned this way; calibration then
+stops instead of raising the threshold.
 After the return's queued movement and `calibration_settle_time` wait (default
 0.25 s) complete, record the return, raise the threshold by STEP, clear the
 candidate and its measurements, and restart discovery. Early reversals retain
@@ -374,22 +426,36 @@ The shared `threshold` is preserved for the other axis; the new per-axis value
 overrides it for the calibrated axis. The other axis's threshold and saved
 model are not changed, except for the documented orientation-conflict invalidation.
 `SAVE_CONFIG=0` only stages the values in memory until an explicit save; it does
-not comment or write configuration files early. Sequential X/Y calibrations
+not comment or write configuration files early. Until `SAVE_CONFIG` writes them
+and Klipper restarts, homing (including `ACCEL_HOMING_TEST` and G28) keeps using
+the previous threshold; the console says so. Sequential X/Y calibrations
 retain both pending results. Failed qualification stages no replacement.
 
 After the ten checks pass, add **0.5 g once** to the qualified candidate and
 stage that value as the selected axis's threshold. For example, ten checks at
-1.25 g produce a saved threshold of 1.75 g. Discovery, retries and all ten
-checks still use the candidate without this final margin; the higher saved
-value was **not tested by those ten homes**. A later `SAVE_CONFIG`, restart or
-model reload does not add the margin again. Failed qualification stages no
-replacement threshold. Beta proposals are unchanged.
+1.25 g produce a saved threshold of 1.75 g, when the measured impacts allow it.
+The saved value never exceeds 80% of the weakest measured impact: with `p` the
+smallest `impact_peak_g` of the discovery and the ten validation homes, the
+saved threshold is `min(candidate + 0.5, max(candidate, 0.8 * p))`. It is
+therefore never below the candidate the ten homes tested. For example, a 1.00 g
+candidate whose weakest impact peaked at 1.30 g saves 1.04 g, and one whose
+weakest impact peaked at 1.10 g saves the tested 1.00 g. When the margin is
+reduced, the console gives both numbers. Peaks from amplitude-limited samples
+are lower bounds, so this stays conservative. If a peak is missing, the full
+0.5 g applies. Discovery, retries and all ten checks still use the candidate
+without this final margin; a higher saved value was **not tested by those ten
+homes**. A later `SAVE_CONFIG`, restart or model reload does not add the margin
+again. Failed qualification stages no replacement threshold. Beta proposals are
+unchanged.
 
 Console output and saved metadata distinguish `tested_threshold_g`,
-`saved_threshold_g` and `threshold_margin_g` (0.5), with
-`saved_threshold_tested: false`. The final result's `threshold_g` is the saved
-value; `candidate_g` remains the tested candidate. Stationary-noise charts
-continue to describe their measurement and initial-value hints.
+`saved_threshold_g` and `threshold_margin_g` (the applied margin, normally 0.5),
+with `saved_threshold_tested` true only when the saved value equals the tested
+one. `weakest_impact_peak_g`, `threshold_margin_reduced` and
+`impact_threshold_fraction` (0.8) record the cap. The final result's
+`threshold_g` is the saved value; `candidate_g` remains the tested candidate.
+Stationary-noise charts continue to describe their measurement and initial-value
+hints.
 
 New models record `impact_metric: mapped_axis` and `axis_mapping` with version,
 machine axis, source channel, sign, `coordinate_frame: configured_sensor_stream`,
@@ -410,6 +476,20 @@ generated setting retains the qualified model's context checks after reload.
 New calibration metadata also records `travel_plausibility_required: true`,
 `recenter_acceleration_policy: restored_normal_limit` and the configured
 settling interval. `physical_position_verified` remains false.
+`min_travel_excess_mm`, `median_travel_excess_mm` and `max_travel_excess_mm`
+summarize the validation excess described above.
+
+The model also records `effective_homing_speed_mm_s` and
+`effective_homing_accel_mm_s2`: the speed and acceleration the homes actually
+ran at, `min(homing_speed, max_velocity)` and `min(max_accel, homing_accel)` (or
+a rail's own homing acceleration on Kalico). These do not make a model stale.
+Before each G28 of a calibrated axis, outside gentle mode, the console prints one
+notice when the effective speed is lower than at calibration (a softer impact
+may not reach the threshold, so the motor can push into the stop without
+triggering) or the effective acceleration differs (a higher one raises the
+start-up ramp and can trigger early). Models saved before this version compare
+the speed with their configured `homing_speed_mm_s` and skip the acceleration
+notice. Homing itself is unchanged.
 
 `ACCEL_HOMING_CALIBRATE_NOISE` remains a separate stationary diagnostic. Its
 configured-stream X/Y component hints do not select a later calibration's initial
@@ -445,6 +525,17 @@ results expose `beta_home_history`; console diagnostics and the PNG report the
 total, retained and omitted capture counts and their actual attempt ranges.
 Attempt labels retain their original numbers. Ordinary calibration keeps its
 existing trial history.
+
+### Gentle mode braking window
+
+With `gentle_homing: True`, a supervised approach commands the
+midpoint-to-endstop distance plus the 2 mm centring tolerance and brakes over
+`v² / (2a)` at the homing speed and acceleration. A contact during that planned
+braking is rejected, so on the far side of the midpoint the usable centring
+window is `2 mm - v² / (2a)`. Settings whose braking leaves less than 0.5 mm of
+the tolerance are rejected with an error before any workflow motion or G28.
+Klipper still starts with them. The message names the minimum `homing_accel`
+for that speed; at 40 mm/s it is 534 mm/s².
 
 ### Limits of this method
 

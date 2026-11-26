@@ -62,6 +62,65 @@ class GentleDetectorTests(unittest.TestCase):
                     self.assertEqual(result["status"], "insufficient_data")
                     self.assertIn("missing/nonuniform samples at interval", result["reasons"][0])
 
+    @staticmethod
+    def beacon_motions():
+        # Field Beacon packets alternate 302.2/345.0 us for 8 samples. Apply that
+        # relative pattern to the fixture while keeping its first/last timestamps.
+        low, high = .0003022 / .0003236, .0003450 / .0003236
+        items = motions()
+        for item in items:
+            item["record"]["axis_mapping_context"]["backend"] = "beacon_raw"
+            cap = item["capture"]
+            cap["sensor_context"]["backend"] = "beacon_raw"
+            rows = cap["samples"]
+            steps = [low if (number // 8) % 2 == 0 else high for number in range(len(rows) - 1)]
+            times = rows[0][0] + np.concatenate(([0.], np.cumsum(steps))) / cap["sample_rate_hz"]
+            times = rows[0][0] + (times - rows[0][0]) * (rows[-1][0] - rows[0][0]) / (times[-1] - rows[0][0])
+            cap["samples"] = [(float(t), *row[1:]) for t, row in zip(times, rows)]
+            cap["beta_capture_diagnostics"] = {"sample_count": len(rows), "capture_dropped": 0,
+                                               "gap_observations": 0}
+        return items
+
+    def test_beacon_packet_jitter_needs_continuity_mean_rate_and_intact_receipt(self):
+        items = self.beacon_motions()
+        original = analyze(motions())
+        result = analyze(items)
+        self.assertEqual(result["status"], "selected", result["reasons"])
+        self.assertEqual(result["profile"]["type"], original["profile"]["type"])
+        self.assertAlmostEqual(result["profile"]["frequency_hz"], original["profile"]["frequency_hz"], delta=1.)
+        timing = result["evidence"]["captures"][0]["sample_timing"]
+        self.assertGreater(timing["packet_jitter_intervals"], 100)
+        self.assertAlmostEqual(timing["mean_rate_hz"], timing["reference_rate_hz"], delta=1.)
+        for case in ("missing_sample", "missing_sample_with_receipt", "sustained", "reported_gap",
+                     "missing_receipt", "dropped"):
+            with self.subTest(case=case):
+                trial = copy.deepcopy(items)
+                cap = trial[0]["capture"]
+                receipt = cap["beta_capture_diagnostics"]
+                if case.startswith("missing_sample"):
+                    cap["samples"].pop(400)
+                    if case == "missing_sample":
+                        receipt["sample_count"] -= 1
+                elif case == "sustained":
+                    # Second half 5% slower: every interval is within the packet
+                    # tolerance, but the capture no longer has the reference rate.
+                    times = np.array([row[0] for row in cap["samples"]])
+                    times[700:] = times[699] + (times[700:] - times[699]) * 1.05
+                    cap["samples"] = [(float(t), *row[1:]) for t, row in zip(times, cap["samples"])]
+                elif case == "reported_gap":
+                    receipt["gap_observations"] = 1
+                elif case == "missing_receipt":
+                    del cap["beta_capture_diagnostics"]
+                else:
+                    receipt["capture_dropped"] = 1
+                report = analyze(trial)
+                self.assertEqual(report["status"], "insufficient_data")
+                self.assertIsNone(report["profile"])
+                if case == "sustained":
+                    self.assertIn("mean sample rate", report["reasons"][0])
+                else:
+                    self.assertIn("missing sample or nonuniform Beacon packet timing", report["reasons"][0])
+
     def test_training_only_frequency_generalizes_and_report_is_json(self):
         for frequency in (80., 330.):
             with self.subTest(frequency=frequency):

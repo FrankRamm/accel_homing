@@ -41,6 +41,8 @@ MIN_PEAK_PROMINENCE = 8.0
 MIN_PEAK_POWER_FRACTION = 0.10
 MIN_CYCLES = 8.0
 MIN_BANDWIDTH_BINS = 2.0
+# Same packet-period tolerance as the native Beacon runtime stream checks.
+BEACON_PACKET_PERIOD_TOLERANCE = 0.25
 
 
 class InsufficientData(ValueError):
@@ -547,6 +549,35 @@ def _gentle_batch_timing(capture, capture_id, periods, rate, np):
     return timing
 
 
+def _gentle_beacon_timing(capture, capture_id, periods, rate, np):
+    """Validate native Beacon packet-derived timestamps before fitting a gentle motion control.
+
+    Beacon reports one span per packet, so packet periods alternate around the
+    mean rate. Require continuity within the runtime's packet-period tolerance,
+    an intact acquisition receipt and the mean rate, not 2 % on every interval.
+    """
+    tolerance = RATE_TOLERANCE + 1e-8
+    deviations = np.abs(periods - 1.)
+    mean_rate = rate / float(periods.mean())
+    timing = {"mean_rate_hz": mean_rate, "reference_rate_hz": rate,
+              "minimum_interval_s": float(periods.min()) / rate,
+              "maximum_interval_s": float(periods.max()) / rate,
+              "packet_jitter_intervals": int(np.count_nonzero(deviations > tolerance))}
+    _require(abs(mean_rate / rate - 1.) <= tolerance,
+             "%s: mean sample rate %.3f Hz differs from reference %.3f Hz" %
+             (capture_id, mean_rate, rate))
+    index = int(np.argmax(deviations))
+    message = ("%s: missing sample or nonuniform Beacon packet timing at interval %d "
+               "(%.3f us; reference %.3f us)" %
+               (capture_id, index, 1e6 * periods[index] / rate, 1e6 / rate))
+    _require(float(deviations[index]) <= BEACON_PACKET_PERIOD_TOLERANCE + 1e-8, message)
+    receipt = capture.get("beta_capture_diagnostics") or {}
+    _require(isinstance(receipt, dict) and receipt.get("gap_observations") == 0
+             and receipt.get("capture_dropped") == 0 and not receipt.get("fault")
+             and receipt.get("sample_count") == len(periods) + 1, message)
+    return timing
+
+
 def _prepare(item, kind, index, raw_threshold, np, check_running, *, gentle=False):
     _check(check_running)
     _require(isinstance(item, dict) and isinstance(item.get("record"), dict)
@@ -703,6 +734,8 @@ def _prepare(item, kind, index, raw_threshold, np, check_running, *, gentle=Fals
     periods = np.diff(times) * rate
     if gentle and kind == "motion" and context.get("backend") == "klipper_batch":
         result["sample_timing"] = _gentle_batch_timing(capture, capture_id, periods, rate, np)
+    elif gentle and kind == "motion" and context.get("backend") == "beacon_raw":
+        result["sample_timing"] = _gentle_beacon_timing(capture, capture_id, periods, rate, np)
     else:
         regular = np.abs(periods - 1) <= RATE_TOLERANCE + 1e-8
         if kind == "home" and start > 0 and "reference_validation" in meta:

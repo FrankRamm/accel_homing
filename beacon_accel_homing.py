@@ -858,7 +858,7 @@ class BeaconAccelHoming:
         self.ordinary_home = context
         try:
             workflows = self.workflows
-            if getattr(workflows, "gentle_homing", False) and workflows.in_home and workflows.session:
+            if workflows.in_home and workflows.session:
                 result = workflows.centered_gentle_home(homing)
             else:
                 result = self.kinematics_home(homing)

@@ -101,8 +101,10 @@ class AutoNotchWorkflowTests(unittest.TestCase):
                 if disabled:
                     rig.selected = dict(DISABLED)
                 if retries:
+                    # Start-up transients keep restarting raw discovery; the
+                    # third spread rejection would stop the run instead.
                     rig.home_results.extend([{"travel_mm": 2.}] +
-                                            [{}, {"travel_mm": 150.}, {"travel_mm": 153.}] * retries)
+                                            [{}, {"travel_mm": 150.}, {"travel_mm": 2.}] * retries)
                 before = copy.deepcopy(rig.owner.notch_profiles)
                 rig.configfile.set("extruder", "pid_kp", "42")
                 pending = dict(rig.configfile.saved)
@@ -118,7 +120,7 @@ class AutoNotchWorkflowTests(unittest.TestCase):
                 result = rig.workflow.last_result
                 if retries:
                     self.assertGreater(result["attempts"], 64)
-                    self.assertEqual(result["auto_notch"]["superseded_reference_captures"], 2 * retries)
+                    self.assertEqual(result["auto_notch"]["superseded_reference_captures"], retries)
                     self.assertEqual(result["auto_notch"]["omitted_attempt_records"], result["attempts"] - 128)
                 self.assertEqual(result["result"], "auto_notch_proposed")
                 self.assertFalse(result["model_staged"])

@@ -2537,7 +2537,7 @@ class ModelTests(unittest.TestCase):
         speed = Rig(sections=sections)
         speed.owner.rails_by_axis["x"].info.speed = 80.0
         speed.workflow._validate_model_connection()
-        with self.assertRaisesRegex(CommandError, "homing_speed_mm_s.*regular \[accel_homing\]"):
+        with self.assertRaisesRegex(CommandError, r"homing_speed_mm_s.*regular \[accel_homing\]"):
             speed.workflow.check_home_axes(["x"])
         # A manual threshold does not bypass the saved axis mapping after an axes_map change.
         manual = Rig({"x_threshold": 8.0}, sections=sections)
@@ -2548,9 +2548,9 @@ class ModelTests(unittest.TestCase):
             fake_context(), capture_axes_map=manual.owner.helper.config.axes_map,
             sensor_axes_map=manual.owner.helper.config.axes_map)
         manual.workflow._validate_model_connection()
-        with self.assertRaisesRegex(CommandError, "axis mapping sensor context changed; manually center XY and "
-                                    "run ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 \(a manual threshold does not "
-                                    "replace a saved axis mapping\)"):
+        with self.assertRaisesRegex(CommandError, r"axis mapping sensor context changed; manually center XY and "
+                                    r"run ACCEL_HOMING_CALIBRATE AXIS=X CENTERED=1 \(a manual threshold does not "
+                                    r"replace a saved axis mapping\)"):
             manual.workflow.check_home_axes(["x"])
 
     def test_saved_models_supply_defaults_but_manual_controls_win(self):

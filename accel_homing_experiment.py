@@ -37,9 +37,10 @@ def validate_mapped_comparison_capture(capture, record, frozen, *, max_age_s):
             or detector.get("onset_sample_matches") != 1
             or not _number(threshold) or threshold <= 0):
         raise ValueError("receipt differs from the frozen calibrated mapped detector")
+    # The homing record reports its threshold rounded to 0.01 g; the detector keeps the exact value.
     if any(not _number(item.get("threshold_g"))
-           or not math.isclose(item["threshold_g"], threshold, rel_tol=1e-12, abs_tol=1e-12)
-           for item in (record, detector)):
+           or not math.isclose(item["threshold_g"], expected, rel_tol=1e-12, abs_tol=1e-12)
+           for item, expected in ((record, round(threshold, 2)), (detector, threshold))):
         raise ValueError("receipt differs from the frozen calibrated mapped threshold")
     expected_filter = frozen["signal_filter"]
     observed_filter = detector.get("signal_filter", {"type": "disabled"})

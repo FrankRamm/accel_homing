@@ -69,10 +69,19 @@ The sequence is:
 
 A clean run therefore includes the mapping strokes when needed, three
 independent central strokes and 22 homes. The raw
-reference phase can need additional attempts under the existing retry policy.
+reference phase can need additional attempts under the existing retry policy,
+including the calibration stops for a repeatable premature contact and the
+third spread rejection ([threshold validity](../guide/calibration.md#threshold-validity-and-homing-attempts)).
 AUTO needs usable unfiltered reference homes; it cannot recover every case
 in which raw homing fails. Missing data, insufficient cruise duration, clipping
-or rate changes are reported as unusable evidence. A rejected notch may fall
+or rate changes are reported as unusable evidence. Native Beacon reports one
+time span per packet, so its sample intervals alternate by several percent
+between packets. For gentle selection on a native Beacon, each interval must
+stay within the 25% packet-period tolerance the runtime stream checks already
+use (a lost sample doubles one interval and is rejected), the capture's mean
+rate must be within 2% of its reference and the acquisition receipt must report
+no gap, drop or fault. Decoded drivers keep their stricter interval checks.
+A rejected notch may fall
 back to the already-tested disabled control; if that control also fails, the
 run is rejected without selecting or saving a profile.
 

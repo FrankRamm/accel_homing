@@ -95,6 +95,7 @@ class CalibrationMarginTests(unittest.TestCase):
 
     def test_exact_sensor_ceiling_round_trips_without_adding_another_margin(self):
         rig = Rig()
+        rig.home_results.extend([{"impact_peak_g": 16.}] * 11)
         rig.calibrate(save=0, START_THRESHOLD=12.3)
         value = float(rig.configfile.saved[("accel_homing_model default", "x_threshold")])
         self.assertEqual(value, 12.8)
@@ -113,6 +114,9 @@ class CalibrationMarginTests(unittest.TestCase):
         for save, tested in itertools.product((0, 1), (12.300000000000002, 12.5, 12.8)):
             with self.subTest(save=save, tested=tested), tempfile.TemporaryDirectory() as directory:
                 rig = Rig({"charts_directory": directory})
+                # Impacts strong enough to keep the full margin (for example
+                # filtered levels above the raw range) still abort at the ceiling.
+                rig.home_results.extend([{"impact_peak_g": 17.}] * 11)
                 with mock.patch.object(rig.workflow, "_release_terminal_home",
                                        wraps=rig.workflow._release_terminal_home) as release, \
                         mock.patch.object(workflow_module, "prepare_noise") as render, \

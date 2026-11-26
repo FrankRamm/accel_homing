@@ -119,7 +119,8 @@ class MappedComparisonTests(unittest.TestCase):
         self.assertEqual(rig.configfile.saved, {})
 
     def test_cartographer_detector_uses_real_workflow_mapping_and_frozen_filter(self):
-        for filtered, threshold in ((False, 1.), (True, 1.), (False, 2.3), (True, 2.3)):
+        for filtered, threshold in ((False, 1.), (True, 1.), (False, 2.3), (True, 2.3),
+                                    (False, .6234), (True, .6234), (False, 1.237), (True, 1.237)):
             with self.subTest(filtered=filtered, threshold=threshold):
                 obj = generic("lis2dw cartographer", options={"threshold": threshold,
                     "y_notch_frequency": 100. if filtered else 0.})
@@ -157,10 +158,23 @@ class MappedComparisonTests(unittest.TestCase):
                 self.assertAlmostEqual(capture["detector"]["threshold_g"], threshold)
                 if threshold == 2.3:
                     self.assertNotEqual(capture["detector"]["threshold_g"], threshold)
+                frozen = {"axis": "y", "axis_mapping": selected, "threshold_g": threshold,
+                          "signal_filter": obj.filter_settings("y")}
+                # The homing record reports 0.01 g; the detector keeps the exact frozen value.
+                self.assertEqual(attempt.record["threshold_g"], round(threshold, 2))
                 receipt = experiment_module.validate_mapped_comparison_capture(capture, attempt.record,
-                    {"axis": "y", "axis_mapping": selected, "threshold_g": threshold,
-                     "signal_filter": obj.filter_settings("y")}, max_age_s=.020)
+                    frozen, max_age_s=.020)
                 self.assertTrue(receipt["verified"])
+                for record_threshold, detector_threshold in ((round(threshold, 2) + .01, None),
+                                                             (None, threshold + .001)):
+                    changed_record, changed_capture = dict(attempt.record), copy.deepcopy(capture)
+                    if record_threshold is not None:
+                        changed_record["threshold_g"] = record_threshold
+                    else:
+                        changed_capture["detector"]["threshold_g"] = detector_threshold
+                    with self.assertRaisesRegex(ValueError, "frozen calibrated mapped threshold"):
+                        experiment_module.validate_mapped_comparison_capture(
+                            changed_capture, changed_record, frozen, max_age_s=.020)
                 obj._end_session()
 
     def test_compact_capture_reproduces_mapped_crossing_and_exports_only_its_signal(self):

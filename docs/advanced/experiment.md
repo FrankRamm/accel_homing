@@ -61,7 +61,9 @@ at the same configured homing speed and calibrated threshold. A calibrated
 notch stays fixed: the experiment never selects or retunes it. Each retained
 capture must reproduce the first mapped threshold crossing from the raw channel
 or the causal filtered channel. Mapping, filter, threshold and age receipts are
-checked before any automatic return. No discovery/training/holdout homes are added.
+checked before any automatic return. The detector's threshold must equal the
+frozen value; the homing record reports it rounded to 0.01 g and is compared at
+that resolution. No discovery/training/holdout homes are added.
 
 The Cartographer-backed Klipper batch adapter uses the existing interval controls
 described below. The ZIP includes `manifest.json`, `experiment.json`,

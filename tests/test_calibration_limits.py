@@ -81,8 +81,9 @@ class CalibrationUnlimitedAttemptsTests(unittest.TestCase):
             with self.subTest(beta=beta, axis=axis, early_count=early_count):
                 rig = self.rig(beta, {"calibration_max_attempts": 12})
                 # Includes the reported 9.5 g candidate, discovery on home 40,
-                # and early-return/threshold progression after home 40.
-                rig.home_results.extend([{"travel_mm": 0.}] * early_count + [{}] * 12)
+                # and early-return/threshold progression after home 40. Impacts
+                # at the sensor range keep the full saved margin below 80% of them.
+                rig.home_results.extend([{"travel_mm": 0.}] * early_count + [{"impact_peak_g": 16.}] * 12)
                 states = []
                 rig.on_home = lambda _axis: states.append(rig.workflow.get_status(0)["active"])
                 self.run_calibration(rig, beta, axis)
@@ -200,6 +201,7 @@ class CalibrationThresholdLimitTests(unittest.TestCase):
             with self.subTest(axis=axis, configured=configured, threshold=threshold):
                 rig = Rig({"calibration_start_threshold": threshold} if configured else {})
                 rig.owner.full_scale_g = sensor_range
+                rig.home_results.extend([{"impact_peak_g": sensor_range}] * 11)
                 rig.calibrate(axis.upper(), save=0, **({} if configured else {"START_THRESHOLD": threshold}))
                 self.assertEqual([item["threshold"] for item in rig.home_calls], [threshold] * 11)
                 options = {key: value for (_section, key), value in rig.configfile.saved.items()}
@@ -221,6 +223,7 @@ class CalibrationThresholdLimitTests(unittest.TestCase):
             recommendation = rig.workflow.last_result["recommendation"]
             self.assertEqual(recommendation["threshold_limit_g"], 25.6)
             self.assertEqual(recommendation["start_threshold_g"]["x"], 15.75)
+            rig.home_results.extend([{"impact_peak_g": 32.}] * 11)
             rig.calibrate(save=0)
             self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 15.75)
             self.assertEqual(rig.workflow.last_result["threshold_g"], 16.25)
@@ -252,6 +255,7 @@ class CalibrationThresholdLimitTests(unittest.TestCase):
     def test_unknown_range_explicit_start_and_model_use_none_without_fixed_g_cap(self):
         rig = Rig()
         rig.owner.full_scale_g = None
+        rig.home_results.extend([{"impact_peak_g": 200.}] * 11)
         rig.calibrate(save=0, START_THRESHOLD=100.)
         self.assertIsNone(rig.workflow._threshold_limit())
         self.assertEqual(rig.workflow.last_result["tested_threshold_g"], 100.)

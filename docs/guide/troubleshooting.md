@@ -140,6 +140,45 @@ bounds. Above-band travel, missing impact, a sensor fault or failed return
 aborts; inspect the machine and manually prepare XY before a new command.
 Commanded return completion is not physical arrival feedback.
 
+**What you see:** calibration stops with `is hitting something repeatably at
+about ... mm from the start`.
+
+Three premature triggers in a row landed within 2 mm of each other, more than
+20 mm into the move, at rising thresholds. That is a contact, not noise:
+usually the toolhead was not centred, or something blocks the axis. Raising the
+threshold further would only hit it harder, so calibration stops after the
+third return. Centre XY again and check the travel path. If the spot is a known
+harmless vibration, restart with a higher `START_THRESHOLD`.
+
+**What you see:** calibration stops with `this is spread rejection 3 in this
+run`.
+
+The ten checks kept spreading more than 2 mm. The message gives the spread as
+time at the homing speed: that much variation is usually detection timing, which
+a higher threshold cannot reduce. Lower `homing_speed` and calibrate again.
+
+**What you see:** `workflow home moved its full ... mm seek without a detected
+impact`, followed by `No trigger on ... after full movement`.
+
+Outside ordinary G28, a supervised home only seeks as far as the travel that
+would be accepted, plus braking, so a missed contact cannot push far into the
+stop. No impact was detected in that distance: the toolhead was not centred, or
+the impact is too soft for the threshold. Klipper switches the motors off after
+this error. Centre XY and check the threshold and homing speed.
+
+**What you see:** calibration stops with `would exceed 16 g and the
+accelerometer range is unknown`.
+
+The sensor does not report its range, so calibration stops raising the
+threshold at 16 g. Check centring and that the axis moves freely.
+
+**What you see:** a gentle home or calibration refuses with `brakes over ... mm`.
+
+At that speed and `homing_accel` the planned braking uses up the 2 mm centring
+tolerance, and a contact during braking is rejected. Raise `homing_accel` to
+the value in the message or lower `homing_speed`. See the
+[gentle braking window](calibration.md#gentle-mode-braking-window).
+
 ### `homed after ... mm, less than min_home_dist ... times`
 
 **What you see:** homing stops with an error, and the printer moved only a short

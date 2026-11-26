@@ -145,7 +145,9 @@ reviewing the reported mismatch rather than editing generated metadata.
 Successful normal calibration defaults to `SAVE_CONFIG=1`: it writes the
 selected axis model and runtime threshold, then restarts Klipper.
 `SAVE_CONFIG=0` stages both in memory, without changing configuration files.
-Its threshold is the qualified candidate plus a fixed 0.5 g final margin; the
+Its threshold is the qualified candidate plus a 0.5 g final margin, reduced if
+needed so the saved value stays at or below 80% of the weakest measured impact
+and never below the candidate; the
 ten qualification homes test the candidate before that addition. Both values
 must satisfy known-range headroom. Saving or reloading never adds the margin again.
 The generated threshold is tied to its qualified model and keeps the model's
